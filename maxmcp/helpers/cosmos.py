@@ -17,6 +17,9 @@ _KIND_TAGS = {"all": (), "model": (1,), "material": (38,), "hdri": (427,)}
 _STATES = {1: "unavailable", 2: "not_downloaded", 3: "ready",
            4: "downloading", 5: "unavailable", 6: "ready", 7: "creating"}
 _EXPECTED = {"model": "nodes", "material": "materials", "hdri": "maps"}
+# Asset kinds that bring materials: when none of the new materials can be tied to the
+# import, all stay listed in materials (with a warning) rather than going apart. None: unknown.
+_MATERIAL_KINDS = (None, "material", "model")
 _import_lock = threading.Lock()
 _download_jobs: dict[tuple[str, str], float] = {}
 _download_lock = threading.Lock()
@@ -214,6 +217,14 @@ def download(client, package_id, wait_seconds, renderer):
 # for HDRIs, bitmap/HDRI map) seen as "known". Later scans get those handles back
 # (sorted, __KNOWN_*__) and also report any material/map NOT among them, whatever
 # its name: package materials are often named differently from the asset.
+# __RECORD__ also returns "newest": the handle of a controller made right then.
+# Animatable handles come from one increasing counter, so a map with a higher handle
+# is new (no map handle set is recorded except for HDRIs).
+# Import-produced ("core") materials: on the asset's nodes, named like the asset, in
+# a Material Editor slot, or sub-materials of those. Other listed materials (new
+# meanwhile, e.g. Forest Pack regenerating its own) are flagged "other", and maps are
+# only collected from core materials, unless no core material is new (material and model
+# assets: then from all, matching the fallback in _resources).
 _ASSET_SNAPSHOT = r"""(
  fn compactName value = (
   (dotNetClass "System.Text.RegularExpressions.Regex").Replace (toLower(value as string)) "[^a-z0-9]" ""
@@ -249,9 +260,9 @@ _ASSET_SNAPSHOT = r"""(
   f
  )
  fn quoteJSON value = ("\"" + (MCP_Server.escapeJsonString(value as string)) + "\"")
- fn refJSON value isNode slot:undefined isSub:false = (
+ fn refJSON value isNode slot:undefined isSub:false isOther:false = (
   local h=if isNode then value.handle as string else formattedPrint (handleOf value) format:"d"
-  "{\"handle\":"+(quoteJSON h)+",\"name\":"+(quoteJSON(try(value.name)catch("")))+",\"class\":"+(quoteJSON(classof value))+",\"filename\":"+(quoteJSON(fileOf value))+(if slot==undefined then "" else ",\"slot\":"+(slot as string))+(if isSub then ",\"sub\":true" else "")+"}"
+  "{\"handle\":"+(quoteJSON h)+",\"name\":"+(quoteJSON(try(value.name)catch("")))+",\"class\":"+(quoteJSON(classof value))+",\"filename\":"+(quoteJSON(fileOf value))+(if slot==undefined then "" else ",\"slot\":"+(slot as string))+(if isSub then ",\"sub\":true" else "")+(if isOther then ",\"other\":true" else "")+"}"
  )
  fn collectSubs value subs depth = (
   if depth<12 do for i=1 to (try(getNumSubMtls value)catch(0)) do (
@@ -269,9 +280,11 @@ _ASSET_SNAPSHOT = r"""(
   for i=1 to values.count do (if i>1 do format "," to:ss; format "%" (formattedPrint values[i] format:"d") to:ss)
   "["+(ss as string)+"]"
  )
+ local newest=if record then (try(handleOf (bezier_float()))catch(-1L)) else -1L
  local nodes=for n in objects where (try(n.cosmosAssetId==aid)catch(false)) collect n
  local mats=#()
  for n in nodes where n.material!=undefined do appendIfUnique mats n.material
+ local nodeMats=for m in mats collect m
  try(
   for m in meditMaterials where m!=undefined do (
    if record do remember m knownMats
@@ -284,6 +297,13 @@ _ASSET_SNAPSHOT = r"""(
    if (matchesName m.name key) or (isNew m knownMats diffMats) do appendIfUnique mats m
   )
  )catch()
+ local core=for m in mats where (findItem nodeMats m)>0 or (try(matchesName m.name key)catch(false)) or (slotOf m)>0 collect m
+ local coreSubs=#()
+ for m in core do collectSubs m coreSubs 0
+ for m in mats where (findItem coreSubs m)>0 do appendIfUnique core m
+ local coreNew=false
+ for m in core while not coreNew do if isNew m knownMats diffMats do coreNew=true
+ local mapRoots=if __MAP_FALLBACK__ and diffMats and not coreNew then mats else core
  local maps=#()
  fn visitMaps value maps visited depth = (
   if value!=undefined and depth<12 and findItem visited value==0 do (
@@ -295,7 +315,7 @@ _ASSET_SNAPSHOT = r"""(
  )
  local visited=#()
  if __SCAN_MAPS__ do (
-  for m in mats do visitMaps m maps visited 0
+  for m in mapRoots do visitMaps m maps visited 0
   for c in textureMap.classes where (matchPattern (c as string) pattern:"*bitmap*" or matchPattern (c as string) pattern:"*hdri*") do try(
    for m in (getClassInstances c processAllAnimatables:true) do (
     if recordMaps do remember m knownMaps
@@ -303,10 +323,10 @@ _ASSET_SNAPSHOT = r"""(
    )
   )catch()
  )
- local knownJSON=if record then (",\"known\":{\"materials\":"+(joinHandles knownMats)+",\"maps\":"+(if recordMaps then joinHandles knownMaps else "null")+"}") else ""
+ local knownJSON=if record then (",\"known\":{\"materials\":"+(joinHandles knownMats)+",\"maps\":"+(if recordMaps then joinHandles knownMaps else "null")+",\"newest\":"+(formattedPrint newest format:"d")+"}") else ""
  local subs=#()
  for m in mats do collectSubs m subs 0
- "{\"nodes\":"+(joinJSON(for n in nodes collect(refJSON n true)))+",\"materials\":"+(joinJSON(for m in mats collect(refJSON m false slot:(slotOf m) isSub:((findItem subs m)>0))))+",\"maps\":"+(joinJSON(for m in maps collect(refJSON m false)))+knownJSON+"}"
+ "{\"nodes\":"+(joinJSON(for n in nodes collect(refJSON n true)))+",\"materials\":"+(joinJSON(for m in mats collect(refJSON m false slot:(slotOf m) isSub:((findItem subs m)>0) isOther:((findItem core m)==0))))+",\"maps\":"+(joinJSON(for m in maps collect(refJSON m false)))+knownJSON+"}"
 )"""
 
 _RENDERER_MATERIAL_CLASSES = (
@@ -350,6 +370,7 @@ def _snapshot_script(asset, light=False, renderer="", scan_classes=False, known=
     return (_ASSET_SNAPSHOT.replace("__KEY__", key).replace("__ASSET__", normalize_id(asset["id"]))
             .replace("__MAT_CLASSES__", classes).replace("__SCAN_MAPS__", scan_maps)
             .replace("__RECORD__", "true" if record else "false")
+            .replace("__MAP_FALLBACK__", "true" if asset["kind"] in _MATERIAL_KINDS else "false")
             .replace("__RECORD_MAPS__", "true" if record and asset["kind"] == "hdri" else "false")
             .replace("__KNOWN_MATS__", _mxs_handles(_handle_ints(known.get("materials")) if diff["materials"] else ()))
             .replace("__KNOWN_MAPS__", _mxs_handles(_handle_ints(known.get("maps")) if diff["maps"] else ()))
@@ -410,34 +431,61 @@ _MEDIT_SWAP = r"""if scanline!=undefined do (
 
 # Issue #10: the native importer writes into the ACTIVE Compact Material Editor slot.
 # A slot is "free" (safe to overwrite) only when its material is an untouched default:
-# named "NN - Default", no sub-materials, no maps, on no scene node and every property
-# equal to a new instance of its class (an edited but unnamed slot is not free; the new
-# instance is never put in a slot). Anything else in the active slot is worth keeping.
+# pristine (no sub-materials, no maps, on no scene node and every property equal to a
+# new instance of its class; an edited slot is not free; the new instance, one per
+# class and run, is never put in a slot) AND default-named, whatever scheme Max or the
+# renderer used ("NN - Default", V-Ray's "Material #N"). mcpFreeSlot falls back to a
+# pristine slot with another name (loose; reported by mcpLooseRef) only when no
+# default-named one is free; with maxH (finalize) a loose one must also predate dispatch
+# (handle <= maxH). A loose material that gets replaced is kept alive (mcpKeepAlive) in
+# mcp_cosmosMeditDisplaced. Anything else in the active slot is worth keeping.
+# mcpSceneMark/mcpSameScene: the other slots' materials at prepare; when none of them is
+# in a slot any more, the scene was reset/replaced (an untitled scene keeps its "" path).
 # Never throws; any doubt means "not free".
-_SLOT_FNS = r"""fn mcpLooksFree m = (
+_SLOT_FNS = r"""local mcpFresh=#()
+ fn mcpDefaultName m = (
+  (try((dotNetClass "System.Text.RegularExpressions.Regex").IsMatch (m.name as string) "(?i)^\\s*(\\d+\\s*-\\s*default|material\\s*#\\s*\\d+)\\s*$")catch(false))==true
+ )
+ fn mcpPristine m = (
   local ok=false
   try(
-   if m!=undefined and (matchPattern (m.name as string) pattern:"?? - Default") and (getNumSubMtls m)==0 and (refs.dependentNodes m).count==0 do (
+   if m!=undefined and (getNumSubMtls m)==0 and (refs.dependentNodes m).count==0 do (
     ok=true
     for j=1 to (getNumSubTexmaps m) while ok do if (getSubTexmap m j)!=undefined do ok=false
     if ok do (
-     local d=(classof m)()
+     local c=classof m, d=undefined
+     for e in mcpFresh while d==undefined do if e[1]==c do d=e[2]
+     if d==undefined do (d=c(); append mcpFresh #(c, d))
      for p in (getPropNames m) while ok do if ((try(getProperty m p)catch(#mcpErr)) as string)!=((try(getProperty d p)catch(#mcpErr)) as string) do ok=false
     )
    )
   )catch(ok=false)
   ok
  )
- fn mcpFreeSlot skip = (
+ fn mcpLooksFree m loose:false = ((loose or (mcpDefaultName m)) and (mcpPristine m))
+ fn mcpOld m maxH = (maxH==undefined or (try(((getHandleByAnim m) as integer64)<=maxH)catch(false)))
+ fn mcpFreeSlot skip maxH:undefined = (
   local s=0
-  try(for i=1 to meditMaterials.count while s==0 do if (findItem skip i)==0 and (mcpLooksFree meditMaterials[i]) do s=i)catch(s=0)
+  for loose in #(false, true) while s==0 do try(for i=1 to meditMaterials.count while s==0 do if (findItem skip i)==0 and (mcpLooksFree meditMaterials[i] loose:loose) and (not loose or (mcpOld meditMaterials[i] maxH)) do s=i)catch(s=0)
   s
+ )
+ fn mcpKeepAlive m = (
+  if mcp_cosmosMeditDisplaced==undefined do mcp_cosmosMeditDisplaced=#()
+  try(appendIfUnique mcp_cosmosMeditDisplaced m; true)catch(false)
+ )
+ fn mcpSceneMark a = (try(for i=1 to meditMaterials.count where i!=a collect meditMaterials[i])catch(#()))
+ fn mcpSameScene marks = (
+  local same=(marks.count==0)
+  for x in marks while not same do for i=1 to meditMaterials.count while not same do (try(if meditMaterials[i]==x do same=true)catch())
+  same
  )
  fn mcpSlotRef m = (
   if m==undefined then "null" else "{\"handle\":\""+(try(formattedPrint ((getHandleByAnim m) as integer64) format:"d")catch(""))+"\",\"name\":\""+(MCP_Server.escapeJsonString(try(m.name as string)catch("")))+"\"}"
- )"""
+ )
+ fn mcpLooseRef m = (if m!=undefined and not (mcpDefaultName m) then mcpSlotRef m else "null")"""
 
-# In _PREPARE (after the baseline snapshot): if the active slot holds a material
+# In _PREPARE (BEFORE the baseline snapshot, so the fresh instances mcpPristine makes
+# are recorded as known, never reported as new): if the active slot holds a material
 # worth keeping, remember it (the global's reference also keeps it alive if the
 # importer displaces it) and make a free slot active so the importer writes there.
 # An earlier import's unfinished record (stale) is kept alive and its switch undone.
@@ -455,9 +503,11 @@ _SLOT_PREPARE = r"""try(
   slotMat=meditMaterials[slotA]
   slotKeep=slotMat!=undefined and not (mcpLooksFree slotMat)
   if slotKeep do (
-   mcp_cosmosMeditSlot=#(slotA, slotMat, 0, maxFilePath+maxFileName)
+   mcp_cosmosMeditSlot=#(slotA, slotMat, 0, maxFilePath+maxFileName, mcpSceneMark slotA)
    slotFree=mcpFreeSlot #(slotA)
    if slotFree>0 do (
+    slotOver=mcpLooseRef meditMaterials[slotFree]
+    if slotOver!="null" do mcpKeepAlive meditMaterials[slotFree]
     mcp_cosmosMeditSlot[3]=slotFree
     activeMeditSlot=slotFree
     slotSwitched=(activeMeditSlot==slotFree)
@@ -469,16 +519,20 @@ _SLOT_PREPARE = r"""try(
 # displaced anyway by a material newer than every pre-dispatch handle (the import),
 # move that one to a free slot and put the kept one back; else keep the kept one
 # alive in mcp_cosmosMeditDisplaced. Then make the user's slot active again.
-# With no free slot before dispatch, moving the import needs a slot freed meanwhile;
-# usually the result is the warning. An open undo transaction (busy) leaves the record
-# for pending_restore; a deleted material or another scene file (stale) leaves the
-# slots as they are. Slot assignments can make the editor render sample slots (V-Ray:
-# on the main thread), as when the user does it by hand. Never throws.
+# The free slot is the one switched to (still pristine; when not default-named, only if
+# it predates dispatch), else any default-named pristine slot, else any pristine slot that
+# predates dispatch (__NEWEST__; moved_over names what it held, kept alive in
+# mcp_cosmosMeditDisplaced); with none, the result is the warning. An open undo
+# transaction (busy) leaves the record for pending_restore; a deleted material, another
+# scene file or none of the other slots' prepare-time materials left in any slot (reset or
+# new scene, also untitled) is "stale": the slots are left as they are. Slot assignments
+# can make the editor render sample slots (V-Ray: on the main thread), as when the user
+# does it by hand. Never throws.
 _SLOT_RESTORE = r"""(
   local out="null"
   try(
    local b=mcp_cosmosMeditSlot
-   if b!=undefined and theHold.Holding() then (out="{\"busy\":true}") else if b!=undefined and ((try(isDeleted b[2])catch(true)) or (try(b[4]!=(maxFilePath+maxFileName))catch(true))) then (
+   if b!=undefined and theHold.Holding() then (out="{\"busy\":true}") else if b!=undefined and ((try(isDeleted b[2])catch(true)) or (try(b[4]!=(maxFilePath+maxFileName))catch(true)) or (try(b.count>=5 and not (mcpSameScene b[5]))catch(true))) then (
     mcp_cosmosMeditSlot=undefined
     local kept=false
     if not (try(isDeleted b[2])catch(true)) do (
@@ -491,10 +545,13 @@ _SLOT_RESTORE = r"""(
     local cur=try(meditMaterials[a])catch(undefined)
     local displaced=(cur!=undefined and cur!=m)
     local fresh=displaced and (__FRESH_TEST__)
-    local movedTo=0, restored=false, keptAlive=false, activeRestored=undefined, err=""
+    local movedTo=0, restored=false, keptAlive=false, activeRestored=undefined, err="", over="null"
     if fresh do (
-     movedTo=if f>0 and (mcpLooksFree (try(meditMaterials[f])catch(undefined))) then f else (mcpFreeSlot #(a))
+     local fm=if f>0 then (try(meditMaterials[f])catch(undefined)) else undefined
+     movedTo=if f>0 and (mcpLooksFree fm loose:(mcpOld fm __NEWEST__)) then f else (mcpFreeSlot #(a) maxH:__NEWEST__)
      if movedTo>0 do try(
+      over=mcpLooseRef meditMaterials[movedTo]
+      if over!="null" do mcpKeepAlive meditMaterials[movedTo]
       meditMaterials[movedTo]=cur
       meditMaterials[a]=m
       restored=(meditMaterials[a]==m)
@@ -509,7 +566,7 @@ _SLOT_RESTORE = r"""(
      activeRestored=(activeMeditSlot==a)
     )catch(activeRestored=false; if err=="" do err=getCurrentException())
     mcp_cosmosMeditSlot=undefined
-    out="{\"original\":"+(a as string)+",\"switched_to\":"+(f as string)+",\"displaced\":"+(if displaced then mcpSlotRef m else "null")+",\"occupant\":"+(if displaced then mcpSlotRef cur else "null")+",\"imported_occupant\":"+(if fresh then "true" else "false")+",\"moved_to\":"+(movedTo as string)+",\"restored\":"+(if restored then "true" else "false")+",\"kept_alive\":"+(if keptAlive then "true" else "false")+",\"active_restored\":"+(if activeRestored==true then "true" else if activeRestored==false then "false" else "null")+",\"error\":\""+(MCP_Server.escapeJsonString(err as string))+"\"}"
+    out="{\"original\":"+(a as string)+",\"switched_to\":"+(f as string)+",\"displaced\":"+(if displaced then mcpSlotRef m else "null")+",\"occupant\":"+(if displaced then mcpSlotRef cur else "null")+",\"imported_occupant\":"+(if fresh then "true" else "false")+",\"moved_to\":"+(movedTo as string)+",\"moved_over\":"+(if restored then over else "null")+",\"restored\":"+(if restored then "true" else "false")+",\"kept_alive\":"+(if keptAlive then "true" else "false")+",\"active_restored\":"+(if activeRestored==true then "true" else if activeRestored==false then "false" else "null")+",\"error\":\""+(MCP_Server.escapeJsonString(err as string))+"\"}"
    )
   )catch(out="{\"error\":\""+(MCP_Server.escapeJsonString(getCurrentException() as string))+"\"}")
   out
@@ -520,15 +577,14 @@ _SLOT_ACTIVE_RESTORE = ('(global mcp_cosmosMeditSlot; local b=mcp_cosmosMeditSlo
                         '"nothing_to_restore" else (try(if b[3]>0 and activeMeditSlot!=b[1] do activeMeditSlot=b[1])'
                         'catch(); mcp_cosmosMeditSlot=undefined; "restored"))')
 
-# ONE bridge call before dispatch: baseline snapshot, selection, Material Editor
-# renderer state, then (only with swap) the swap to Scanline (V-Ray rendering the
-# imported material's slot preview blocked Max's main thread for minutes), then
-# the active-slot guard (#10).
+# ONE bridge call before dispatch: selection, Material Editor renderer state, then
+# (only with swap) the swap to Scanline (V-Ray rendering the imported material's slot
+# preview blocked Max's main thread for minutes), then the active-slot guard (#10),
+# then the baseline snapshot (last, so nothing made before it can read as new).
 _PREPARE = r"""(
  global mcp_cosmosMeditBackup
  global mcp_cosmosMeditSlot, mcp_cosmosMeditDisplaced
  if theHold.Holding() do throw "USER_BUSY"
- local snap=__SNAPSHOT__
  __SLOT_FNS__
  fn jsonBool v = (if v==true then "true" else if v==false then "false" else "null")
  fn jsonStr v = ("\"" + (MCP_Server.escapeJsonString(v as string)) + "\"")
@@ -548,10 +604,12 @@ _PREPARE = r"""(
  local leftover=false
  __SWAP__
  local slotA=0, slotMat=undefined, slotKeep=false, slotFree=0, slotSwitched=false, slotStale=false, slotErr=""
+ local slotOver="null"
  local slotMode=try((MatEditor.mode) as string)catch("")
  __SLOT__
+ local snap=__SNAPSHOT__
  clearSelection()
- "{\"before\":"+snap+",\"selection\":"+selJSON+",\"medit\":{\"class\":"+(jsonStr meditClass)+",\"instance\":"+(jsonStr meditName)+",\"locked\":"+(jsonBool locked)+",\"editor_open\":"+(jsonBool editorOpen)+",\"scanline_available\":"+(jsonBool (scanline!=undefined))+",\"swapped\":"+(jsonBool swapped)+",\"backup_pending\":"+(jsonBool pending)+",\"leftover_backup\":"+(jsonBool leftover)+",\"error\":"+(jsonStr swapError)+"},\"medit_slot\":{\"active\":"+(slotA as string)+",\"material\":"+(mcpSlotRef slotMat)+",\"keep\":"+(jsonBool slotKeep)+",\"free_slot\":"+(slotFree as string)+",\"switched\":"+(jsonBool slotSwitched)+",\"mode\":"+(jsonStr slotMode)+",\"stale\":"+(jsonBool slotStale)+",\"error\":"+(jsonStr slotErr)+"}}"
+ "{\"before\":"+snap+",\"selection\":"+selJSON+",\"medit\":{\"class\":"+(jsonStr meditClass)+",\"instance\":"+(jsonStr meditName)+",\"locked\":"+(jsonBool locked)+",\"editor_open\":"+(jsonBool editorOpen)+",\"scanline_available\":"+(jsonBool (scanline!=undefined))+",\"swapped\":"+(jsonBool swapped)+",\"backup_pending\":"+(jsonBool pending)+",\"leftover_backup\":"+(jsonBool leftover)+",\"error\":"+(jsonStr swapError)+"},\"medit_slot\":{\"active\":"+(slotA as string)+",\"material\":"+(mcpSlotRef slotMat)+",\"keep\":"+(jsonBool slotKeep)+",\"free_slot\":"+(slotFree as string)+",\"free_slot_material\":"+slotOver+",\"switched\":"+(jsonBool slotSwitched)+",\"mode\":"+(jsonStr slotMode)+",\"stale\":"+(jsonBool slotStale)+",\"error\":"+(jsonStr slotErr)+"}}"
 )"""
 
 # After Max is quiet: restore the selection, then (only if the Material
@@ -617,23 +675,37 @@ def _prepare_script(asset, swap=True):
             .replace("__SLOT_FNS__", _SLOT_FNS).replace("__SLOT__", _SLOT_PREPARE))
 
 
+def _newest_handle(before):
+    """The "newest" handle recorded right before dispatch (None: not recorded). Animatable
+    handles come from one increasing counter, so a higher handle was created after it."""
+    newest = _handle_ints([((before or {}).get("known") or {}).get("newest")])
+    return max(newest) if newest and max(newest) >= 0 else None
+
+
 def _newest_known(before):
-    """Highest pre-dispatch material handle (-1: none recorded). Handles only grow, and
-    the record scan gave every existing material one, so a higher handle is new."""
-    return max(_handle_ints(((before or {}).get("known") or {}).get("materials")), default=-1)
+    """Highest pre-dispatch handle: the recorded materials and "newest" (-1: none recorded).
+    Handles only grow, so a material with a higher handle is new."""
+    known = _handle_ints(((before or {}).get("known") or {}).get("materials"))
+    newest = _newest_handle(before)
+    if newest is not None:
+        known.add(newest)
+    return max(known, default=-1)
 
 
 def _finalize_script(handles, restore_medit, newest_known=-1):
     """newest_known: a slot occupant above this handle counts as the import's (-1: none
     does, so a displaced slot material is kept alive and reported, not swapped back)."""
     values = ",".join(str(int(h)) for h in handles)
-    fresh = ("false" if int(newest_known) < 0
-             else "try(((getHandleByAnim cur) as integer64)>(%dL))catch(false)" % int(newest_known))
+    newest = int(newest_known)
+    fresh = ("false" if newest < 0
+             else "try(((getHandleByAnim cur) as integer64)>(%dL))catch(false)" % newest)
+    restore = (_SLOT_RESTORE.replace("__FRESH_TEST__", fresh)
+               .replace("__NEWEST__", "undefined" if newest < 0 else "(%dL)" % newest))
     return (_FINALIZE.replace("__HANDLES__", values)
             .replace("__RESTORE__", "true" if restore_medit else "false")
             .replace("__MEDIT_RESTORE__", _MEDIT_RESTORE)
             .replace("__SLOT_FNS__", _SLOT_FNS)
-            .replace("__SLOT_RESTORE__", _SLOT_RESTORE.replace("__FRESH_TEST__", fresh))
+            .replace("__SLOT_RESTORE__", restore)
             .replace("__EDITOR_OPEN__", _EDITOR_OPEN))
 
 
@@ -810,6 +882,10 @@ def _wait_import(client, asset, before, renderer, pid, timeout=_DETECT_TIMEOUT_S
     waits instead. Polls are dropped at their deadline; the first dropped poll
     ends detection (error in the result) so requests never pile up on Max.
     A material or map counts by handle (absent before dispatch), whatever its name.
+    A new material flagged "other" (not tied to the import, e.g. Forest Pack regenerating)
+    does not count, except for a material asset when two class-scan polls in a row show the
+    same non-empty set of them and nothing tied to the import (Slate mode, package named
+    otherwise: nothing could ever be tied); then "unattributed" is true.
     """
     expected = _EXPECTED.get(asset["kind"])
     timing = {"detected": False, "after_s": 0.0, "polls": 0, "skipped_hung": 0, "probe": None}
@@ -818,6 +894,7 @@ def _wait_import(client, asset, before, renderer, pid, timeout=_DETECT_TIMEOUT_S
     old = _known(before, expected)
     started = time.monotonic()
     interval = 0.5
+    last_other = None  # the new "other" handles of the previous class-scan poll
     while True:
         time.sleep(interval)
         elapsed = time.monotonic() - started
@@ -826,19 +903,26 @@ def _wait_import(client, asset, before, renderer, pid, timeout=_DETECT_TIMEOUT_S
             timing["skipped_hung"] += 1
         else:
             timing["polls"] += 1
+            # Renderer material classes every other poll after ~4 s (Slate mode misses slots).
+            scan = elapsed >= 4 and timing["polls"] % 2 == 0
             try:
-                # Renderer material classes every other poll after ~4 s (Slate mode misses slots).
-                probe = _asset_snapshot(client, asset, light=True, renderer=renderer,
-                                        scan_classes=elapsed >= 4 and timing["polls"] % 2 == 0,
+                probe = _asset_snapshot(client, asset, light=True, renderer=renderer, scan_classes=scan,
                                         timeout=_POLL_TIMEOUT_S, probe=True, known=before.get("known"))
             except _LOST as exc:
                 timing["error"] = exc
                 timing["after_s"] = round(time.monotonic() - started, 1)
                 return timing
             timing["probe"] = probe
-            if any(item["handle"] not in old for item in probe.get(expected, [])):
+            new = [item for item in probe.get(expected, []) if item["handle"] not in old]
+            if any(not item.get("other") for item in new):
                 timing["detected"] = True
                 return timing
+            if scan and asset["kind"] == "material":
+                other = frozenset(str(item["handle"]) for item in new)
+                if other and other == last_other:
+                    timing.update(detected=True, unattributed=True)
+                    return timing
+                last_other = other
         if time.monotonic() - started >= timeout:
             return timing
         interval = min(interval * 1.5, 3.0)
@@ -879,14 +963,26 @@ def _known(before, kind):
     return handles
 
 
-def _resources(before, after):
-    resources = {}
+def _resources(before, after, warnings=None, asset_kind=None):
+    """nodes/materials/maps with "created" flags. A map counts as created only when its
+    handle is above the pre-dispatch "newest" handle (when recorded), never just because
+    a new material reaches it. Created materials the snapshot flags "other" (not in a
+    Material Editor slot, not named like the asset, not on its nodes, not a sub-material
+    of those) go to other_new_materials when the import produced a new material of its
+    own; otherwise (assets that bring materials: material and model) they stay in
+    materials, with a warning. An HDRI brings no material: they always go apart."""
+    resources, other = {}, []
+    newest = _newest_handle(before)
     for kind in ("nodes", "materials", "maps"):
         old = _known(before, kind)
         resources[kind] = []
         for item in after.get(kind, []):
             item = dict(item)
             item["created"] = str(item["handle"]) not in old
+            if kind == "maps" and newest is not None and item["created"]:
+                item["created"] = max(_handle_ints([item["handle"]]), default=-1) > newest
+            if item.pop("other", False) and kind == "materials":
+                other.append(item)
             slot, sub = item.pop("slot", None), item.pop("sub", False)
             if kind == "materials":
                 item["medit_slot"] = slot or None
@@ -899,6 +995,18 @@ def _resources(before, after):
             else:
                 item.pop("filename", None)
             resources[kind].append(item)
+    other_new = [item for item in other if item["created"]]
+    if not other_new:
+        return resources
+    own_new = any(item["created"] and not any(item is o for o in other) for item in resources["materials"])
+    if own_new or asset_kind not in _MATERIAL_KINDS:
+        resources["materials"] = [item for item in resources["materials"] if not any(item is o for o in other_new)]
+        resources["other_new_materials"] = other_new
+    elif warnings is not None:
+        warnings.append("No new material could be tied to the import (none is in a Material Editor slot, named like "
+                        "the asset or on its nodes), so all %d new materials are listed in materials; some may come "
+                        "from other activity during the import (e.g. a plugin such as Forest Pack regenerating its "
+                        "materials)." % len(other_new))
     return resources
 
 
@@ -954,6 +1062,13 @@ def _slot_guard(response, prep, fin, warnings, ran=True):
         response["medit_slot"] = primary.get("medit_slot")
 
 
+def _kept_alive_hint(ref):
+    """Where a replaced, unused but named slot material is kept (the slot scripts keep it alive)."""
+    handle = str((ref or {}).get("handle") or "")
+    return (" It is kept alive in the MAXScript global mcp_cosmosMeditDisplaced%s." % (
+        " (getAnimByHandle %sL)" % handle if handle.isdigit() else ""))
+
+
 def _slot_record(response, prep, fin, warnings, ran):
     if not prep:
         return
@@ -969,6 +1084,12 @@ def _slot_record(response, prep, fin, warnings, ran):
     if not prep.get("keep"):
         record["state"] = "not_needed"  # the active slot held an unused default material
         return
+    over = prep.get("free_slot_material") if switched else None
+    if over:
+        record["switched_over"] = over
+        warnings.append("No Material Editor slot held a default-named unused material, so the import was directed to "
+                        "slot %s, whose '%s' is unused and unedited (default settings) but named; the import replaces "
+                        "it there.%s" % (switched, over.get("name"), _kept_alive_hint(over)))
     if not ran:
         record["state"] = "pending"
         return
@@ -1009,9 +1130,16 @@ def _slot_record(response, prep, fin, warnings, ran):
             record["state"] = "restored"
             _set_slot(response, occupant.get("handle"), fin.get("moved_to"))
             _set_slot(response, displaced.get("handle"), original)
+            moved_over = fin.get("moved_over")
+            if moved_over and str(moved_over.get("handle")) != str((over or {}).get("handle")):
+                record["moved_over"] = moved_over
+                warnings.append("The imported material was moved to Material Editor slot %s, replacing '%s' there "
+                                "(unused and unedited, but not default-named; no default-named unused slot was "
+                                "left).%s" % (fin.get("moved_to"), moved_over.get("name"), _kept_alive_hint(moved_over)))
         else:
             record["state"] = "displaced"
-            why = (error or ("no free (unused default) slot for the imported material" if fin.get("imported_occupant")
+            why = (error or ("no free slot (one holding an unused, unedited material) for the imported material"
+                             if fin.get("imported_occupant")
                              else "the slot's new material is not recognised as this import's"))
             handle = str(displaced.get("handle") or "")
             how = ("meditMaterials[%s] = getAnimByHandle %sL" % (original, handle) if handle.isdigit()
@@ -1250,7 +1378,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                               _SETTLING_GUARD_S)
             seen = after if after is not None else detection.get("probe")
             if seen:
-                response.update(_resources(before, seen))
+                response.update(_resources(before, seen, warnings, asset["kind"]))
                 _primary(response, asset, detection.get("probe"))
             _slot_guard(response, slot_prep, None, warnings, ran=False)
             if dialog is not None:
@@ -1286,7 +1414,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         expected = _EXPECTED.get(asset["kind"])
         observed = False
         if after is not None:
-            response.update(_resources(before, after))
+            response.update(_resources(before, after, warnings, asset["kind"]))
             _primary(response, asset, detection.get("probe"))
             observed = bool(expected) and any(item["created"] for item in response[expected])
         if finished is None:
