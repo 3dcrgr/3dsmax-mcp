@@ -485,8 +485,8 @@ static bool HasFilePath(const json& files, const std::string& path) {
     return false;
 }
 
-// Asset-backed sources are reported once per node, after the plain string params,
-// so a Bitmap's "bitmap" asset does not duplicate its "fileName" string. Relative
+// Asset-backed sources are reported only for nodes without a plain string/filename
+// path, so a Bitmap's "bitmap" asset never duplicates its "fileName" string. Relative
 // paths (common in Revit/ATF imports) resolve through the Max search paths.
 static void AppendAssetFile(json& files, const AssetCandidate& c, const std::string& nodeId, InspectContext& ctx) {
     if (c.raw.empty() || HasFilePath(files, c.raw)) return;
@@ -673,7 +673,11 @@ static bool CollectPB2Values(MtlBase* base, const std::string& nodeId, InspectCo
             }
         }
     }
-    for (const auto& c : assets) AppendAssetFile(files, c, nodeId, ctx);
+    // Asset-backed sources are a fallback for nodes without a plain path: a VRayBitmap
+    // reports HDRIMapName, and its internal bitmap asset (a Cosmos package-relative
+    // path that never resolves) must not add a second, bogus FILE_MISSING row.
+    if (files.empty())
+        for (const auto& c : assets) AppendAssetFile(files, c, nodeId, ctx);
     if (!ctx.readAssetFiles) return false;
     const bool auxFound = CollectOwnAuxFiles(base, nodeId, ctx, files);
     return fileParams && !fileValues && !auxFound && files.empty();
