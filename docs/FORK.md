@@ -27,6 +27,7 @@ The worst of these problems hung Max and lost unsaved work. Everything here is m
 | Failed agent scripts print raw compile errors in the user's Listener | Run agent scripts with quiet errors; the caller still gets the detail. Upstream 1.7.5 made the same change, which replaced the fork's in the merge | [smaller-fixes.md](fork/smaller-fixes.md#failed-agent-scripts-printed-errors-in-the-users-listener) | Verified live |
 | A Cosmos import silently replaces the material in the user's active Material Editor slot | Point the importer at a free slot, then put any displaced material back once Max is quiet | [cosmos-import.md](fork/cosmos-import.md#keeping-the-users-material-editor-slot-10-c1e09a7) | Deployed; live test pending |
 | After a restart and Hold/Fetch, the agent viewport can't be reclaimed | Tag the agent's floating viewport in the scene and reclaim exactly that restored window | [smaller-fixes.md](fork/smaller-fixes.md#the-agent-viewport-couldnt-be-reclaimed-after-a-restart) | Reviewed; native bridge staged, not in `native/bin/` yet |
+| Upstream 1.7.5's dialog monitor can report the Cosmos browser, the Material Editor or the agent viewport as a blocking dialog, and reads or presses dialogs of any thread | These windows are never dialogs; dialogs of other threads (e.g. the Cosmos importer's) are listed but never read or pressed; Qt dialogs are only read while Max's main thread pumps | [cosmos-import.md](fork/cosmos-import.md) | Unit tested; not tested live yet |
 | Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Verified live |
 
 What the status words mean:
@@ -53,7 +54,7 @@ After updating, start a new client session. MCP clients cache the tool list, so 
 
 **The native bridge:** `install.py` copies the prebuilt bridges from `native/bin/`.
 - In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available. It's the same build that's deployed on the production machine (sha256 `c621db103b176d77…`).
-- The 2023, 2024, 2025 and 2027 bridges are still upstream's builds (1.7.5). With those, the Python-side fixes work, but the native ones are missing: `health`, the executor shutdown drain, Autodesk Bitmap paths and the duplicate VRayBitmap row fix, `MAXSCRIPT_INTERRUPTED`, `replace_material`'s sub-material matching and source search, and the agent viewport reclaim (#11).
+- The 2023, 2024, 2025 and 2027 bridges are still upstream's builds (1.7.5). With those, the Python-side fixes work, but the native ones are missing: `health`, the executor shutdown drain, Autodesk Bitmap paths and the duplicate VRayBitmap row fix, `MAXSCRIPT_INTERRUPTED`, `replace_material`'s sub-material matching and source search, the agent viewport reclaim (#11), and the dialog monitor's rules for Cosmos, Material Editor and other-thread windows.
 - To get them for another Max version, build the bridge yourself (below).
 
 ## Building the native bridge
@@ -101,7 +102,7 @@ With the installer's runtime instead (it ignores `PYTHONPATH`; the tests put the
 & "C:\Program Files\3dsmax-mcp\runtime\python.exe" -m unittest discover -s tests
 ```
 
-Native tests. They don't need the Max SDK; they cover the executor and the health bookkeeping:
+Native tests. They don't need the Max SDK; they cover the executor, the health bookkeeping and the dialog monitor's rules:
 
 ```powershell
 cmake -S native/tests -B native/build-tests -G "Visual Studio 17 2022" -A x64

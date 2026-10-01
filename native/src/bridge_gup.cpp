@@ -190,6 +190,12 @@ DWORD MCPBridgeGUP::Start() {
     pipe_name_utf8_ = "\\\\.\\pipe\\3dsmax-mcp-" + instance_id_;
 
     // Before the pipe: control requests rely on the monitor and its lane.
+    // A stale heartbeat (3 periods) means the main thread is not pumping: the
+    // dialog lane then never sends into it.
+    DialogWatch::SetMainThreadPumping([] {
+        const long long age = MainThreadExecutor::HeartbeatAgeMs();
+        return age < 0 || age <= 3LL * MainThreadExecutor::kHeartbeatMs;
+    });
     DialogWatch::Start({QtDialogs::Snapshot, QtDialogs::Click});
     StartPipe();
     SceneJournal::Register();

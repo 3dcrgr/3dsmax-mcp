@@ -69,6 +69,8 @@ DWORD main_thread = 0;
 HWND lane = nullptr;
 WPARAM lane_cookie = 0;
 QtBackend qt;
+std::mutex pumping_mutex;
+std::function<bool()> main_pumping;
 std::mutex monitor_mutex;
 std::condition_variable monitor_wake;
 bool monitor_stop = false;
@@ -124,6 +126,36 @@ std::string InternalText(HWND hwnd, bool* truncated = nullptr) {
 
 bool IsQt(const std::string& cls) {
     return cls.rfind("Qt", 0) == 0 && cls.find("QWindow") != std::string::npos;
+}
+
+// Modeless tool windows that a modal dialog elsewhere can leave enabled above a
+// disabled owner. They are never blocking dialogs, and some must never be
+// messaged: a Chaos Cosmos browser may belong to a deadlocked importer thread,
+// and closing or activating the Material Editor around a Cosmos import
+// deadlocked Max. Window-manager title only; no message is sent.
+bool ToolWindow(HWND hwnd) {
+    const std::string title = InternalText(hwnd);
+    auto starts = [&title](const char* prefix) { return title.rfind(prefix, 0) == 0; };
+    return title == "Chaos Cosmos Browser" || title == "Material Editor" || starts("Material Editor - ") ||
+        starts("Slate Material Editor") || starts("AGENT VIEWPORT") || starts("Floating Viewport");
+}
+
+// Only dialogs on Max's main thread are read or pressed. Another thread's
+// window may belong to a thread that is itself hung (the Cosmos importer's),
+// and a Qt widget may only be touched from the thread that owns it.
+bool OnMainThread(HWND hwnd) {
+    return main_thread != 0 && GetWindowThreadProcessId(hwnd, nullptr) == main_thread;
+}
+constexpr char kNotMainThread[] = "not on Max's main thread, so it is not read or pressed (its thread may be hung); "
+                                  "the user can answer it in Max";
+
+bool MainThreadPumping() {
+    std::function<bool()> pumping;
+    {
+        std::lock_guard<std::mutex> lock(pumping_mutex);
+        pumping = main_pumping;
+    }
+    try { return !pumping || pumping(); } catch (...) { return true; }
 }
 
 std::string Lower(std::string text) {
@@ -222,6 +254,10 @@ LRESULT CALLBACK LaneProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 json RunOnMain(std::function<json()> work, DWORD timeout_ms) {
     if (!lane) Fail("DIALOG_LANE_UNAVAILABLE", "the dialog monitor is not running");
     if (GetCurrentThreadId() == main_thread) return work();
+    // A main thread that stops retrieving posted messages is not in a dialog's
+    // loop; a sent message would only run inside whatever call blocks it.
+    if (!MainThreadPumping())
+        Fail("MAIN_THREAD_BUSY", "Max's main thread is not processing messages", true);
     auto task = std::make_shared<LaneTask>();
     task->work = std::move(work);
     auto* raw = new std::shared_ptr<LaneTask>(task);
@@ -346,6 +382,7 @@ json Win32Snapshot(HWND hwnd, std::vector<HWND>* button_windows = nullptr) {
 }
 
 json Snapshot(HWND hwnd, const std::string& cls, DWORD timeout_ms = 1500) {
+    if (!OnMainThread(hwnd)) return Unreadable(hwnd, cls, kNotMainThread);
     if (!IsQt(cls)) return Win32Snapshot(hwnd);
     if (!qt.snapshot) return Unreadable(hwnd, cls, "Qt dialog reader unavailable in this build");
     try {
@@ -392,6 +429,7 @@ struct Pressed { json snapshot, button; };
 
 // Re-reads the dialog, requires the inspected state, then posts the click.
 Pressed PressButton(HWND hwnd, const std::string& id, const std::string& cls, const std::string& expected, const json& spec) {
+    if (!OnMainThread(hwnd)) Fail("DIALOG_NOT_ON_MAIN_THREAD", std::string("this dialog is ") + kNotMainThread);
     if (IsQt(cls)) {
         if (!qt.snapshot || !qt.click) Fail("DIALOG_UNREADABLE", "Qt dialog support is unavailable in this build");
         json out = RunOnMain([hwnd, id, expected, spec]() -> json {
@@ -479,7 +517,7 @@ void Refresh() {
 
     std::set<HWND> blocked, blockers;
     for (HWND hwnd : windows) {
-        if (hwnd == lane || !IsWindowEnabled(hwnd)) continue;
+        if (hwnd == lane || !IsWindowEnabled(hwnd) || ToolWindow(hwnd)) continue;
         HWND blocker = GetWindow(hwnd, GW_OWNER);
         if (blocker) {
             DWORD pid = 0;
@@ -590,6 +628,7 @@ void AutoAcknowledge() {
 // operation, and it blocks the main thread until acknowledged. Max 2027 draws
 // it with Qt; #32770 covers a Win32 message box with the same title.
 bool IsScriptControllerException(HWND hwnd) {
+    if (!OnMainThread(hwnd)) return false;
     const std::string cls = ClassOf(hwnd);
     if (!IsQt(cls) && cls != "#32770") return false;
     HWND owner = GetWindow(hwnd, GW_OWNER);
@@ -692,6 +731,11 @@ void Start(QtBackend backend) {
     monitor_stop = false;
     monitor = std::thread(Monitor);
     monitor_running = true;
+}
+
+void SetMainThreadPumping(std::function<bool()> pumping) {
+    std::lock_guard<std::mutex> lock(pumping_mutex);
+    main_pumping = std::move(pumping);
 }
 
 void Stop() {
@@ -877,7 +921,9 @@ std::string Control(const std::string& command) {
         }
     }
     result["recent_actions"] = recent;
-    result["policy"] = "Any listed button can be pressed with respond. Automatic: Script Controller Exception boxes "
+    result["policy"] = "Any listed button of a dialog on Max's main thread can be pressed with respond; dialogs of "
+        "other threads are listed but never read or pressed. Cosmos browser, Material Editor and viewport windows "
+        "are never dialogs. Automatic: Script Controller Exception boxes "
         "are closed at any time; recognized acknowledgment-only MAXScript errors are acknowledged only when new "
         "during an MCP operation, which then fails with MAX_DIALOG_ERROR.";
     return result.dump();

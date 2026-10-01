@@ -212,9 +212,9 @@ _CONTROL_CMD_TYPES = frozenset({"native:render_cancel", "native:render_cancel_ca
 _QUEUE_TIMEOUT_MARKER = "main thread execution timed out"
 # Modeless tool windows, never dialogs: the auto dialog check neither reports nor
 # inspects them (messaging a Cosmos browser on a deadlocked importer thread blocks).
-# Bridges from this fork exclude them natively; this covers older bridges.
-_NOT_DIALOG_TITLE = re.compile(r"^(?:Chaos Cosmos Browser$|Material Editor\b|Slate Material Editor\b|"
-                               r"AGENT VIEWPORT\b|Floating Viewport\b)")
+# Same titles as DialogWatch's ToolWindow(); this covers bridges without it (upstream).
+_NOT_DIALOG_TITLE = re.compile(r"^(?:Chaos Cosmos Browser$|Material Editor(?:$| - )|Slate Material Editor|"
+                               r"AGENT VIEWPORT|Floating Viewport)")
 
 
 def _grace(timeout: float) -> float:

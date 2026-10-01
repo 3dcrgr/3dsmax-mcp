@@ -380,8 +380,7 @@ MainThreadExecutor::Health MainThreadExecutor::GetHealth() const {
     // sends a message, so it is safe while the main thread is blocked.
     health.executor_window_hung = hwnd != nullptr && IsHungAppWindow(hwnd) != FALSE;
 
-    const long long beat = s_heartbeat_ms_.load(std::memory_order_acquire);
-    if (beat > 0) health.heartbeat_age_ms = (std::max)(0LL, SteadyNowMs() - beat);
+    health.heartbeat_age_ms = HeartbeatAgeMs();
 
     const auto now = std::chrono::steady_clock::now();
     auto age_ms = [&now](std::chrono::steady_clock::time_point since) {

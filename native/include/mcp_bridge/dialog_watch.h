@@ -23,6 +23,12 @@ struct QtBackend {
 void Start(QtBackend qt = {});
 void Stop();
 
+// Optional. Returns false while Max's main thread is known not to retrieve
+// posted messages (e.g. blocked inside its own SendMessage). Qt reads and
+// presses then fail at once instead of sending into that thread, where they
+// would run re-entrantly inside the blocked call.
+void SetMainThreadPumping(std::function<bool()> pumping);
+
 // One bridge request, for the lifetime of its dispatch on a pipe worker.
 struct RequestContext {
     RequestContext(const std::string& request, const std::string& command);

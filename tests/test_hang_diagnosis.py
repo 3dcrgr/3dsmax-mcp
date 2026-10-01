@@ -632,6 +632,14 @@ class DialogCheckTests(unittest.TestCase):
         self.assertEqual(self.client._dialogs_blocking("r1"), [])
         self.assertEqual(self.actions, ["status"])
 
+    def test_tool_window_titles_match_the_bridge(self):
+        # DialogWatch ToolWindow() in native/src/dialog_watch.cpp uses the same titles.
+        for title in ("Chaos Cosmos Browser", "Material Editor", "Material Editor - 24 - Default",
+                      "Slate Material Editor", "AGENT VIEWPORT", "Floating Viewport - 3"):
+            self.assertTrue(max_client._NOT_DIALOG_TITLE.match(title), title)
+        for title in ("Material Editor Options", "Chaos Cosmos Browser - Sign in", "Save Changes", "Missing External Files"):
+            self.assertFalse(max_client._NOT_DIALOG_TITLE.match(title), title)
+
     def test_a_real_dialog_beside_a_tool_window_is_reported_without_inspect(self):
         self.status["dialogs"] = [{"dialog_id": "1", "title": "Material Editor - 01 - Default", "main_thread": True},
                                   {"dialog_id": "2", "title": "Missing External Files", "main_thread": True}]

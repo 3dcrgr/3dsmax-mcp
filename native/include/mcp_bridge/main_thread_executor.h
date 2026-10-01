@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <mutex>
@@ -72,6 +73,11 @@ public:
     // that filters our messages). WM_TIMER is not used: it is starved by any
     // steady stream of posted messages or paints while the thread still pumps.
     static constexpr UINT kHeartbeatMs = 1000;
+    // Age of the last heartbeat, -1 when unavailable. Lock-free; any thread.
+    static long long HeartbeatAgeMs() {
+        const long long beat = s_heartbeat_ms_.load(std::memory_order_acquire);
+        return beat > 0 ? (std::max)(0LL, SteadyNowMs() - beat) : -1;
+    }
 
     // Snapshot for the pipe-thread "health" command. Never waits on the main
     // thread or on a running item's mutex, so it answers while Max is hung.
