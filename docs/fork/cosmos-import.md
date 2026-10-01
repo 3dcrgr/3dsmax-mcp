@@ -76,7 +76,9 @@ New result fields:
   - `asset_name` comes with `material_name` or `map_name`, plus a `note` when they differ.
 - Nothing is renamed. The behaviour from the steps above is unchanged: no new bridge calls, the OS-only settle, the main-thread browser, the `IMPORT_SETTLING` guard, and never opening or closing the Material Editor.
 
-**Status.** Unit tested in `tests/test_cosmos_import.py`, and deployed (Python) on 2026-10-01. The two snapshot scripts compiled in Max and returned valid JSON, including the 24 Material Editor slots. A live re-import of "Steel Blurry" hasn't been run yet.
+**Status.** Unit tested in `tests/test_cosmos_import.py`, and verified live on 2026-10-01. Re-importing "Steel Blurry" returned `imported` with `primary_material` "Steel_Polished #0" (`medit_slot` 13, `primary_reason` `only_new`), `asset_name` "Steel Blurry" and the note about the different name. The scene's existing "Steel_Blurry" was correctly not reported as new.
+
+**Watch out.** Chaos's importer puts the new material into the *active* Material Editor slot, replacing whatever material was there. `cosmos_import` reports the slot (`medit_slot`) but doesn't put the previous material back.
 
 ## How it was verified
 
@@ -88,7 +90,7 @@ Live on 3ds Max 2026 with V-Ray 7 update 4 hotfix 2 (GPU production renderer), o
   - It detected the new material 19.8 s after dispatch, with 8 polls skipped while Max was hung. The settle check then passed with a quiet streak of 7, and it returned `imported` and `safe_to_edit: true`.
   - The user's selection came back, and the material wasn't auto-assigned to it.
 - **`cosmos_search`:** answered with `renderer_source: "scene"`, because V-Ray and Corona both registered an importer for that Max.
-- **Not yet run:** an import on a freshly started Max with the browser closed, which exercises the "open the browser" path.
+- **Import on a freshly started Max with no browser open:** the "Steel Blurry" re-import at 13:08 ran right after a Max restart. `cosmos_import` opened the browser on Max's main thread through the V-Ray "Chaos Cosmos browser" action, the Material Editor renderer wasn't swapped, and the import returned `imported` and `safe_to_edit: true` after about 17 s.
 
 Unit tests are in `tests/test_cosmos_import.py`. They use fake windows to cover a hung browser, a missing browser, settle streaks, the guard expiring, and the Scanline fallback.
 
