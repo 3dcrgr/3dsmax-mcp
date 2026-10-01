@@ -19,8 +19,10 @@
 #include <maxscript/maxscript.h>
 #include <maxscript/foundation/strings.h>
 #include <maxscript/maxwrapper/mxsobjects.h>
+#include <maxscript/compiler/parser.h>
 #include <CoreFunctions.h>
 #include "mcp_bridge/color_value.h"
+#include "mcp_bridge/main_thread_executor.h"
 
 class MCPBridgeGUP;
 
@@ -295,16 +297,118 @@ inline INode* ResolveNodeFromPayload(
 // returns either the user's value, or a string with this sentinel prefix.
 inline const char* MaxScriptErrorSentinel() { return "__MCP_MS_ERR__:"; }
 
+inline const wchar_t* MaxScriptWrapPrefix() {
+    return L"(\n"
+           L"  local __mcp_err = undefined\n"
+           L"  local __mcp_res = try (\n";
+}
+inline const wchar_t* MaxScriptWrapSuffix() {
+    return L"\n  ) catch (__mcp_err = getCurrentException(); undefined)\n"
+           L"  if __mcp_err != undefined then (\"__MCP_MS_ERR__:\" + __mcp_err) else __mcp_res\n"
+           L")\n";
+}
+
 inline std::wstring WrapForErrorCapture(const std::wstring& wcmd) {
-    return std::wstring(
-        L"(\n"
-        L"  local __mcp_err = undefined\n"
-        L"  local __mcp_res = try (\n"
-    ) + wcmd + std::wstring(
-        L"\n  ) catch (__mcp_err = getCurrentException(); undefined)\n"
-        L"  if __mcp_err != undefined then (\"__MCP_MS_ERR__:\" + __mcp_err) else __mcp_res\n"
-        L")\n"
-    );
+    return MaxScriptWrapPrefix() + wcmd + MaxScriptWrapSuffix();
+}
+
+// ExecuteMAXScriptScript also returns FALSE when a script is aborted by
+// something MAXScript try/catch does not catch (quitMax, escape, system
+// exceptions), so a FALSE is not proof of a parse error. This re-compiles the
+// same text WITHOUT evaluating it (Parser::compile only, never eval) to tell
+// the two apart. Main thread only; skipped during shutdown or direct mode.
+// A parse error's detail comes from the unwrapped user text when that also
+// fails, so line numbers and quoted code are the user's, not the wrapper's.
+// Sets *code to "BAD_PARAM" or "MAXSCRIPT_INTERRUPTED". Never throws.
+inline std::string MaxScriptFailureMessage(const std::wstring& wcmd, std::string* code = nullptr) {
+    static const char* kUnclassified =
+        "MAXScript execution failed: the script did not complete and the syntax check "
+        "could not run, so this is either a parse error or an interruption "
+        "(quitMax/resetMaxFile/exit, escape/abort, or a system exception).";
+    if (code) *code = "BAD_PARAM";
+    try {
+        Interface7* ip = GetCOREInterface7();
+        if (MainThreadExecutor::IsShuttingDown() || (ip && ip->QuitingApp())) {
+            if (code) *code = "MAXSCRIPT_INTERRUPTED";
+            return "MAXScript did not complete: 3ds Max is shutting down (e.g. after quitMax), "
+                   "so the syntax check was skipped. If the script ended the Max session that is expected.";
+        }
+        if (MainThreadExecutor::IsDirectMode()) return kUnclassified;
+
+        ScopedMaxScriptEvaluationContext context;
+        MAXScript_TLS* _tls = context.Get_TLS();
+        four_typed_value_locals_tls(StringStream* source, StringStream* errors, Parser* parser, StringStream* text);
+        // Parser updates the current-source thread locals; restore them on every path.
+        struct SourceRestore {
+            MAXScript_TLS* tls; decltype(_tls->source_file) file; decltype(_tls->current_pkg) pkg;
+            decltype(_tls->source_pos) pos; decltype(_tls->source_line) line; decltype(_tls->source_flags) flags;
+            ~SourceRestore() {
+                tls->source_file = file; tls->current_pkg = pkg; tls->source_pos = pos;
+                tls->source_line = line; tls->source_flags = flags;
+            }
+        } restoreSource{_tls, _tls->source_file, _tls->current_pkg, _tls->source_pos,
+                        _tls->source_line, _tls->source_flags};
+        // 0 = compiles, 1 = compile error (detail set), -1 = the check itself failed.
+        auto compileOnly = [&](const std::wstring& text, std::string& detail) -> int {
+            vl.source = new StringStream(text.c_str());
+            vl.errors = new StringStream();
+            vl.parser = new Parser(vl.errors);
+            int result = 0;
+            try {
+                MAXScriptException::ScopedMXSCallstackCaptureDisable noCallstack(_tls);
+                vl.source->flush_whitespace();
+                while (!vl.source->at_eos() || vl.parser->back_tracked) {
+                    vl.parser->compile(vl.source, MAXScript::ScriptSource::NonEmbedded);  // code is never eval()'d
+                    vl.source->flush_whitespace();
+                }
+                if (vl.parser->expr_level != 0) {
+                    result = 1;
+                    detail = "unexpected end of script";
+                }
+            } catch (CompileError& e) {
+                clear_error_source_data(_tls);  // this catch eats the mxs exception
+                result = 1;
+                vl.text = new StringStream();
+                e.sprin1(vl.text);
+                detail = WideToUtf8(vl.text->to_string());
+            } catch (...) {
+                clear_error_source_data(_tls);
+                result = -1;
+            }
+            vl.source->close();
+            return result;
+        };
+
+        std::string detail;
+        const int compiled = compileOnly(wcmd, detail);
+        if (compiled < 0) return kUnclassified;
+        if (compiled == 0) {
+            if (code) *code = "MAXSCRIPT_INTERRUPTED";
+            return "MAXScript did not complete (not a parse error): the script was interrupted, e.g. by "
+                   "quitMax/resetMaxFile/exit, an escape/abort, or a system exception. If it ended or "
+                   "reset the Max session that is expected.";
+        }
+        const std::wstring prefix = MaxScriptWrapPrefix(), suffix = MaxScriptWrapSuffix();
+        if (wcmd.size() >= prefix.size() + suffix.size() &&
+            wcmd.compare(0, prefix.size(), prefix) == 0 &&
+            wcmd.compare(wcmd.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            std::string userDetail;
+            const std::wstring userText = wcmd.substr(prefix.size(), wcmd.size() - prefix.size() - suffix.size());
+            if (compileOnly(userText, userDetail) == 1 && !userDetail.empty()) detail = userDetail;
+        }
+        for (auto& c : detail) if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+        detail.erase(0, detail.find_first_not_of(" -"));
+        if (detail.size() > 500) {
+            size_t cut = 500;
+            while (cut > 0 && (static_cast<unsigned char>(detail[cut]) & 0xC0) == 0x80) --cut;  // keep UTF-8 valid for json
+            detail = detail.substr(0, cut) + "...";
+        }
+        return detail.empty()
+            ? std::string("MAXScript execution failed (parse error)")
+            : "MAXScript execution failed (parse error): " + detail;
+    } catch (...) {
+        return kUnclassified;
+    }
 }
 
 // ── MAXScript execution (for hybrid handlers) ───────────────────
@@ -326,7 +430,11 @@ inline std::string RunMAXScript(const std::string& script) {
     }
 
     if (!ok) {
-        throw std::runtime_error("MAXScript execution failed");
+        // Explicit code, so compiler detail quoting the script cannot be
+        // re-keyworded by NormalizeNativeError (e.g. "not found" -> NOT_FOUND).
+        std::string code;
+        std::string message = MaxScriptFailureMessage(wcmd, &code);
+        throw std::runtime_error(StructuredErrorPayload(code, message));
     }
 
     // Convert FPValue to string

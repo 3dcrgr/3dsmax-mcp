@@ -8,19 +8,20 @@ constexpr char kShutdownError[] = "MainThreadExecutor is shutting down";
 }
 
 thread_local bool MainThreadExecutor::tl_direct_mode_ = false;
-thread_local std::string MainThreadExecutor::tl_label_;
+thread_local MainThreadExecutor::WorkLabel MainThreadExecutor::tl_label_;
 WPARAM MainThreadExecutor::s_execute_cookie_ = 0;
 bool MainThreadExecutor::s_executing_ = false;
 std::deque<std::shared_ptr<MainThreadExecutor::WorkItem>> MainThreadExecutor::s_deferred_;
 std::atomic<bool> MainThreadExecutor::s_shutting_down_{false};
 std::mutex MainThreadExecutor::s_submit_mutex_;
 std::mutex MainThreadExecutor::s_stats_mutex_;
-std::list<std::weak_ptr<MainThreadExecutor::WorkItem>> MainThreadExecutor::s_pending_;
+std::list<std::shared_ptr<MainThreadExecutor::Ticket>> MainThreadExecutor::s_pending_;
 bool MainThreadExecutor::s_running_ = false;
-std::string MainThreadExecutor::s_running_label_;
+MainThreadExecutor::WorkLabel MainThreadExecutor::s_running_label_;
 std::chrono::steady_clock::time_point MainThreadExecutor::s_running_since_{};
 std::atomic<unsigned long long> MainThreadExecutor::s_completed_{0};
 std::atomic<long long> MainThreadExecutor::s_heartbeat_ms_{0};
+std::atomic<long long> MainThreadExecutor::s_beat_posted_ms_{0};
 
 MainThreadExecutor::~MainThreadExecutor() {
     Shutdown();
@@ -72,9 +73,34 @@ void MainThreadExecutor::Initialize() {
     if (!hwnd_) return;
     health_hwnd_.store(hwnd_, std::memory_order_release);
 
-    // Main-thread heartbeat for the health command (see kHeartbeatMs).
-    s_heartbeat_ms_.store(SteadyNowMs(), std::memory_order_release);
-    SetTimer(hwnd_, kHeartbeatTimerId, kHeartbeatMs, nullptr);
+    // Main-thread heartbeat for the health command (see kHeartbeatMs). Without
+    // the timer the heartbeat stays 0 and health reports it unavailable instead
+    // of calling a pumping main thread stale.
+    s_beat_posted_ms_.store(0, std::memory_order_release);
+    heartbeat_timer_ = CreateThreadpoolTimer(&HeartbeatTimerProc, this, nullptr);
+    if (heartbeat_timer_) {
+        s_heartbeat_ms_.store(SteadyNowMs(), std::memory_order_release);
+        ULARGE_INTEGER due;
+        due.QuadPart = static_cast<ULONGLONG>(-static_cast<LONGLONG>(kHeartbeatMs) * 10000);  // relative
+        FILETIME due_time;
+        due_time.dwLowDateTime = due.LowPart;
+        due_time.dwHighDateTime = due.HighPart;
+        SetThreadpoolTimer(heartbeat_timer_, &due_time, kHeartbeatMs, 0);
+    }
+}
+
+void CALLBACK MainThreadExecutor::HeartbeatTimerProc(PTP_CALLBACK_INSTANCE, PVOID context, PTP_TIMER) {
+    auto* self = static_cast<MainThreadExecutor*>(context);
+    const HWND hwnd = self->health_hwnd_.load(std::memory_order_acquire);
+    if (!hwnd) return;
+    const long long now = SteadyNowMs();
+    long long posted = s_beat_posted_ms_.load(std::memory_order_acquire);
+    // One beat at a time, so a stuck main thread does not pile beats into its queue.
+    if (posted != 0 && now - posted < kBeatRepostMs) return;
+    if (!s_beat_posted_ms_.compare_exchange_strong(posted, now, std::memory_order_acq_rel)) return;
+    if (!PostMessage(hwnd, WM_MCP_HEARTBEAT, s_execute_cookie_, 0)) {
+        s_beat_posted_ms_.store(0, std::memory_order_release);
+    }
 }
 
 void MainThreadExecutor::BeginShutdown() {
@@ -109,9 +135,15 @@ void MainThreadExecutor::DrainPendingWork() {
 
 void MainThreadExecutor::Shutdown() {
     BeginShutdown();
+    health_hwnd_.store(nullptr, std::memory_order_release);
+    if (heartbeat_timer_) {
+        // Cancel pending callbacks and wait out a running one (it only posts).
+        SetThreadpoolTimer(heartbeat_timer_, nullptr, 0, 0);
+        WaitForThreadpoolTimerCallbacks(heartbeat_timer_, TRUE);
+        CloseThreadpoolTimer(heartbeat_timer_);
+        heartbeat_timer_ = nullptr;
+    }
     if (hwnd_) {
-        health_hwnd_.store(nullptr, std::memory_order_release);
-        KillTimer(hwnd_, kHeartbeatTimerId);
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
@@ -153,8 +185,8 @@ std::string MainThreadExecutor::ExecuteSync(
 
     auto item = std::make_shared<WorkItem>();
     item->work = std::move(work);
-    item->label = tl_label_;
-    item->posted_at = std::chrono::steady_clock::now();
+    item->ticket->label = tl_label_;
+    item->ticket->posted_at = std::chrono::steady_clock::now();
 
     // prevent shared_ptr from dying before main thread processes it
     auto* raw = new std::shared_ptr<WorkItem>(item);
@@ -170,7 +202,7 @@ std::string MainThreadExecutor::ExecuteSync(
         }
         TrackPending(item);
         if (!PostMessage(hwnd_, WM_MCP_EXECUTE, s_execute_cookie_, reinterpret_cast<LPARAM>(raw))) {
-            item->phase.store(kDone, std::memory_order_release);
+            item->ticket->phase.store(kDone, std::memory_order_release);
             delete raw;
             throw std::runtime_error("Failed to post work to main thread");
         }
@@ -187,7 +219,7 @@ std::string MainThreadExecutor::ExecuteSync(
         // stack references. Running work holds this mutex until it completes.
         item->completed = true;
         item->work = {};
-        item->phase.store(kDone, std::memory_order_release);
+        item->ticket->phase.store(kDone, std::memory_order_release);
         throw std::runtime_error("Main thread execution timed out");
     }
 
@@ -210,8 +242,11 @@ LRESULT CALLBACK MainThreadExecutor::WndProc(
         return 0;
     }
 
-    if (msg == WM_TIMER && wp == kHeartbeatTimerId) {
-        s_heartbeat_ms_.store(SteadyNowMs(), std::memory_order_release);
+    if (msg == WM_MCP_HEARTBEAT) {
+        if (wp == s_execute_cookie_) {
+            s_heartbeat_ms_.store(SteadyNowMs(), std::memory_order_release);
+            s_beat_posted_ms_.store(0, std::memory_order_release);
+        }
         return 0;
     }
 
@@ -258,7 +293,7 @@ void MainThreadExecutor::RunWorkItem(const std::shared_ptr<WorkItem>& item) {
     {
         std::lock_guard<std::mutex> lock(item->mutex);
         if (item->completed) return; // timed out (or failed) before it started
-        item->phase.store(kRunning, std::memory_order_release);
+        item->ticket->phase.store(kRunning, std::memory_order_release);
         SetRunning(item.get());
         try {
             item->result = item->work();
@@ -270,7 +305,8 @@ void MainThreadExecutor::RunWorkItem(const std::shared_ptr<WorkItem>& item) {
             item->error_message = "Unknown exception on main thread";
         }
         SetRunning(nullptr);
-        item->phase.store(kDone, std::memory_order_release);
+        item->work = {};  // drop the callback and its captures here, on the main thread
+        item->ticket->phase.store(kDone, std::memory_order_release);
         s_completed_.fetch_add(1, std::memory_order_relaxed);
         item->completed = true;
     }
@@ -285,7 +321,7 @@ void MainThreadExecutor::FailWorkItem(const std::shared_ptr<WorkItem>& item,
         item->error = true;
         item->error_message = message;
         item->work = {};
-        item->phase.store(kDone, std::memory_order_release);
+        item->ticket->phase.store(kDone, std::memory_order_release);
         item->completed = true;
     }
     item->cv.notify_all();
@@ -299,17 +335,16 @@ long long MainThreadExecutor::SteadyNowMs() {
 void MainThreadExecutor::TrackPending(const std::shared_ptr<WorkItem>& item) {
     std::lock_guard<std::mutex> lock(s_stats_mutex_);
     // Prune finished entries here too so the list stays tiny without a reader.
-    s_pending_.remove_if([](const std::weak_ptr<WorkItem>& weak) {
-        auto alive = weak.lock();
-        return !alive || alive->phase.load(std::memory_order_acquire) != kQueued;
+    s_pending_.remove_if([](const std::shared_ptr<Ticket>& ticket) {
+        return ticket->phase.load(std::memory_order_acquire) != kQueued;
     });
-    s_pending_.push_back(item);
+    s_pending_.push_back(item->ticket);
 }
 
 void MainThreadExecutor::SetRunning(const WorkItem* item) {
     std::lock_guard<std::mutex> lock(s_stats_mutex_);
     s_running_ = item != nullptr;
-    s_running_label_ = item ? item->label : std::string();
+    s_running_label_ = item ? item->ticket->label : WorkLabel{};
     s_running_since_ = item ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
 }
@@ -340,16 +375,16 @@ MainThreadExecutor::Health MainThreadExecutor::GetHealth() const {
         health.running_ms = age_ms(s_running_since_);
     }
     for (auto it = s_pending_.begin(); it != s_pending_.end();) {
-        auto item = it->lock();
-        if (!item || item->phase.load(std::memory_order_acquire) != kQueued) {
+        const Ticket& ticket = **it;
+        if (ticket.phase.load(std::memory_order_acquire) != kQueued) {
             it = s_pending_.erase(it);
             continue;
         }
         ++health.queued;
-        const long long waited = age_ms(item->posted_at);
+        const long long waited = age_ms(ticket.posted_at);
         if (waited > health.oldest_queued_ms) {
             health.oldest_queued_ms = waited;
-            health.oldest_queued_label = item->label;
+            health.oldest_queued_label = ticket.label;
         }
         ++it;
     }

@@ -43,6 +43,7 @@ class ErrorCode(str, Enum):
     HIERARCHY_CYCLE = "HIERARCHY_CYCLE"
     DUPLICATE_NAME = "DUPLICATE_NAME"
     PATCH_APPLY_FAILED = "PATCH_APPLY_FAILED"
+    MAXSCRIPT_INTERRUPTED = "MAXSCRIPT_INTERRUPTED"
 
 
 class ToolEnvelope(BaseModel):
@@ -289,6 +290,8 @@ def _classify_error_code(message: str, error_type: str = "") -> ErrorCode:
     lowered = f"{error_type} {message}".lower()
     if "safe mode" in lowered:
         return ErrorCode.SAFE_MODE
+    if "maxscript did not complete" in lowered:
+        return ErrorCode.MAXSCRIPT_INTERRUPTED
     if "is not responding" in lowered:
         return ErrorCode.MAX_NOT_RESPONDING
     if "busy with another request" in lowered:

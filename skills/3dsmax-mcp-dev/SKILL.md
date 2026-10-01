@@ -201,6 +201,7 @@ The `code` string is delivered as a JSON value, so it is **un-escaped once befor
 - **`\n` / `\t` inside `"..."` become real control chars** and corrupt the literal the same way. Don't embed escapes in strings you send; build output without them.
 - **Keep the whole script on one line, statements separated by `;`.** Multi-line code through the transport is unreliable; `;` is not.
 - **Debug tell:** on a `BAD_PARAM` parse error, shrink to a known-good core — `try ( local n=0; for x in (getClassInstances C) do (...); n ) catch (getCurrentException() as string)` — and add pieces back. The piece that reintroduces a `\` or `\n` in a *literal* is the culprit.
+- **Quitting Max via MCP:** use `try (quitMax #noPrompt quiet:true) catch ()` and expect the bridge connection to drop; a `MAXSCRIPT_INTERRUPTED` "did not complete (not a parse error)" error means the script was aborted (quitMax/reset/escape), not that its syntax is wrong.
 
 ## MCP Tool Pitfalls
 

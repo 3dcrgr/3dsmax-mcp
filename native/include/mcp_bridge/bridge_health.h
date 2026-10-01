@@ -16,13 +16,17 @@ struct RequestInfo {
     std::string request_id;
     std::string cmd_type;
     long long elapsed_ms = 0;
-    int nested = 0;  // requests this one dispatched in turn (e.g. invoke_tool probes)
+    // Same-client requests dispatched while this one runs. invoke_tool and
+    // tool_smoke probes do not count here: they dispatch as "native-tool-probe",
+    // which is listed as its own entry with internal = true.
+    int nested = 0;
+    bool internal = false;  // client id never connected over the pipe (bridge-internal dispatch)
 };
 
 struct ClientsSnapshot {
     int connected = 0;
     unsigned long long total_connections = 0;
-    std::vector<RequestInfo> inflight;  // outermost request per client (pipe requests are sequential)
+    std::vector<RequestInfo> inflight;  // outermost request per client id (pipe requests are sequential)
 };
 
 void ClientConnected(const std::string& client_id);

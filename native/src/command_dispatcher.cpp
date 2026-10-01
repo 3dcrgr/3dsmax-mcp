@@ -288,11 +288,11 @@ struct DirectModeGuard {
 };
 
 // RAII guard — names the main-thread work this request submits (health shows
-// the cmd type of what is queued or running). Restores the outer label so a
-// nested Dispatch does not clear it.
+// whose request, and which cmd type, is queued or running). Restores the outer
+// label so a nested Dispatch does not clear it.
 struct ExecutorLabelGuard {
-    std::string previous;
-    explicit ExecutorLabelGuard(const std::string& label)
+    MainThreadExecutor::WorkLabel previous;
+    explicit ExecutorLabelGuard(const MainThreadExecutor::WorkLabel& label)
         : previous(MainThreadExecutor::ThreadLabel()) {
         MainThreadExecutor::SetThreadLabel(label);
     }
@@ -390,9 +390,12 @@ static std::string HandleMaxScript(
         }
 
         if (!ok) {
-            // Parse-time errors fall through here; runtime errors are caught
-            // inside MAXScript and surface as a sentinel string in fpv below.
-            throw std::runtime_error("MAXScript execution failed (parse error)");
+            // Runtime errors are caught inside MAXScript and surface as a
+            // sentinel string in fpv below. FALSE means a parse error OR an
+            // abort try/catch cannot catch (quitMax, escape): classify it.
+            std::string code;
+            std::string message = HandlerHelpers::MaxScriptFailureMessage(wcmd, &code);
+            throw std::runtime_error(HandlerHelpers::StructuredErrorPayload(code, message));
         }
 
         // Convert FPValue to string
@@ -451,11 +454,14 @@ static std::string HandleHealth(MCPBridgeGUP* gup, const std::string& client_ses
     const MainThreadExecutor::Health ex = gup->GetExecutor().GetHealth();
     const BridgeHealth::ClientsSnapshot clients = BridgeHealth::Snapshot();
 
-    const bool heartbeatStale = ex.heartbeat_age_ms < 0 || ex.heartbeat_age_ms > kHeartbeatStaleMs;
+    // -1: the heartbeat timer could not be created; never read that as stale.
+    const bool heartbeatKnown = ex.heartbeat_age_ms >= 0;
+    const bool heartbeatStale = heartbeatKnown && ex.heartbeat_age_ms > kHeartbeatStaleMs;
     std::string state;
     if (!ex.initialized) state = "not_initialized";
     else if (ex.shutting_down) state = "shutting_down";
     else if (ex.running) state = "busy_mcp";        // a bridge request is executing on it
+    else if (!heartbeatKnown) state = "unknown";    // no heartbeat: callers fall back to ping
     else if (heartbeatStale) state = "busy_other";  // stopped pumping outside the bridge
     else state = "responsive";
 
@@ -464,7 +470,9 @@ static std::string HandleHealth(MCPBridgeGUP* gup, const std::string& client_ses
 #ifdef MCP_BRIDGE_VERSION
     result["bridgeVersion"] = MCP_BRIDGE_VERSION;
 #endif
-    result["healthVersion"] = 1;
+    // 2: posted-message heartbeat (1 used WM_TIMER, which paints and posted
+    // messages starve), request ids on executor items, internal clients.
+    result["healthVersion"] = 2;
     result["protocolVersion"] = 2;
     result["transport"] = "namedpipe";
     result["pid"] = static_cast<unsigned long>(GetCurrentProcessId());
@@ -472,20 +480,23 @@ static std::string HandleHealth(MCPBridgeGUP* gup, const std::string& client_ses
     result["maxVersion"] = 1998 + (HIWORD(v) / 1000);
     result["mainThread"] = {
         {"state", state},
-        {"pumping", !heartbeatStale},
+        {"pumping", heartbeatKnown ? json(!heartbeatStale) : json(nullptr)},
         {"heartbeatAgeMs", ex.heartbeat_age_ms < 0 ? json(nullptr) : json(ex.heartbeat_age_ms)},
         {"heartbeatPeriodMs", MainThreadExecutor::kHeartbeatMs},
         {"windowHung", ex.executor_window_hung},
     };
     json running = nullptr;
     if (ex.running) {
-        running = {{"cmdType", ex.running_label}, {"runningMs", ex.running_ms}};
+        running = {{"cmdType", ex.running_label.cmd_type}, {"runningMs", ex.running_ms},
+                   {"clientId", ex.running_label.client_id},
+                   {"requestId", ex.running_label.request_id}};
     }
     result["executor"] = {
         {"running", running},
         {"queued", ex.queued},
         {"oldestQueuedMs", ex.queued ? json(ex.oldest_queued_ms) : json(nullptr)},
-        {"oldestQueuedCmd", ex.queued ? json(ex.oldest_queued_label) : json(nullptr)},
+        {"oldestQueuedCmd", ex.queued ? json(ex.oldest_queued_label.cmd_type) : json(nullptr)},
+        {"oldestQueuedRequestId", ex.queued ? json(ex.oldest_queued_label.request_id) : json(nullptr)},
         {"completed", ex.completed},
         {"shuttingDown", ex.shutting_down},
     };
@@ -497,6 +508,7 @@ static std::string HandleHealth(MCPBridgeGUP* gup, const std::string& client_ses
             {"cmdType", r.cmd_type},
             {"elapsedMs", r.elapsed_ms},
             {"nested", r.nested},
+            {"internal", r.internal},
         });
     }
     result["clients"] = {
@@ -542,7 +554,7 @@ std::string CommandDispatcher::Dispatch(
         }
     }
     BridgeHealth::RequestScope inflight(client_session_id, request_id, cmd_type);
-    ExecutorLabelGuard label(cmd_type);
+    ExecutorLabelGuard label({cmd_type, client_session_id, request_id});
 
     // Route to handler — read-only handlers run directly on pipe thread
     // _forceMainThread flag allows benchmarking the same handler both ways

@@ -65,6 +65,7 @@ ClientsSnapshot Snapshot() {
         info.elapsed_ms = static_cast<long long>(
             std::chrono::duration_cast<std::chrono::milliseconds>(now - outer.started).count());
         info.nested = static_cast<int>(stack.size()) - 1;
+        info.internal = g_connected.count(client_id) == 0;
         snapshot.inflight.push_back(std::move(info));
     }
     return snapshot;

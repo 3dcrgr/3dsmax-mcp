@@ -6,6 +6,7 @@
 //   ctest --test-dir native/build-tests -C Release --output-on-failure
 #include "mcp_bridge/bridge_health.h"
 #include "mcp_bridge/main_thread_executor.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -57,8 +58,60 @@ void heartbeat_tracks_pumping() {
     health = executor.GetHealth();
     require(health.heartbeat_age_ms > 3 * MainThreadExecutor::kHeartbeatMs,
             "heartbeat stayed fresh without pumping");
+    pump_for(300);  // the one outstanding beat is answered as soon as it pumps again
+    require(executor.GetHealth().heartbeat_age_ms < (long long)MainThreadExecutor::kHeartbeatMs,
+            "heartbeat did not recover after pumping resumed");
     executor.Shutdown();
     require(!executor.GetHealth().initialized, "executor still initialized after shutdown");
+    require(executor.GetHealth().heartbeat_age_ms < 0, "heartbeat still reported after shutdown");
+}
+
+// A main thread that keeps pumping under a steady stream of posted messages
+// (progressive render, UI update loops) never lets WM_TIMER through; the
+// heartbeat must still read fresh, since queued bridge work would still run.
+std::atomic<bool> g_flood{false};
+LRESULT CALLBACK FloodProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_APP) {
+        if (g_flood.load()) PostMessage(hwnd, WM_APP, 0, 0);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+void heartbeat_survives_a_posted_message_flood() {
+    WNDCLASSEX wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = FloodProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = L"HealthTestFlood";
+    RegisterClassEx(&wc);
+    HWND flood = CreateWindowEx(0, L"HealthTestFlood", L"", 0, 0, 0, 0, 0, nullptr, nullptr,
+                                GetModuleHandle(nullptr), nullptr);
+    require(flood != nullptr, "flood window not created");
+
+    MainThreadExecutor executor;
+    executor.Initialize();
+    g_flood = true;
+    PostMessage(flood, WM_APP, 0, 0);
+    const auto start = Clock::now();
+    long long worst = 0;
+    unsigned long long pumped = 0;
+    MSG message;
+    while (ms_since(start) < 3500) {
+        if (PeekMessage(&message, nullptr, 0, 0, PM_REMOVE)) {
+            DispatchMessage(&message);
+            ++pumped;
+        }
+        if (ms_since(start) > 1500) worst = (std::max)(worst, executor.GetHealth().heartbeat_age_ms);
+    }
+    g_flood = false;
+    pump_for(20);
+    executor.Shutdown();
+    DestroyWindow(flood);
+    UnregisterClass(L"HealthTestFlood", GetModuleHandle(nullptr));
+    require(pumped > 1000, "flood did not run");
+    require(worst >= 0 && worst < 2 * MainThreadExecutor::kHeartbeatMs + 500,
+            "heartbeat went stale while the main thread was pumping a message flood");
 }
 
 // Work posted by a client but not yet picked up is visible, labelled and aged.
@@ -69,7 +122,7 @@ void queued_work_is_visible_with_label() {
 
     std::atomic<bool> done{false};
     std::thread worker([&] {
-        MainThreadExecutor::SetThreadLabel("native:test_queued");
+        MainThreadExecutor::SetThreadLabel({"native:test_queued", "pipe-7", "req-q"});
         executor.ExecuteSync([] { return std::string("ok"); }, 20000);
         done = true;
     });
@@ -77,7 +130,8 @@ void queued_work_is_visible_with_label() {
             "posted work never showed as queued");
     Sleep(50);
     auto health = executor.GetHealth();
-    require(health.oldest_queued_label == "native:test_queued", "queued work lost its label");
+    require(health.oldest_queued_label.cmd_type == "native:test_queued", "queued work lost its label");
+    require(health.oldest_queued_label.request_id == "req-q", "queued work lost its request id");
     require(health.oldest_queued_ms >= 40, "queued age not tracked");
     require(!health.running, "queued work reported as running");
 
@@ -101,7 +155,7 @@ void running_work_is_visible() {
     executor.Initialize();
     std::atomic<bool> entered{false}, release{false}, done{false};
     std::thread worker([&] {
-        MainThreadExecutor::SetThreadLabel("maxscript");
+        MainThreadExecutor::SetThreadLabel({"maxscript", "pipe-3", "req-run"});
         executor.ExecuteSync([&] {
             entered = true;
             while (!release.load()) Sleep(1);
@@ -112,7 +166,7 @@ void running_work_is_visible() {
 
     std::atomic<bool> observed{false};
     std::atomic<long long> observed_ms{-1};
-    std::string observed_label;
+    MainThreadExecutor::WorkLabel observed_label;
     std::thread observer([&] {
         if (!wait_until(5000, [&] { return entered.load(); })) return;
         Sleep(60);
@@ -137,7 +191,11 @@ void running_work_is_visible() {
     observer.join();
     worker.join();
     require(observed, "running work not visible to an observer thread");
-    require(observed_label == "maxscript", "running work lost its label");
+    require(observed_label.cmd_type == "maxscript", "running work lost its label");
+    // Owner attribution: the running item names its client and request, not
+    // just its cmd type (another client's same-type request may be queued).
+    require(observed_label.client_id == "pipe-3" && observed_label.request_id == "req-run",
+            "running work lost its client/request id");
     require(observed_ms >= 50, "running time not tracked");
     require(!executor.GetHealth().running, "finished work still reported as running");
     executor.Shutdown();
@@ -177,14 +235,16 @@ void client_registry_tracks_connections_and_requests() {
             RequestScope nested("pipe-test-a", "req-3", "native:inspect_object");
             Sleep(20);
             snap = Snapshot();
-            bool sawOuter = false;
+            bool sawOuter = false, sawProbe = false;
             for (const auto& r : snap.inflight) {
                 if (r.client_id == "pipe-test-a") {
                     sawOuter = r.request_id == "req-1" && r.cmd_type == "maxscript" &&
-                               r.nested == 1 && r.elapsed_ms >= 15;
+                               r.nested == 1 && r.elapsed_ms >= 15 && !r.internal;
                 }
+                if (r.client_id == "native-tool-probe") sawProbe = r.internal;
             }
             require(sawOuter, "outer request not reported with its nesting");
+            require(sawProbe, "never-connected probe not marked internal");
             require(snap.connected == base.connected + 2, "a nested probe counted as a connection");
         }
         snap = Snapshot();
@@ -218,8 +278,10 @@ int main() {
         running_work_is_visible();
         expired_work_leaves_the_queue();
         heartbeat_tracks_pumping();
+        heartbeat_survives_a_posted_message_flood();
         std::cout << "PASS: client registry; queued work visible with label; running work visible "
-                     "without blocking; expired work leaves the queue; heartbeat tracks pumping\n";
+                     "without blocking; expired work leaves the queue; heartbeat tracks pumping; "
+                     "heartbeat survives a posted-message flood\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

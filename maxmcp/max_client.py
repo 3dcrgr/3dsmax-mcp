@@ -389,6 +389,11 @@ class MaxClient:
         """This client's in-flight request (cmd_type, request_id, target, running_s), if any."""
         return self._inflight_snapshot()
 
+    def hung_verdict(self, pid: int | None) -> dict[str, Any] | None:
+        """The remembered not-responding verdict for `pid` (incl. the abandoned inflight), if any."""
+        verdict = self._hung_pids.get(pid) if pid else None
+        return dict(verdict) if verdict else None
+
     def _inflight_snapshot(self) -> dict[str, Any] | None:
         inflight = self._inflight
         if not inflight:
