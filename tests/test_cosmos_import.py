@@ -268,7 +268,9 @@ class ImportOrderTests(_FlowCase):
     def test_prepare_script_records_and_swaps_medit_renderer(self):
         self.run_import(swap_medit_renderer=True)
         script = self.op_client.commands[0][1]
-        self.assertLess(script.index("local snap="), script.index("renderers.medit_locked=false"))
+        # The baseline snapshot comes last (nothing the prepare call makes may read as new later).
+        self.assertLess(script.index("renderers.medit=sl"), script.index("local snap="))
+        self.assertLess(script.index("local snap="), script.index("clearSelection()"))
         for needle in ("renderers.medit_locked", "MatEditor.isOpen()", "SME.isOpen()", "Default_Scanline_Renderer",
                        "if scanline!=undefined do", "sl=scanline()", "renderers.medit=sl", "clearSelection()",
                        'throw "USER_BUSY"', "mcp_cosmosMeditBackup[3]==renderers.medit"):
@@ -774,6 +776,169 @@ class HandleDiffTests(_FlowCase):
         self.assertNotIn("medit_slot", response["maps"][0])
 
 
+def other(item, sub=False):
+    """A material the snapshot flags as not tied to the import (e.g. Forest Pack regenerating)."""
+    return {**item, "other": True, **({"sub": True} if sub else {})}
+
+
+# Pre-dispatch record with "newest" (issue #9 follow-up): handles above 100 are newer than dispatch.
+NEWEST_BEFORE = {"nodes": [], "materials": [], "maps": [],
+                 "known": {"materials": [3, 1, 2], "maps": None, "newest": 100}}
+
+
+class ImportAttributionTests(_FlowCase):
+    """Issue #9 follow-up: other activity during the import window (Forest Pack regenerating its
+    forest_automat_* multimaterials) is not reported as imported; old maps are never created."""
+
+    def use(self, after, probe=None, before=NEWEST_BEFORE):
+        self.flow["prepare"] = {**prepared(), "before": before}
+        self.light_results = [probe or after]
+        self.flow["full"] = after
+
+    def forest_after(self):
+        return {"nodes": [], "materials": [
+            other(slotted(140, "forest_automat_5693B0E0", 0, "Multimaterial")),
+            other(slotted(141, "FPColor Standard", 0, "Standardmaterial"), sub=True),
+            slotted(150, "Asphalt_C01", 15),
+            other(slotted(142, "forest_automat_569338A0", 0, "Multimaterial"))],
+            "maps": [ref(49, "plant_bark.jpg", "Bitmaptexture"),  # an existing plant map (49 < newest 100)
+                     ref(151, "asphalt_diffuse", "VRayBitmap"), ref(160, "asphalt_bump", "VRayBitmap")]}
+
+    def test_plugin_regeneration_is_listed_apart_and_old_maps_not_created(self):
+        self.use(self.forest_after())
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertNotIn("warnings", result)
+        self.assertEqual([(m["handle"], m["created"]) for m in result["materials"]], [("150", True)])
+        self.assertEqual([m["handle"] for m in result["other_new_materials"]], ["140", "141", "142"])
+        self.assertTrue(all(m["created"] for m in result["other_new_materials"]))
+        self.assertNotIn("other", result["other_new_materials"][0])
+        self.assertTrue(result["other_new_materials"][1]["sub_material"])
+        self.assertEqual(result["primary_material"]["handle"], "150")
+        self.assertEqual(result["primary_reason"], "only_new")  # the regenerated ones do not compete
+        self.assertNotIn("top-level materials appeared", result.get("note", ""))
+        self.assertEqual([(m["handle"], m["created"]) for m in result["maps"]],
+                         [("49", False), ("151", True), ("160", True)])
+
+    def test_detection_ignores_other_new_materials(self):
+        probe = {"nodes": [], "materials": [other(slotted(140, "forest_automat_5693B0E0", 0, "Multimaterial"))],
+                 "maps": []}
+        self.light_results = [probe, probe, self.forest_after()]
+        asset = cosmos._download(self.service, ASSET_ID, 0)
+        timing = cosmos._wait_import(self.op_client, asset, NEWEST_BEFORE, "V-Ray", PID)
+        self.assertTrue(timing["detected"])
+        self.assertEqual(timing["polls"], 3)  # the first two polls saw only the plugin's material
+        self.light_results = [probe]
+        self.assertFalse(cosmos._wait_import(self.op_client, asset, NEWEST_BEFORE, "V-Ray", PID, timeout=5)["detected"])
+
+    def test_nothing_tied_to_import_falls_back_with_warning(self):
+        # Slate mode, package named otherwise: no slot, no name match; everything new stays listed.
+        after = {"nodes": [], "materials": [other(slotted(140, "forest_automat_5693B0E0", 0, "Multimaterial")),
+                                            other(slotted(150, "Steel_Polished #0"))], "maps": []}
+        self.use(after)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertNotIn("other_new_materials", result)
+        self.assertEqual([m["handle"] for m in result["materials"] if m["created"]], ["140", "150"])
+        self.assertTrue(any("No new material could be tied to the import" in w for w in result["warnings"]))
+        self.assertIn("primary_material", result)
+        self.assertTrue(result["import_timing"]["unattributed"])  # stable class scans, no 30 s timeout
+
+    def test_model_import_falls_back_like_material_hdri_never(self):
+        before = {**NEWEST_BEFORE, "nodes": []}
+        after = {"nodes": [ref(500, "Chair", "Editable_Poly")],
+                 "materials": [slotted(150, "Chair wood"), other(slotted(140, "forest_automat_1", 0, "Multimaterial"))],
+                 "maps": []}
+        warnings = []
+        response = cosmos._resources(before, after, warnings, "model")
+        self.assertEqual([m["handle"] for m in response["materials"]], ["150"])
+        self.assertEqual([m["handle"] for m in response["other_new_materials"]], ["140"])
+        self.assertEqual(warnings, [])
+        # The model's materials sit on untagged child nodes: nothing new can be tied to the
+        # import, so everything new stays in materials, with the warning (as for materials).
+        only_other = {**after, "materials": [other(slotted(150, "Chair wood")), after["materials"][1]]}
+        response = cosmos._resources(before, only_other, warnings, "model")
+        self.assertEqual([m["handle"] for m in response["materials"]], ["150", "140"])
+        self.assertNotIn("other_new_materials", response)
+        [warning] = warnings
+        self.assertIn("No new material could be tied to the import", warning)
+        # An HDRI brings no material: new ones always go apart, without a warning.
+        warnings = []
+        response = cosmos._resources(before, {**only_other, "nodes": []}, warnings, "hdri")
+        self.assertEqual(response["materials"], [])
+        self.assertEqual(len(response["other_new_materials"]), 2)
+        self.assertEqual(warnings, [])
+
+    def test_stable_unattributed_materials_end_detection(self):
+        # Slate mode, package named otherwise: only class scans (polls 4, 6, ...) see the new
+        # material and it is flagged "other"; the same set twice ends detection early.
+        probe = {"nodes": [], "materials": [other(slotted(140, "forest_automat_1", 0, "Multimaterial")),
+                                            other(slotted(150, "Steel_Polished #0"))], "maps": []}
+        self.light_results = [probe]
+        asset = cosmos._download(self.service, ASSET_ID, 0)
+        timing = cosmos._wait_import(self.op_client, asset, NEWEST_BEFORE, "V-Ray", PID)
+        self.assertTrue(timing["detected"])
+        self.assertTrue(timing["unattributed"])
+        self.assertEqual(timing["polls"], 6)  # the second class scan, ~10 s instead of the 30 s timeout
+        scans = [c[1] for c in self.op_client.commands if c[0] == "light"]
+        self.assertEqual([("for c in #() do" not in s) for s in scans], [False, False, False, True, False, True])
+        # The set changed between class scans (the import landed meanwhile): keep polling.
+        grown = {**probe, "materials": probe["materials"] + [other(slotted(160, "Steel_Polished #1"))]}
+        self.light_results = [probe] * 5 + [grown]
+        timing = cosmos._wait_import(self.op_client, asset, NEWEST_BEFORE, "V-Ray", PID)
+        self.assertEqual((timing["detected"], timing["polls"]), (True, 8))
+        # A core material still ends detection at once, without "unattributed".
+        self.light_results = [{**probe, "materials": probe["materials"] + [slotted(170, "Steel_Polished #2", 4)]}]
+        timing = cosmos._wait_import(self.op_client, asset, NEWEST_BEFORE, "V-Ray", PID)
+        self.assertEqual((timing["detected"], timing["polls"]), (True, 1))
+        self.assertNotIn("unattributed", timing)
+
+    def test_settling_reports_split_too(self):
+        self.use(self.forest_after())
+        self.settle = settle_result(False, hung_browser=True)
+        result = self.run_import()
+        self.assertEqual(result["state"], "settling")
+        self.assertEqual([m["handle"] for m in result["materials"]], ["150"])
+        self.assertEqual(len(result["other_new_materials"]), 3)
+
+    def test_without_newest_record_maps_keep_old_rule(self):
+        # An older record without "newest": maps not seen before still read as created.
+        response = cosmos._resources(KNOWN_BEFORE, {"nodes": [], "materials": [], "maps": [ref(49, "m")]})
+        self.assertTrue(response["maps"][0]["created"])
+        response = cosmos._resources(NEWEST_BEFORE, {"nodes": [], "materials": [],
+                                                     "maps": [ref(49, "m"), ref(101, "n"), ref("bad", "x")]})
+        self.assertEqual([m["created"] for m in response["maps"]], [False, True, False])
+
+    def test_newest_handle_helpers(self):
+        self.assertEqual(cosmos._newest_handle(NEWEST_BEFORE), 100)
+        self.assertIsNone(cosmos._newest_handle(KNOWN_BEFORE))
+        self.assertIsNone(cosmos._newest_handle({"known": {"newest": -1}}))
+        self.assertIsNone(cosmos._newest_handle(None))
+        self.assertEqual(cosmos._newest_known(NEWEST_BEFORE), 100)
+        self.assertEqual(cosmos._newest_known({"known": {"materials": [7], "newest": 5}}), 7)
+
+    def test_snapshot_classifies_and_records_newest(self):
+        mat = {"id": ASSET_ID, "name": "Asphalt C01", "kind": "material"}
+        record = cosmos._snapshot_script(mat, record=True)
+        self.assertIn("local newest=if record then (try(handleOf (bezier_float()))catch(-1L)) else -1L", record)
+        self.assertIn('",\\"newest\\":"+(formattedPrint newest format:"d")', record)
+        # newest is taken before any scan; maps are visited from import-produced materials only.
+        self.assertLess(record.index("local newest="), record.index("local nodes="))
+        self.assertIn("local mapRoots=if true and diffMats and not coreNew then mats else core", record)
+        model = cosmos._snapshot_script({**mat, "kind": "model"}, known=NEWEST_BEFORE["known"])
+        self.assertIn("local mapRoots=if true and diffMats and not coreNew then mats else core", model)
+        hdri = cosmos._snapshot_script({**mat, "kind": "hdri"}, known=NEWEST_BEFORE["known"])
+        self.assertIn("local mapRoots=if false and diffMats and not coreNew then mats else core", hdri)
+        self.assertIn("for m in mapRoots do visitMaps m maps visited 0", record)
+        self.assertNotIn("for m in mats do visitMaps", record)
+        self.assertIn("isOther:((findItem core m)==0)", record)
+        self.assertIn("(findItem nodeMats m)>0 or (try(matchesName m.name key)catch(false)) or (slotOf m)>0", record)
+        self.assertIn("for m in mats where (findItem coreSubs m)>0 do appendIfUnique core m", record)
+        self.assertEqual(record.count("("), record.count(")"))
+        prepare = cosmos._prepare_script(mat, swap=False)
+        self.assertNotIn("__", prepare.replace("__KEY__", ""))
+
+
 def slot_prep(active=13, keep=True, free_slot=4, switched=True, **extra):
     return {"active": active, "material": {"handle": "2", "name": "Steel_Blurry"}, "keep": keep,
             "free_slot": free_slot, "switched": switched, "mode": "basic", "stale": False, "error": "", **extra}
@@ -827,8 +992,10 @@ class ActiveSlotTests(_FlowCase):
         self.assertFalse([e for e in self.events[start:end] if e[0] == "bridge"])
         prepare = self.op_client.commands[0][1]
         self.assertLess(self.events.index(("bridge", "operation", "prepare")), dispatch)
-        self.assertLess(prepare.index("local snap="), prepare.index("activeMeditSlot=slotFree"))
-        self.assertLess(prepare.index("activeMeditSlot=slotFree"), prepare.index("clearSelection()"))
+        # The slot guard runs before the baseline snapshot, so its fresh comparison instances
+        # are recorded as known and never reported as created.
+        self.assertLess(prepare.index("activeMeditSlot=slotFree"), prepare.index("local snap="))
+        self.assertLess(prepare.index("local snap="), prepare.index("clearSelection()"))
         finalize = self.op_client.commands[-1][1]
         self.assertGreater(self.events.index(("bridge", "operation", "finalize")), end)
         self.assertIn("activeMeditSlot=a", finalize)
@@ -861,7 +1028,7 @@ class ActiveSlotTests(_FlowCase):
         self.assertEqual(result["medit_active_slot"]["state"], "displaced")
         self.assertEqual(result["medit_slot"], 13)
         [warning] = result["warnings"]
-        for needle in ("'Steel_Blurry'", "slot 13", "'Steel_Polished #0'", "no free (unused default) slot",
+        for needle in ("'Steel_Blurry'", "slot 13", "'Steel_Polished #0'", "no free slot (one holding an unused",
                        "mcp_cosmosMeditDisplaced", "meditMaterials[13] = getAnimByHandle 2L"):
             self.assertIn(needle, warning)
 
@@ -952,6 +1119,99 @@ class ActiveSlotTests(_FlowCase):
         self.assertNotIn("getAnimByHandle", warning)
         self.assertIn("meditMaterials[13] = <its entry in mcp_cosmosMeditDisplaced>", warning)
 
+    def test_default_slot_names_of_every_scheme_recognised(self):
+        # The regex as MAXScript passes it to .NET (the \\ escapes unescaped); .NET and Python agree here.
+        literal = re.search(r'IsMatch \(m\.name as string\) "((?:[^"\\]|\\.)*)"', cosmos._SLOT_FNS).group(1)
+        pattern = re.compile(literal.replace("\\\\", "\\"))
+        for name in ("01 - Default", "16 - Default", "1 - Default", "Material #16", "Material #24", "material #3",
+                     "Material #123"):
+            self.assertTrue(pattern.search(name), name)
+        for name in ("Porcelain_White_Glossy_001", "Material #16 copy", "Default", "Steel_Blurry", "Material",
+                     "Material #", "01 - Default wood", "Asphalt C01"):
+            self.assertIsNone(pattern.search(name), name)
+
+    def test_free_slot_search_default_names_first_then_any_pristine(self):
+        fns = cosmos._SLOT_FNS
+        self.assertIn("fn mcpLooksFree m loose:false = ((loose or (mcpDefaultName m)) and (mcpPristine m))", fns)
+        self.assertIn("for loose in #(false, true) while s==0 do", fns)
+        self.assertIn("mcpLooksFree meditMaterials[i] loose:loose", fns)
+        # The kept-slot decision stays strict (a named pristine material in the active slot is kept).
+        self.assertIn("slotKeep=slotMat!=undefined and not (mcpLooksFree slotMat)", cosmos._SLOT_PREPARE)
+        self.assertIn("slotOver=mcpLooseRef meditMaterials[slotFree]", cosmos._SLOT_PREPARE)
+        # Finalize: the switched-to slot only needs to be pristine; what a move replaced is reported.
+        self.assertIn("mcpLooksFree fm loose:(mcpOld fm __NEWEST__)", cosmos._SLOT_RESTORE)
+        self.assertLess(cosmos._SLOT_RESTORE.index("over=mcpLooseRef meditMaterials[movedTo]"),
+                        cosmos._SLOT_RESTORE.index("meditMaterials[movedTo]=cur"))
+        self.assertIn('\\"moved_over\\":"+(if restored then over else "null")', cosmos._SLOT_RESTORE)
+
+    def test_replaced_named_pristine_material_kept_alive_and_predates_dispatch(self):
+        fns, prepare, restore = cosmos._SLOT_FNS, cosmos._SLOT_PREPARE, cosmos._SLOT_RESTORE
+        # A loose (named) slot material is kept alive before the importer or the move replaces it.
+        self.assertIn("try(appendIfUnique mcp_cosmosMeditDisplaced m; true)catch(false)", fns)
+        self.assertLess(prepare.index('if slotOver!="null" do mcpKeepAlive meditMaterials[slotFree]'),
+                        prepare.index("activeMeditSlot=slotFree"))
+        self.assertLess(restore.index('if over!="null" do mcpKeepAlive meditMaterials[movedTo]'),
+                        restore.index("meditMaterials[movedTo]=cur"))
+        # Finalize takes a loose slot only when its material predates dispatch (made by hand later: not taken).
+        self.assertIn("(not loose or (mcpOld meditMaterials[i] maxH))", fns)
+        self.assertIn("fn mcpOld m maxH = (maxH==undefined or (try(((getHandleByAnim m) as integer64)<=maxH)"
+                      "catch(false)))", fns)
+        self.assertLess(fns.index("fn mcpOld"), fns.index("fn mcpFreeSlot"))  # defined before use
+        self.assertIn("slotFree=mcpFreeSlot #(slotA)\n", prepare)  # prepare: everything predates dispatch
+        finalize = cosmos._finalize_script([], False, 3)
+        self.assertIn("mcpLooksFree fm loose:(mcpOld fm (3L))", finalize)
+        self.assertIn("(mcpFreeSlot #(a) maxH:(3L))", finalize)
+        self.assertIn("(mcpFreeSlot #(a) maxH:undefined)", cosmos._finalize_script([], False))
+        self.assertNotIn("__NEWEST__", finalize)
+
+    def test_scene_reset_detected_by_slot_marks_even_untitled(self):
+        fns, prepare, restore = cosmos._SLOT_FNS, cosmos._SLOT_PREPARE, cosmos._SLOT_RESTORE
+        # Prepare records the other slots' materials; after a reset/new scene none is in a slot.
+        self.assertIn("mcp_cosmosMeditSlot=#(slotA, slotMat, 0, maxFilePath+maxFileName, mcpSceneMark slotA)",
+                      prepare)
+        self.assertIn("for i=1 to meditMaterials.count where i!=a collect meditMaterials[i]", fns)
+        self.assertIn("local same=(marks.count==0)", fns)
+        # Stale (slots left alone) is decided before anything is moved; a record without marks
+        # (an earlier version's) keeps the old test.
+        self.assertIn("(try(b.count>=5 and not (mcpSameScene b[5]))catch(true))", restore)
+        self.assertLess(restore.index("mcpSameScene b[5]"), restore.index("local a=b[1]"))
+
+    def test_vray_material_n_slots_now_count_as_free(self):
+        # Live result A: slots 16-24 held "Material #16".."#24"; prepare now switches to slot 16.
+        self.use(slot_prep(active=15, free_slot=16), slot_fin(original=15, switched_to=16), imported_slot=16)
+        result = self.run_import()
+        self.assertEqual(result["medit_active_slot"]["state"], "kept")
+        self.assertEqual(result["medit_active_slot"]["switched_to"], 16)
+        self.assertNotIn("switched_over", result["medit_active_slot"])
+        self.assertNotIn("warnings", result)
+
+    def test_named_pristine_free_slot_is_used_with_warning(self):
+        over = {"handle": "40", "name": "Placeholder"}
+        self.use(slot_prep(free_slot_material=over), slot_fin(), imported_slot=4)
+        result = self.run_import()
+        self.assertEqual(result["medit_active_slot"]["switched_over"], over)
+        [warning] = result["warnings"]
+        self.assertIn("slot 4", warning)
+        self.assertIn("'Placeholder'", warning)
+        self.assertIn("unused and unedited", warning)
+        self.assertIn("kept alive in the MAXScript global mcp_cosmosMeditDisplaced (getAnimByHandle 40L)", warning)
+
+    def test_finalize_moving_over_named_pristine_slot_is_reported(self):
+        over = {"handle": "40", "name": "Placeholder"}
+        fin = {**slot_fin(switched_to=0, displaced=USER_MAT, occupant=IMPORTED, fresh=True, moved_to=7,
+                          restored=True, active_restored=None), "moved_over": over}
+        self.use(slot_prep(free_slot=0, switched=False), fin, imported_slot=13)
+        result = self.run_import()
+        self.assertTrue(result["medit_slot_restored"])
+        self.assertEqual(result["medit_active_slot"]["state"], "restored")
+        self.assertEqual(result["medit_active_slot"]["moved_over"], over)
+        self.assertEqual(self.slots(result), {"2": 13, "77": 7})
+        [warning] = result["warnings"]
+        self.assertIn("moved to Material Editor slot 7, replacing 'Placeholder'", warning)
+        self.assertIn("kept alive in the MAXScript global mcp_cosmosMeditDisplaced (getAnimByHandle 40L)", warning)
+        self.assertEqual(cosmos._kept_alive_hint({"handle": "", "name": "x"}),
+                         " It is kept alive in the MAXScript global mcp_cosmosMeditDisplaced.")
+
     def test_slot_scripts_shape(self):
         asset = {"id": ASSET_ID, "name": "Plaster White", "kind": "material"}
         prepare, finalize = cosmos._prepare_script(asset, False), cosmos._finalize_script([5], False)
@@ -970,7 +1230,6 @@ class ActiveSlotTests(_FlowCase):
         self.assertIn(")catch(out=", restore)
         self.assertLess(restore.index("if f>0 do try("), restore.index("activeMeditSlot=a"))
         self.assertIn("catch(ok=false)", cosmos._SLOT_FNS)
-        self.assertIn('pattern:"?? - Default"', cosmos._SLOT_FNS)
         self.assertIn("refs.dependentNodes m", cosmos._SLOT_FNS)
         # The switch is recorded before it is made, so finalize can undo a partial switch.
         self.assertLess(prepare.index("mcp_cosmosMeditSlot[3]=slotFree"), prepare.index("activeMeditSlot=slotFree"))
@@ -979,11 +1238,13 @@ class ActiveSlotTests(_FlowCase):
         self.assertNotIn(">(-1L)", finalize)
         self.assertIn("displaced and (try(((getHandleByAnim cur) as integer64)>(3L))catch(false))",
                       cosmos._finalize_script([], False, 3))
-        # Free means pristine: every property equals a new instance of its class.
-        self.assertIn("local d=(classof m)()", cosmos._SLOT_FNS)
+        # Free means pristine: every property equals a new instance of its class (one per class).
+        self.assertIn("local c=classof m, d=undefined", cosmos._SLOT_FNS)
+        self.assertIn("if d==undefined do (d=c(); append mcpFresh #(c, d))", cosmos._SLOT_FNS)
         self.assertIn("for p in (getPropNames m) while ok do", cosmos._SLOT_FNS)
         # Finalize leaves slots alone during an undo transaction or after a scene change.
-        self.assertIn("mcp_cosmosMeditSlot=#(slotA, slotMat, 0, maxFilePath+maxFileName)", prepare)
+        self.assertIn("mcp_cosmosMeditSlot=#(slotA, slotMat, 0, maxFilePath+maxFileName, mcpSceneMark slotA)",
+                      prepare)
         self.assertLess(restore.index("theHold.Holding()"), restore.index("meditMaterials[movedTo]=cur"))
         self.assertLess(restore.index("isDeleted b[2]"), restore.index("meditMaterials[movedTo]=cur"))
         self.assertLess(restore.index("b[4]!=(maxFilePath+maxFileName)"), restore.index("local a=b[1]"))

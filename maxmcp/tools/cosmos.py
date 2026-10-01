@@ -49,7 +49,10 @@ def cosmos_import(
     """Download if needed and import one Cosmos asset into the selected Max instance.
     Returns imported nodes, materials or maps and their file checks; selection is
     preserved. New materials/maps are found by handle whatever their name (created means
-    new since the import started, not proven to come from it): primary_material (or
+    new since the import started): materials list those tied to the import (in a Material
+    Editor slot, named like the asset, on its nodes, or their sub-materials); other new ones
+    (e.g. Forest Pack regenerating its own) go to other_new_materials (if none can be tied to a
+    material or model import, all stay in materials, with a warning). primary_material (or
     primary_map) is the main one, primary_reason says how it was picked, note says when
     its name differs from the asset's. A pending download makes no scene edit. Repeating a completed model
     import creates another instance; if completion is unknown, inspect before retrying.
@@ -61,7 +64,7 @@ def cosmos_import(
     settle; other calls get IMPORT_SETTLING meanwhile. If safe_to_edit is false,
     follow next and run pending_restore later. Never open or close the Material
     Editor right after. The importer fills the active Material Editor slot: a used
-    one is swapped for a free slot first and made active again after (medit_active_slot;
+    one is swapped for a free (unused, unedited) slot first and made active again after (medit_active_slot;
     displaced_material/medit_slot_restored if it was replaced anyway).
     """
     return impl.import_asset(client, asset_id, wait_seconds, renderer, settle_seconds, restore_medit_renderer,
