@@ -61,7 +61,19 @@ private:
 };
 
 // Call before committing a transaction, and after returning from MAXScript.
+// Waits for an acknowledgment still being published.
 void ThrowIfDismissed();
+
+// Within its scope ThrowIfDismissed does not throw on this thread, so cleanup
+// that runs several scripts (restoring leased settings) finishes after an
+// acknowledged error. The operation still fails with MAX_DIALOG_ERROR when its
+// Guard finishes, and a transaction checks again before committing.
+struct DeferDismissed {
+    DeferDismissed();
+    ~DeferDismissed();
+    DeferDismissed(const DeferDismissed&) = delete;
+    DeferDismissed& operator=(const DeferDismissed&) = delete;
+};
 
 // Open blocking dialogs from window-manager state only, for response metadata.
 nlohmann::json OpenDialogs();

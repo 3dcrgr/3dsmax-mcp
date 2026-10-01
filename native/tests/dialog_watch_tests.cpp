@@ -1,7 +1,10 @@
 // SDK-independent tests for the fork's DialogWatch rules on top of upstream
 // 1.7.5: Cosmos browser, Material Editor and viewport windows are never
 // blocking dialogs; dialogs of other threads are listed but never messaged;
-// Qt reads never send into a main thread that stopped pumping.
+// Qt reads never send into a main thread that stopped pumping; a Qt press that
+// timed out never clicks later; an acknowledged error is published before the
+// operation can commit; a Qt error box refused while the main thread did not
+// pump is acknowledged once it pumps again.
 //
 //   cmake -S native/tests -B native/build-tests -G "Visual Studio 17 2022" -A x64
 //   cmake --build native/build-tests --config Release
@@ -111,19 +114,78 @@ json find_dialog(const json& listing, const std::string& title) {
     return json();
 }
 
-std::atomic<int> g_qt_reads{0};
-std::atomic<bool> g_pumping{true};
+std::atomic<int> g_qt_reads{0}, g_qt_clicks{0}, g_qt_error_reads{0}, g_qt_error_clicks{0};
+std::atomic<bool> g_pumping{true}, g_slow_next_read{false};
+std::atomic<HWND> g_qt_error{nullptr};
+
+json qt_snapshot(HWND hwnd) {
+    const json ok = json::array({{{"index", 0}, {"label", "OK"}, {"enabled", true}, {"kind", "push"}}});
+    if (hwnd == g_qt_error.load()) {
+        ++g_qt_error_reads;
+        return {{"kind", "qt"}, {"title", "MAXScript Runtime Error"}, {"text", "-- Runtime error: qt test"},
+                {"buttons", ok}, {"fields", json::array()}, {"complete", true}};
+    }
+    ++g_qt_reads;
+    if (g_slow_next_read.exchange(false)) Sleep(2200);  // longer than the 1.5 s lane timeout
+    return {{"kind", "qt"}, {"title", "Qt Dialog"}, {"text", "qt text"},
+            {"buttons", ok}, {"fields", json::array()}, {"complete", true}};
+}
+void qt_click(HWND hwnd, int) {
+    if (hwnd == g_qt_error.load()) {
+        ++g_qt_error_clicks;
+        DestroyWindow(hwnd);
+    } else {
+        ++g_qt_clicks;
+    }
+}
+
+// A recognized Win32 MAXScript error box. Its OK press is the first moment the
+// operation's thread runs again, so it checks for the acknowledgment there.
+std::string g_ack_seen;
+std::atomic<bool> g_ack_done{false};
+LRESULT CALLBACK ErrorBoxProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_COMMAND && LOWORD(wp) == IDOK && HIWORD(wp) == BN_CLICKED) {
+        try {
+            DialogWatch::ThrowIfDismissed();
+            g_ack_seen = "no error";
+        } catch (const std::exception& e) {
+            g_ack_seen = e.what();
+        }
+        g_ack_done = true;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Pumps like a modal loop until done() or the timeout.
+template <class Done>
+bool pump_until(Done done, int timeout_ms) {
+    const auto start = Clock::now();
+    while (!done() && ms_since(start) < timeout_ms) {
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 20, QS_ALLINPUT);
+        pump();
+    }
+    return done();
+}
+
+json error_payload(const std::string& error) {
+    const json parsed = json::parse(error, nullptr, false);
+    return parsed.is_object() ? parsed : json::object();
+}
 
 int run() {
     register_class(L"DWTestWindow");
     register_class(L"Qt5QWindowIcon");  // what IsQt() recognises
     DialogWatch::SetMainThreadPumping([] { return g_pumping.load(); });
-    DialogWatch::Start({[](HWND) -> json {
-                            ++g_qt_reads;
-                            return {{"kind", "qt"}, {"title", "Qt Dialog"}, {"text", "qt text"},
-                                    {"buttons", json::array()}, {"fields", json::array()}, {"complete", true}};
-                        },
-                        [](HWND, int) {}});
+    DialogWatch::Start({qt_snapshot, qt_click});
+    {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = ErrorBoxProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"DWErrorBox";
+        RegisterClassExW(&wc);
+    }
 
     HWND owner = top(L"DWTestWindow", L"Owner", nullptr);
     EnableWindow(owner, FALSE);  // a modal loop disabled it
@@ -211,7 +273,106 @@ int run() {
     require(g_qt_reads.load() == reads, "Qt dialog read while the main thread was not pumping");
     require(qt_read.value("unavailable", "").find("not processing messages") != std::string::npos,
             "Qt dialog not reported unreadable while the main thread is not pumping");
+    require(!control({{"action", "status"}}).value("main_thread_pumping", true),
+            "status does not report a main thread that stopped pumping");
     g_pumping = true;
+    require(control({{"action", "status"}}).value("main_thread_pumping", false),
+            "status does not report a pumping main thread");
+
+    // 5. A Qt press whose send timed out before the main thread took it is
+    //    withdrawn: MAIN_THREAD_BUSY (retryable) and no click afterwards.
+    //    (Windows 11 already drops such a message; the lane does not rely on it.)
+    inspect = control({{"action", "inspect"}});
+    json qt_dialog_read = find_dialog(inspect, "Qt Dialog");
+    {
+        std::string failure;
+        std::thread worker([&] {
+            try {
+                DialogWatch::Control(json{{"action", "respond"}, {"dialog_id", qt_dialog_read["dialog_id"]},
+                                          {"expected_dialog", qt_dialog_read["expected_dialog"]},
+                                          {"button", 0}}.dump());
+            } catch (const std::exception& e) { failure = e.what(); }
+        });
+        Sleep(2200);  // busy main thread, heartbeat still fresh: the 1.5 s send times out
+        worker.join();
+        const auto start = Clock::now();
+        while (ms_since(start) < 400) { pump(); Sleep(5); }  // were it delivered late, it does nothing
+        const json failed = error_payload(failure);
+        require(failed.value("code", "") == "MAIN_THREAD_BUSY" && failed.value("retryable", false),
+                ("timed-out press not reported as retryable MAIN_THREAD_BUSY: " + failure).c_str());
+        require(g_qt_clicks.load() == 0, "a press reported as not made clicked after its timeout");
+    }
+
+    // 6. A Qt press the main thread started but did not finish in time may
+    //    still click: its outcome is reported unknown, never retryable.
+    inspect = control({{"action", "inspect"}});
+    qt_dialog_read = find_dialog(inspect, "Qt Dialog");
+    g_slow_next_read = true;
+    error.clear();
+    control({{"action", "respond"}, {"dialog_id", qt_dialog_read["dialog_id"]},
+             {"expected_dialog", qt_dialog_read["expected_dialog"]}, {"button", 0}}, &error);
+    {
+        const json unknown = error_payload(error);
+        require(unknown.value("code", "") == "DIALOG_OUTCOME_UNKNOWN" && !unknown.value("retryable", true),
+                ("started press not reported as outcome unknown: " + error).c_str());
+        require(pump_until([] { return g_qt_clicks.load() == 1; }, 3000), "a started press did not click");
+    }
+
+    // 7. A recognized error box during an operation on this thread is
+    //    acknowledged and published before the operation resumes, so a check
+    //    right where it resumes (before a commit) already fails.
+    {
+        // One CPU, operation thread above the monitor: the posted click preempts
+        // the monitor before it publishes, the order that let a commit slip by.
+        DWORD_PTR process_mask = 0, system_mask = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+        DWORD_PTR one_cpu = process_mask & (~process_mask + 1);
+        SetProcessAffinityMask(GetCurrentProcess(), one_cpu);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        struct Restore {
+            DWORD_PTR mask;
+            ~Restore() {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+                SetProcessAffinityMask(GetCurrentProcess(), mask);
+            }
+        } restore{process_mask};
+        DialogWatch::Guard guard("req-ack", "native:test");
+        HWND box = top(L"DWErrorBox", L"MAXScript Runtime Error", owner);
+        CreateWindowExW(0, L"Static", L"-- Runtime error: test", WS_CHILD | WS_VISIBLE, 0, 0, 150, 20, box, nullptr,
+                        GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"Button", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 40, 60, 20, box,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), GetModuleHandleW(nullptr), nullptr);
+        require(pump_until([] { return g_ack_done.load(); }, 5000), "recognized error box was not acknowledged");
+        require(g_ack_seen.find("MAX_DIALOG_ERROR") != std::string::npos,
+                ("operation resumed before its acknowledged error was published: " + g_ack_seen).c_str());
+        require(guard.Error().find("MAX_DIALOG_ERROR") != std::string::npos, "operation not failed by the error box");
+        {
+            DialogWatch::DeferDismissed cleanup;
+            DialogWatch::ThrowIfDismissed();  // cleanup steps keep running
+        }
+        bool thrown = false;
+        try { DialogWatch::ThrowIfDismissed(); } catch (const std::exception&) { thrown = true; }
+        require(thrown, "the dismissed error is lost after a deferred scope");
+    }
+
+    // 8. A Qt error box seen while the main thread does not pump is not read
+    //    (and not used up); once the main thread pumps it is acknowledged.
+    {
+        g_pumping = false;
+        DialogWatch::Guard guard("req-qt-ack", "native:test");
+        g_qt_error = top(L"Qt5QWindowIcon", L"MAXScript Runtime Error", owner);
+        pump_until([] { return false; }, 700);  // several monitor ticks
+        require(g_qt_error_reads.load() == 0 && g_qt_error_clicks.load() == 0,
+                "a Qt error box was read while the main thread was not pumping");
+        g_pumping = true;
+        require(pump_until([] { return g_qt_error_clicks.load() == 1; }, 3000),
+                "a Qt error box refused while the main thread did not pump was never acknowledged");
+        // The click can run before the monitor publishes; the check waits for it.
+        std::string failure;
+        try { DialogWatch::ThrowIfDismissed(); } catch (const std::exception& e) { failure = e.what(); }
+        require(failure.find("MAX_DIALOG_ERROR") != std::string::npos,
+                "the late acknowledgment did not fail the operation");
+    }
 
     stop = true;
     other_thread.join();
@@ -221,7 +382,8 @@ int run() {
     DestroyWindow(owner);
     DialogWatch::Stop();
     std::cout << "PASS: tool windows are never dialogs; other-thread dialogs are listed, never read or pressed; "
-                 "Qt reads need a pumping main thread\n";
+                 "Qt reads need a pumping main thread; timed-out presses never click; acknowledgments publish "
+                 "before the operation resumes; refused Qt error reads are retried\n";
     return 0;
 }
 

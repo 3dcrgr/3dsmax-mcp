@@ -40,8 +40,12 @@ constexpr int kAutoLimit = 8;
 // window that a later modal dialog happened to block, not the dialog itself.
 constexpr auto kModalGrace = std::chrono::milliseconds(1000);
 
+// Longest ThrowIfDismissed waits for an acknowledgment in flight to publish.
+constexpr auto kPublishWait = std::chrono::milliseconds(3000);
+
 thread_local std::string request_id, command_type;
 thread_local std::shared_ptr<Session> current;
+thread_local int defer_depth = 0;
 
 struct Request { std::string command, state; DWORD thread; Clock::time_point since; };
 struct Open {
@@ -148,6 +152,7 @@ bool OnMainThread(HWND hwnd) {
 }
 constexpr char kNotMainThread[] = "not on Max's main thread, so it is not read or pressed (its thread may be hung); "
                                   "the user can answer it in Max";
+constexpr char kNotPumping[] = "Max's main thread is not processing messages";
 
 bool MainThreadPumping() {
     std::function<bool()> pumping;
@@ -232,10 +237,15 @@ std::vector<HWND> Windows() {
 // Qt widgets are only readable on Max's main thread. A modal dialog runs a
 // nested message loop there, so a message-only window receives work even
 // while an MCP operation is blocked inside that dialog.
+// A sent task that its caller gave up on is withdrawn unless the lane already
+// started it, so a late delivery does nothing (a press reported as not made
+// never clicks afterwards).
+enum LaneState : int { kLaneQueued, kLaneStarted, kLaneWithdrawn };
 struct LaneTask {
     std::function<json()> work;
     json result;
     std::string error;
+    std::atomic<int> state{kLaneQueued};
 };
 
 LRESULT CALLBACK LaneProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -243,6 +253,8 @@ LRESULT CALLBACK LaneProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* raw = reinterpret_cast<std::shared_ptr<LaneTask>*>(lp);
         std::shared_ptr<LaneTask> task = std::move(*raw);
         delete raw;
+        int queued = kLaneQueued;
+        if (!task->state.compare_exchange_strong(queued, kLaneStarted)) return 1;  // withdrawn
         try { task->result = task->work(); }
         catch (const std::exception& e) { task->error = e.what(); }
         catch (...) { task->error = "Unknown dialog lane error"; }
@@ -256,16 +268,21 @@ json RunOnMain(std::function<json()> work, DWORD timeout_ms) {
     if (GetCurrentThreadId() == main_thread) return work();
     // A main thread that stops retrieving posted messages is not in a dialog's
     // loop; a sent message would only run inside whatever call blocks it.
-    if (!MainThreadPumping())
-        Fail("MAIN_THREAD_BUSY", "Max's main thread is not processing messages", true);
+    if (!MainThreadPumping()) Fail("MAIN_THREAD_BUSY", kNotPumping, true);
     auto task = std::make_shared<LaneTask>();
     task->work = std::move(work);
     auto* raw = new std::shared_ptr<LaneTask>(task);
     DWORD_PTR ignored = 0;
-    // On timeout the message may still run later; the lane then frees raw.
+    // On timeout the message may still be delivered later; the lane then frees
+    // raw. Withdraw it so it does nothing then; only a task the lane already
+    // started can still act, and its caller is told the outcome is unknown.
     if (!SendMessageTimeoutW(lane, kLaneSend, lane_cookie, reinterpret_cast<LPARAM>(raw),
-            SMTO_ABORTIFHUNG | SMTO_BLOCK, timeout_ms, &ignored))
-        Fail("MAIN_THREAD_BUSY", "Max's main thread is not processing messages", true);
+            SMTO_ABORTIFHUNG | SMTO_BLOCK, timeout_ms, &ignored)) {
+        int queued = kLaneQueued;
+        if (task->state.compare_exchange_strong(queued, kLaneWithdrawn)) Fail("MAIN_THREAD_BUSY", kNotPumping, true);
+        Fail("DIALOG_OUTCOME_UNKNOWN", "Max's main thread started this dialog action but did not finish it in time; "
+             "it may still take effect (a press may still click). Inspect again before responding");
+    }
     if (!task->error.empty()) throw std::runtime_error(task->error);
     return task->result;
 }
@@ -601,9 +618,13 @@ void AutoAcknowledge() {
             ++session->pending;
         }
         json event;
+        bool retry = false;
         try {
             const json snapshot = Snapshot(hwnd, dialog.cls);
-            if (KnownError(snapshot)) {
+            // A Qt read refused (or withdrawn) while the main thread did not take
+            // it is no reading of the dialog: leave it for a later tick.
+            retry = snapshot.value("unavailable", "") == kNotPumping;
+            if (!retry && KnownError(snapshot)) {
                 const Pressed pressed = PressButton(hwnd, dialog.id, dialog.cls, Token(dialog.id, snapshot), 0);
                 event = Event("acknowledged_error", dialog, pressed.snapshot);
                 event["button"] = pressed.button.value("label", "");
@@ -616,9 +637,15 @@ void AutoAcknowledge() {
             // commit before its error is recorded.
             std::lock_guard<std::mutex> lock(session->mutex);
             if (!event.is_null()) session->events.push_back(event);
+            if (retry) session->attempted.erase(dialog.id);
             --session->pending;
         }
         session->idle.notify_all();
+        if (retry) {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            auto found = open.find(hwnd);
+            if (found != open.end() && found->second.token == dialog.token) found->second.checked = false;
+        }
         if (!event.is_null()) RecordHistory(event);
     }
 }
@@ -697,7 +724,10 @@ json Status() {
     for (const auto& [id, request] : requests)
         in_flight.push_back({{"request_id", id}, {"command", request.command}, {"state", request.state},
             {"main_thread", request.thread == main_thread}, {"age_ms", AgeMs(request.since)}});
+    // A main thread that stopped pumping is busy or hung whatever dialog is open:
+    // clients then diagnose the hang instead of reporting the dialog.
     return {{"pid", GetCurrentProcessId()}, {"dialogs", dialogs}, {"requests", in_flight},
+        {"main_thread_pumping", MainThreadPumping()},
         {"monitor", {{"running", monitor_running.load()}, {"qt_reader", static_cast<bool>(qt.snapshot)},
             {"script_controller_exceptions_closed", controller_closed.load()}}}};
 }
@@ -816,9 +846,17 @@ std::string Guard::Error(const std::string& cause) const {
         {"message", "Max showed an error dialog during this operation; it was acknowledged. Inspect the affected scene before retrying."},
         {"details", {{"dialogs", session_->events}, {"cause", cause}, {"scene_state", "verification_required"}}}}.dump();
 }
+DeferDismissed::DeferDismissed() { ++defer_depth; }
+DeferDismissed::~DeferDismissed() { --defer_depth; }
+
 void ThrowIfDismissed() {
-    if (!current) return;
-    std::lock_guard<std::mutex> lock(current->mutex);
+    if (!current || defer_depth > 0) return;
+    std::unique_lock<std::mutex> lock(current->mutex);
+    // An acknowledgment publishes its event after posting the click, so the
+    // operation can resume first. Wait for it: a commit must never precede the
+    // error it should fail on. Bounded: a read the main thread does not take
+    // here times out after 1.5 s anyway.
+    current->idle.wait_for(lock, kPublishWait, [] { return current->pending == 0; });
     if (!current->events.empty())
         throw std::runtime_error(json{{"type", "NativeError"}, {"code", "MAX_DIALOG_ERROR"}, {"retryable", false},
             {"message", "Max displayed an error dialog during the operation."},
