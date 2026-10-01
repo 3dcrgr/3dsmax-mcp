@@ -21,7 +21,7 @@ Commit `011e547`.
 
 Tests: `tests/test_execute_failures.py`. They cover how the Python server classifies the bridge's messages, not the re-compile itself.
 
-**Status.** The check is in the native bridge, and only the rebuilt 2026 bridge in `native/bin/` has it. With upstream's 2023, 2024, 2025 and 2027 bridges, an interrupted script is still reported as "(parse error)". The syntax-error path was verified live on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message. The quitMax case hasn't been tested yet.
+**Status.** The check is in the native bridge, and only the rebuilt 2026 bridge in `native/bin/` has it. With upstream's 2023, 2024, 2025 and 2027 bridges, an interrupted script is still reported as "(parse error)". The syntax-error path was verified live on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message. Quitting with `try (quitMax #noPrompt quiet:true) catch ()` was also run live: the bridge connection dropped and Max exited cleanly. A bare `quitMax`, which should give `MAXSCRIPT_INTERRUPTED`, hasn't been tested yet.
 
 ## Failed agent scripts printed errors in the user's Listener
 
@@ -31,7 +31,7 @@ Fork issue #8. Commit `6552786`.
 
 **What changed.** `execute_maxscript`, and the native tools that run MAXScript internally, now run scripts with quiet errors. Compile errors and aborts go to Max's log, not the Listener, and the compile-only check behind the parse-error detail prints nothing either. The caller gets the same results as before: `BAD_PARAM` "MAXScript execution failed (parse error): <detail>", `MAXSCRIPT_INTERRUPTED`, and runtime errors with their message. A script's own output, such as `print`, still reaches the Listener.
 
-**Status.** This is in the native bridge, so only the rebuilt 2026 bridge in `native/bin/` (sha256 `c621db10…`) has it. It was deployed on 2026-10-01 and hasn't been tested live yet.
+**Status.** This is in the native bridge, so only the rebuilt 2026 bridge in `native/bin/` (sha256 `c621db10…`) has it. Verified live on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message and left the Listener unchanged, and `print "hello"; 42` returned `42` with only `"hello"` added to the Listener.
 
 ## Curve tools rejected Line objects
 

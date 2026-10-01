@@ -76,7 +76,7 @@ New result fields:
   - `asset_name` comes with `material_name` or `map_name`, plus a `note` when they differ.
 - Nothing is renamed. The behaviour from the steps above is unchanged: no new bridge calls, the OS-only settle, the main-thread browser, the `IMPORT_SETTLING` guard, and never opening or closing the Material Editor.
 
-**Status.** Unit tested in `tests/test_cosmos_import.py`, and deployed (Python) on 2026-10-01. A live re-import of "Steel Blurry" hasn't been run yet.
+**Status.** Unit tested in `tests/test_cosmos_import.py`, and deployed (Python) on 2026-10-01. The two snapshot scripts compiled in Max and returned valid JSON, including the 24 Material Editor slots. A live re-import of "Steel Blurry" hasn't been run yet.
 
 ## How it was verified
 
