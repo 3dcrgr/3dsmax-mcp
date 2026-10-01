@@ -136,9 +136,10 @@ Debugging:
 - `cosmos_search` finds models, materials and HDRIs compatible with the selected Max instance and renderer.
 - `cosmos_download` caches an asset without importing it; ready means completed, queued/downloading means call again to wait.
 - `cosmos_import` downloads if needed, then imports through the renderer and returns asset-scoped nodes/materials/maps with file checks. Selection is preserved.
+- `cosmos_import` opens the Cosmos browser on Max's main thread before importing (the importer's hidden browser on another thread stalled/deadlocked Max); the Scanline Material Editor swap (`swap_medit_renderer`) is optional.
 - Use returned node refs with existing transform, layer and instance tools. Materials/HDRIs may create editor resources instead of scene nodes.
 - Sign in through Cosmos when requested. If an import returns unknown/unverified, inspect before retrying; repeating a completed model import creates another instance.
-- After `cosmos_import`, edit only when `safe_to_edit` is true. On `settling` or `IMPORT_SETTLING`, wait (V-Ray/Cosmos stalls cleared in 5-8 min), never kill Max, then run `pending_restore.maxscript` once. Never call `MatEditor.Close()`/`Open()` right after an import: that deadlocked Max.
+- After `cosmos_import`, edit only when `safe_to_edit` is true. On `settling` or `IMPORT_SETTLING`, wait up to ~10 min re-checking with `get_bridge_status` (preview stalls cleared in 5-8 min; the post-import cross-thread deadlock never did, so still blocked after that means the user must end Max), then run `pending_restore.maxscript` once. Never call `MatEditor.Close()`/`Open()` right after an import: that deadlocked Max.
 
 ### External .max files (no scene load)
 - `inspect_max_file`, `search_max_files`, `merge_from_file`, `batch_file_info`

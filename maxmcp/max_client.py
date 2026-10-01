@@ -57,6 +57,12 @@ class MaxImportSettlingError(MaxBusyError):
     code = "IMPORT_SETTLING"
 
 
+BLOCKED_CAUSE = "deadlock, stalled I/O, or a long blocking call (possibly from another MCP client)"
+HANG_ADVICE = ("Some stalls (V-Ray Material Editor preview) cleared in 5-8 min, but the cross-thread deadlock "
+               "after a Cosmos import never did: wait up to ~10 min, re-checking with get_bridge_status. If Max "
+               "is still blocked after that, treat it as a deadlock: the user must end the process (unsaved "
+               "work is lost).")
+
 # Import settling guard, shared by every MaxClient (Cosmos imports use their own client).
 SETTLING_MAX_S = 900.0  # hard expiry: the guard can never lock the user out for good
 _settling_lock = threading.Lock()
@@ -416,10 +422,10 @@ class MaxClient:
         # One sample is not enough to call a healthy-but-stalled op hung; only an overdue request is.
         if state == "exited" or (state == "blocked" and overdue):
             what = ("Max has exited." if state == "exited"
-                    else "Max is blocked (deadlock or stalled I/O).")
+                    else "Max is blocked: " + BLOCKED_CAUSE + ".")
             return MaxNotRespondingError(
                 f"{label} is not responding: {describe_process(process)}, {running}. {what} "
-                "Nothing was sent. Do not retry yet. Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+                "Nothing was sent. Do not retry yet. " + HANG_ADVICE,
                 details,
             )
         evidence = f" ({describe_process(process)})" if process else ""
@@ -452,7 +458,7 @@ class MaxClient:
                else "the bridge cancelled an earlier request its main thread never picked up")
         raise MaxNotRespondingError(
             f"{self._label(pid, pipe_name)} is still not responding ({describe_process(process)}; {why}). "
-            "Nothing was sent. Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+            "Nothing was sent. " + HANG_ADVICE,
             {"inflight": None, "process": process, "previous": verdict.get("inflight"),
              "previous_process": verdict.get("process"), "request_sent": False},
         )
@@ -497,8 +503,7 @@ class MaxClient:
         raise MaxImportSettlingError(
             f"{self._label(pid, pipe_name)} is still settling after {entry['reason']}: {names} not responding "
             f"({now - entry['since']:.0f} s so far; this guard lifts within {expires:.0f} s at the latest). "
-            "Nothing was sent. Wait and retry in a minute; these stalls cleared on their own after 5-8 min. "
-            "Do not end Max, and do not open or close the Material Editor.",
+            "Nothing was sent. Do not open or close the Material Editor. " + HANG_ADVICE,
             details,
         )
 
@@ -861,8 +866,7 @@ class MaxClient:
         self._remember_hung(pid, process, inflight, "abandoned")
         raise MaxNotRespondingAfterDispatch(
             f"{self._label(pid)} is not responding: {describe_process(process)}, {running}. "
-            "Max is blocked (deadlock or stalled I/O). Do not replay this request. "
-            "Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+            "Max is blocked: " + BLOCKED_CAUSE + ". Do not replay this request. " + HANG_ADVICE,
             details,
         )
 
@@ -876,11 +880,10 @@ class MaxClient:
         label = self._label(pid, (inflight or {}).get("target_pipe"))
         probe = f"'{(inflight or {}).get('cmd_type') or 'probe'}'"
         if state in ("blocked", "exited"):
-            what = "Max has exited." if state == "exited" else "Max is blocked (deadlock or stalled I/O)."
+            what = "Max has exited." if state == "exited" else "Max is blocked: " + BLOCKED_CAUSE + "."
             raise MaxNotRespondingError(
                 f"{label} is not responding: {describe_process(process)}; {probe} got no answer within "
-                f"{timeout:g} s. {what} The probe was dropped (it changes nothing). "
-                "Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+                f"{timeout:g} s. {what} The probe was dropped (it changes nothing). " + HANG_ADVICE,
                 details,
             )
         evidence = f" ({describe_process(process)})" if process else ""
@@ -918,10 +921,10 @@ class MaxClient:
             )
         if state == "blocked":
             self._remember_hung(pid, process, inflight, "queue_timeout")
-        cause = "Max has exited." if state == "exited" else "Max is blocked (deadlock or stalled I/O)."
+        cause = "Max has exited." if state == "exited" else "Max is blocked: " + BLOCKED_CAUSE + "."
         raise MaxNotRespondingError(
             f"{self._label(pid)} is not responding: {describe_process(process)}. {what} {cause} "
-            "Do not retry yet. Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+            "Do not retry yet. " + HANG_ADVICE,
             details,
         )
 

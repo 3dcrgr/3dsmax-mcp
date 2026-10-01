@@ -1,12 +1,14 @@
 """Child process with real top-level windows, for process_health window tests.
 
-usage: fake_window.py --title TITLE [--hidden] [--mode pump|hang] [--main]
+usage: fake_window.py --title TITLE [--hidden] [--mode pump|hang] [--main] [--on-main]
 
 --title   title of the probed window, created on the main thread
 --hidden  never show the probed window (EnumWindows must still list it)
 --mode    pump: keep pumping messages; hang: pump 0.5 s, then stop pumping
 --main    also create a visible, off-screen, non-activating "Fake 3ds Max"
           window on a second thread that keeps pumping (Max's main window)
+--on-main implies --main; the probed window is created on that main-window
+          thread instead, and --mode applies to that thread
 
 Prints "ready <probed hwnd> <main hwnd or 0>" once the windows exist.
 Windows are off-screen and never activated, so nothing takes focus.
@@ -23,6 +25,7 @@ parser.add_argument("--title", required=True)
 parser.add_argument("--hidden", action="store_true")
 parser.add_argument("--mode", choices=("pump", "hang"), default="pump")
 parser.add_argument("--main", action="store_true")
+parser.add_argument("--on-main", action="store_true")
 args = parser.parse_args()
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -84,24 +87,35 @@ def _pump(seconds):
         time.sleep(0.01)
 
 
+def _run_mode():
+    if args.mode == "pump":
+        _pump(3600)
+    else:
+        _pump(0.5)
+        time.sleep(3600)  # stop pumping: the probed window's thread looks hung
+
+
 main_hwnd = [0]
+probed = [0]
 main_ready = threading.Event()
 
 
 def _main_window_thread():
     main_hwnd[0] = _create("Fake 3ds Max", True) or 0
+    if args.on_main:
+        probed[0] = _create(args.title, not args.hidden) or 0
     main_ready.set()
-    _pump(3600)
+    _run_mode() if args.on_main else _pump(3600)
 
 
-if args.main:
+if args.main or args.on_main:
     threading.Thread(target=_main_window_thread, daemon=True).start()
     main_ready.wait(10)
 
-probed = _create(args.title, not args.hidden)
-print("ready %d %d" % (probed or 0, main_hwnd[0]), flush=True)
-if args.mode == "pump":
-    _pump(3600)
+if not args.on_main:
+    probed[0] = _create(args.title, not args.hidden) or 0
+print("ready %d %d" % (probed[0], main_hwnd[0]), flush=True)
+if args.on_main:
+    time.sleep(3600)
 else:
-    _pump(0.5)
-    time.sleep(3600)  # stop pumping: the probed window's thread looks hung
+    _run_mode()

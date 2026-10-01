@@ -166,8 +166,8 @@ def quick_hung_check(pid: int) -> bool | None:
 def diagnose_process(pid: int, cpu_sample_s: float = 1.0) -> dict[str, Any]:
     """Classify a process as exited / blocked / busy / responsive / unknown.
 
-    blocked: main window hung and CPU below BLOCKED_CPU_THRESHOLD (deadlock or
-    stalled I/O). busy: hung but burning CPU. Never raises.
+    blocked: main window hung and CPU below BLOCKED_CPU_THRESHOLD (deadlock,
+    stalled I/O, or a long blocking call). busy: hung but burning CPU. Never raises.
     """
     result: dict[str, Any] = {
         "pid": pid,
@@ -274,6 +274,55 @@ def main_windows(pid: int) -> list[int]:
         return [int(h) for h in _top_level_windows(pid)]
     except Exception:
         return []
+
+
+def window_thread(hwnd: int) -> int | None:
+    """Thread id that owns `hwnd` (GetWindowThreadProcessId); None if gone or unknown."""
+    if not _IS_WINDOWS or not hwnd:
+        return None
+    try:
+        if not _user32.IsWindow(hwnd):
+            return None
+        return int(_user32.GetWindowThreadProcessId(hwnd, None)) or None
+    except Exception:
+        return None
+
+
+def main_threads(pid: int, exclude_title: str = COSMOS_BROWSER_TITLE) -> list[int]:
+    """Thread ids of Max's main window(s): visible unowned windows not titled
+    `exclude_title`, preferring those titled "...3ds Max...". Never raises."""
+    try:
+        excluded = set(find_windows(pid, exclude_title)) if exclude_title else set()
+        mains = [h for h in main_windows(pid) if h not in excluded]
+        named = [h for h in mains if "3ds max" in _window_title(h).casefold()]
+        threads = [window_thread(h) for h in (named or mains)]
+        return sorted({t for t in threads if t})
+    except Exception:
+        return []
+
+
+def thread_windows(pid: int, title: str, timeout_ms: int = 500) -> dict[str, Any]:
+    """Windows of `pid` titled `title` (hidden too) with their owning thread.
+
+    Per window: thread, main_thread (owned by Max's main-window thread),
+    visible, and hung (IsHungAppWindow, or no answer to a WM_NULL within
+    `timeout_ms`). Query-only apart from that WM_NULL; never raises.
+    """
+    result: dict[str, Any] = {"main_threads": [], "windows": []}
+    try:
+        result["main_threads"] = mains = main_threads(pid, title)
+        for hwnd in find_windows(pid, title):
+            state = window_responsive(hwnd, timeout_ms)
+            if not state.get("exists"):
+                continue
+            thread = window_thread(hwnd)
+            result["windows"].append({
+                "hwnd": hwnd, "thread": thread, "main_thread": bool(thread) and thread in mains,
+                "visible": state.get("visible"),
+                "hung": bool(state.get("hung")) or state.get("responds") is False})
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
 def window_hung(hwnd: int) -> bool | None:

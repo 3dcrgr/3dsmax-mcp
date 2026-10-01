@@ -26,7 +26,8 @@ assert Path(cosmos.__file__).resolve().parents[2] == REPO_ROOT, cosmos.__file__
 PID = 4242
 PIPE = rf"\\.\pipe\3dsmax-mcp-pid-{PID}"
 ASSET_ID = "0e5c6d4a-1111-2222-3333-444455556666"
-MAIN_HWND, BROWSER_HWND = 101, 202
+MAIN_HWND, BROWSER_HWND, NEW_BROWSER_HWND = 101, 202, 303
+MAIN_TID, OTHER_TID = 11, 22
 FAKE_WINDOW = Path(__file__).resolve().parent / "fake_window.py"
 CLOSE_OR_OPEN = re.compile(r"mateditor\s*\.\s*(close|open)\s*\(", re.IGNORECASE)
 
@@ -89,9 +90,11 @@ class FakeClient:
 
 
 def classify(command):
+    if "actionMan.executeAction" in command:
+        return "browser"
     if "renderers.current" in command and "cosmosAssetId" not in command:
         return "renderer"
-    if "mcp_cosmosMeditBackup=#(" in command:
+    if "clearSelection()" in command:
         return "prepare"
     if "maxOps.getNodeByHandle" in command:
         return "finalize"
@@ -167,13 +170,20 @@ class _FlowCase(unittest.TestCase):
         self.light_results = [BEFORE, AFTER]
         self.flow = {"renderer": {"renderer": "V_Ray_7"}, "prepare": prepared(), "light": self._light,
                      "full": AFTER, "finalize": {"selection_restored": True, "medit": "restored",
-                                                 "editor_open": False}}
+                                                 "editor_open": False}, "browser": self._open_browser}
         self.global_client = FakeClient("global", self.events, self.flow)
         self.op_client = FakeClient("operation", self.events, self.flow)
         self.service = FakeService(self.events, [VRAY, OTHER])
         self.hung = []  # quick_hung_check answers, then False
         self.settle = settle_result(True)
-        self.mains, self.browsers, self.hung_hwnds = [], [], set()
+        # Default: a responsive Cosmos browser on Max's main thread (no browser action needed).
+        self.mains, self.browsers, self.hung_hwnds = [MAIN_HWND], [BROWSER_HWND], set()
+        self.threads = {MAIN_HWND: MAIN_TID, BROWSER_HWND: MAIN_TID}
+        self.titles = {MAIN_HWND: "Untitled - Autodesk 3ds Max 2026"}
+        self.browser_action = {"found": True, "table": "V-Ray", "description": "Chaos Cosmos browser",
+                               "executed": True, "error": ""}
+        self.browser_appears = MAIN_TID  # thread of the window the action creates (None: no window)
+        self.hung_after_action = set()  # hwnds that stop answering once the action ran
         self.wm_null = []  # window_responsive "responds" answers, then True
         max_client._settling.clear()
         self.addCleanup(max_client._settling.clear)
@@ -188,6 +198,8 @@ class _FlowCase(unittest.TestCase):
             (process_health, "find_windows", lambda pid, title: list(self.browsers)),
             (process_health, "window_hung", lambda hwnd: hwnd in self.hung_hwnds),
             (process_health, "window_responsive", self._window_responsive),
+            (process_health, "window_thread", lambda hwnd: self.threads.get(hwnd)),
+            (process_health, "_window_title", lambda hwnd: self.titles.get(hwnd, "")),
             (max_client, "process_start_time", mock.Mock(return_value=1)),
         ):
             p = mock.patch.object(target, attr, value)
@@ -203,8 +215,17 @@ class _FlowCase(unittest.TestCase):
 
     def _window_responsive(self, hwnd, timeout_ms=500):
         self.events.append(("wm_null", hwnd, timeout_ms))
-        responds = self.wm_null.pop(0) if self.wm_null else True
-        return {"hwnd": hwnd, "exists": True, "hung": False, "responds": responds}
+        hung = hwnd in self.hung_hwnds
+        responds = (self.wm_null.pop(0) if self.wm_null else True) and not hung
+        return {"hwnd": hwnd, "exists": True, "hung": hung, "responds": responds,
+                "visible": hwnd != BROWSER_HWND, "title": self.titles.get(hwnd, "")}
+
+    def _open_browser(self):
+        if self.browser_action.get("found") and self.browser_appears:
+            self.browsers.append(NEW_BROWSER_HWND)
+            self.threads[NEW_BROWSER_HWND] = self.browser_appears
+        self.hung_hwnds |= self.hung_after_action
+        return self.browser_action
 
     def _wait_responsive(self, pid, max_seconds, **kwargs):
         self.events.append(("settle_start", max_seconds, kwargs.get("titles")))
@@ -245,7 +266,7 @@ class ImportOrderTests(_FlowCase):
         self.assertEqual(self.events[-1], ("release", "operation"))
 
     def test_prepare_script_records_and_swaps_medit_renderer(self):
-        self.run_import()
+        self.run_import(swap_medit_renderer=True)
         script = self.op_client.commands[0][1]
         self.assertLess(script.index("local snap="), script.index("renderers.medit_locked=false"))
         for needle in ("renderers.medit_locked", "MatEditor.isOpen()", "SME.isOpen()", "Default_Scanline_Renderer",
@@ -277,7 +298,7 @@ class ImportOrderTests(_FlowCase):
 
     def test_editor_open_leaves_scanline_with_exact_restore_script(self):
         self.flow["finalize"] = {"selection_restored": True, "medit": "editor_open", "editor_open": True}
-        result = self.run_import()
+        result = self.run_import(swap_medit_renderer=True)
         self.assertTrue(result["safe_to_edit"])
         self.assertEqual(len(result["warnings"]), 1)
         self.assertIn("still Scanline", result["warnings"][0])
@@ -286,13 +307,13 @@ class ImportOrderTests(_FlowCase):
 
     def test_restore_medit_renderer_false(self):
         self.flow["finalize"] = {"selection_restored": True, "medit": "not_requested", "editor_open": False}
-        result = self.run_import(restore_medit_renderer=False)
+        result = self.run_import(restore_medit_renderer=False, swap_medit_renderer=True)
         self.assertIn("if false then", self.op_client.commands[-1][1])
         self.assertIn("restore_medit_renderer is false", result["warnings"][0])
 
     def test_scanline_unavailable_skips_swap_with_warning(self):
         self.flow["prepare"] = prepared(scanline_available=False, swapped=False, backup_pending=False)
-        result = self.run_import()
+        result = self.run_import(swap_medit_renderer=True)
         self.assertEqual(result["state"], "imported")
         self.assertIn("Default_Scanline_Renderer is unavailable", result["warnings"][0])
         self.assertIn("if false then", self.op_client.commands[-1][1])  # nothing to restore
@@ -326,6 +347,7 @@ class ImportOrderTests(_FlowCase):
 
 class LightPollTests(_FlowCase):
     def test_polls_back_off_and_skip_while_hung(self):
+        self.mains = []  # IsHungAppWindow gate only (no WM_NULL to a main window)
         self.hung = [True, True, False, False, False, False]
         self.light_results = [BEFORE, BEFORE, BEFORE, AFTER]
         result = cosmos._wait_import(self.op_client, cosmos._download(self.service, ASSET_ID, 0), BEFORE,
@@ -373,12 +395,14 @@ class LightPollTests(_FlowCase):
 class SettlingTests(_FlowCase):
     def test_not_quiet_returns_unsafe_and_guards_the_pid(self):
         self.settle = settle_result(False, hung_browser=True)
-        result = self.run_import()
+        result = self.run_import(swap_medit_renderer=True)
         self.assertEqual(result["state"], "settling")
         self.assertFalse(result["safe_to_edit"])
         self.assertTrue(result["detected"])
         self.assertIn("IMPORT_SETTLING", result["next"])
         self.assertIn("5-8 min", result["next"])
+        self.assertIn("~10 min", result["next"])
+        self.assertIn("deadlock", result["next"])
         self.assertIn("'Chaos Cosmos Browser' (hidden) hung", result["next"])
         self.assertIn("renderers.medit=b[1]", result["pending_restore"]["maxscript"])
         self.assertEqual(result["pending_restore"]["selection"], [5, 6])
@@ -428,7 +452,7 @@ class ReviewFixTests(_FlowCase):
         self.mains, self.browsers = [MAIN_HWND], [BROWSER_HWND]
         self.flow["finalize"] = [MaxNotRespondingAfterDispatch(
             "3ds Max (PID 4242) is not responding", {"process": {"state": "blocked"}, "request_sent": True})]
-        result = self.run_import()
+        result = self.run_import(swap_medit_renderer=True)
         self.assertEqual(result["state"], "settling")
         self.assertFalse(result["safe_to_edit"])
         self.assertEqual(result["health"]["code"], "MAX_NOT_RESPONDING")
@@ -482,13 +506,14 @@ class ReviewFixTests(_FlowCase):
         self.assertIsNone(max_client.settling_state(PID))
         self.assertNotIn(("dispatch",), self.events)
 
-    def test_hung_browser_before_dispatch_refuses_import(self):
-        self.browsers, self.hung_hwnds = [BROWSER_HWND], {BROWSER_HWND}
+    def test_hung_main_window_before_dispatch_refuses_import(self):
+        self.hung = [True]
         with self.assertRaises(CosmosError) as ctx:
             self.run_import()
         self.assertEqual(ctx.exception.code, "IMPORT_SETTLING")
         self.assertTrue(ctx.exception.retryable)
-        self.assertIn("Chaos Cosmos Browser", str(ctx.exception))
+        self.assertIn("main window hung", str(ctx.exception))
+        self.assertIn("~10 min", str(ctx.exception))
         self.assertFalse(self.bridge_kinds("operation"))
         self.assertNotIn(("dispatch",), self.events)
         self.assertIsNone(max_client.settling_state(PID))
@@ -502,17 +527,17 @@ class ReviewFixTests(_FlowCase):
                          {"main_hung": False, "browser_windows": 1, "browser_hung": 0})
 
     def test_prepare_lost_returns_structured_result_without_dispatch(self):
-        self.mains = [MAIN_HWND]
         self.flow["prepare"] = MaxNotRespondingAfterDispatch(
             "3ds Max (PID 4242) is not responding", {"process": {"state": "blocked"}, "request_sent": True})
-        result = self.run_import()
+        result = self.run_import(swap_medit_renderer=True)
         self.assertEqual(result["state"], "not_imported")
         self.assertFalse(result["safe_to_edit"])
         self.assertFalse(result["dispatched"])
         self.assertEqual(result["health"]["code"], "MAX_NOT_RESPONDING")
         self.assertEqual(result["pending_restore"]["maxscript"], cosmos._MEDIT_RESTORE)
         self.assertNotIn(("dispatch",), self.events)
-        self.assertEqual(max_client.settling_state(PID)["windows"], {MAIN_HWND: ""})
+        self.assertEqual(max_client.settling_state(PID)["windows"],
+                         {MAIN_HWND: "", BROWSER_HWND: process_health.COSMOS_BROWSER_TITLE})
 
     def test_prepare_not_sent_is_reraised(self):
         self.flow["prepare"] = MaxBusyError("busy", {"request_sent": False})
@@ -556,9 +581,291 @@ class ReviewFixTests(_FlowCase):
 
     def test_stale_backup_warns_without_overwriting(self):
         self.flow["finalize"] = {"selection_restored": True, "medit": "stale", "editor_open": False}
-        result = self.run_import()
+        result = self.run_import(swap_medit_renderer=True)
         self.assertTrue(result["safe_to_edit"])
         self.assertIn("left as is", result["warnings"][0])
+
+
+class BrowserEnsureTests(_FlowCase):
+    """Main-thread Cosmos browser before _PREPARE: the decision table."""
+
+    def test_main_thread_browser_needs_no_bridge_call(self):
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertNotIn("browser", self.bridge_kinds())
+        self.assertEqual(self.bridge_kinds("operation")[0], "prepare")
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["ensured"], browser["opened"], browser["main_thread"]), (True, False, MAIN_TID))
+        self.assertEqual(browser["windows"], [{"thread": MAIN_TID, "main_thread": True, "visible": False,
+                                               "hung": False}])
+        self.assertIsNone(browser["warning"])
+        self.assertEqual(result["medit_renderer"]["swap"], "off")
+
+    def test_hung_non_main_browser_refused_without_action_or_dispatch(self):
+        self.threads[BROWSER_HWND], self.hung_hwnds = OTHER_TID, {BROWSER_HWND}
+        result = self.run_import()
+        self.assertEqual(result["state"], "browser_hung")
+        self.assertEqual(result["code"], "IMPORT_SETTLING")
+        self.assertFalse(result["safe_to_edit"])
+        self.assertFalse(result["dispatched"])
+        self.assertTrue(result["retryable"])
+        self.assertIn("(hidden) on a separate thread %d hung" % OTHER_TID, result["evidence"])
+        self.assertIn("~10 min", result["next"])
+        self.assertIn("deadlock", result["next"])
+        self.assertEqual(result["cosmos_browser"]["windows"][0]["main_thread"], False)
+        self.assertIn("nothing was sent", result["next"])
+        self.assertFalse(self.bridge_kinds("operation"))  # no browser action, no prepare
+        self.assertNotIn(("dispatch",), self.events)
+        guard = max_client.settling_state(PID)  # other clients refused while it stays hung
+        self.assertEqual(guard["windows"], {BROWSER_HWND: process_health.COSMOS_BROWSER_TITLE, MAIN_HWND: ""})
+        self.assertIsNone(guard["owner"])
+        self.assertTrue(cosmos._import_lock.acquire(blocking=False))
+        cosmos._import_lock.release()
+
+    def test_wm_null_failure_alone_counts_as_hung(self):
+        self.threads[BROWSER_HWND] = OTHER_TID
+        self.wm_null = [False]  # IsHungAppWindow not yet true (~5 s lag)
+        result = self.run_import()
+        self.assertEqual(result["state"], "browser_hung")
+        self.assertFalse(self.bridge_kinds("operation"))
+
+    def test_no_browser_runs_action_then_waits_before_prepare(self):
+        self.browsers = []
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(self.bridge_kinds("operation")[:2], ["browser", "prepare"])
+        browser_call = self.index(("bridge", "operation", "browser"))
+        checks = [e for e in self.events[browser_call:self.index(("bridge", "operation", "prepare"))]
+                  if e[0] == "wm_null" and e[1] == NEW_BROWSER_HWND]
+        self.assertGreaterEqual(len(checks), cosmos._BROWSER_CHECKS)  # OS-level wait, no bridge traffic
+        self.assertLess(self.index(("bridge", "operation", "prepare")), self.index(("dispatch",)))
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["ensured"], browser["opened"]), (True, True))
+        self.assertEqual(browser["action"]["table"], "V-Ray")
+        self.assertEqual(result["medit_renderer"]["swap"], "off")
+        self.assertNotIn("warnings", result)
+        prepare = next(c[1] for c in self.op_client.commands if c[0] == "prepare")
+        self.assertNotIn("renderers.medit=", prepare)
+
+    def test_action_not_found_falls_back_to_swap_with_warning(self):
+        self.browsers = []
+        self.browser_action = {"found": False, "table": "", "description": "", "executed": False, "error": ""}
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["ensured"], browser["opened"]), (False, False))
+        self.assertIn("no Cosmos browser action found", result["warnings"][0])
+        self.assertIn("Scanline", result["warnings"][0])
+        self.assertEqual(browser["warning"], result["warnings"][0])
+        self.assertEqual(result["medit_renderer"]["swap"], "fallback")
+        prepare = next(c[1] for c in self.op_client.commands if c[0] == "prepare")
+        self.assertIn("renderers.medit=sl", prepare)
+        self.assertIn("if true then", self.op_client.commands[-1][1])  # restored afterwards
+
+    def test_window_on_other_thread_is_not_ensured(self):
+        self.browsers = []
+        self.browser_appears = OTHER_TID
+        started = self.clock.now
+        result = self.run_import()
+        self.assertFalse(result["cosmos_browser"]["ensured"])
+        self.assertTrue(result["cosmos_browser"]["opened"])
+        self.assertIn("within 15 s", result["warnings"][0])
+        self.assertEqual(result["medit_renderer"]["swap"], "fallback")
+        self.assertGreaterEqual(self.clock.now - started, cosmos._BROWSER_WAIT_S)
+
+    def test_only_responsive_non_main_browser_runs_action_and_warns(self):
+        self.threads[BROWSER_HWND] = OTHER_TID
+        result = self.run_import()
+        self.assertEqual(self.bridge_kinds("operation")[:2], ["browser", "prepare"])
+        self.assertTrue(result["cosmos_browser"]["ensured"])
+        self.assertIn("separate (non-main) thread", result["warnings"][0])
+        self.assertEqual(result["medit_renderer"]["swap"], "off")
+
+    def test_browser_call_lost_returns_structured_result_without_dispatch(self):
+        self.browsers = []
+        self.flow["browser"] = MaxNotRespondingAfterDispatch(
+            "3ds Max (PID 4242) is not responding", {"process": {"state": "blocked"}, "request_sent": True})
+        result = self.run_import()
+        self.assertEqual(result["state"], "not_imported")
+        self.assertFalse(result["safe_to_edit"])
+        self.assertIn("browser action may have run", result["warnings"][0])
+        self.assertNotIn("pending_restore", result)
+        self.assertFalse(result["cosmos_browser"]["ensured"])
+        self.assertEqual(self.bridge_kinds("operation"), ["browser"])
+        self.assertNotIn(("dispatch",), self.events)
+
+    def test_swap_default_off_leaves_medit_untouched(self):
+        self.flow["prepare"] = prepared(swapped=False, backup_pending=False)
+        self.flow["finalize"] = {"selection_restored": True, "medit": "not_requested", "editor_open": False}
+        result = self.run_import()
+        prepare, finalize = self.op_client.commands[0][1], self.op_client.commands[-1][1]
+        for needle in ("renderers.medit=", "renderers.medit_locked=", "mcp_cosmosMeditBackup=", "scanline()"):
+            self.assertNotIn(needle, prepare)
+        self.assertIn("if false then", finalize)  # no restore
+        self.assertNotIn("warnings", result)
+        self.assertNotIn("pending_restore", result)
+
+    def test_prepare_lost_without_swap_has_no_medit_restore(self):
+        self.flow["prepare"] = MaxNotRespondingAfterDispatch(
+            "not responding", {"process": {"state": "blocked"}, "request_sent": True})
+        result = self.run_import()
+        self.assertNotIn("pending_restore", result)
+        self.assertNotIn("Scanline", result["warnings"][0])
+        self.assertTrue(result["cosmos_browser"]["ensured"])
+
+
+    def test_busy_main_thread_browser_waits_without_action_or_refusal(self):
+        self.wm_null = [False]  # main-thread browser misses one WM_NULL: Max's main thread is busy
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(result["import_timing"]["pre_dispatch"]["browser_hung"], 0)
+        self.assertNotIn("browser", self.bridge_kinds())
+        self.assertTrue(result["cosmos_browser"]["ensured"])
+        self.assertEqual(result["medit_renderer"]["swap"], "off")
+        self.assertNotIn("warnings", result)
+
+    def test_browser_hung_after_action_refused_before_prepare(self):
+        self.threads[BROWSER_HWND] = OTHER_TID  # responsive non-main browser, so the action runs
+        self.browser_appears = None
+        self.hung_after_action = {BROWSER_HWND}
+        result = self.run_import()
+        self.assertEqual(result["state"], "browser_hung")
+        self.assertFalse(result["dispatched"])
+        self.assertFalse(result["safe_to_edit"])
+        self.assertIn("browser action was sent", result["next"])
+        self.assertEqual(self.bridge_kinds("operation"), ["browser"])  # no prepare
+        self.assertNotIn(("dispatch",), self.events)
+        guard = max_client.settling_state(PID)
+        self.assertEqual(guard["windows"], {BROWSER_HWND: process_health.COSMOS_BROWSER_TITLE, MAIN_HWND: ""})
+        self.assertIsNone(guard["owner"])
+
+    def test_new_browser_hung_on_other_thread_refused_before_prepare(self):
+        self.browsers = []
+        self.browser_appears = OTHER_TID
+        self.hung_after_action = {NEW_BROWSER_HWND}
+        result = self.run_import()
+        self.assertEqual(result["state"], "browser_hung")
+        self.assertEqual(self.bridge_kinds("operation"), ["browser"])
+        self.assertNotIn(("dispatch",), self.events)
+        self.assertIn(NEW_BROWSER_HWND, max_client.settling_state(PID)["windows"])
+
+    def test_main_window_busy_after_action_refused_before_prepare(self):
+        self.browsers = []
+        self.hung = [False] + [True] * 100  # pre-dispatch check fine, then hung through the gate
+        result = self.run_import()
+        self.assertEqual(result["state"], "not_imported")
+        self.assertEqual(result["code"], "IMPORT_SETTLING")
+        self.assertFalse(result["safe_to_edit"])
+        self.assertIn("main window does not respond", result["evidence"])
+        self.assertIn("~10 min", result["next"])
+        self.assertEqual(self.bridge_kinds("operation"), ["browser"])
+        self.assertNotIn(("dispatch",), self.events)
+        self.assertEqual(max_client.settling_state(PID)["windows"], {MAIN_HWND: ""})
+
+    def test_main_window_briefly_busy_at_gate_then_imports(self):
+        self.browsers = []
+        self.hung = [False, True, True]
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(self.bridge_kinds("operation")[:2], ["browser", "prepare"])
+
+    def test_fresh_check_before_action_refuses_hung_browser(self):
+        hung = {"hwnd": BROWSER_HWND, "thread": OTHER_TID, "main_thread": False, "visible": False, "hung": True}
+        states = [{"main_threads": [MAIN_TID], "windows": []}, {"main_threads": [MAIN_TID], "windows": [hung]}]
+        with mock.patch.object(cosmos, "_browser_state", side_effect=lambda pid: states.pop(0)):
+            result = self.run_import()
+        self.assertEqual(result["state"], "browser_hung")
+        self.assertIn("nothing was sent", result["next"])
+        self.assertFalse(self.bridge_kinds("operation"))  # no browser action, no prepare
+        self.assertNotIn(("dispatch",), self.events)
+        self.assertIn(BROWSER_HWND, max_client.settling_state(PID)["windows"])
+
+    def test_found_but_not_executed_still_waits(self):
+        self.browsers = []
+        self.browser_action = dict(self.browser_action, executed=False)
+        result = self.run_import()
+        self.assertTrue(result["cosmos_browser"]["ensured"])
+        self.assertFalse(result["cosmos_browser"]["opened"])
+        self.assertEqual(result["medit_renderer"]["swap"], "off")
+
+    def test_found_but_not_executed_without_window_falls_back(self):
+        self.browsers = []
+        self.browser_action = dict(self.browser_action, executed=False)
+        self.browser_appears = None
+        result = self.run_import()
+        self.assertIn("'Chaos Cosmos browser' in table 'V-Ray' reported not executed", result["warnings"][0])
+        self.assertEqual(result["medit_renderer"]["swap"], "fallback")
+
+    def test_transport_error_on_browser_call_propagates(self):
+        self.browsers = []
+        self.flow["browser"] = TimeoutError("3ds Max did not respond within 30s")
+        with self.assertRaises(TimeoutError):
+            self.run_import()
+        self.assertNotIn("prepare", self.bridge_kinds())
+        self.assertNotIn(("dispatch",), self.events)
+        self.assertIsNone(max_client.settling_state(PID))
+
+    def test_main_and_non_main_browser_warns_without_action(self):
+        self.browsers = [BROWSER_HWND, NEW_BROWSER_HWND]
+        self.threads[NEW_BROWSER_HWND] = OTHER_TID
+        result = self.run_import()
+        self.assertNotIn("browser", self.bridge_kinds())
+        self.assertTrue(result["cosmos_browser"]["ensured"])
+        self.assertIn("separate (non-main) thread", result["warnings"][0])
+        self.assertEqual(result["medit_renderer"]["swap"], "off")
+
+    def test_leftover_backup_warns_without_restoring(self):
+        self.flow["prepare"] = prepared(swapped=False, backup_pending=False, leftover_backup=True)
+        result = self.run_import()
+        self.assertIn("earlier import left", result["warnings"][0])
+        self.assertIn(cosmos._MEDIT_RESTORE, result["warnings"][0])
+        self.assertIn("if false then", self.op_client.commands[-1][1])
+
+
+class BrowserActionScriptTests(unittest.TestCase):
+    def test_searches_by_description_without_fixed_indices(self):
+        for renderer, table in (("V-Ray", '"*v-ray*"'), ("Corona", '"*corona*"')):
+            script = cosmos._open_browser_script(renderer)
+            self.assertIn(table, script)
+            self.assertIn('pattern:"*cosmos browser*"', script)
+            self.assertIn("actionMan.executeAction tid (aid as string)", script)
+            # getActionTable/getActionItem take 1-based <index> arguments.
+            self.assertIn("for i=1 to actionMan.numActionTables while not found", script)
+            self.assertIn("for j=1 to (try(t.numActionItems)catch(0)) while not found", script)
+            self.assertIsNone(re.search(r"for [ij]=0 ", script))
+            self.assertIsNone(re.search(r"getAction(Table|Item)\s+\d", script))
+            self.assertIsNone(re.search(r"executeAction\s+-?\d", script))
+            self.assertIsNone(CLOSE_OR_OPEN.search(script))
+            self.assertNotIn("SME.", script)
+            self.assertNotIn("__", script)
+            self.assertEqual(script.count("("), script.count(")"))
+            self.assertIn("catch(err=getCurrentException())", script)
+        self.assertNotIn("v-ray", cosmos._open_browser_script("Corona"))
+
+    def test_prepare_swap_block_only_when_requested(self):
+        asset = {"id": ASSET_ID, "name": "Plaster White", "kind": "material"}
+        on, off = cosmos._prepare_script(asset, True), cosmos._prepare_script(asset, False)
+        self.assertIn(cosmos._MEDIT_SWAP, on)
+        self.assertNotIn("renderers.medit=", off)
+        self.assertIn(cosmos._MEDIT_LEFTOVER, off)  # read-only check for an earlier swap's backup
+        self.assertNotIn(cosmos._MEDIT_LEFTOVER, on)
+        self.assertNotIn("__", off.replace("__KEY__", ""))
+        for script in (on, off):
+            self.assertEqual(script.count("("), script.count(")"))
+
+
+class HangWordingTests(unittest.TestCase):
+    def test_bounded_advice_with_deadlock_caveat(self):
+        advice = max_client.HANG_ADVICE
+        for needle in ("5-8 min", "never did", "~10 min", "get_bridge_status", "deadlock", "end the process"):
+            self.assertIn(needle, advice)
+        self.assertIn("possibly from another MCP client", max_client.BLOCKED_CAUSE)
+        self.assertIn(advice, cosmos._WAIT_ADVICE)
+        for module in (max_client, cosmos):
+            source = Path(module.__file__).read_text(encoding="utf-8")
+            self.assertNotIn("on their own", source)
+            self.assertNotIn("(deadlock or stalled I/O)", source)
+            self.assertNotIn("Do not end Max", source)
 
 
 class MaxScriptShapeTests(unittest.TestCase):
@@ -647,6 +954,8 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(exc.details["request_sent"])
         self.assertIn("'Chaos Cosmos Browser' not responding", str(exc))
         self.assertIn("5-8 min", str(exc))
+        self.assertIn("~10 min", str(exc))
+        self.assertNotIn("Do not end Max", str(exc))
         envelope = tool_response._error_from_exception(exc)
         self.assertEqual(envelope["code"], "IMPORT_SETTLING")
         self.assertTrue(envelope["retryable"])
@@ -899,6 +1208,37 @@ class WindowFinderTests(unittest.TestCase):
                                                 timeout_ms=500)
         self.assertTrue(settle["quiet"], settle)
         self.assertEqual(sorted(settle["hwnds"]), sorted([hwnd, main]))
+
+    def test_thread_windows_main_thread_browser(self):
+        title = "MCP Test Main Browser %d" % os.getpid()
+        child, hwnd, main = self.spawn(title, "--on-main", "--mode", "pump")
+        state = process_health.thread_windows(child.pid, title, 500)
+        tid = process_health.window_thread(main)
+        self.assertTrue(tid)
+        self.assertEqual(process_health.window_thread(hwnd), tid)
+        self.assertEqual(state["main_threads"], [tid])
+        self.assertEqual(state["windows"], [{"hwnd": hwnd, "thread": tid, "main_thread": True, "visible": True,
+                                             "hung": False}])
+
+    def test_thread_windows_visible_browser_on_other_thread(self):
+        title = "MCP Test Other Browser %d" % os.getpid()
+        child, hwnd, main = self.spawn(title, "--main", "--mode", "pump")
+        self.assertIn(hwnd, process_health.main_windows(child.pid))  # visible+unowned, yet not the main thread
+        state = process_health.thread_windows(child.pid, title, 500)
+        self.assertEqual(state["main_threads"], [process_health.window_thread(main)])
+        self.assertNotEqual(process_health.window_thread(hwnd), process_health.window_thread(main))
+        self.assertEqual([(w["main_thread"], w["visible"], w["hung"]) for w in state["windows"]],
+                         [(False, True, False)])
+
+    def test_thread_windows_hidden_hung_browser_on_other_thread(self):
+        title = "MCP Test Hung Other Browser %d" % os.getpid()
+        child, hwnd, main = self.spawn(title, "--hidden", "--main", "--mode", "hang")
+        time.sleep(1.0)  # past the child's initial 0.5 s of pumping; WM_NULL catches it before IsHungAppWindow
+        state = process_health.thread_windows(child.pid, title, 300)
+        self.assertEqual([(w["hwnd"], w["main_thread"], w["visible"], w["hung"]) for w in state["windows"]],
+                         [(hwnd, False, False, True)])
+        self.assertEqual(process_health.thread_windows(os.getpid(), title), {"main_threads": [], "windows": []})
+        self.assertIsNone(process_health.window_thread(0))
 
 
 if __name__ == "__main__":

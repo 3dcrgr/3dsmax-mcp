@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 
 from .. import process_health
-from ..max_client import MaxClient, MaxHealthError, RequestOutcomeUnknown, mark_settling, release_settling
+from ..max_client import (HANG_ADVICE, MaxClient, MaxHealthError, RequestOutcomeUnknown, mark_settling,
+                          release_settling)
 
 from .cosmos_client import Cosmos, CosmosError, asset_id as normalize_id
 
@@ -32,11 +33,13 @@ _SETTLE_FLOOR_S = 8          # settle_seconds below this still wait this long
 _SETTLE_CPU_GRACE_S = 10.0   # windows answer but CPU busy: stop waiting after this
 _SETTLE_MESSAGE_TIMEOUT_MS = 500
 _SETTLING_GUARD_S = 900.0
+_BROWSER_WAIT_S = 15.0       # after the browser action: wait this long for a main-thread browser
+_BROWSER_INTERVAL_S = 0.5
+_BROWSER_CHECKS = 2          # consecutive responsive checks (WM_NULL catches a fresh stall at once)
+_BROWSER_MESSAGE_TIMEOUT_MS = 500
 # True when the Compact or the Slate Material Editor is open (both render slots with renderers.medit).
 _EDITOR_OPEN = "((try(MatEditor.isOpen())catch(true)) or (try(SME.isOpen())catch(false)))"
-_WAIT_ADVICE = ("Stalls like this (V-Ray rendering the Material Editor preview, or the Cosmos importer) "
-                "cleared on their own after 5-8 min: wait, check with get_bridge_status, and do not end Max. "
-                "Do not open or close the Material Editor meanwhile.")
+_WAIT_ADVICE = HANG_ADVICE + " Do not open or close the Material Editor meanwhile."
 
 
 def _max(client, command, cmd_type="maxscript", timeout=None, probe=False):
@@ -275,29 +278,11 @@ _MEDIT_RESTORE = (
     'else (if b[1]!=undefined do renderers.medit=b[1]; if b[2]==false do renderers.medit_locked=false); '
     'mcp_cosmosMeditBackup=undefined; "restored")catch("failed: "+(getCurrentException()))))')
 
-# ONE bridge call before dispatch: baseline snapshot, selection, Material Editor
-# renderer state, then the swap to Scanline (V-Ray rendering the imported
-# material's slot preview blocked Max's main thread for minutes).
-_PREPARE = r"""(
- global mcp_cosmosMeditBackup
- if theHold.Holding() do throw "USER_BUSY"
- local snap=__SNAPSHOT__
- fn jsonBool v = (if v==true then "true" else if v==false then "false" else "null")
- fn jsonStr v = ("\"" + (MCP_Server.escapeJsonString(v as string)) + "\"")
- local sel=selection as array
- local selJSON="["
- for i=1 to sel.count do (if i>1 do selJSON+=","; selJSON+=(sel[i].handle as string))
- selJSON+="]"
- local meditClass=try((classof renderers.medit) as string)catch("undefined")
- local meditName=try(renderers.medit as string)catch("undefined")
- local locked=try(renderers.medit_locked)catch(undefined)
- local editorOpen=try(__EDITOR_OPEN__)catch(undefined)
- local scanline=Default_Scanline_Renderer
- local sl=undefined
- local swapped=false
- local pending=false
- local swapError=""
- if scanline!=undefined do (
+# Without the swap: only read whether an earlier swapped import left medit at our Scanline.
+_MEDIT_LEFTOVER = "leftover=try(mcp_cosmosMeditBackup[3]==renderers.medit)catch(false)"
+
+# Inserted into _PREPARE only when the Scanline swap is wanted.
+_MEDIT_SWAP = r"""if scanline!=undefined do (
   if (try(classof renderers.medit)catch(undefined))==scanline then (
    pending=try(mcp_cosmosMeditBackup[3]==renderers.medit)catch(false)
    if not pending do mcp_cosmosMeditBackup=undefined
@@ -318,9 +303,34 @@ _PREPARE = r"""(
     )
    )
   )
- )
+ )"""
+
+# ONE bridge call before dispatch: baseline snapshot, selection, Material Editor
+# renderer state, then (only with swap) the swap to Scanline (V-Ray rendering the
+# imported material's slot preview blocked Max's main thread for minutes).
+_PREPARE = r"""(
+ global mcp_cosmosMeditBackup
+ if theHold.Holding() do throw "USER_BUSY"
+ local snap=__SNAPSHOT__
+ fn jsonBool v = (if v==true then "true" else if v==false then "false" else "null")
+ fn jsonStr v = ("\"" + (MCP_Server.escapeJsonString(v as string)) + "\"")
+ local sel=selection as array
+ local selJSON="["
+ for i=1 to sel.count do (if i>1 do selJSON+=","; selJSON+=(sel[i].handle as string))
+ selJSON+="]"
+ local meditClass=try((classof renderers.medit) as string)catch("undefined")
+ local meditName=try(renderers.medit as string)catch("undefined")
+ local locked=try(renderers.medit_locked)catch(undefined)
+ local editorOpen=try(__EDITOR_OPEN__)catch(undefined)
+ local scanline=Default_Scanline_Renderer
+ local sl=undefined
+ local swapped=false
+ local pending=false
+ local swapError=""
+ local leftover=false
+ __SWAP__
  clearSelection()
- "{\"before\":"+snap+",\"selection\":"+selJSON+",\"medit\":{\"class\":"+(jsonStr meditClass)+",\"instance\":"+(jsonStr meditName)+",\"locked\":"+(jsonBool locked)+",\"editor_open\":"+(jsonBool editorOpen)+",\"scanline_available\":"+(jsonBool (scanline!=undefined))+",\"swapped\":"+(jsonBool swapped)+",\"backup_pending\":"+(jsonBool pending)+",\"error\":"+(jsonStr swapError)+"}}"
+ "{\"before\":"+snap+",\"selection\":"+selJSON+",\"medit\":{\"class\":"+(jsonStr meditClass)+",\"instance\":"+(jsonStr meditName)+",\"locked\":"+(jsonBool locked)+",\"editor_open\":"+(jsonBool editorOpen)+",\"scanline_available\":"+(jsonBool (scanline!=undefined))+",\"swapped\":"+(jsonBool swapped)+",\"backup_pending\":"+(jsonBool pending)+",\"leftover_backup\":"+(jsonBool leftover)+",\"error\":"+(jsonStr swapError)+"}}"
 )"""
 
 # After Max is quiet: restore the selection, then (only if the Material
@@ -339,8 +349,46 @@ _FINALIZE = r"""(
 )"""
 
 
-def _prepare_script(asset):
-    return _PREPARE.replace("__SNAPSHOT__", _snapshot_script(asset)).replace("__EDITOR_OPEN__", _EDITOR_OPEN)
+# ONE bridge call when no responsive main-thread Cosmos browser exists: find the
+# renderer's "Cosmos browser" action by search (never a fixed table/item index)
+# and run it. Opened this way the browser lives on Max's main thread; the
+# importer's own hidden browser on another thread is what stalled/deadlocked Max.
+# getActionTable/getActionItem take 1-based <index> arguments (0 would read index -1).
+_OPEN_BROWSER = r"""(
+ fn jsonStr v = ("\"" + (MCP_Server.escapeJsonString(v as string)) + "\"")
+ local found=false, tableName="", desc="", executed=false, err="", tid=undefined, aid=undefined
+ try(
+  for i=1 to actionMan.numActionTables while not found do (
+   local t=try(actionMan.getActionTable i)catch(undefined)
+   local n=if t==undefined then "" else (try(t.name as string)catch(""))
+   if t!=undefined and (__TABLE_TEST__) do (
+    for j=1 to (try(t.numActionItems)catch(0)) while not found do (
+     local a=try(t.getActionItem j)catch(undefined)
+     if a!=undefined do (
+      local d=""
+      try(a.getDescriptionText &d)catch()
+      if not (matchPattern d pattern:"*cosmos browser*") do (d=""; try(a.getButtonText &d)catch())
+      if matchPattern d pattern:"*cosmos browser*" do (found=true; tableName=n; desc=d; tid=t.id; aid=a.id)
+     )
+    )
+   )
+  )
+  if found do executed=((actionMan.executeAction tid (aid as string))==true)
+ )catch(err=getCurrentException())
+ "{\"found\":"+(if found then "true" else "false")+",\"table\":"+(jsonStr tableName)+",\"description\":"+(jsonStr desc)+",\"executed\":"+(if executed then "true" else "false")+",\"error\":"+(jsonStr err)+"}"
+)"""
+_BROWSER_TABLES = {"vray": '(matchPattern n pattern:"*v-ray*" or matchPattern n pattern:"*vray*")',
+                   "corona": 'matchPattern n pattern:"*corona*"'}
+
+
+def _open_browser_script(renderer):
+    table = _BROWSER_TABLES.get("corona" if _compact(renderer).startswith("corona") else "vray")
+    return _OPEN_BROWSER.replace("__TABLE_TEST__", table)
+
+
+def _prepare_script(asset, swap=True):
+    return (_PREPARE.replace("__SWAP__", _MEDIT_SWAP if swap else _MEDIT_LEFTOVER)
+            .replace("__SNAPSHOT__", _snapshot_script(asset)).replace("__EDITOR_OPEN__", _EDITOR_OPEN))
 
 
 def _finalize_script(handles, restore_medit):
@@ -351,23 +399,148 @@ def _finalize_script(handles, restore_medit):
             .replace("__EDITOR_OPEN__", _EDITOR_OPEN))
 
 
-def _pre_dispatch_state(pid):
-    """OS-level only (nothing sent): is Max's main window or a "Chaos Cosmos
-    Browser" window (hidden included) already hung before this import?"""
-    browser = process_health.find_windows(pid, process_health.COSMOS_BROWSER_TITLE)
-    return {"main_hung": process_health.quick_hung_check(pid), "browser_windows": len(browser),
-            "browser_hung": sum(1 for h in browser if process_health.window_hung(h) is True)}
+def _browser_state(pid):
+    """OS-level only: "Chaos Cosmos Browser" windows (hidden included) with owning thread and hung state."""
+    return process_health.thread_windows(pid, process_health.COSMOS_BROWSER_TITLE, _BROWSER_MESSAGE_TIMEOUT_MS)
 
 
-def _before_dispatch(pid, prepared):
-    """PRE-DISPATCH HOOK (intentionally a no-op).
+def _main_browser_ready(state):
+    return any(w["main_thread"] and not w["hung"] for w in state.get("windows") or [])
 
-    The place for an OS-level step between the preparation call and the Cosmos
-    import RPC, e.g. the untested idea of showing the hidden "Chaos Cosmos
-    Browser" so its throttled Qt page does not stall the import handshake.
-    Must not send bridge calls. Returns an optional note for the result.
+
+def _hung_elsewhere(state):
+    """Hung "Chaos Cosmos Browser" windows NOT owned by Max's main thread: main-thread
+    work activating one of those is the cross-thread deadlock."""
+    return [w for w in state.get("windows") or [] if w["hung"] and not w["main_thread"]]
+
+
+def _pre_dispatch_state(pid, browser):
+    """OS-level only (nothing sent): is Max's main window, or a "Chaos Cosmos
+    Browser" (hidden included) on a separate thread, already hung before this import?
+    A hung main-thread browser only means Max's main thread is busy."""
+    windows = browser.get("windows") or []
+    return {"main_hung": process_health.quick_hung_check(pid), "browser_windows": len(windows),
+            "browser_hung": len(_hung_elsewhere(browser))}
+
+
+def _browser_record(state, opened, warning=None, **extra):
+    mains = state.get("main_threads") or []
+    return {"ensured": _main_browser_ready(state), "opened": opened, "main_thread": mains[0] if mains else None,
+            "windows": [{k: w.get(k) for k in ("thread", "main_thread", "visible", "hung")}
+                        for w in state.get("windows") or []], "warning": warning, **extra}
+
+
+def _browser_evidence(state):
+    return ", ".join("'%s'%s on %s thread %s %s" % (
+        process_health.COSMOS_BROWSER_TITLE, "" if w.get("visible") else " (hidden)",
+        "Max's main" if w["main_thread"] else "a separate", w.get("thread"), "hung" if w["hung"] else "responding")
+        for w in state.get("windows") or []) or "no 'Chaos Cosmos Browser' window"
+
+
+def _wait_main_browser(pid):
+    """OS-level only, bounded: wait for a responsive main-thread Cosmos browser."""
+    started, streak = time.monotonic(), 0
+    while True:
+        state = _browser_state(pid)
+        streak = streak + 1 if _main_browser_ready(state) else 0
+        if streak >= _BROWSER_CHECKS or time.monotonic() - started >= _BROWSER_WAIT_S:
+            return state
+        time.sleep(_BROWSER_INTERVAL_S)
+
+
+def _on_main(state):
+    return any(w["main_thread"] for w in state.get("windows") or [])
+
+
+def _ensure_browser(client, pid, renderer, state):
+    """Make sure a responsive "Chaos Cosmos Browser" is owned by Max's main thread.
+
+    No bridge call when one already is, or when one exists there but Max's main
+    thread is busy (OS-level wait instead). Otherwise a fresh OS check, then ONE
+    call runs the renderer's Cosmos browser action, then an OS-level wait.
+    Returns (record, warnings, state); record["refused"] when the fresh check
+    found a hung separate-thread browser (no action sent). Lost calls and transport
+    errors (MaxHealthError, RequestOutcomeUnknown, OSError) propagate.
     """
-    return None
+    had_other = any(not w["main_thread"] for w in state.get("windows") or [])
+    action = None
+    if not _main_browser_ready(state) and not _on_main(state):
+        state = _browser_state(pid)  # the first check predates selecting and guarding this instance
+        if _hung_elsewhere(state):
+            return _browser_record(state, False, refused=True), [], state
+    if _main_browser_ready(state):
+        pass
+    elif _on_main(state):  # there, but Max's main thread is busy: running the action would only queue
+        state = _wait_main_browser(pid)
+    else:
+        try:
+            action = _max(client, _open_browser_script(renderer))
+        except (MaxHealthError, RequestOutcomeUnknown, OSError):
+            raise
+        except Exception as exc:
+            action = {"found": False, "executed": False, "error": str(exc)}
+        if action.get("found"):  # some actions report not executed after doing their work
+            state = _wait_main_browser(pid)
+    warnings = []
+    if had_other:
+        warnings.append("A 'Chaos Cosmos Browser' is also open on a separate (non-main) thread; the importer "
+                        "may use it, the path that stalled and deadlocked Max.")
+    extra = {} if action is None else {"action": action}
+    record = _browser_record(state, bool(action and action.get("executed")), **extra)
+    if not record["ensured"]:
+        if action is None:
+            why = "the browser on Max's main thread did not respond within %g s" % _BROWSER_WAIT_S
+        elif action.get("error"):
+            why = "its action failed: %s" % action["error"]
+        elif action.get("found"):
+            why = "its action %s, but no responsive browser appeared on Max's main thread within %g s" % (
+                "ran" if action.get("executed") else "'%s' in table '%s' reported not executed" % (
+                    action.get("description"), action.get("table")), _BROWSER_WAIT_S)
+        else:
+            why = "no Cosmos browser action found for this renderer"
+        warnings.append("Could not open the Cosmos browser on Max's main thread (%s). The importer uses a hidden "
+                        "browser on its own thread, the path that stalled and deadlocked Max; the Material Editor "
+                        "renderer is switched to Scanline for this import as a mitigation." % why)
+    record["warning"] = " ".join(warnings) or None
+    return record, warnings, state
+
+
+def _dispatch_gate(pid):
+    """OS-level only, bounded, right before _PREPARE (earlier checks predate the
+    browser action and its wait). Returns (browser state, main_busy) as soon as a
+    separate-thread browser is hung or Max's main window answers."""
+    started = time.monotonic()
+    while True:
+        state = _browser_state(pid)
+        busy = _main_window_busy(pid)
+        if _hung_elsewhere(state) or not busy or time.monotonic() - started >= _BROWSER_WAIT_S:
+            return state, busy
+        time.sleep(_BROWSER_INTERVAL_S)
+
+
+def _busy_refusal(base, pid, state, pre, record, main_busy=False):
+    """Nothing dispatched: a separate-thread Cosmos browser is hung, or Max's main
+    window does not answer. Guards the PID (requests refused, nothing sent) while
+    those windows stay hung."""
+    hung = _hung_elsewhere(state)
+    windows = {w["hwnd"]: process_health.COSMOS_BROWSER_TITLE for w in hung if w.get("hwnd")}
+    for hwnd in process_health.main_windows(pid):
+        windows.setdefault(hwnd, "")
+    evidence = ("Max's main window does not respond; " if main_busy else "") + _browser_evidence(state)
+    if windows:
+        mark_settling(pid, windows, "a hung Cosmos browser" if hung else "a Cosmos import", evidence,
+                      _SETTLING_GUARD_S)
+    sent = "the Cosmos browser action was sent, nothing else" if "action" in record else "nothing was sent"
+    if hung:
+        advice = ("Do not open the Cosmos browser or open/close any window now (activating a hung window on "
+                  "another thread is the deadlock). " + HANG_ADVICE)
+    else:
+        advice = _WAIT_ADVICE
+    return {**base, "state": "browser_hung" if hung else "not_imported", "code": "IMPORT_SETTLING",
+            "dispatched": False, "safe_to_edit": False, "retryable": True, "evidence": evidence,
+            "import_timing": {"pre_dispatch": pre}, "cosmos_browser": record,
+            "next": "Nothing was imported (%s): %s. Requests to this Max are refused with IMPORT_SETTLING (nothing "
+                    "sent) while it stays hung. %s Then retry." % (sent, evidence, advice)}
 
 
 def _main_window_busy(pid):
@@ -476,20 +649,26 @@ def _health_failure(exc):
             "process": details.get("process"), "request_sent": details.get("request_sent")}
 
 
-def _prepare_failed(base, pid, exc, restore_medit_renderer):
-    """The one pre-dispatch call was sent but its result was lost: nothing was
-    dispatched, yet the selection may be cleared and medit switched to Scanline."""
+def _prepare_failed(base, pid, exc, restore_medit_renderer, swap=True, step="preparation"):
+    """A pre-dispatch call was sent but its result was lost: nothing was dispatched.
+    preparation: the selection may be cleared (and, with swap, medit switched to
+    Scanline). browser: only the Cosmos browser action may have run."""
     lost = isinstance(exc, (MaxHealthError, RequestOutcomeUnknown))
     if lost:
         windows = _guard_windows(pid, None)
         if windows:
-            mark_settling(pid, windows, "a Cosmos import", "preparation call lost", _SETTLING_GUARD_S)
+            mark_settling(pid, windows, "a Cosmos import", "%s call lost" % step, _SETTLING_GUARD_S)
+    restore_medit_renderer = restore_medit_renderer and swap and step == "preparation"
+    if step == "browser":
+        warning = "The Cosmos browser action may have run; nothing else was changed."
+    else:
+        warning = ("The preparation call may have run: the selection may be cleared%s. %sInspect the scene before "
+                   "retrying the import." % (
+                       " and the Material Editor renderer switched to Scanline" if swap else "",
+                       "Once Max responds, run pending_restore.maxscript once (it reports nothing_to_restore "
+                       "if nothing was switched). " if restore_medit_renderer else ""))
     response = {**base, "state": "not_imported", "dispatched": False, "safe_to_edit": not lost,
-                "message": str(exc),
-                "warnings": ["The preparation call may have run: the selection may be cleared and the Material "
-                             "Editor renderer switched to Scanline. %sInspect the scene before retrying the import."
-                             % ("Once Max responds, run pending_restore.maxscript once (it reports nothing_to_restore "
-                                "if nothing was switched). " if restore_medit_renderer else "")],
+                "message": str(exc), "warnings": [warning],
                 "next": "Nothing was imported. " + (_WAIT_ADVICE if lost else "Retry the import.")}
     if lost:
         response["health"] = _health_failure(exc)
@@ -500,7 +679,7 @@ def _prepare_failed(base, pid, exc, restore_medit_renderer):
 
 
 def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETTLE_SECONDS_DEFAULT,
-                 restore_medit_renderer=True):
+                 restore_medit_renderer=True, swap_medit_renderer=False):
     if (not isinstance(settle_seconds, int) or isinstance(settle_seconds, bool)
             or not 0 <= settle_seconds <= SETTLE_SECONDS_MAX):
         raise ValueError("settle_seconds must be an integer from 0 to %d" % SETTLE_SECONDS_MAX)
@@ -516,13 +695,16 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
             return result
         pid = importer["pid"]
         _snapshot_script(asset)  # validate the asset identity before touching Max
-        pre = _pre_dispatch_state(pid)
-        if pre["main_hung"] or pre["browser_hung"]:
-            # A browser thread still blocked by an earlier import plus new main-thread
-            # work is the cross-thread deadlock shape: do not start another import.
-            raise CosmosError("Max (PID %s) is not responding: %s hung. Nothing was sent and nothing was imported. %s"
-                              % (pid, "its main window" if pre["main_hung"] else "its 'Chaos Cosmos Browser' window",
-                                 _WAIT_ADVICE), "IMPORT_SETTLING", True)
+        browser_state = _browser_state(pid)
+        pre = _pre_dispatch_state(pid, browser_state)
+        if pre["main_hung"]:
+            raise CosmosError("Max (PID %s) is not responding: its main window hung. Nothing was sent and nothing "
+                              "was imported. %s" % (pid, _WAIT_ADVICE), "IMPORT_SETTLING", True)
+        if pre["browser_hung"]:
+            # A browser thread still blocked by an earlier import plus main-thread work
+            # (e.g. the browser action activating it) is the cross-thread deadlock shape.
+            return _busy_refusal({**result, "renderer": importer["renderer"], "max_pid": pid}, pid, browser_state,
+                                 pre, _browser_record(browser_state, False))
         operation_client = MaxClient()
         operation_client.select_max_instance(pid)
         client = operation_client
@@ -532,22 +714,37 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         import_guard = mark_settling(pid, {}, "a Cosmos import", None, _SETTLING_GUARD_S, owner=client)
         base = {**result, "renderer": importer["renderer"], "max_pid": pid, "repeat_safe": False}
         try:
-            prepared = _max(client, _prepare_script(asset))
+            browser, warnings, ensured_state = _ensure_browser(client, pid, importer["renderer"], browser_state)
+        except (MaxHealthError, RequestOutcomeUnknown) as exc:
+            if (getattr(exc, "details", None) or {}).get("request_sent") is False:
+                raise  # nothing was sent, so nothing changed
+            return {**_prepare_failed(base, pid, exc, restore_medit_renderer, step="browser"),
+                    "cosmos_browser": _browser_record(browser_state, False, warning="browser action call lost")}
+        if browser.get("refused"):
+            return _busy_refusal(base, pid, ensured_state, pre, browser)
+        gate, main_busy = _dispatch_gate(pid)  # the checks above predate the action and its wait
+        if _hung_elsewhere(gate) or main_busy:
+            return _busy_refusal(base, pid, gate, pre, browser, main_busy)
+        # Not ensured means the hidden-browser path: Scanline avoids the V-Ray slot-preview stall there.
+        swap = bool(swap_medit_renderer) or not browser["ensured"]
+        swap_mode = "requested" if swap_medit_renderer else ("fallback" if swap else "off")
+        try:
+            prepared = _max(client, _prepare_script(asset, swap))
         except (MaxHealthError, RequestOutcomeUnknown, ValueError) as exc:
             if (getattr(exc, "details", None) or {}).get("request_sent") is False:
                 raise  # nothing was sent, so nothing changed
-            return _prepare_failed(base, pid, exc, restore_medit_renderer)
+            return {**_prepare_failed(base, pid, exc, restore_medit_renderer, swap), "cosmos_browser": browser}
         before, selected, medit = prepared["before"], prepared["selection"], prepared["medit"]
-        warnings, failure, health = [], None, None
-        if not medit.get("scanline_available"):
+        failure, health = None, None
+        if swap and not medit.get("scanline_available"):
             warnings.append("Default_Scanline_Renderer is unavailable, so the Material Editor renderer was not "
                             "switched; the importer's slot preview may stall Max with V-Ray.")
-        elif medit.get("error"):
+        elif swap and medit.get("error"):
             warnings.append("Could not switch the Material Editor renderer to Scanline: %s" % medit["error"])
-        restore_pending = bool(medit.get("backup_pending"))
-        hook_note = _before_dispatch(pid, prepared)
-        if hook_note:
-            warnings.append(hook_note)
+        if not swap and medit.get("leftover_backup"):
+            warnings.append("An earlier import left the Material Editor renderer at Scanline. Once the Material "
+                            "Editor is closed, restore it with execute_maxscript: %s" % _MEDIT_RESTORE)
+        restore_pending = swap and bool(medit.get("backup_pending"))
         baseline_cpu = process_health.cpu_cores(pid, 0.5)
         detection = {"detected": False, "probe": None}
         try:
@@ -584,7 +781,9 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                 warnings.append("Could not confirm the import or restore the selection: %s" % exc)
         timing = {k: v for k, v in detection.items() if k != "probe"}
         response = {**base, "import_timing": {**timing, "pre_dispatch": pre, "settle": _settle_summary(settle)},
-                    "medit_renderer": {k: medit.get(k) for k in ("class", "locked", "editor_open", "swapped")}}
+                    "medit_renderer": {k: medit.get(k) for k in ("class", "locked", "editor_open", "swapped")}
+                    | {"swap": swap_mode},
+                    "cosmos_browser": browser}
         if health:
             response["health"] = health
         if failure:
