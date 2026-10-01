@@ -16,16 +16,22 @@ The worst of these problems hung Max and lost unsaved work. Everything here is m
 | The import polls Max with a full class scan every 250 ms | Light, read-only probes with backoff | [cosmos-import.md](fork/cosmos-import.md) | Verified live |
 | `cosmos_search` needs Max's main thread | Gets the PID and renderer without a bridge call | [cosmos-import.md](fork/cosmos-import.md) | Verified live |
 | A hung Max gives every tool a bare timeout | Lock timeout, real reply deadline, process diagnosis, `MAX_BUSY` / `MAX_NOT_RESPONDING` | [hung-max.md](fork/hung-max.md) | Verified live |
-| `get_bridge_status` can't tell what holds the main thread | Native `health` command served from a pipe thread | [hung-max.md](fork/hung-max.md#bridge-health-from-a-pipe-thread-f8d4e6f) | Unit tested; live test pending |
-| No way to see *where* Max is stuck | `capture_hang_diagnostics`: native stacks via dbghelp, read from the OS | [hung-max.md](fork/hung-max.md#capture_hang_diagnostics) | Unit tested |
+| `get_bridge_status` can't tell what holds the main thread | Native `health` command served from a pipe thread | [hung-max.md](fork/hung-max.md#bridge-health-from-a-pipe-thread-f8d4e6f-reviewed-in-d971a56) | Reviewed; Python deployed, native bridge staged |
+| No way to see *where* Max is stuck | `capture_hang_diagnostics`: native stacks via dbghelp, read from the OS | [hung-max.md](fork/hung-max.md#capture_hang_diagnostics) | Reviewed and deployed; tested on spawned processes, not yet on a hung Max |
 | Max's exit stalls while MCP requests are queued; an expired request can run later | Executor shutdown drain and late-execution guard (from Geddart's fork) | [hung-max.md](fork/hung-max.md#native-executor-25ac1ed-ported-from-geddarts-fork) | Verified live (loading and calls; exit-with-queued-call not yet exercised) |
 | Crashed clients leave `maxmcp.server` processes connected to Max | The server exits with its client; the bridge reports connected clients | [hung-max.md](fork/hung-max.md#orphaned-servers-6-6e9188b) | Verified live (partly) |
-| `replace_material` "replaces" nothing and reports success | Direction documented, `no_match` warning, sub-material slots matched, sources found outside the scene | [replace-material.md](fork/replace-material.md) | Partly verified live |
-| Revit (Autodesk Bitmap) texture paths read as empty | Read bitmap-asset parameters; flag unreadable paths | [autodesk-bitmap-paths.md](fork/autodesk-bitmap-paths.md) | Verified live |
-| `execute_maxscript` calls an interrupted script (e.g. `quitMax`) a "parse error" | Re-compile to tell syntax errors from interruptions; new code `MAXSCRIPT_INTERRUPTED` | [smaller-fixes.md](fork/smaller-fixes.md) | Unit tested |
-| Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Unit tested |
+| `replace_material` "replaces" nothing and reports success | Direction documented, `no_match` warning, sub-material slots matched, sources found outside the scene | [replace-material.md](fork/replace-material.md) | Direction and `no_match` verified live; sub-material matching reviewed, native bridge staged |
+| Revit (Autodesk Bitmap) texture paths read as empty | Read bitmap-asset parameters; flag unreadable paths | [autodesk-bitmap-paths.md](fork/autodesk-bitmap-paths.md) | Verified live; duplicate VRayBitmap row fix staged |
+| `execute_maxscript` calls an interrupted script (e.g. `quitMax`) a "parse error" | Re-compile to tell syntax errors from interruptions; new code `MAXSCRIPT_INTERRUPTED` | [smaller-fixes.md](fork/smaller-fixes.md) | Reviewed; Python deployed, native bridge staged |
+| Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Deployed |
 
-"Verified live" means the fix was exercised in a real Max 2026 session, against the scene that showed the problem, on 2026-10-01. The details pages say exactly what was and wasn't tested.
+What the status words mean:
+- **Verified live:** the fix was exercised in a real Max 2026 session, against the scene that showed the problem, on 2026-10-01.
+- **Reviewed:** an adversarial code review was run before deployment.
+- **Deployed:** the fix runs on the production machine.
+- **Staged:** the change is in the rebuilt 2026 bridge (sha256 `5f49226e…`), which takes effect the next time Max restarts.
+
+The details pages say exactly what was and wasn't tested.
 
 ## Installing
 
@@ -42,7 +48,7 @@ uv run python install.py
 Close 3ds Max and your AI clients first, as upstream's README says.
 
 **The native bridge:** `install.py` copies the prebuilt bridges from `native/bin/`.
-- In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available.
+- In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available. It's the same build that's staged on the production machine (sha256 `5f49226e2341e5ad…`).
 - The 2023, 2024, 2025 and 2027 bridges are still upstream's builds. With those, the Python-side fixes work, but the native ones (`health`, sub-material matching, Autodesk Bitmap paths, the executor fixes) are missing.
 - To get them for another Max version, build the bridge yourself (below).
 

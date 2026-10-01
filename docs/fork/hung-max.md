@@ -60,7 +60,7 @@ The native bridge now answers a `health` command on the pipe thread that receive
 
 ### `capture_hang_diagnostics`
 
-Commits `91c8662`, `1dab496` and `5466a32`.
+Commits `91c8662`, `1dab496`, `5466a32` and `e58464a` (review fixes).
 
 Timeouts tell you *that* Max is stuck, not *where*. During the Cosmos investigation ([cosmos-import.md](cosmos-import.md)), a small script that walked native thread stacks with `dbghelp` attributed both hangs within minutes, with no debugger installed. That script is now part of the package.
 
@@ -68,11 +68,18 @@ Timeouts tell you *that* Max is stuck, not *where*. During the Cosmos investigat
 capture_hang_diagnostics(pid=None, all_threads=False, depth=48, save=True)
 ```
 
-- **It sends nothing to Max.** Everything is read from the OS, so it's safe while Max is hung. Each thread is paused only while its context is read and its stack walked: about 0.2–2 ms, or 10–20 ms for the first thread that touches a module. The walk stops at 250 ms, and the stack is then marked truncated.
-- **A paused thread never outlives the server.** A thread suspended by a process that dies stays suspended for good, and that would freeze Max. So every suspension is registered in `maxmcp/suspend_guard.py` in the same step as `SuspendThread`, and it's resumed exactly once.
-  - Every exit path calls `release_all()` first: the parent watchdog's `os._exit` and its fallback timer, the exit after stdin closes, and `atexit`.
-  - `release_all()` blocks new suspensions, waits up to 0.5 s for active walks, then resumes anything still suspended itself.
-  - Only a hard kill of the server (`TerminateProcess`) can skip this.
+- **It sends nothing to Max: OS-only.** It pauses each Max thread for a few milliseconds while it reads the thread's context and walks its stack, so it's safe while Max is hung.
+  - `dbghelp` loads all module symbols *before* any thread is paused, so no pause waits on a module load.
+  - The walk stops at 250 ms, and the stack is then marked truncated.
+  - The capture runs on its own thread, so Ctrl+C can't interrupt it halfway through a pause.
+- **A paused thread never outlives the server.** A thread left suspended by a process that dies would stay suspended for good, freezing Max.
+  - **Windows 11 and Server 2022+:** each thread is paused through a thread state-change object (`NtCreateThreadStateChange` / `NtChangeThreadState`). The kernel resumes the thread itself when that handle closes, so even a hard kill of the server can't leave Max frozen.
+  - **Older Windows:** it falls back to `SuspendThread` under `maxmcp/suspend_guard.py`. Every pause is registered in the same step as the suspend, and resumed exactly once.
+    - Every exit path calls `release_all()` before `os._exit`, which itself runs in a `finally`. The exit paths are the parent watchdog and its fallback timer, the exit after stdin closes, and `atexit`.
+    - `release_all()` blocks new pauses, waits up to 0.5 s for active walks, then resumes anything still paused itself.
+    - Here only a hard kill of the server (`TerminateProcess`) can skip the guard.
+  - The result's `pause_methods` says which method was used.
+  - Before pausing, a thread id is checked with `GetProcessIdOfThread`, so a reused id that now belongs to another process is never paused.
 - **Finding the target.** It uses `pid` if given, otherwise the Max this server is talking to (read from memory, without the pipe lock), otherwise the only running `3dsmax.exe`. If none of those works, it lists the candidates instead of guessing.
 - **The main thread** is the thread that owns Max's main window.
 - **What it returns:**
@@ -81,7 +88,8 @@ capture_hang_diagnostics(pid=None, all_threads=False, depth=48, save=True)
   - `hung_windows`;
   - process health;
   - the paths of the files it saved.
-- **Saved files.** With `save=true`, the full stacks go to `%LOCALAPPDATA%\3dsmax-mcp\diagnostics\hang-<pid>-<timestamp>.txt` and `.json`, for bug reports to Autodesk or Chaos.
+- **Saved files.** With `save=true`, the full stacks go to `%LOCALAPPDATA%\3dsmax-mcp\diagnostics\hang-<pid>-<timestamp>.txt` and `.json`, for bug reports to Autodesk or Chaos. Only the newest 20 captures are kept.
+- **Not marked read-only.** It pauses threads and writes files, so it doesn't claim the MCP `readOnlyHint`.
 - **Which threads are kept.** By default it keeps the main thread, threads that own a window, threads in application code, and any thread inside a watched module such as `galaxyimporter`. Use `all_threads=true` to keep every thread.
 - **Command line:** `python -m maxmcp.diagnostics.stackdump <pid> [--all] [--depth N] [--json]`.
 
