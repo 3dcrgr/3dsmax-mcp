@@ -26,14 +26,14 @@ The worst of these problems hung Max and lost unsaved work. Everything here is m
 | A Cosmos material whose package name differs from the asset name isn't found | Detect what the import created by handle, whatever its name; report both names | [cosmos-import.md](fork/cosmos-import.md#finding-what-the-import-created-9-2853b1c) | Verified live |
 | Failed agent scripts print raw compile errors in the user's Listener | Run agent scripts with quiet errors; the caller still gets the detail. Upstream 1.7.5 made the same change, which replaced the fork's in the merge | [smaller-fixes.md](fork/smaller-fixes.md#failed-agent-scripts-printed-errors-in-the-users-listener) | Verified live |
 | A Cosmos import silently replaces the material in the user's active Material Editor slot | Point the importer at a free slot, then put any displaced material back once Max is quiet | [cosmos-import.md](fork/cosmos-import.md#keeping-the-users-material-editor-slot-10-c1e09a7) | Deployed; live test pending |
-| After a restart and Hold/Fetch, the agent viewport can't be reclaimed | Tag the agent's floating viewport in the scene and reclaim exactly that restored window | [smaller-fixes.md](fork/smaller-fixes.md#the-agent-viewport-couldnt-be-reclaimed-after-a-restart) | Reviewed; native bridge staged, not in `native/bin/` yet |
+| After a restart and Hold/Fetch, the agent viewport can't be reclaimed | Tag the agent's floating viewport in the scene and reclaim exactly that restored window | [smaller-fixes.md](fork/smaller-fixes.md#the-agent-viewport-couldnt-be-reclaimed-after-a-restart) | Reviewed; in the 2026 bridge built from the 1.7.5 merge (sha256 `53ccb4df…`); not tested live yet |
 | Upstream 1.7.5's dialog monitor can report the Cosmos browser, the Material Editor or the agent viewport as a blocking dialog, and reads or presses dialogs of any thread | These windows are never dialogs; dialogs of other threads (e.g. the Cosmos importer's) are listed but never read or pressed; Qt dialogs are only read while Max's main thread pumps | [cosmos-import.md](fork/cosmos-import.md) | Unit tested; not tested live yet |
 | Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Verified live |
 
 What the status words mean:
 - **Verified live:** the fix was exercised in a real Max 2026 session on the production machine, on 2026-10-01. Some checks used a stand-in for the original failure, such as a 20 s `sleep` instead of a real hang.
 - **Reviewed:** an adversarial code review was run before deployment.
-- **Deployed:** the fix runs on the production machine. Native fixes are in the rebuilt 2026 bridge (sha256 `c621db10…`).
+- **Deployed:** the fix runs on the production machine. Its native fixes are in the 1.7.3-based fork build of the 2026 bridge (sha256 `c621db10…`). The 2026 bridge now in `native/bin/` is built from the 1.7.5 merge (sha256 `53ccb4df…`) and is neither deployed nor verified live yet.
 
 The details pages say exactly what was and wasn't tested.
 
@@ -53,7 +53,7 @@ Close 3ds Max and your AI clients first, as upstream's README says.
 After updating, start a new client session. MCP clients cache the tool list, so new tools such as `capture_hang_diagnostics` don't appear in sessions that were already open, even after the server restarts.
 
 **The native bridge:** `install.py` copies the prebuilt bridges from `native/bin/`.
-- In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available. It's the same build that's deployed on the production machine (sha256 `c621db103b176d77…`).
+- In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available. It's built from this tree, upstream 1.7.5 plus the fork (sha256 `53ccb4dfe42e525b…`). The production machine still runs the 1.7.3-based fork build (sha256 `c621db103b176d77…`).
 - The 2023, 2024, 2025 and 2027 bridges are still upstream's builds (1.7.5). With those, the Python-side fixes work, but the native ones are missing: `health`, the executor shutdown drain, Autodesk Bitmap paths and the duplicate VRayBitmap row fix, `MAXSCRIPT_INTERRUPTED`, `replace_material`'s sub-material matching and source search, the agent viewport reclaim (#11), and the dialog monitor's rules for Cosmos, Material Editor and other-thread windows.
 - To get them for another Max version, build the bridge yourself (below).
 
