@@ -39,6 +39,8 @@ std::string NativeToolRegistry::ExecuteTool(
     req["type"] = cmdType;
     req["command"] = command;
     req["requestId"] = std::string("invoke-") + toolName;
+    if (cmdType == "maxscript" && input.contains("quiet") && input["quiet"].is_boolean())
+        req["quiet"] = input["quiet"];
 
     std::string raw = CommandDispatcher::Dispatch(req.dump(), gup, "native-tool-probe");
 

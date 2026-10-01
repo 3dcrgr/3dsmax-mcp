@@ -5,9 +5,11 @@
 #include "mcp_bridge/main_thread_executor.h"
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/transaction_policy.h"
+#include "mcp_bridge/dialog_watch.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <unordered_set>
 #include <shlobj.h>
 
@@ -56,6 +58,7 @@ static bool IsSafeModeEnabled() {
 // execution always marshal to the main thread.
 static bool IsDirectHandler(const std::string& cmd_type) {
     static const std::unordered_set<std::string> kDirect = {
+        "native:max_dialogs",
         // Scene reads
         "native:scene_info",
         "native:selection",
@@ -338,6 +341,9 @@ static std::string BuildResponse(
         {"transport", "namedpipe"},
         {"threadMode", MainThreadExecutor::IsDirectMode() ? "direct" : "mainThread"}
     };
+    // Every response reports dialogs blocking Max, whoever opened them.
+    json dialogs = DialogWatch::OpenDialogs();
+    if (!dialogs.empty()) resp["meta"]["openDialogs"] = std::move(dialogs);
     return resp.dump();
 }
 
@@ -364,13 +370,19 @@ static bool ContainsBlockedCommand(const std::string& cmd) {
 // ── MAXScript handler ───────────────────────────────────────────
 static std::string HandleMaxScript(
     const std::string& command,
-    MCPBridgeGUP* gup) {
+    MCPBridgeGUP* gup,
+    bool quiet) {
 
     if (IsSafeModeEnabled() && ContainsBlockedCommand(command)) {
         throw std::runtime_error("Blocked by safe mode: command contains a restricted function. Set safe_mode=false in %LOCALAPPDATA%\\3dsmax-mcp\\mcp_config.ini to disable.");
     }
 
-    return gup->GetExecutor().ExecuteSync([&command]() -> std::string {
+    return gup->GetExecutor().ExecuteSync([&command, quiet]() -> std::string {
+        // Quiet mode lets prompts take their defaults, as batch scripts expect.
+        // quiet=false leaves Max's mode alone so prompts reach the agent as
+        // blocking dialogs. quietErrors keeps errors textual either way.
+        std::optional<TempQuietMode> quiet_mode;
+        if (quiet) quiet_mode.emplace(TRUE);
         std::wstring wcmd = HandlerHelpers::WrapForErrorCapture(
             HandlerHelpers::Utf8ToWide(command));
 
@@ -378,12 +390,10 @@ static std::string HandleMaxScript(
         BOOL ok = FALSE;
 
         try {
-            // Quiet: a parse error or abort goes to the MAXScript log, not the
-            // user's Listener; the caller gets the detail from the classification.
             ok = ExecuteMAXScriptScript(
                 wcmd.c_str(),
                 MAXScript::ScriptSource::NonEmbedded,
-                TRUE,    // quietErrors
+                TRUE,    // quietErrors: diagnostics belong in the response/log
                 &fpv,    // result goes here
                 TRUE     // logQuietErrors
             );
@@ -394,11 +404,14 @@ static std::string HandleMaxScript(
         if (!ok) {
             // Runtime errors are caught inside MAXScript and surface as a
             // sentinel string in fpv below. FALSE means a parse error OR an
-            // abort try/catch cannot catch (quitMax, escape): classify it.
+            // abort try/catch cannot catch (quitMax, escape): classify it,
+            // with Max's own error text as the fallback detail.
+            const std::string detail = fpv.type == TYPE_TSTR && fpv.tstr ? WideToUtf8(fpv.tstr->data()) : "";
             std::string code;
-            std::string message = HandlerHelpers::MaxScriptFailureMessage(wcmd, &code);
+            std::string message = HandlerHelpers::MaxScriptFailureMessage(wcmd, &code, detail);
             throw std::runtime_error(HandlerHelpers::StructuredErrorPayload(code, message));
         }
+        DialogWatch::ThrowIfDismissed();
 
         // Convert FPValue to string
         if (fpv.type == TYPE_STRING || fpv.type == TYPE_FILENAME) {
@@ -543,7 +556,7 @@ std::string CommandDispatcher::Dispatch(
     std::string request_id = req.value("requestId", "");
 
     // health runs here on the pipe thread, ahead of every main-thread path and
-    // outside the in-flight registry (it would only ever report itself).
+    // outside both request registries (it would only ever report itself).
     if (cmd_type == "health") {
         DirectModeGuard pipeThread(true);  // reported as threadMode "direct"
         try {
@@ -555,8 +568,16 @@ std::string CommandDispatcher::Dispatch(
             return BuildResponse(false, "", NormalizeNativeError(e.what()), request_id, cmd_type, 0);
         }
     }
-    BridgeHealth::RequestScope inflight(client_session_id, request_id, cmd_type);
-    ExecutorLabelGuard label({cmd_type, client_session_id, request_id});
+    DialogWatch::RequestContext request_context(request_id, cmd_type);
+    // native:max_dialogs is a control request like health: it never reaches the
+    // main thread, and listing the client's 1 s dialog polls as in-flight work
+    // would misreport them as other clients' requests.
+    std::optional<BridgeHealth::RequestScope> inflight;
+    std::optional<ExecutorLabelGuard> label;
+    if (cmd_type != "native:max_dialogs") {
+        inflight.emplace(client_session_id, request_id, cmd_type);
+        label.emplace(MainThreadExecutor::WorkLabel{cmd_type, client_session_id, request_id});
+    }
 
     // Route to handler — read-only handlers run directly on pipe thread
     // _forceMainThread flag allows benchmarking the same handler both ways
@@ -568,7 +589,10 @@ std::string CommandDispatcher::Dispatch(
         auto invoke = [&]() -> std::string {
         std::string result;
 
-        if (cmd_type == "ping") {
+        if (cmd_type == "native:max_dialogs") {
+            // No ExecuteSync, SDK calls, undo hold, or blocked command's pipe.
+            result = DialogWatch::Control(command);
+        } else if (cmd_type == "ping") {
             result = HandlePing(gup);
         } else if (cmd_type == "native:plugin_inspect") {
             result = NativeHandlers::PluginInspect(command, gup);
@@ -580,7 +604,7 @@ std::string CommandDispatcher::Dispatch(
             if (command.empty()) {
                 throw std::runtime_error("Empty MAXScript command");
             }
-            result = HandleMaxScript(command, gup);
+            result = HandleMaxScript(command, gup, req.value("quiet", true));
         // Native handlers
         } else if (cmd_type == "native:scene_info") {
             result = NativeHandlers::SceneInfo(command, gup);
@@ -833,6 +857,7 @@ std::string CommandDispatcher::Dispatch(
             result = gup->GetExecutor().ExecuteSync([&]() -> std::string {
                 NativeUndoTransaction tx(cmd_type);
                 std::string inner = invoke();
+                DialogWatch::ThrowIfDismissed();
                 if (ResultLooksLikeError(inner)) {
                     tx.Cancel();
                 } else {

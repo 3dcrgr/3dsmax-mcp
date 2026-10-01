@@ -10,6 +10,16 @@
 using json = nlohmann::json;
 using namespace HandlerHelpers;
 
+// RunMAXScript returns its caught exception as a sentinel. Mutations must
+// propagate it to the dispatcher's undo transaction, never turn it into OK.
+static std::string RunControllerScript(const std::string& script) {
+    std::string result = RunMAXScript(script);
+    const std::string sentinel = MaxScriptErrorSentinel();
+    if (result.compare(0, sentinel.size(), sentinel) == 0)
+        throw std::runtime_error(result.substr(sentinel.size()));
+    return result;
+}
+
 // ── Helper: get compact value string from a SubAnim ─────────
 static std::string CompactValue(Animatable* sa, TimeValue t) {
     if (!sa) return "";
@@ -389,6 +399,9 @@ std::string NativeHandlers::AssignController(const std::string& params, MCPBridg
             {"spring", "Spring"},
         };
 
+        std::transform(ctrlType.begin(), ctrlType.end(), ctrlType.begin(), ::tolower);
+        const bool isScript = ctrlType == "float_script" || ctrlType == "position_script" ||
+            ctrlType == "rotation_script" || ctrlType == "scale_script" || ctrlType == "point3_script";
         auto it = ctrlMap.find(ctrlType);
         std::string msClass = (it != ctrlMap.end()) ? it->second : ctrlType;
 
@@ -416,7 +429,18 @@ std::string NativeHandlers::AssignController(const std::string& params, MCPBridg
             ms += "  local ctrl = newCtrl\n";
         } else {
             ms += "  local ctrl = " + msClass + "()\n";
-            ms += "  sa.controller = ctrl\n";
+            if (!isScript) ms += "  sa.controller = ctrl\n";
+        }
+
+        // Bind inputs before compiling an expression which may reference them.
+        if (isScript) for (const auto& v : variables) {
+            std::string varName = v.value("var_name", v.value("name", ""));
+            std::string targetObj = v.value("object", v.value("target", ""));
+            if (varName.empty() || targetObj.empty())
+                throw std::runtime_error("Script variables require name/var_name and object");
+            ms += "  local tgt = getNodeByName \"" + JsonEscape(targetObj) + "\"\n";
+            ms += "  if tgt == undefined do throw \"Binding target not found\"\n";
+            ms += "  if not (ctrl.addNode \"" + JsonEscape(varName) + "\" tgt) do throw \"Binding rejected\"\n";
         }
 
         // Script text for script controllers
@@ -433,16 +457,6 @@ std::string NativeHandlers::AssignController(const std::string& params, MCPBridg
                 else safe += c;
             }
             ms += "  ctrl.script = \"" + safe + "\"\n";
-        }
-
-        // Node variables for script controllers
-        for (const auto& v : variables) {
-            std::string varName = v.value("name", "");
-            std::string targetObj = v.value("object", v.value("target", ""));
-            if (!varName.empty() && !targetObj.empty()) {
-                ms += "  local tgt = getNodeByName \"" + JsonEscape(targetObj) + "\"\n";
-                ms += "  if tgt != undefined do ctrl.addNode \"" + varName + "\" tgt\n";
-            }
         }
 
         // Constraint targets
@@ -473,13 +487,14 @@ std::string NativeHandlers::AssignController(const std::string& params, MCPBridg
             else if (vt == json::value_t::number_integer || vt == json::value_t::number_unsigned) valStr = std::to_string(val.get<int>());
             else if (vt == json::value_t::boolean) valStr = val.get<bool>() ? "true" : "false";
             else valStr = val.dump();
-            ms += "  try (ctrl." + key + " = " + valStr + ") catch ()\n";
+            ms += "  ctrl." + key + " = " + valStr + "\n";
         }
 
+        if (isScript && !layer) ms += "  sa.controller = ctrl\n";
         ms += "  \"OK\"\n";
         ms += ")\n";
 
-        RunMAXScript(ms);
+        RunControllerScript(ms);
 
         json result;
         result["controller"] = msClass;
@@ -562,6 +577,8 @@ std::string NativeHandlers::SetControllerProps(const std::string& params, MCPBri
         ms += "  local sa = execute (\"$'\" + obj.name + \"'\" + \"" + JsonEscape(paramPath) + "\")\n";
         ms += "  local ctrl = sa.controller\n";
         ms += "  if ctrl == undefined do throw \"No controller\"\n";
+        if (!script.empty())
+            ms += "  if isProperty ctrl #script do ctrl = copy ctrl\n";
 
         if (!script.empty()) {
             std::string safe;
@@ -572,7 +589,10 @@ std::string NativeHandlers::SetControllerProps(const std::string& params, MCPBri
                 else if (c == '\r') continue;
                 else safe += c;
             }
-            ms += "  try (ctrl.script = \"" + safe + "\") catch (try (ctrl.SetExpression \"" + safe + "\"; ctrl.Update()) catch ())\n";
+            ms += "  if isProperty ctrl #script then (ctrl.script = \"" + safe + "\") else (\n";
+            ms += "    if not (ctrl.SetExpression \"" + safe + "\") do throw \"Expression rejected\"\n";
+            ms += "    ctrl.Update()\n";
+            ms += "  )\n";
         }
 
         // Avoid is_string() etc. — MAXScript macro collision
@@ -584,13 +604,14 @@ std::string NativeHandlers::SetControllerProps(const std::string& params, MCPBri
             else if (vt == json::value_t::number_integer || vt == json::value_t::number_unsigned) valStr = std::to_string(val.get<int>());
             else if (vt == json::value_t::boolean) valStr = val.get<bool>() ? "true" : "false";
             else valStr = val.dump();
-            ms += "  try (ctrl." + key + " = " + valStr + ") catch ()\n";
+            ms += "  ctrl." + key + " = " + valStr + "\n";
         }
 
+        if (!script.empty()) ms += "  sa.controller = ctrl\n";
         ms += "  \"OK\"\n";
         ms += ")\n";
 
-        RunMAXScript(ms);
+        RunControllerScript(ms);
 
         json result;
         result["status"] = "ok";
@@ -679,7 +700,7 @@ std::string NativeHandlers::AddControllerTarget(const std::string& params, MCPBr
             throw std::runtime_error("Controller type '" + cls + "' does not support node targets. Use float_script or constraint controllers.");
         }
 
-        RunMAXScript(ms);
+        RunControllerScript(ms);
 
         json result;
         result["status"] = "ok";

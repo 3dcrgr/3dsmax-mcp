@@ -19,7 +19,7 @@ When Max's main thread hung, every tool returned the MCP client's generic "Reque
 ### Client side (`a9d2a0d`)
 
 - **The pipe lock has a timeout.** A request waits for the lock for up to its own timeout (120 s by default). If it still can't get it, nothing is sent. It fails with `MAX_BUSY`, or with `MAX_NOT_RESPONDING` if Max has exited, or is blocked while the request holding the lock is past its own timeout plus grace (the larger of 10 s and 10 % of that timeout). The idea comes from the stoxsss111 fork.
-- **Replies are polled with a real deadline.** The client uses `PeekNamedPipe` instead of a blocking `ReadFile`. Past the deadline plus grace it checks the target process: are its top-level windows hung (`IsHungAppWindow`), and how much CPU does it use over a one-second sample? A hung window with under 0.05 CPU-s/s counts as blocked.
+- **Replies have a real deadline.** The caller never blocks in `ReadFile`: the fork polled with `PeekNamedPipe`; since the 1.7.5 merge, upstream's reader thread does the read and the caller waits on it. Past the deadline plus grace it checks the target process: are its top-level windows hung (`IsHungAppWindow`), and how much CPU does it use over a one-second sample? A hung window with under 0.05 CPU-s/s counts as blocked.
   - **Anything short of exited or confirmed blocked** (responsive, hung but still using CPU, or a state it can't read): the client keeps waiting and checks again every 15 s, so a slow result still arrives. There's no upper limit. If the client can't tell Max's PID, it can't check at all and just keeps waiting.
   - **Max has exited, or is blocked on two checks 20 s apart:** the request is abandoned with `MAX_NOT_RESPONDING`. It's never replayed, because it may already have run.
   - **Read-only probes** (`ping`, `health`): dropped at their deadline.
@@ -126,7 +126,7 @@ The original script set `SizeOfStruct` wrong for `SYMBOL_INFOW` (90 instead of 8
 ### Native executor (`adcfd93`, ported from Geddart's fork)
 
 - **Shutdown drain** (Geddart `8e004f7`). `MCPBridgeGUP::Stop()` now closes the executor gate first, then fails every queued and deferred work item, so client threads blocked in `ExecuteSync` wake at once. A background `ExecuteSync` during shutdown fails fast. `Initialize()` reopens the gate.
-- **Expired work never runs** (Geddart `599e6f7`). A work item that timed out while still queued is marked done and its callback dropped. It can't run later against the caller's unwound stack.
+- **Expired work never runs.** A work item that timed out while still queued can't run later against the caller's unwound stack. The fork ported this from Geddart (`599e6f7`); since the 1.7.5 merge it is upstream's mechanism (`5c44e76`): the item is cancelled with "Main thread execution timed out before starting; queued work cancelled". Work that already started is waited for.
 
 ### Orphaned servers (#6, `a9d2a0d`)
 
@@ -156,6 +156,6 @@ Tests:
 
 ## Upstream status
 
-None of this is fixed upstream as of 2026-10-01. Related work:
+Upstream 1.7.5 (2026-10-01) covers two parts: a call waiting on a modal dialog returns `BLOCKED_BY_DIALOG` (answered with `max_dialogs`), and a timed-out queued request is cancelled. The rest is not upstream: the reply deadline and process diagnosis (`MAX_BUSY` / `MAX_NOT_RESPONDING`), `health`, `capture_hang_diagnostics`, the shutdown drain and the orphaned-server watchdog. Related work:
 - Upstream PR 32 (executor cancellation, closed unmerged) was deliberately not ported. Its contributor's fork has been deleted.
 - The lock timeout idea comes from stoxsss111's fork. From Geddart's come the executor drain and the process-exit check (`_process_alive` there, rewritten here in `maxmcp/process_health.py`).

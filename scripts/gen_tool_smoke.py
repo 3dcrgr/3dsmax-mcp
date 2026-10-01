@@ -31,6 +31,8 @@ FLAG_EXPECT_ERROR = 2
 
 # Skipped unless run_tool_smoke(include_skipped=True) / native includeSkipped
 SKIP_DEFAULT = {
+    "max_dialogs",
+    "script_controller",
     "cosmos_search",
     "cosmos_download",
     "cosmos_import",
@@ -194,6 +196,7 @@ CUSTOM: dict[str, dict] = {
 }
 
 MUTATE_TOOLS = {
+    "script_controller",
     "create_lights",
     "edit_lights",
     "plugin_patch",

@@ -260,10 +260,21 @@ c.DeleteVariable "A"
 
 ## Script Controllers
 
+For agent authoring, prefer `script_controller`: inspect the destination, validate
+the expression and typed inputs at relevant frames, then apply with the inspected
+token. It stages a detached controller and reports binding, compilation, runtime,
+and output-type errors separately. Omitted bindings preserve existing inputs;
+an empty binding map clears them.
+
+In raw MAXScript, configure a detached controller, add its inputs before setting
+the expression, and catch both expression assignment and evaluation errors.
+`ThrowOnError=false` does not stop Max's Script Controller Exception box and does
+not establish that the expression is valid. Controller inputs must be value-only and bounded.
+
 ```maxscript
 c = float_script()
-$box01.height.controller = c
 c.script = "sin(F * 3) * 25 + 50"
+$box01.height.controller = c
 -- Built-in vars: T (ticks), S (seconds), F (frames), NT (normalized time)
 
 -- Position script example

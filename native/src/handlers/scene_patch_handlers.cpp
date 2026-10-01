@@ -746,6 +746,7 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
             ip->RedrawViews(time);
             result["operations"] = BuildProofArray(plan, time, true);
             result["touched"] = UniqueTouchedRefs(plan);
+            DialogWatch::ThrowIfDismissed();
             transaction.Accept();
         } catch (const std::exception& error) {
             try {

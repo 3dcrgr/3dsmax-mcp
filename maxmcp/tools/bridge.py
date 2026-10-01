@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from ..max_client import (BLOCKED_CAUSE, HANG_ADVICE, MaxBusyError, MaxNotRespondingError, _grace,
-                          settling_state)
+from ..max_client import (_NOT_DIALOG_TITLE, BLOCKED_CAUSE, HANG_ADVICE, DialogBlocked, MaxBusyError,
+                          MaxNotRespondingError, _grace, settling_state)
 from ..process_health import describe as describe_process, diagnose_process
 from ..server import mcp, client
 
@@ -20,6 +20,8 @@ _BUSY_RUNNING_MS = 2000
 _INTERNAL_CLIENTS = frozenset({"native-tool-probe"})
 # Clock skew allowed between a request's registry age and its executor run time.
 _ATTRIBUTION_SLACK_MS = 250
+# Control requests answered on a bridge pipe thread; never another client's work on Max.
+_CONTROL_REQUESTS = frozenset({"native:max_dialogs", "health"})
 
 
 def _legacy_bridge_status() -> str:
@@ -64,7 +66,13 @@ def _native_health() -> dict | MaxBusyError | MaxNotRespondingError | None:
         return exc
     except Exception:  # best-effort probe: old bridge, no pipe, TCP-only
         return None
-    return payload if isinstance(payload, dict) and isinstance(payload.get("mainThread"), dict) else None
+    if not isinstance(payload, dict) or not isinstance(payload.get("mainThread"), dict):
+        return None
+    # Bridges from 1.7.5 list the dialogs blocking Max on every reply (window-manager state only).
+    meta = response.get("meta") if isinstance(response.get("meta"), dict) else {}
+    dialogs = meta.get("openDialogs")
+    payload["openDialogs"] = dialogs if isinstance(dialogs, list) else []
+    return payload
 
 
 def _compact_health(health: dict) -> dict:
@@ -108,6 +116,86 @@ def _internal(entry: dict) -> bool:
     return bool(entry.get("internal")) or entry.get("clientId") in _INTERNAL_CLIENTS
 
 
+def _blocked_ids() -> set:
+    """This server's BLOCKED_BY_DIALOG calls still waiting in Max (they are ours, not another client's)."""
+    ids = client.blocked_request_ids()
+    return {i for i in ids if isinstance(i, str)} if isinstance(ids, (list, tuple, set)) else set()
+
+
+def _dialog_summaries(dialogs) -> list[dict]:
+    keep = ("dialog_id", "title", "kind", "main_thread", "age_ms", "during_requests", "text", "buttons")
+    return [{k: d[k] for k in keep if k in d} for d in dialogs or [] if isinstance(d, dict)]
+
+
+def _blocked_by_dialog_status(dialogs: list, *, health: dict | None = None, running: dict | None = None,
+                              owner: str | None = None, request_sent: bool = False) -> str:
+    """pong=false status: a modal dialog holds Max's main thread. Not a hang: it pumps."""
+    pid = (health or {}).get("pid")
+    label = f"3ds Max (PID {pid})" if pid else "3ds Max"
+    titles = ", ".join(repr(d.get("title", "")) for d in dialogs if isinstance(d, dict)) or "a dialog"
+    if running:
+        holder = {"this_server": "this server's", "other_client": "another MCP client's"}.get(owner or "", "a")
+        what = f"{holder} '{running.get('cmdType') or 'unlabelled'}' request waits on it"
+    else:
+        what = "a request waits on it"
+    main = (health or {}).get("mainThread") or {}
+    executor = (health or {}).get("executor") or {}
+    return json.dumps({
+        "pong": False,
+        "connected": True,
+        "bridge_state": "blocked_by_dialog",
+        "bridge_code": DialogBlocked.code,
+        "retryable": False,
+        "message": (f"{label} is waiting on {titles}: {what}, and new requests queue behind it. Max is not hung "
+                    "(its main thread runs the dialog). Read it with max_dialogs(action='inspect'); answer it with "
+                    "max_dialogs(action='respond') only when the user authorized unattended work, otherwise ask the "
+                    "user. Do not repeat the waiting call."),
+        "dialogs": _dialog_summaries(dialogs),
+        "main_thread": ({"state": main.get("state"), "pumping": main.get("pumping"),
+                         "heartbeat_age_s": _seconds(main.get("heartbeatAgeMs")),
+                         "running": ({"cmd_type": running.get("cmdType"),
+                                      "running_s": _seconds(running.get("runningMs")),
+                                      "owner": owner, "blocked_by_dialog": True} if running else None),
+                         "queued": executor.get("queued")} if health else None),
+        "blocked_calls": sorted(_blocked_ids()),
+        "request_sent": request_sent,
+        **({"health": _compact_health(health)} if health else {}),
+    })
+
+
+def _held_by_dialog(health: dict) -> str | None:
+    """blocked_by_dialog status when a main-thread dialog holds the running MCP request.
+
+    Only while the main thread still pumps (a modal loop does); a main thread that
+    stopped pumping is busy or hung whatever dialog is open, and the busy logic
+    reports it. The dialog monitor's status reads window-manager state only.
+    """
+    main = health.get("mainThread") or {}
+    running = (health.get("executor") or {}).get("running") or {}
+    request_id = running.get("requestId")
+    if not health.get("openDialogs") or main.get("state") != "busy_mcp" or main.get("pumping") is False \
+            or not request_id:
+        return None
+    try:
+        status = client._dialog_control("status")
+        holding = [d for d in status.get("dialogs", []) if isinstance(d, dict) and d.get("main_thread")
+                   and request_id in (d.get("during_requests") or [])
+                   and not _NOT_DIALOG_TITLE.match(str(d.get("title", "")))]
+    except Exception:
+        return None
+    if not holding:
+        return None
+    mine = client.inflight()
+    mine_id = mine.get("request_id") if isinstance(mine, dict) else None
+    if request_id == mine_id or request_id in _blocked_ids():
+        owner = "this_server"
+    else:
+        entry = next((r for r in (health.get("clients") or {}).get("inflight") or []
+                      if r.get("requestId") == request_id), None)
+        owner = "other_client" if entry is not None and not _internal(entry) else "unknown"
+    return _blocked_by_dialog_status(holding, health=health, running=running, owner=owner)
+
+
 def _running_owner(running: dict, inflight: list[dict], mine_id, abandoned_id) -> str:
     """Who submitted the running item: this_server, abandoned (ours), other_client or unknown."""
     request_id = running.get("requestId")
@@ -149,11 +237,16 @@ def _busy_from_health(health: dict) -> str | None:
     mine_id = (mine or {}).get("request_id")
     abandoned_id = (abandoned or {}).get("request_id")
     inflight = (health.get("clients") or {}).get("inflight") or []
-    ours = {i for i in (mine_id, abandoned_id) if i}
-    others = [r for r in inflight if r.get("requestId") not in ours and not _internal(r)]
+    blocked_ids = _blocked_ids()
+    ours = {i for i in (mine_id, abandoned_id) if i} | blocked_ids
+    others = [r for r in inflight if r.get("requestId") not in ours and not _internal(r)
+              and r.get("cmdType") not in _CONTROL_REQUESTS]
 
+    held_by_dialog = False
     if running:
         owner = _running_owner(running, inflight, mine_id, abandoned_id)
+        if owner in ("other_client", "unknown") and running.get("requestId") in blocked_ids:
+            owner, held_by_dialog = "this_server", True  # returned BLOCKED_BY_DIALOG, still running in Max
         cmd = running.get("cmdType") or "unlabelled"
         elapsed = _seconds(running.get("runningMs"))
         if owner == "abandoned":
@@ -202,10 +295,12 @@ def _busy_from_health(health: dict) -> str | None:
             "heartbeat_age_s": _seconds(main.get("heartbeatAgeMs")),
             "running": ({"cmd_type": running.get("cmdType"), "running_s": _seconds(running.get("runningMs")),
                          "owner": "this_server" if owner == "abandoned" else owner,
-                         "abandoned": owner == "abandoned"} if running else None),
+                         "abandoned": owner == "abandoned",
+                         **({"blocked_by_dialog": True} if held_by_dialog else {})} if running else None),
             "queued": executor.get("queued"),
             "oldest_queued_s": _seconds(executor.get("oldestQueuedMs")),
         },
+        **({"open_dialogs": _dialog_summaries(health["openDialogs"])} if health.get("openDialogs") else {}),
         "inflight": mine,
         **({"previous": abandoned, "previous_process": verdict.get("process")} if abandoned else {}),
         "other_clients": [{"client_id": r.get("clientId"), "cmd_type": r.get("cmdType"),
@@ -232,6 +327,7 @@ def _unhealthy_status(exc: MaxBusyError | MaxNotRespondingError, health: dict | 
         "process": details.get("process"),
         "request_sent": details.get("request_sent", False),
         **{key: details[key] for key in ("settling", "previous") if details.get(key)},
+        **({"open_dialogs": _dialog_summaries(health["openDialogs"])} if (health or {}).get("openDialogs") else {}),
         **({"health": _compact_health(health)} if health else {}),
     })
 
@@ -264,17 +360,27 @@ def get_bridge_status() -> str:
     Use when: a tool failed with a connection/transport/claim error and you need to diagnose.
     If Max is busy or hung, returns pong=false with bridge_state, what holds the main thread
     (this server's request, another MCP client's, or work outside the bridge) and process health.
+    bridge_state blocked_by_dialog: a modal dialog holds a request; read it with max_dialogs.
     Not when: starting a session or before every task — prefer query_scene for scene work.
     """
+    # Precedence: silent bridge; import settling guard (calls get IMPORT_SETTLING, nothing
+    # sent); a dialog holding the running request while the main thread pumps
+    # (BLOCKED_BY_DIALOG); busy or hung (MAX_BUSY / MAX_NOT_RESPONDING); then a ping.
     health = _native_health()
     if isinstance(health, (MaxBusyError, MaxNotRespondingError)):
         return _silent_bridge_status(health)  # a ping would wait out the same silence
+    if health and not (health.get("pid") and settling_state(int(health["pid"]))):
+        status = _held_by_dialog(health)
+        if status is not None:
+            return status
     if health and _skip_ping(health):
         status = _busy_from_health(health)
         if status is not None:
             return status
     try:
         response = client.send_command("", cmd_type="ping", timeout=5.0)
+    except DialogBlocked as exc:
+        return _blocked_by_dialog_status(exc.dialogs, health=health or None, request_sent=True)
     except (MaxBusyError, MaxNotRespondingError) as exc:
         return _unhealthy_status(exc, health)
     except RuntimeError as exc:
@@ -282,6 +388,8 @@ def get_bridge_status() -> str:
         if "Empty command" in error or "Unknown command type" in error:
             try:
                 return _legacy_bridge_status()
+            except DialogBlocked as legacy_exc:
+                return _blocked_by_dialog_status(legacy_exc.dialogs, request_sent=True)
             except (MaxBusyError, MaxNotRespondingError) as legacy_exc:
                 return _unhealthy_status(legacy_exc)
         raise

@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "tool_count": 176,
+  "tool_count": 178,
   "starter_tools": [
     "query_scene",
     "get_session_context",
@@ -198,7 +198,7 @@
     {
       "name": "Animation",
       "hint": "Controllers and wire params",
-      "tool_count": 9,
+      "tool_count": 10,
       "categories": [
         {
           "name": "Controllers",
@@ -209,6 +209,7 @@
             "inspect_controller",
             "inspect_track_view",
             "list_wireable_params",
+            "script_controller",
             "set_controller_props",
             "unwire_params",
             "wire_params"
@@ -376,7 +377,7 @@
     {
       "name": "Other",
       "hint": "",
-      "tool_count": 24,
+      "tool_count": 25,
       "categories": [
         {
           "name": "Booleans",
@@ -411,7 +412,8 @@
         {
           "name": "Mainthread",
           "tools": [
-            "main_thread"
+            "main_thread",
+            "max_dialogs"
           ]
         },
         {
@@ -512,6 +514,9 @@
           },
           "command": {
             "type": "string"
+          },
+          "quiet": {
+            "type": "boolean"
           }
         }
       },
@@ -818,6 +823,50 @@
       },
       "risk": "safe",
       "routing": "native:list_wireable_params",
+      "starter": false
+    },
+    {
+      "name": "script_controller",
+      "description": "Inspect, validate or atomically apply a script controller with typed inputs.",
+      "category": "Controllers",
+      "group": "Animation",
+      "module": "controllers",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "target": {
+            "type": "object"
+          },
+          "script": {
+            "type": "string"
+          },
+          "bindings": {
+            "type": "object"
+          },
+          "expected_controller": {
+            "type": "string"
+          },
+          "sample_frames": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          }
+        },
+        "required": [
+          "action",
+          "target"
+        ]
+      },
+      "example": {
+        "action": "info",
+        "target": {}
+      },
+      "risk": "advanced",
+      "routing": "python",
       "starter": false
     },
     {
@@ -3847,6 +3896,37 @@
       "example": {},
       "risk": "read",
       "routing": "native:main_thread",
+      "starter": false
+    },
+    {
+      "name": "max_dialogs",
+      "description": "Read and answer dialogs blocking 3ds Max, over an independent connection.",
+      "category": "Mainthread",
+      "group": "Other",
+      "module": "mainthread",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "dialog_id": {
+            "type": "string"
+          },
+          "expected_dialog": {
+            "type": "string"
+          },
+          "button": {
+            "type": "string"
+          },
+          "wait_seconds": {
+            "type": "number"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
       "starter": false
     },
     {

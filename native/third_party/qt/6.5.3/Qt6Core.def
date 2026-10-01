@@ -1,0 +1,14 @@
+LIBRARY Qt6Core.dll
+EXPORTS
+    ??1QByteArray@@QEAA@XZ
+    ??1QString@@QEAA@XZ
+    ?cast@QMetaObject@@QEBAPEAVQObject@@PEAV2@@Z
+    ?cast@QMetaObject@@QEBAPEBVQObject@@PEBV2@@Z
+    ?className@QMetaObject@@QEBAPEBDXZ
+    ?constData@QByteArray@@QEBAPEBDXZ
+    ?deallocate@QArrayData@@SAXPEAU1@_J1@Z
+    ?inherits@QObject@@QEBA_NPEBD@Z
+    ?qt_assert@@YAXPEBD0H@Z
+    ?qt_qFindChildren_helper@@YAXPEBVQObject@@AEBUQMetaObject@@PEAV?$QList@PEAX@@V?$QFlags@W4FindChildOption@Qt@@@@@Z
+    ?size@QByteArray@@QEBA_JXZ
+    ?toUtf8@QString@@QEGBA?AVQByteArray@@XZ

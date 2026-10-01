@@ -1,0 +1,19 @@
+LIBRARY Qt5Core.dll
+EXPORTS
+    ??0QPoint@@QEAA@HH@Z
+    ??0QString@@QEAA@XZ
+    ??1QByteArray@@QEAA@XZ
+    ??1QString@@QEAA@XZ
+    ?begin@QListData@@QEBAPEAPEAXXZ
+    ?cast@QMetaObject@@QEBAPEAVQObject@@PEAV2@@Z
+    ?className@QMetaObject@@QEBAPEBDXZ
+    ?constData@QByteArray@@QEBAPEBDXZ
+    ?dispose@QListData@@SAXPEAUData@1@@Z
+    ?end@QListData@@QEBAPEAPEAXXZ
+    ?inherits@QObject@@QEBA_NPEBD@Z
+    ?qt_qFindChildren_helper@@YAXPEBVQObject@@AEBVQString@@AEBUQMetaObject@@PEAV?$QList@PEAX@@V?$QFlags@W4FindChildOption@Qt@@@@@Z
+    ?shared_null@QListData@@2UData@1@B DATA
+    ?size@QByteArray@@QEBAHXZ
+    ?toUtf8@QString@@QEGBA?AVQByteArray@@XZ
+    ?x@QPoint@@QEBAHXZ
+    ?y@QPoint@@QEBAHXZ

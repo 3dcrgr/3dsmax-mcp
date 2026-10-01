@@ -513,6 +513,17 @@ def envelope_exception(
     return _finalize_envelope(payload)
 
 
+def _add_dialog_warning(envelope: dict[str, Any], transport: dict[str, Any] | None, tool_name: str) -> dict[str, Any]:
+    """Tell the caller about dialogs blocking Max, whoever opened them."""
+    dialogs = (transport or {}).get("open_dialogs")
+    if not dialogs or tool_name == "max_dialogs":
+        return envelope
+    titles = ", ".join(repr(d.get("title", "")) for d in dialogs[:3] if isinstance(d, dict))
+    envelope.setdefault("warnings", []).append(
+        f"3ds Max has {len(dialogs)} open dialog(s): {titles}. Read or answer it with max_dialogs.")
+    return envelope
+
+
 def make_structured_tool(
     fn: Callable[..., Any],
     *,
@@ -553,23 +564,23 @@ def make_structured_tool(
             raw = fn(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             transport = transport_provider() if transport_provider else None
-            return envelope_result(
+            return _add_dialog_warning(envelope_result(
                 raw,
                 elapsed_ms=elapsed_ms,
                 transport=transport,
                 tool_name=tool_name,
                 script=script,
-            )
+            ), transport, tool_name)
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             transport = transport_provider() if transport_provider else None
-            return envelope_exception(
+            return _add_dialog_warning(envelope_exception(
                 exc,
                 elapsed_ms=elapsed_ms,
                 transport=transport,
                 tool_name=tool_name,
                 script=script,
-            )
+            ), transport, tool_name)
 
     wrapped.__signature__ = fn_signature  # type: ignore[attr-defined]
     wrapped.__annotations__ = resolved_annotations

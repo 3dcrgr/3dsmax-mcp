@@ -1,10 +1,12 @@
 // SDK-independent MainThreadExecutor regressions. Ported from Geddart's fork
-// (native/tests/transport_tests.cpp, commits 599e6f7 and 8e004f7).
+// (native/tests/transport_tests.cpp, commits 599e6f7 and 8e004f7); since the
+// 1.7.5 merge the expired-work guard is upstream's started/cancelled mechanism.
 //
 //   cmake -S native/tests -B native/build-tests -G "Visual Studio 17 2022" -A x64
 //   cmake --build native/build-tests --config Release
 //   ctest --test-dir native/build-tests -C Release --output-on-failure
 #include "mcp_bridge/main_thread_executor.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -39,20 +41,121 @@ bool wait_for_queued_message(int timeout_ms) {
 void ClaimNativeInstance() {}
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 
+bool contains_nocase(std::string text, std::string needle) {
+    auto lower = [](std::string& s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(tolower(c)); });
+    };
+    lower(text);
+    lower(needle);
+    return text.find(needle) != std::string::npos;
+}
+
+void pump_until(const std::atomic<bool>& done, int timeout_ms) {
+    const auto start = Clock::now();
+    MSG message;
+    while (!done.load() && ms_since(start) < timeout_ms) {
+        while (PeekMessage(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessage(&message);
+        Sleep(1);
+    }
+}
+
 // A callback that timed out while queued must never run later: it captures the
 // caller's stack by reference, and that frame is gone once ExecuteSync threw.
 void expired_work_does_not_execute() {
     MainThreadExecutor executor;
     executor.Initialize();
     std::atomic<bool> ran{false}, expired{false};
+    std::string error;
     std::thread worker([&] {
         try { executor.ExecuteSync([&] { ran = true; return std::string("late"); }, 10); }
-        catch (const std::runtime_error&) { expired = true; }
+        catch (const std::runtime_error& e) { expired = true; error = e.what(); }
     });
     worker.join(); // deliberately do not pump the queued callback before timeout
     MSG message;
     while (PeekMessage(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessage(&message);
     require(expired && !ran, "expired callback executed");
+    // The Python client recognises this text (_QUEUE_TIMEOUT_MARKER) as "never ran".
+    require(contains_nocase(error, "main thread execution timed out"), "queue timeout lost the client's marker");
+    require(contains_nocase(error, "before starting"), "queue timeout does not say the work never started");
+    executor.Shutdown();
+}
+
+// Work that already started is not interruptible: a caller whose timeout
+// expires keeps waiting, so its captured references stay alive, and it gets
+// the real result (upstream 1.7.5).
+void running_work_outlives_caller_timeout() {
+    MainThreadExecutor executor;
+    executor.Initialize();
+    std::atomic<bool> finished_work{false}, done{false};
+    std::string result, error;
+    std::thread worker([&] {
+        try {
+            result = executor.ExecuteSync([&] {
+                Sleep(300);
+                finished_work = true;
+                return std::string("slow");
+            }, 50);
+        } catch (const std::exception& e) { error = e.what(); }
+        require(finished_work.load(), "caller returned before its running work finished");
+        done = true;
+    });
+    pump_until(done, 5000);
+    worker.join();
+    require(error.empty(), "running work past the caller's timeout reported an error");
+    require(result == "slow", "running work past the caller's timeout lost its result");
+    executor.Shutdown();
+}
+
+// BeginShutdown from inside a running item (Max's exit can begin from a
+// nested message loop): the running item still completes, and the item it
+// deferred is failed without running.
+void begin_shutdown_inside_running_item() {
+    MainThreadExecutor executor;
+    executor.Initialize();
+    std::atomic<bool> b_posted{false}, b_ran{false}, a_done{false}, b_done{false};
+    std::string a_result, b_error;
+    std::thread worker_b;
+    std::thread worker_a([&] {
+        a_result = executor.ExecuteSync([&] {
+            worker_b = std::thread([&] {
+                try { executor.ExecuteSync([&] { b_ran = true; return std::string("b"); }, 20000); }
+                catch (const std::exception& e) { b_error = e.what(); }
+                b_done = true;
+            });
+            require(wait_for_queued_message(5000), "second item never reached the queue");
+            MSG message;  // nested pump: B is delivered while A runs, so it is deferred
+            while (PeekMessage(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessage(&message);
+            executor.BeginShutdown();
+            return std::string("ok");
+        }, 20000);
+        a_done = true;
+    });
+    pump_until(a_done, 10000);
+    worker_a.join();
+    if (worker_b.joinable()) worker_b.join();
+    require(a_result == "ok", "running item did not complete after BeginShutdown");
+    require(b_done && !b_ran, "deferred item ran during shutdown");
+    require(b_error == "MainThreadExecutor is shutting down", "deferred item not failed by the drain");
+    executor.Shutdown();
+}
+
+// Direct mode (read-only handlers on the pipe thread) runs through upstream's
+// DialogWatch::Guard: without dialog events it returns the value and rethrows
+// the work's own exception unchanged.
+void direct_mode_passes_through_dialog_guard() {
+    MainThreadExecutor executor;
+    executor.Initialize();
+    std::string result, error;
+    std::thread worker([&] {
+        MainThreadExecutor::EnableDirectMode();
+        result = executor.ExecuteSync([] { return std::string("direct"); }, 50);
+        try { executor.ExecuteSync([]() -> std::string { throw std::runtime_error("boom"); }, 50); }
+        catch (const std::exception& e) { error = e.what(); }
+        MainThreadExecutor::DisableDirectMode();
+    });
+    worker.join();  // deliberately never pumps: direct work must not need the main thread
+    require(result == "direct", "direct-mode work did not return its value");
+    require(error == "boom", "direct-mode exception was not passed through unchanged");
     executor.Shutdown();
 }
 
@@ -154,11 +257,16 @@ int main() {
     try {
         queued_work_runs();
         expired_work_does_not_execute();
+        running_work_outlives_caller_timeout();
         shutdown_wakes_queued_waiter();
         execute_after_shutdown_fails_fast();
         initialize_reopens_after_shutdown();
-        std::cout << "PASS: queued work runs; expired work skipped; shutdown wakes queued waiter; "
-                     "execute-after-shutdown fails fast; initialize reopens the gate\n";
+        begin_shutdown_inside_running_item();
+        initialize_reopens_after_shutdown();
+        direct_mode_passes_through_dialog_guard();
+        std::cout << "PASS: queued work runs; expired work skipped; running work outlives the caller's "
+                     "timeout; shutdown wakes queued waiter; execute-after-shutdown fails fast; initialize "
+                     "reopens the gate; shutdown inside a running item; direct mode passes the dialog guard\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

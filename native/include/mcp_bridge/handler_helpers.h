@@ -22,6 +22,7 @@
 #include <maxscript/compiler/parser.h>
 #include <CoreFunctions.h>
 #include "mcp_bridge/color_value.h"
+#include "mcp_bridge/dialog_watch.h"
 #include "mcp_bridge/main_thread_executor.h"
 
 class MCPBridgeGUP;
@@ -312,6 +313,20 @@ inline std::wstring WrapForErrorCapture(const std::wstring& wcmd) {
     return MaxScriptWrapPrefix() + wcmd + MaxScriptWrapSuffix();
 }
 
+// One-line, length-bounded MAXScript error text for a response message.
+inline std::string CleanMaxScriptDetail(std::string detail) {
+    for (auto& c : detail) if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    const size_t first = detail.find_first_not_of(" -");
+    detail.erase(0, first == std::string::npos ? detail.size() : first);
+    while (!detail.empty() && detail.back() == ' ') detail.pop_back();
+    if (detail.size() > 500) {
+        size_t cut = 500;
+        while (cut > 0 && (static_cast<unsigned char>(detail[cut]) & 0xC0) == 0x80) --cut;  // keep UTF-8 valid for json
+        detail = detail.substr(0, cut) + "...";
+    }
+    return detail;
+}
+
 // ExecuteMAXScriptScript also returns FALSE when a script is aborted by
 // something MAXScript try/catch does not catch (quitMax, escape, system
 // exceptions), so a FALSE is not proof of a parse error. This re-compiles the
@@ -321,21 +336,32 @@ inline std::wstring WrapForErrorCapture(const std::wstring& wcmd) {
 // fails, so line numbers and quoted code are the user's, not the wrapper's.
 // Silent: compiler output goes to a private StringStream and CompileError is
 // caught here, so nothing reaches the Listener.
+// sdk_detail is the error text ExecuteMAXScriptScript returned (TYPE_TSTR in
+// its result): the parse-error detail when the compile check found none, and
+// appended as "Max reported: ..." to the other messages.
 // Sets *code to "BAD_PARAM" or "MAXSCRIPT_INTERRUPTED". Never throws.
-inline std::string MaxScriptFailureMessage(const std::wstring& wcmd, std::string* code = nullptr) {
+inline std::string MaxScriptFailureMessage(const std::wstring& wcmd, std::string* code = nullptr,
+                                           const std::string& sdk_detail = {}) {
     static const char* kUnclassified =
         "MAXScript execution failed: the script did not complete and the syntax check "
         "could not run, so this is either a parse error or an interruption "
         "(quitMax/resetMaxFile/exit, escape/abort, or a system exception).";
+    auto withSdk = [&sdk_detail](std::string message) {
+        try {
+            const std::string extra = CleanMaxScriptDetail(sdk_detail);
+            if (!extra.empty()) message += " Max reported: " + extra;
+        } catch (...) {}
+        return message;
+    };
     if (code) *code = "BAD_PARAM";
     try {
         Interface7* ip = GetCOREInterface7();
         if (MainThreadExecutor::IsShuttingDown() || (ip && ip->QuitingApp())) {
             if (code) *code = "MAXSCRIPT_INTERRUPTED";
-            return "MAXScript did not complete: 3ds Max is shutting down (e.g. after quitMax), "
-                   "so the syntax check was skipped. If the script ended the Max session that is expected.";
+            return withSdk("MAXScript did not complete: 3ds Max is shutting down (e.g. after quitMax), "
+                           "so the syntax check was skipped. If the script ended the Max session that is expected.");
         }
-        if (MainThreadExecutor::IsDirectMode()) return kUnclassified;
+        if (MainThreadExecutor::IsDirectMode()) return withSdk(kUnclassified);
 
         ScopedMaxScriptEvaluationContext context;
         MAXScript_TLS* _tls = context.Get_TLS();
@@ -383,12 +409,12 @@ inline std::string MaxScriptFailureMessage(const std::wstring& wcmd, std::string
 
         std::string detail;
         const int compiled = compileOnly(wcmd, detail);
-        if (compiled < 0) return kUnclassified;
+        if (compiled < 0) return withSdk(kUnclassified);
         if (compiled == 0) {
             if (code) *code = "MAXSCRIPT_INTERRUPTED";
-            return "MAXScript did not complete (not a parse error): the script was interrupted, e.g. by "
-                   "quitMax/resetMaxFile/exit, an escape/abort, or a system exception. If it ended or "
-                   "reset the Max session that is expected.";
+            return withSdk("MAXScript did not complete (not a parse error): the script was interrupted, e.g. by "
+                           "quitMax/resetMaxFile/exit, an escape/abort, or a system exception. If it ended or "
+                           "reset the Max session that is expected.");
         }
         const std::wstring prefix = MaxScriptWrapPrefix(), suffix = MaxScriptWrapSuffix();
         if (wcmd.size() >= prefix.size() + suffix.size() &&
@@ -398,33 +424,29 @@ inline std::string MaxScriptFailureMessage(const std::wstring& wcmd, std::string
             const std::wstring userText = wcmd.substr(prefix.size(), wcmd.size() - prefix.size() - suffix.size());
             if (compileOnly(userText, userDetail) == 1 && !userDetail.empty()) detail = userDetail;
         }
-        for (auto& c : detail) if (c == '\r' || c == '\n' || c == '\t') c = ' ';
-        detail.erase(0, detail.find_first_not_of(" -"));
-        if (detail.size() > 500) {
-            size_t cut = 500;
-            while (cut > 0 && (static_cast<unsigned char>(detail[cut]) & 0xC0) == 0x80) --cut;  // keep UTF-8 valid for json
-            detail = detail.substr(0, cut) + "...";
-        }
+        detail = CleanMaxScriptDetail(detail);
+        if (detail.empty()) detail = CleanMaxScriptDetail(sdk_detail);
         return detail.empty()
             ? std::string("MAXScript execution failed (parse error)")
             : "MAXScript execution failed (parse error): " + detail;
     } catch (...) {
-        return kUnclassified;
+        return withSdk(kUnclassified);
     }
 }
 
 // ── MAXScript execution (for hybrid handlers) ───────────────────
 inline std::string RunMAXScript(const std::string& script) {
+    // Tool scripts are batch work: prompts take their defaults.
+    TempQuietMode quiet;
     std::wstring wcmd = WrapForErrorCapture(Utf8ToWide(script));
     FPValue fpv;
     BOOL ok = FALSE;
 
     try {
-        // Quiet: errors go to the MAXScript log, not the user's Listener.
         ok = ExecuteMAXScriptScript(
             wcmd.c_str(),
             MAXScript::ScriptSource::NonEmbedded,
-            TRUE,    // quietErrors
+            TRUE,    // quietErrors: never route agent diagnostics to modal UI
             &fpv,    // result
             TRUE     // logQuietErrors
         );
@@ -433,13 +455,15 @@ inline std::string RunMAXScript(const std::string& script) {
     }
 
     if (!ok) {
+        const std::string detail = fpv.type == TYPE_TSTR && fpv.tstr ? WideToUtf8(fpv.tstr->data()) : "";
         // Explicit code, so compiler detail quoting the script cannot be
         // re-keyworded by NormalizeNativeError (e.g. "not found" -> NOT_FOUND).
         std::string code;
-        std::string message = MaxScriptFailureMessage(wcmd, &code);
+        std::string message = MaxScriptFailureMessage(wcmd, &code, detail);
         throw std::runtime_error(StructuredErrorPayload(code, message));
     }
 
+    DialogWatch::ThrowIfDismissed();
     // Convert FPValue to string
     if (fpv.type == TYPE_STRING || fpv.type == TYPE_FILENAME) {
         return WideToUtf8(fpv.s);

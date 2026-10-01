@@ -5,6 +5,7 @@
 //   cmake --build native/build-tests --config Release
 //   ctest --test-dir native/build-tests -C Release --output-on-failure
 #include "mcp_bridge/bridge_health.h"
+#include "mcp_bridge/dialog_watch.h"
 #include "mcp_bridge/main_thread_executor.h"
 #include <algorithm>
 #include <atomic>
@@ -148,8 +149,8 @@ void queued_work_is_visible_with_label() {
     executor.Shutdown();
 }
 
-// While a callback runs, an observer thread sees it as running (without ever
-// blocking on the item's mutex, which the main thread holds throughout).
+// While a callback runs, an observer thread sees it as running. GetHealth never
+// takes an item mutex, so it answers whatever the item's waiter is doing.
 void running_work_is_visible() {
     MainThreadExecutor executor;
     executor.Initialize();
@@ -216,6 +217,79 @@ void expired_work_leaves_the_queue() {
     executor.Shutdown();
 }
 
+// A running item whose caller timed out is still running, not queued, and is
+// counted as completed once it really finishes (upstream 1.7.5 waits for it).
+void running_past_timeout_stays_running() {
+    MainThreadExecutor executor;
+    executor.Initialize();
+    const unsigned long long before = executor.GetHealth().completed;
+    std::atomic<bool> entered{false}, release{false}, done{false};
+    std::string result;
+    std::thread worker([&] {
+        MainThreadExecutor::SetThreadLabel({"maxscript", "pipe-5", "req-slow"});
+        result = executor.ExecuteSync([&] {
+            entered = true;
+            while (!release.load()) Sleep(1);
+            return std::string("late");
+        }, 50);
+        done = true;
+    });
+    std::atomic<bool> observed{false};
+    std::thread observer([&] {
+        if (!wait_until(5000, [&] { return entered.load(); })) return;
+        Sleep(200);  // well past the caller's 50 ms timeout
+        auto health = executor.GetHealth();
+        observed = health.running && health.queued == 0 && health.running_label.request_id == "req-slow";
+        release = true;
+    });
+    const auto start = Clock::now();
+    MSG message;
+    while (!done.load() && ms_since(start) < 10000) {
+        while (PeekMessage(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessage(&message);
+        Sleep(1);
+    }
+    release = true;
+    observer.join();
+    worker.join();
+    require(observed, "running item past its caller's timeout not reported as running");
+    require(result == "late", "waiter did not get the result of its running item");
+    require(executor.GetHealth().completed == before + 1, "completed counter not incremented");
+    require(!executor.GetHealth().running, "finished item still reported as running");
+    executor.Shutdown();
+}
+
+// The two request registries agree: DialogWatch (max_dialogs status) and the
+// executor tickets (health) both see the same queued request.
+void dialogwatch_and_health_agree() {
+    MainThreadExecutor executor;
+    executor.Initialize();
+    std::atomic<bool> done{false};
+    std::thread worker([&] {
+        DialogWatch::RequestContext context("req-dw", "maxscript");
+        MainThreadExecutor::SetThreadLabel({"maxscript", "pipe-9", "req-dw"});
+        executor.ExecuteSync([] { return std::string("ok"); }, 20000);
+        done = true;
+    });
+    require(wait_until(5000, [&] { return executor.GetHealth().queued == 1; }), "request never queued");
+    std::string status;
+    std::thread control([&] { status = DialogWatch::Control(R"({"action":"status"})"); });
+    control.join();
+    const auto parsed = nlohmann::json::parse(status);
+    bool queued = false;
+    for (const auto& request : parsed["requests"])
+        queued = queued || (request.value("request_id", "") == "req-dw" && request.value("state", "") == "queued");
+    require(queued, "max_dialogs status does not list the queued request");
+    require(executor.GetHealth().oldest_queued_label.request_id == "req-dw", "health lost the request id");
+    const auto start = Clock::now();
+    MSG message;
+    while (!done.load() && ms_since(start) < 5000) {
+        while (PeekMessage(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessage(&message);
+        Sleep(1);
+    }
+    worker.join();
+    executor.Shutdown();
+}
+
 void client_registry_tracks_connections_and_requests() {
     using namespace BridgeHealth;
     const auto base = Snapshot();
@@ -276,12 +350,15 @@ int main() {
         client_registry_tracks_connections_and_requests();
         queued_work_is_visible_with_label();
         running_work_is_visible();
+        running_past_timeout_stays_running();
         expired_work_leaves_the_queue();
+        dialogwatch_and_health_agree();
         heartbeat_tracks_pumping();
         heartbeat_survives_a_posted_message_flood();
         std::cout << "PASS: client registry; queued work visible with label; running work visible "
-                     "without blocking; expired work leaves the queue; heartbeat tracks pumping; "
-                     "heartbeat survives a posted-message flood\n";
+                     "without blocking; running past its timeout stays running; expired work leaves the "
+                     "queue; dialog watch and health agree; heartbeat tracks pumping; heartbeat survives "
+                     "a posted-message flood\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

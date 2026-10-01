@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## Fork changes (3dcrgr/3dsmax-mcp, on top of 1.7.5)
+
 - `cosmos_import` no longer stalls or deadlocks V-Ray scenes. It opens the Cosmos browser on Max's main thread before importing (the importer's own hidden browser thread caused the stalls), waits for Max to settle, restores the selection, and never opens or closes the Material Editor. If Max stays busy, the result says `safe_to_edit: false` and other calls fail with `IMPORT_SETTLING` without being sent, for 15 minutes at most. See [docs/fork/cosmos-import.md](fork/cosmos-import.md).
 - The new `cosmos_import` option `swap_medit_renderer` (off by default) uses Scanline as the Material Editor renderer during the import. It's turned on automatically when the browser can't be opened on the main thread. It avoids the preview stall, not the deadlock. The original renderer is put back once Max settles. If a Material Editor is open then, or `restore_medit_renderer` is false, it stays at Scanline and the result gives the script to restore it.
 - `cosmos_import` polls with light read-only probes instead of a full class scan every 250 ms. `cosmos_search` no longer needs a Max round trip when exactly one Cosmos importer is registered for the target Max, or when `renderer` is `vray` or `corona` and that Max has an importer for it. With both the V-Ray and Corona importers and `renderer="current"`, it still reads the scene renderer from Max once (`renderer_source: "scene"`).
@@ -21,7 +23,19 @@ All notable changes to this project are documented here.
 - `cosmos_import` no longer lets the Chaos importer overwrite the material in the user's active Material Editor slot. It points the importer at a free slot, and puts any displaced material back once Max is quiet (`medit_active_slot`, `displaced_material`, `medit_slot_restored`). See [docs/fork/cosmos-import.md](fork/cosmos-import.md#keeping-the-users-material-editor-slot-10-c1e09a7).
 - `agent_viewport` reclaims its own floating viewport after a restart and Hold/Fetch, instead of failing with "All floating viewports are in use". Needs the rebuilt bridge.
 - Material graphs read Autodesk Bitmap paths from Revit/ATF materials. They no longer report a hidden, unnamed parameter of Cosmos VRayBitmaps as a second texture file, which raised a false `FILE_MISSING`. `material_roles` reports file-bearing maps whose path can't be read (`FILE_PATH_UNREADABLE`, `complete: false`) and empty slots (`FILE_NOT_ASSIGNED`). See [docs/fork/autodesk-bitmap-paths.md](fork/autodesk-bitmap-paths.md).
+- With upstream 1.7.5's dialog handling: a call held by a modal dialog returns `BLOCKED_BY_DIALOG` before the hang diagnosis can call Max busy or hung, and every wait, the dialog checks on the control channel included, stays bounded. `get_bridge_status` reports `bridge_state: "blocked_by_dialog"` when a dialog holds the running request, after a settling Cosmos import and before busy or hung.
+- `cosmos_import` treats a call held by a dialog as lost: it stops before dispatch, or returns `state: "dialog_open"` with `pending_restore` instead of confirming the import inside the dialog's loop. Its browser action runs with quiet mode off, as verified live; max_dialogs also reports the import's interrupted calls.
+- A failed `execute_maxscript` keeps `BAD_PARAM` with the compiler's message or `MAXSCRIPT_INTERRUPTED`, and now appends Max's own error text when that adds anything.
 - The native changes above ship only in the rebuilt `native/bin/mcp_bridge_2026.gup`. The 2023, 2024, 2025 and 2027 bridges are still upstream's builds; for those versions, build the bridge from source ([docs/FORK.md](FORK.md#building-the-native-bridge)). [docs/FORK.md](FORK.md) lists which fixes were verified live.
+
+## [1.7.5] — 2026-10-01
+
+- Agents can read and answer any dialog blocking 3ds Max, Win32 or Qt. A call that opens or waits behind a dialog now returns `BLOCKED_BY_DIALOG` with the title, text and buttons instead of hanging; `max_dialogs` presses a chosen button and returns the interrupted call's result. Other tool replies warn while a dialog is open. Agents ask the user before save, overwrite, discard, Fetch, Reset or licensing choices unless told to proceed.
+- MAXScript run by MCP calls now uses Max's quiet mode, so prompts take their default answer instead of stalling the call. `execute_maxscript(quiet=False)` shows them to the agent instead. MAXScript errors are returned as text rather than shown in a dialog.
+- Recognized MAXScript error boxes during an MCP call are acknowledged and fail that call with `MAX_DIALOG_ERROR` and the error text. Script Controller Exception boxes are closed automatically and recorded.
+- Added `script_controller`: inspect, validate and apply script controllers with typed inputs, frame sampling, token-guarded assignment and rollback.
+- A queued bridge request that times out before starting no longer runs later.
+- The agent skill is shorter and leaves per-tool detail to tool descriptions.
 - `inspect_material_network` now reads 6 levels deep by default (up to 16), so typical wrapper chains no longer report `replicateReady: false` from depth alone. Compact output keeps `complete`. Rebuilt bridges for Max 2023-2027.
 - `install.py` now updates an existing Claude Code registration instead of skipping it, keeping its environment variables such as `MCP_TOOL_PROFILE`. Registration failures show the agent CLI's error.
 - `install.py` no longer replaces Claude Desktop, Cursor or Gemini settings it cannot parse (comments, invalid JSON), which previously deleted the other MCP servers in that file. It reads files saved with a BOM and writes settings atomically.

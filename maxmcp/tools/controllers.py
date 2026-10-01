@@ -12,6 +12,53 @@ from ..coerce import DictList
 from ..helpers.maxscript import safe_string, safe_name, normalize_subanim_path
 
 
+@mcp.tool()
+def script_controller(
+    action: str,
+    target: dict,
+    script: str = "",
+    bindings: Optional[dict] = None,
+    expected_controller: Optional[str] = None,
+    sample_frames: Optional[list[float]] = None,
+) -> dict:
+    """Inspect, validate or atomically apply a script controller with typed inputs.
+
+    target: {node:{handle and/or name}, track:"position"|"rotation"|"scale"|
+    a path from inspect_track_view|[1-based sub-anim indices/names]}.
+    Handles are animatable handles from MCP, not maxOps node handles.
+    inspect returns expected_controller; apply requires that token.
+    validate stages off-track and samples without assigning. apply repeats those
+    checks, assigns in one undo step, verifies, and rolls back on failure.
+    sample_frames: up to 64 explicit frames; validate/apply default to current time.
+    inspect without frames does not evaluate the script.
+
+    bindings maps variable names to {kind:"constant",value:...},
+    {kind:"node",node:{handle/name}}, {kind:"track",target:{node,track},
+    offset_frames:0}, or {kind:"controller",target:{node,track}}.
+    Constants optionally use value_type:"point3"|"quat" with 3/4 components.
+    Omit bindings to preserve existing script bindings; {} clears user bindings.
+    Float/position/rotation/scale/point3 output is inferred from the destination.
+    Existing script settings are copied; assignment replaces only this track.
+
+    Write value-only expressions, using declared inputs and T/S/F/NT/this.
+    Validation executes real MAXScript, not a sandbox or an execution timeout.
+    Successful samples do not prove all frames. A later failing frame makes Max
+    show a Script Controller Exception box; the native bridge closes it and
+    max_dialogs lists it. The failed controller then returns zero at every
+    frame until reapplied. Use inspect with sample_frames to find the frame.
+    """
+    from ..helpers.script_controller import run
+    # Keep the schema's annotation exactly str: FastMCP pre-parses JSON-looking
+    # strings for Optional[str], turning a valid "[0,0,0]" expression into a list.
+    response = run(action, target, script or None, bindings, expected_controller, sample_frames)
+    if response["ok"]:
+        return response["result"]
+    error = response["error"]
+    return {"status": "error", "error": error["message"], "code": error["code"],
+            "retryable": error.get("retryable", False),
+            "details": {k: v for k, v in error.items() if k not in {"message", "code", "retryable"}}}
+
+
 # ── Controller type registry ────────────────────────────────────────
 # Maps friendly names to MAXScript constructor expressions.
 _CONTROLLER_MAP = {
@@ -76,13 +123,20 @@ def _build_prop_lines(prefix: str, params: dict) -> list[str]:
     for key, val in params.items():
         safe_key = safe_string(key)
         if isinstance(val, bool):
-            lines.append(f'try ({prefix}.{safe_key} = {"true" if val else "false"}) catch ()')
+            lines.append(f'{prefix}.{safe_key} = {"true" if val else "false"}')
         elif isinstance(val, (int, float)):
-            lines.append(f'try ({prefix}.{safe_key} = {val}) catch ()')
+            lines.append(f'{prefix}.{safe_key} = {val}')
         elif isinstance(val, str):
             safe_val = safe_string(val)
-            lines.append(f'try ({prefix}.{safe_key} = "{safe_val}") catch ()')
+            lines.append(f'{prefix}.{safe_key} = "{safe_val}"')
     return lines
+
+
+def _controller_result(response: dict):
+    result = response.get("result", str(response))
+    if isinstance(result, str) and result.startswith("__MCP_MS_ERR__:"):
+        raise RuntimeError(result[len("__MCP_MS_ERR__:"):].strip())
+    return result
 
 
 @mcp.tool()
@@ -95,7 +149,11 @@ def assign_controller(
     params: Optional[dict] = None,
     layer: bool = False,
 ) -> str:
-    """Create and assign a controller to a sub-anim track."""
+    """Create and assign a controller to a sub-anim track.
+
+    Prefer script_controller for script authoring: it validates typed bindings,
+    reports compilation/evaluation errors, and guards assignment with readback.
+    """
     if client.native_available:
         payload = {
             "name": name,
@@ -107,7 +165,7 @@ def assign_controller(
             "layer": layer,
         }
         response = client.send_command(_json.dumps(payload), cmd_type="native:assign_controller")
-        return response.get("result", "")
+        return _controller_result(response)
 
     ct = controller_type.lower()
     if ct not in _CONTROLLER_MAP:
@@ -157,7 +215,7 @@ def assign_controller(
 
         maxscript = "(\n    " + "\n    ".join(lines) + "\n)"
         response = client.send_command(maxscript)
-        return response.get("result", str(response))
+        return _controller_result(response)
 
     # ── Direct assignment mode ──
     lines = [
@@ -177,7 +235,7 @@ def assign_controller(
 
     maxscript = "(\n    " + "\n    ".join(lines) + "\n)"
     response = client.send_command(maxscript)
-    return response.get("result", str(response))
+    return _controller_result(response)
 
 
 def _build_controller_config(
@@ -194,10 +252,13 @@ def _build_controller_config(
     if variables:
         if ct in _SCRIPT_TYPES:
             for var in variables:
-                vname = safe_string(var.get("var_name", ""))
-                vobj = safe_name(var.get("object", ""))
+                vname = safe_string(var.get("var_name", var.get("name", "")))
+                vobj = safe_name(var.get("object", var.get("target", "")))
+                if not vname or not vobj:
+                    raise ValueError("Script variables require name/var_name and object")
                 lines.append(f'local varNode = getNodeByName "{vobj}"')
-                lines.append(f'if varNode != undefined do {ctrl_var}.addNode "{vname}" varNode')
+                lines.append('if varNode == undefined do throw "Binding target not found"')
+                lines.append(f'if not ({ctrl_var}.addNode "{vname}" varNode) do throw "Binding rejected"')
         elif ct in _CONSTRAINT_TYPES:
             for var in variables:
                 tobj = safe_name(var.get("object", ""))
@@ -605,7 +666,10 @@ def set_controller_props(
     script: Optional[str] = None,
     params: Optional[dict] = None,
 ) -> str:
-    """Modify script text or properties on an existing controller."""
+    """Modify script text or properties on an existing controller.
+
+    Prefer script_controller for guarded script edits and frame validation.
+    """
     if client.native_available:
         payload = {
             "name": name,
@@ -614,7 +678,7 @@ def set_controller_props(
             "params": {k: str(v) for k, v in (params or {}).items()},
         }
         response = client.send_command(_json.dumps(payload), cmd_type="native:set_controller_props")
-        return response.get("result", "")
+        return _controller_result(response)
 
     safe_obj = safe_name(name)
     safe_path = safe_string(normalize_subanim_path(param_path))
@@ -653,4 +717,4 @@ def set_controller_props(
 
     maxscript = "(\n    " + "\n    ".join(lines) + "\n)"
     response = client.send_command(maxscript)
-    return response.get("result", str(response))
+    return _controller_result(response)

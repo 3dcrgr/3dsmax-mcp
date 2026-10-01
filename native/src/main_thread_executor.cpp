@@ -1,4 +1,5 @@
 #include "mcp_bridge/main_thread_executor.h"
+#include "mcp_bridge/dialog_watch.h"
 
 #include <algorithm>
 #include <random>
@@ -176,7 +177,8 @@ std::string MainThreadExecutor::ExecuteSync(
     // Direct mode: run on calling thread, skip main-thread roundtrip.
     // Used for read-only handlers on pipe worker threads.
     if (tl_direct_mode_) {
-        return work();
+        DialogWatch::Guard guard(DialogWatch::RequestId(), DialogWatch::CommandType());
+        return guard.Execute(work);
     }
 
     if (!hwnd_) {
@@ -185,9 +187,12 @@ std::string MainThreadExecutor::ExecuteSync(
 
     auto item = std::make_shared<WorkItem>();
     item->work = std::move(work);
+    item->request_id = DialogWatch::RequestId();
+    item->command_type = DialogWatch::CommandType();
     item->ticket->label = tl_label_;
     item->ticket->posted_at = std::chrono::steady_clock::now();
 
+    DialogWatch::MarkQueued();
     // prevent shared_ptr from dying before main thread processes it
     auto* raw = new std::shared_ptr<WorkItem>(item);
 
@@ -215,12 +220,18 @@ std::string MainThreadExecutor::ExecuteSync(
         [&] { return item->completed; });
 
     if (!finished) {
-        // Still queued: prevent late execution of callbacks that capture caller
-        // stack references. Running work holds this mutex until it completes.
-        item->completed = true;
-        item->work = {};
-        item->ticket->phase.store(kDone, std::memory_order_release);
-        throw std::runtime_error("Main thread execution timed out");
+        if (!item->started) {
+            // A timed-out queued mutation must never execute later, after the
+            // caller has left (its lambda may also capture stack references).
+            item->cancelled = true;
+            item->ticket->phase.store(kDone, std::memory_order_release);
+            throw std::runtime_error("Main thread execution timed out before starting; queued work cancelled");
+        }
+        // Running SDK work is not safely interruptible. Keep its caller and
+        // captured references alive until it exits. The pipe client's timeout
+        // reports an unknown outcome without replaying; dialog recovery uses a
+        // separate connection and remains available while we wait here.
+        item->cv.wait(lock, [&] { return item->completed; });
     }
 
     if (item->error) {
@@ -292,20 +303,29 @@ LRESULT CALLBACK MainThreadExecutor::WndProc(
 void MainThreadExecutor::RunWorkItem(const std::shared_ptr<WorkItem>& item) {
     {
         std::lock_guard<std::mutex> lock(item->mutex);
-        if (item->completed) return; // timed out (or failed) before it started
+        // Cancelled: its caller timed out while it was queued. Completed: the
+        // shutdown drain already failed it.
+        if (item->cancelled || item->completed) return;
+        item->started = true;
         item->ticket->phase.store(kRunning, std::memory_order_release);
-        SetRunning(item.get());
-        try {
-            item->result = item->work();
-        } catch (const std::exception& e) {
-            item->error = true;
-            item->error_message = e.what();
-        } catch (...) {
-            item->error = true;
-            item->error_message = "Unknown exception on main thread";
-        }
-        SetRunning(nullptr);
-        item->work = {};  // drop the callback and its captures here, on the main thread
+    }
+    SetRunning(item.get());
+    std::string result, error;
+    try {
+        DialogWatch::Guard guard(item->request_id, item->command_type);
+        result = guard.Execute(item->work);
+    } catch (const std::exception& e) {
+        error = e.what();
+    } catch (...) {
+        error = "Unknown exception on main thread";
+    }
+    SetRunning(nullptr);
+    item->work = {};  // drop the callback and its captures here, on the main thread
+    {
+        std::lock_guard<std::mutex> lock(item->mutex);
+        item->result = std::move(result);
+        item->error = !error.empty();
+        item->error_message = std::move(error);
         item->ticket->phase.store(kDone, std::memory_order_release);
         s_completed_.fetch_add(1, std::memory_order_relaxed);
         item->completed = true;
@@ -317,7 +337,8 @@ void MainThreadExecutor::FailWorkItem(const std::shared_ptr<WorkItem>& item,
                                       const char* message) {
     {
         std::lock_guard<std::mutex> lock(item->mutex);
-        if (item->completed) return; // already ran, or the caller timed out
+        // Started items finish on their own; cancelled ones have no waiter.
+        if (item->completed || item->started || item->cancelled) return;
         item->error = true;
         item->error_message = message;
         item->work = {};

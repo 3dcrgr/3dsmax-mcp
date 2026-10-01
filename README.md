@@ -218,6 +218,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `watch_scene` | Live event watcher for interactive sessions |
 | `isolate_and_capture_selected` | Per-selection isolated viewport captures |
 | `main_thread` | Inspect or clean up callbacks and timers running on Max's main/UI thread |
+| `max_dialogs` | Read any dialog blocking Max (Win32 or Qt) and press a chosen button, even while a tool call waits on it |
 
 ### Plugins & introspection
 
@@ -255,6 +256,7 @@ and existing procedural skies use the provider's dome or environment binding.
 | Tool | Description |
 |------|-------------|
 | `assign_controller` | Create and assign a controller to a sub-anim track |
+| `script_controller` | Inspect, validate and apply scripts with typed inputs, frame checks and rollback |
 | `inspect_controller` | Inspect one controller track |
 | `inspect_track_view` | Track View-style controller hierarchy |
 | `set_controller_props` | Edit script text or controller properties |

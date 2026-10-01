@@ -18,7 +18,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from maxmcp import max_client, process_health, tool_response  # noqa: E402
 from maxmcp.helpers import cosmos  # noqa: E402
 from maxmcp.helpers.cosmos_client import CosmosError  # noqa: E402
-from maxmcp.max_client import (MaxBusyError, MaxClient, MaxImportSettlingError,  # noqa: E402
+from maxmcp.max_client import (DialogBlocked, MaxBusyError, MaxClient, MaxImportSettlingError,  # noqa: E402
                                MaxNotRespondingAfterDispatch)
 
 assert Path(cosmos.__file__).resolve().parents[2] == REPO_ROOT, cosmos.__file__
@@ -62,11 +62,13 @@ class FakeClient:
         self.flow = flow
         self.commands = []
         self.probes = []
+        self.fields = []
 
-    def send_command(self, command, cmd_type="maxscript", timeout=None, probe=False):
+    def send_command(self, command, cmd_type="maxscript", timeout=None, request_fields=None, probe=False):
         kind = classify(command)
         self.commands.append((kind, command, timeout))
         self.probes.append(probe)
+        self.fields.append((kind, request_fields))
         self.events.append(("bridge", self.name, kind))
         handler = self.flow.get(kind)
         value = handler() if callable(handler) else handler
@@ -443,6 +445,106 @@ class SettlingTests(_FlowCase):
         self.assertTrue(result["safe_to_edit"])
         self.assertIn("not responding", result["message"])
         self.assertEqual(self.bridge_kinds("operation")[-2:], ["full", "finalize"])
+
+
+SAVE = {"dialog_id": "4242:7", "title": "Missing External Files", "main_thread": True, "during_requests": []}
+
+
+def blocked(kind="maxscript"):
+    return DialogBlocked("rid-" + kind, "maxscript", [dict(SAVE)])
+
+
+class DialogTests(_FlowCase):
+    """BLOCKED_BY_DIALOG (upstream 1.7.5) inside the import: a lost call, never an action failure."""
+
+    def test_browser_action_is_sent_with_quiet_mode_off(self):
+        self.browsers = []
+        self.run_import()
+        self.assertIn(("browser", {"quiet": False}), self.op_client.fields)
+        self.assertIn(("prepare", None), self.op_client.fields)
+
+    def test_dialog_on_browser_action_is_not_an_action_failure(self):
+        self.browsers = []
+        self.flow["browser"] = blocked("browser")
+        result = self.run_import()
+        self.assertEqual(result["state"], "not_imported")
+        self.assertFalse(result["safe_to_edit"])
+        self.assertEqual(result["dialogs"][0]["title"], "Missing External Files")
+        self.assertEqual(result["health"]["code"], "BLOCKED_BY_DIALOG")
+        self.assertIn("max_dialogs", result["next"])
+        self.assertEqual(self.bridge_kinds("operation"), ["browser"])  # nothing sent after it
+        self.assertNotIn(("dispatch",), self.events)
+        self.assertNotIn("Scanline", " ".join(result["warnings"]))
+        self.assertIsNone(max_client.settling_state(PID))  # a dialog hangs nothing
+
+    def test_dialog_on_prepare_keeps_the_pending_restore(self):
+        self.flow["prepare"] = blocked("prepare")
+        result = self.run_import(swap_medit_renderer=True)
+        self.assertEqual(result["state"], "not_imported")
+        self.assertFalse(result["safe_to_edit"])
+        self.assertTrue(result["pending_restore"]["restore_medit_renderer"])
+        self.assertIn("holds the preparation call", result["warnings"][0])
+        self.assertNotIn(("dispatch",), self.events)
+
+    def test_dialog_on_a_poll_ends_detection(self):
+        self.light_results = [blocked("light")]
+        result = self.run_import()
+        self.assertEqual(result["health"]["code"], "BLOCKED_BY_DIALOG")
+        self.assertEqual(result["health"]["dialogs"][0]["title"], "Missing External Files")
+
+    def test_dialog_on_confirm_is_dialog_open_without_restore(self):
+        self.flow["full"] = [blocked("full")]
+        result = self.run_import(swap_medit_renderer=True)
+        self.assertEqual(result["state"], "dialog_open")
+        self.assertFalse(result["safe_to_edit"])
+        self.assertIn("pending_restore", result)
+        self.assertEqual(self.bridge_kinds("operation")[-1], "full")  # finalize never sent
+        self.assertIn("max_dialogs", result["next"])
+        self.assertIsNone(max_client.settling_state(PID))
+
+    def test_dialog_on_finalize_is_never_rerun(self):
+        self.flow["finalize"] = [blocked("finalize")]
+        result = self.run_import(swap_medit_renderer=True)
+        self.assertEqual(result["state"], "dialog_open")
+        self.assertEqual(self.bridge_kinds("operation")[-2:], ["full", "finalize"])
+        self.assertEqual(self.bridge_kinds("operation").count("finalize"), 1)
+        self.assertIn("only if max_dialogs reports that call failed", " ".join(result["warnings"]))
+
+    def test_open_dialog_after_settle_skips_confirm_and_finalize(self):
+        self.op_client._dialog_control = mock.Mock(return_value={"dialogs": [
+            {"dialog_id": "1", "title": "Chaos Cosmos Browser", "main_thread": True},
+            {"dialog_id": "2", "title": "Material Editor - 01 - Default", "main_thread": True},
+            dict(SAVE)]})
+        result = self.run_import()
+        self.assertEqual(result["state"], "dialog_open")
+        self.assertFalse(result["safe_to_edit"])
+        self.assertEqual([d["title"] for d in result["dialogs"]], ["Missing External Files"])
+        self.assertNotIn("full", self.bridge_kinds("operation"))
+        self.assertNotIn("finalize", self.bridge_kinds("operation"))
+        self.assertIn("nothing more was sent", result["next"])
+        self.op_client._dialog_control.assert_called_once_with("status")
+
+    def test_cosmos_and_material_editor_windows_do_not_stop_the_finalize(self):
+        self.op_client._dialog_control = mock.Mock(return_value={"dialogs": [
+            {"dialog_id": "1", "title": "Chaos Cosmos Browser", "main_thread": True},
+            {"dialog_id": "2", "title": "Slate Material Editor", "main_thread": True},
+            {"dialog_id": "3", "title": "Sign in", "main_thread": False}]})
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(self.bridge_kinds("operation")[-2:], ["full", "finalize"])
+
+    def test_operation_client_shares_the_blocked_registry(self):
+        real = MaxClient(transport="pipe", pipe_name=PIPE)
+        op = MaxClient(transport="pipe", pipe_name=PIPE)
+        with mock.patch.object(cosmos, "MaxClient", lambda: op), \
+                mock.patch.object(op, "select_max_instance"), \
+                mock.patch.object(op, "get_selected_max_instance", return_value={"target_pid": PID}), \
+                mock.patch.object(cosmos, "_ensure_browser", side_effect=RuntimeError("stop here")), \
+                mock.patch.object(cosmos, "_context", return_value=(self.service, VRAY)):
+            with self.assertRaises(RuntimeError):
+                cosmos.import_asset(real, ASSET_ID, 0, "current")
+        self.assertIs(op._blocked, real._blocked)
+        self.assertIs(op._blocked_lock, real._blocked_lock)
 
 
 class ReviewFixTests(_FlowCase):

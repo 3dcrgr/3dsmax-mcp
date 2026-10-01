@@ -615,6 +615,7 @@ json Apply(const json& p) {
             resources.push_back(resource);
         }
         json result={{"status","applied"},{"resources",resources},{"properties",proofs},{"verification","typed_readback_matched"},{"transaction","one_native_hold"},{"context",Context()}};
+        DialogWatch::ThrowIfDismissed();
         theHold.Accept(_M("MCP Plugin Edit")); committed=true;
         SceneJournal::AppendSynthetic("plugin_patch",{{"created",resources.size()},{"properties",proofs.size()}});
         ip->RedrawViews(t);

@@ -86,6 +86,45 @@ class HybridHandlerPayloadTests(unittest.TestCase):
             self.assertFalse(error["retryable"])
 
 
+class UpstreamBridgeMessageTests(unittest.TestCase):
+    """Upstream 1.7.5 bridges (2023/2024/2025/2027) send Max's own text, unstructured."""
+
+    UPSTREAM_PARSE = "MAXScript execution failed: -- Syntax error: at ), expected <factor>\n--  In line: (1 +"
+
+    def test_upstream_syntax_error_is_bad_param_never_interrupted(self):
+        for message in (self.UPSTREAM_PARSE, "MAXScript execution failed: "):
+            self.assertEqual(tool_response._classify_error_code(message), ErrorCode.BAD_PARAM)
+            error = tool_response._error_from_exception(RuntimeError(message))
+            self.assertNotEqual(error["code"], ErrorCode.MAXSCRIPT_INTERRUPTED.value)
+
+    def test_merged_bridge_appends_max_text_to_an_interruption(self):
+        message = INTERRUPTED + " Max reported: Unknown system exception"
+        error = tool_response._error_from_exception(_native_error("MAXSCRIPT_INTERRUPTED", message))
+        self.assertEqual(error["code"], ErrorCode.MAXSCRIPT_INTERRUPTED.value)
+
+    def test_dialog_error_keeps_its_code(self):
+        payload = json.dumps({"type": "NativeError", "code": "MAX_DIALOG_ERROR", "retryable": False,
+                              "message": "Max showed an error dialog during this operation; it was acknowledged.",
+                              "details": {"cause": PARSE, "scene_state": "verification_required"}})
+        error = tool_response._error_from_exception(MaxBridgeError(payload, {"success": False}))
+        self.assertEqual(error["code"], "MAX_DIALOG_ERROR")
+        self.assertFalse(error["retryable"])
+
+
+class QuietRequestFieldTests(unittest.TestCase):
+    def _sent(self, **kwargs):
+        client = mock.Mock()
+        client.send_command.return_value = {"result": "ok"}
+        _load_execute(client).execute_maxscript(code="1+1", **kwargs)
+        return client.send_command.call_args.kwargs
+
+    def test_default_is_quiet_without_extra_fields(self):
+        self.assertIsNone(self._sent()["request_fields"])
+
+    def test_quiet_false_is_sent(self):
+        self.assertEqual(self._sent(quiet=False)["request_fields"], {"quiet": False})
+
+
 class PlainMessageClassificationTests(unittest.TestCase):
     """Fallback for unstructured text (e.g. an older bridge): goes through _classify_error_code."""
 
@@ -126,6 +165,18 @@ class QuietListenerSourceTests(unittest.TestCase):
                 # (script, source, quietErrors, fpv, logQuietErrors): log file only, never Listener.
                 self.assertEqual(args[2], "TRUE")
                 self.assertEqual(args[4], "TRUE")
+
+    def test_failures_are_classified_with_max_text_as_fallback(self):
+        for rel_path, function in (
+            ("src/command_dispatcher.cpp", "static std::string HandleMaxScript("),
+            ("include/mcp_bridge/handler_helpers.h", "inline std::string RunMAXScript("),
+        ):
+            text = (self.NATIVE / rel_path).read_text(encoding="utf-8")
+            body = text[text.index(function):]
+            body = body[:body.index("ThrowIfDismissed")]
+            with self.subTest(function=function):
+                self.assertIn("MaxScriptFailureMessage(wcmd, &code, detail)", body)
+                self.assertIn("TempQuietMode", body)  # upstream 1.7.5 quiet mode
 
 
 if __name__ == "__main__":

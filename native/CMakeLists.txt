@@ -77,6 +77,7 @@ set(SOURCES
     src/pipe_server.cpp
     src/command_dispatcher.cpp
     src/main_thread_executor.cpp
+    src/dialog_watch.cpp
     src/bridge_health.cpp
     src/gdiplus_runtime.cpp
     src/scene_journal.cpp
@@ -118,6 +119,43 @@ add_library(mcp_bridge SHARED ${SOURCES})
 target_sources(mcp_bridge PRIVATE src/window_capture.cpp)
 
 add_dependencies(mcp_bridge gen_tool_registry gen_tool_smoke)
+
+# ── Qt dialogs ───────────────────────────────────────────────────
+# qt_dialogs.cpp reads Qt dialogs through the Qt DLLs Max already loads; no Qt
+# binary is shipped. It compiles against vendored headers of the oldest Qt of
+# Max's major version and links import libraries generated from the vendored
+# symbol lists. Regenerate both with scripts/vendor_qt.py.
+if(MAX_VERSION GREATER_EQUAL 2025)
+    set(MCP_QT_VERSION "6.5.3")
+else()
+    set(MCP_QT_VERSION "5.15.1")
+endif()
+set(MCP_QT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/qt/${MCP_QT_VERSION}")
+file(GLOB MCP_QT_DEFS CONFIGURE_DEPENDS "${MCP_QT_DIR}/*.def")
+if(NOT MCP_QT_DEFS)
+    message(FATAL_ERROR "Missing Qt symbol lists in ${MCP_QT_DIR}; run scripts/vendor_qt.py")
+endif()
+set(MCP_QT_IMPORT_LIBS)
+foreach(def ${MCP_QT_DEFS})
+    get_filename_component(module "${def}" NAME_WE)
+    set(import_lib "${CMAKE_CURRENT_BINARY_DIR}/qt/${module}.lib")
+    add_custom_command(
+        OUTPUT "${import_lib}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/qt"
+        COMMAND "${CMAKE_AR}" /nologo "/def:${def}" "/out:${import_lib}" /machine:x64
+        DEPENDS "${def}"
+        COMMENT "Generating ${module} import library"
+        VERBATIM)
+    list(APPEND MCP_QT_IMPORT_LIBS "${import_lib}")
+endforeach()
+add_custom_target(qt_import_libs DEPENDS ${MCP_QT_IMPORT_LIBS})
+add_dependencies(mcp_bridge qt_import_libs)
+target_sources(mcp_bridge PRIVATE src/qt_dialogs.cpp)
+set_source_files_properties(src/qt_dialogs.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${MCP_QT_DIR}/include"
+    COMPILE_DEFINITIONS "QT_NO_VERSION_TAGGING"
+    COMPILE_OPTIONS "/Zc:__cplusplus;/permissive-")
+target_link_libraries(mcp_bridge PRIVATE ${MCP_QT_IMPORT_LIBS})
 
 # Output as .gup
 set_target_properties(mcp_bridge PROPERTIES
@@ -184,11 +222,15 @@ if(MCP_BUILD_TRANSACTION_POLICY_TESTS)
     add_executable(color_value_tests tests/color_value_tests.cpp)
     target_include_directories(color_value_tests PRIVATE include)
     add_test(NAME color_value COMMAND color_value_tests)
+    add_executable(dialog_sweeper_tests tests/dialog_sweeper_tests.cpp src/dialog_watch.cpp)
+    target_include_directories(dialog_sweeper_tests PRIVATE include third_party)
+    target_compile_definitions(dialog_sweeper_tests PRIVATE NOMINMAX _UNICODE UNICODE)
+    add_test(NAME dialog_sweeper COMMAND dialog_sweeper_tests)
 endif()
 
 option(MCP_BUILD_AGENT_VIEWPORT_PROBE "Build optional live agent viewport SDK test harness" OFF)
 if(MCP_BUILD_AGENT_VIEWPORT_PROBE)
-    add_library(agent_viewport_probe SHARED tests/agent_viewport_probe.cpp src/agent_viewport.cpp src/spatial_snapshot.cpp src/scene_journal.cpp src/handlers/viewport_handlers.cpp src/gdiplus_runtime.cpp src/main_thread_executor.cpp)
+    add_library(agent_viewport_probe SHARED tests/agent_viewport_probe.cpp src/agent_viewport.cpp src/spatial_snapshot.cpp src/scene_journal.cpp src/handlers/viewport_handlers.cpp src/gdiplus_runtime.cpp src/main_thread_executor.cpp src/dialog_watch.cpp)
     target_include_directories(agent_viewport_probe PRIVATE include third_party "${MAXSDK_PATH}/include")
     target_compile_definitions(agent_viewport_probe PRIVATE NOMINMAX _UNICODE UNICODE MAX_SDK_VERSION=${MAX_VERSION} MAX_SILENCE_DEPRECATED_MATRIX_BOOL_CTOR)
     target_link_directories(agent_viewport_probe PRIVATE "${MAXSDK_PATH}/lib/x64/Release")

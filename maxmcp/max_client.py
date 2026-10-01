@@ -19,10 +19,41 @@ DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_PIPE_NAME = r"\\.\pipe\3dsmax-mcp"
 MCP_PIPE_ENV = "MCP_MAX_PIPE"
+# A call still unanswered after this long is checked for a blocking dialog.
+DIALOG_CHECK_AFTER = 1.0
+DIALOG_POLL_INTERVAL = 1.0
+MAX_BLOCKED_CALLS = 16
 
 
 class RequestOutcomeUnknown(Exception):
     """The request reached Max but its response was lost; never replay it."""
+
+
+class DialogBlocked(Exception):
+    """A call is waiting on a modal dialog in Max and keeps running there.
+
+    The client keeps its connection and reports the eventual result through
+    blocked_calls(); the call must not be repeated.
+    """
+
+    code = "BLOCKED_BY_DIALOG"
+    retryable = False
+
+    def __init__(self, request_id: str, command: str, dialogs: list[dict[str, Any]]) -> None:
+        self.request_id = request_id
+        self.dialogs = dialogs
+        titles = ", ".join(repr(d.get("title", "")) for d in dialogs) or "a dialog"
+        message = (f"3ds Max is waiting on {titles}. The call is still running inside Max "
+                   "and finishes after the dialog is answered.")
+        self.bridge_message = json.dumps({
+            "type": "DialogBlocked", "code": self.code, "retryable": False, "message": message,
+            "hint": ("Read the dialog. If the user has authorized you to proceed unattended, answer it with "
+                     "max_dialogs(action='respond', dialog_id, expected_dialog, button) as the task intends; "
+                     "otherwise ask the user which button to press. Do not repeat the call: max_dialogs "
+                     "reports its result after the dialog closes."),
+            "details": {"request_id": request_id, "command": command, "dialogs": dialogs},
+        })
+        super().__init__(message)
 
 
 class MaxHealthError(Exception):
@@ -165,8 +196,6 @@ _kernel32.GetNamedPipeServerProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTE
 _INVALID_HANDLE = wintypes.HANDLE(-1).value
 
 INSTANCE_LOCK_TIMEOUT = 10.0
-_POLL_MIN_S = 0.002
-_POLL_MAX_S = 0.05
 _REDIAGNOSE_S = 15.0
 _BLOCKED_CONFIRM_S = 20.0
 _CPU_SAMPLE_S = 1.0
@@ -175,11 +204,17 @@ _RECHECK_SAMPLE_S = 0.25
 _PROBE_CMD_TYPES = frozenset({"ping", "health"})
 # Answered on a bridge pipe thread without touching Max's main thread. Sent on the
 # control channel so a stuck request holding the pipe lock cannot delay them.
-_MAIN_THREAD_FREE_CMD_TYPES = frozenset({"health"})
+_MAIN_THREAD_FREE_CMD_TYPES = frozenset({"health", "native:max_dialogs"})
+# Separate connection: bypasses the pipe lock, the hung-PID latch and the settling guard.
 _CONTROL_CMD_TYPES = frozenset({"native:render_cancel", "native:render_cancel_capture",
                                 "native:capture_screen"}) | _MAIN_THREAD_FREE_CMD_TYPES
 # Native ExecuteSync cancels work the main thread never started after 120 s.
 _QUEUE_TIMEOUT_MARKER = "main thread execution timed out"
+# Modeless tool windows, never dialogs: the auto dialog check neither reports nor
+# inspects them (messaging a Cosmos browser on a deadlocked importer thread blocks).
+# Bridges from this fork exclude them natively; this covers older bridges.
+_NOT_DIALOG_TITLE = re.compile(r"^(?:Chaos Cosmos Browser$|Material Editor\b|Slate Material Editor\b|"
+                               r"AGENT VIEWPORT\b|Floating Viewport\b)")
 
 
 def _grace(timeout: float) -> float:
@@ -197,6 +232,61 @@ class MaxBridgeError(Exception):
         self.bridge_message = message
         self.bridge_response = response
         super().__init__(f"MAXScript error: {message}")
+
+
+class _PipeReader:
+    """Reads one newline-terminated response on its own thread.
+
+    The caller may stop waiting while Max sits in a modal dialog; the reader
+    then owns the pipe handle and closes it once the response arrives.
+    """
+
+    def __init__(self, handle: int) -> None:
+        self.handle = handle
+        self.done = threading.Event()
+        self.data = b""
+        self.error: BaseException | None = None
+        self._detached = False
+        self._lock = threading.Lock()
+        threading.Thread(target=self._run, name="max-pipe-reader", daemon=True).start()
+
+    def _run(self) -> None:
+        response = bytearray()
+        buf = ctypes.create_string_buffer(65536)
+        try:
+            while True:
+                bytes_read = wintypes.DWORD()
+                ok = _kernel32.ReadFile(self.handle, buf, len(buf), ctypes.byref(bytes_read), None)
+                if bytes_read.value > 0:
+                    response.extend(buf.raw[:bytes_read.value])
+                    if b"\n" in response:
+                        self.data = bytes(response)
+                        return
+                if not ok:
+                    err = ctypes.get_last_error()
+                    if err == _ERROR_BROKEN_PIPE:
+                        raise BrokenPipeError("Pipe closed while reading response.")
+                    raise ConnectionError(f"Failed reading from pipe: Win32 error {err}")
+                if bytes_read.value == 0:
+                    raise BrokenPipeError("Pipe closed before response terminator.")
+        except BaseException as exc:
+            self.error = exc
+        finally:
+            with self._lock:
+                self.done.set()
+                if self._detached:
+                    _kernel32.CloseHandle(self.handle)
+
+    def detach(self) -> None:
+        with self._lock:
+            self._detached = True
+            if self.done.is_set():
+                _kernel32.CloseHandle(self.handle)
+
+    def result(self) -> bytes:
+        if self.error is not None:
+            raise self.error
+        return self.data
 
 
 class MaxClient:
@@ -224,6 +314,9 @@ class MaxClient:
         self._bound_target: dict[str, Any] | None = None
         self._inflight: dict[str, Any] | None = None
         self._hung_pids: dict[int, dict[str, Any]] = {}
+        self._blocked: dict[str, dict[str, Any]] = {}
+        self._blocked_lock = threading.Lock()
+        self._no_dialog_watch: set[str] = set()  # pipes whose bridge has no native:max_dialogs
         env_pipe = os.environ.get(MCP_PIPE_ENV)
         env_pid = os.environ.get("MCP_MAX_PID")
         if env_pid and (not env_pid.isdecimal() or int(env_pid) <= 0):
@@ -243,7 +336,7 @@ class MaxClient:
         response = getattr(self._local, "last_response", None)
         if isinstance(response, dict):
             meta = response.get("meta") if isinstance(response.get("meta"), dict) else {}
-            return {
+            transport = {
                 "transport": meta.get("transport"),
                 "requested_transport": meta.get("requestedTransport"),
                 "request_id": response.get("requestId"),
@@ -252,6 +345,9 @@ class MaxClient:
                 "fallback_error": meta.get("fallbackError"),
                 **meta.get("target", {}),
             }
+            if meta.get("openDialogs"):
+                transport["open_dialogs"] = meta["openDialogs"]
+            return transport
         error = getattr(self._local, "last_error", None)
         if isinstance(error, dict):
             return error
@@ -630,12 +726,14 @@ class MaxClient:
                 f"Win32 error {wait_err}"
             )
 
-    def _send_control_command(self, command: str, cmd_type: str, timeout: Optional[float]) -> dict[str, Any]:
+    def _send_control_command(self, command: str, cmd_type: str, timeout: Optional[float],
+                              probe: bool = False) -> dict[str, Any]:
         """Bypass an in-flight request's pipe lock, without changing Max targets.
 
-        Only cancellation, pure desktop capture and the main-thread-free health
-        probe use this channel. It cannot fall back to TCP or re-resolve another
-        Max after a claim/environment change.
+        Cancellation, dialog recovery, pure desktop capture and the main-thread-free
+        health probe use this channel. It cannot fall back to TCP or re-resolve another
+        Max after a claim/environment change. probe=True drops a read-only request at
+        its deadline instead of waiting out a stuck bridge.
         """
         acquired = self._pipe_lock.acquire(blocking=False)
         try:
@@ -649,7 +747,7 @@ class MaxClient:
             control._bound_target = target
             self.clear_last_response()
             try:
-                response = control.send_command(command, cmd_type=cmd_type, timeout=timeout)
+                response = control.send_command(command, cmd_type=cmd_type, timeout=timeout, probe=probe)
                 if acquired and self._bound_target is None:
                     self._bound_target = target
                 return response
@@ -668,15 +766,17 @@ class MaxClient:
         command: str,
         cmd_type: str = "maxscript",
         timeout: Optional[float] = None,
+        request_fields: Optional[dict[str, Any]] = None,
         *,
         probe: bool = False,
     ) -> dict[str, Any]:
         """Send a command to 3ds Max and return the parsed JSON response.
 
+        request_fields adds handler options beside the command, e.g. quiet.
         probe=True marks a read-only command that may be dropped at its deadline.
         """
         if cmd_type in _CONTROL_CMD_TYPES and self.transport != "tcp" and not self._control_channel:
-            return self._send_control_command(command, cmd_type, timeout)
+            return self._send_control_command(command, cmd_type, timeout, probe=probe)
         effective_timeout = timeout or self.timeout
         request_id = uuid4().hex
         started_at = time.perf_counter()
@@ -685,6 +785,7 @@ class MaxClient:
         self.clear_last_response()
 
         request = json.dumps({
+            **(request_fields or {}),
             "command": command,
             "type": cmd_type,
             "requestId": request_id,
@@ -792,8 +893,9 @@ class MaxClient:
                                 "Pipe write returned 0 bytes written."
                             )
 
-                    reply = self._read_pipe_response(handle, deadline, timeout, pid,
-                                                     probe=probe or cmd_type in _PROBE_CMD_TYPES)
+                    reply = self._await_response(handle, request_id or "", cmd_type or "", deadline=deadline,
+                                                 timeout=timeout, pid=pid,
+                                                 probe=probe or cmd_type in _PROBE_CMD_TYPES)
                     if pid:
                         self._hung_pids.pop(pid, None)  # Max answered, so any old verdict is stale
                     self._check_queue_timeout(reply, pid)
@@ -817,79 +919,20 @@ class MaxClient:
         finally:
             self._pipe_lock.release()
 
-    def _read_pipe_response(self, handle: Any, deadline: float, timeout: float, pid: int | None,
-                            probe: bool = False) -> bytes:
-        """Poll for the newline-terminated reply without ever blocking in ReadFile.
+    def _release_reader(self, reader: _PipeReader) -> None:
+        """Stop waiting on a reply without closing its handle under a pending ReadFile.
 
-        Past the deadline (+ grace) the target is diagnosed: healthy long work keeps
-        waiting so its real result still arrives; an exited or confirmed-blocked Max
-        is abandoned with MaxNotRespondingAfterDispatch. A read-only probe is dropped
-        at its deadline.
+        CloseHandle on a synchronous pipe handle waits for the reader's ReadFile, i.e.
+        for Max to answer. The reader closes the handle once its read returns.
         """
-        response_data = bytearray()
-        buf = ctypes.create_string_buffer(65536)
-        delay = _POLL_MIN_S
-        next_check = deadline if probe else deadline + _grace(timeout)
-        blocked_since: float | None = None
-        while True:
-            available = wintypes.DWORD()
-            if not _kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
-                err = ctypes.get_last_error()
-                if err == _ERROR_BROKEN_PIPE:
-                    raise BrokenPipeError(
-                        "Pipe closed before response terminator."
-                        if response_data else "Pipe closed while reading response."
-                    )
-                raise ConnectionError(f"Failed reading from pipe: Win32 error {err}")
+        self._pipe_handle = None
+        reader.detach()
 
-            if available.value:
-                bytes_read = wintypes.DWORD()
-                ok = _kernel32.ReadFile(
-                    handle, buf, min(available.value, len(buf)), ctypes.byref(bytes_read), None
-                )
-                if bytes_read.value > 0:
-                    response_data.extend(buf.raw[:bytes_read.value])
-                    if b"\n" in response_data:
-                        return bytes(response_data)
-                if not ok:
-                    err = ctypes.get_last_error()
-                    if err == _ERROR_BROKEN_PIPE:
-                        raise BrokenPipeError("Pipe closed while reading response.")
-                    raise ConnectionError(f"Failed reading from pipe: Win32 error {err}")
-                if bytes_read.value == 0:
-                    raise BrokenPipeError("Pipe closed before response terminator.")
-                delay = _POLL_MIN_S
-                continue
-
-            now = time.perf_counter()
-            if now >= next_check:
-                if probe:
-                    self._abandon_probe(pid, timeout)
-                if not pid:
-                    next_check = now + _REDIAGNOSE_S
-                    continue
-                process = diagnose_process(pid, _CPU_SAMPLE_S)
-                state = process.get("state")
-                now = time.perf_counter()
-                if state == "exited" or (state == "blocked" and blocked_since is not None
-                                         and now - blocked_since >= _BLOCKED_CONFIRM_S):
-                    self._abandon_request(pid, process, blocked_since)
-                if state == "blocked":
-                    if blocked_since is None:
-                        blocked_since = now
-                    next_check = now + _BLOCKED_CONFIRM_S
-                else:
-                    blocked_since = None
-                    next_check = now + _REDIAGNOSE_S
-                continue
-
-            time.sleep(delay)
-            delay = min(delay * 2, _POLL_MAX_S)
-
-    def _abandon_request(self, pid: int, process: dict[str, Any], blocked_since: float | None) -> None:
-        """Close the pipe and raise MaxNotRespondingAfterDispatch (never replay)."""
+    def _abandon_request(self, pid: int, process: dict[str, Any], blocked_since: float | None,
+                         reader: _PipeReader) -> None:
+        """Give up the connection and raise MaxNotRespondingAfterDispatch (never replay)."""
         inflight = self._inflight_snapshot()
-        self._close_pipe_handle()
+        self._release_reader(reader)
         details = {"inflight": inflight, "process": process, "request_sent": True}
         running = (f"request '{inflight['cmd_type']}' running for {inflight['running_s']:.0f} s"
                    if inflight else "request in flight")
@@ -908,11 +951,16 @@ class MaxClient:
             details,
         )
 
-    def _abandon_probe(self, pid: int | None, timeout: float) -> None:
-        """Drop a read-only probe that missed its deadline (safe: it changes nothing)."""
+    def _abandon_probe(self, pid: int | None, timeout: float, reader: _PipeReader) -> None:
+        """Drop a read-only probe that missed its deadline (safe: it changes nothing).
+
+        Returns without raising when the reply arrived during the diagnosis.
+        """
         process = diagnose_process(pid, _CPU_SAMPLE_S) if pid else None
+        if reader.done.is_set():
+            return
         inflight = self._inflight_snapshot()
-        self._close_pipe_handle()
+        self._release_reader(reader)
         state = (process or {}).get("state")
         details = {"inflight": inflight, "process": process, "request_sent": True}
         label = self._label(pid, (inflight or {}).get("target_pipe"))
@@ -965,6 +1013,161 @@ class MaxClient:
             "Do not retry yet. " + HANG_ADVICE,
             details,
         )
+
+    def _await_response(self, handle: int, request_id: str, cmd_type: str, *, deadline: float,
+                        timeout: float, pid: int | None, probe: bool = False) -> bytes:
+        """Wait for the reply on a reader thread; this thread never blocks in ReadFile.
+
+        Precedence while waiting (the pre-send refusals - pipe lock, hung-PID latch,
+        settling guard - already passed, so the request was written):
+        1. From DIALOG_CHECK_AFTER, every DIALOG_POLL_INTERVAL (not on the control
+           channel): a dialog holding this request raises DialogBlocked
+           (BLOCKED_BY_DIALOG). Max keeps running the call; blocked_calls() reports it.
+        2. From the deadline (probes) or deadline + grace: a probe is dropped
+           (MAX_BUSY / MAX_NOT_RESPONDING); anything else is diagnosed and keeps
+           waiting while Max is busy or responsive, and is abandoned with
+           MaxNotRespondingAfterDispatch once Max exited or stayed blocked.
+        A reply that arrives meanwhile always wins. Every wait is bounded, the
+        control channel's included.
+        """
+        reader = _PipeReader(handle)
+        watch = bool(request_id) and not self._control_channel
+        next_dialog = time.perf_counter() + DIALOG_CHECK_AFTER if watch else float("inf")
+        next_check = deadline if probe else deadline + _grace(timeout)
+        blocked_since: float | None = None
+        while not reader.done.wait(max(0.0, min(next_dialog, next_check) - time.perf_counter())):
+            if time.perf_counter() >= next_dialog:
+                dialogs = self._dialogs_blocking(request_id)
+                if reader.done.is_set():
+                    break
+                if dialogs:
+                    # Max keeps running the call; its connection now belongs to the reader.
+                    self._release_reader(reader)
+                    with self._blocked_lock:
+                        while len(self._blocked) >= MAX_BLOCKED_CALLS:
+                            self._blocked.pop(next(iter(self._blocked)))
+                        self._blocked[request_id] = {"command": cmd_type, "reader": reader,
+                                                     "blocked_at": time.perf_counter()}
+                    raise DialogBlocked(request_id, cmd_type, dialogs)
+                next_dialog = time.perf_counter() + DIALOG_POLL_INTERVAL
+            now = time.perf_counter()
+            if now < next_check:
+                continue
+            if probe:
+                self._abandon_probe(pid, timeout, reader)
+                continue  # the reply arrived during the diagnosis
+            if not pid:
+                next_check = now + _REDIAGNOSE_S
+                continue
+            process = diagnose_process(pid, _CPU_SAMPLE_S)
+            if reader.done.is_set():
+                break
+            state = process.get("state")
+            now = time.perf_counter()
+            if state == "exited" or (state == "blocked" and blocked_since is not None
+                                     and now - blocked_since >= _BLOCKED_CONFIRM_S):
+                self._abandon_request(pid, process, blocked_since, reader)
+            if state == "blocked":
+                if blocked_since is None:
+                    blocked_since = now
+                next_check = now + _BLOCKED_CONFIRM_S
+            else:
+                blocked_since = None
+                next_check = now + _REDIAGNOSE_S
+        return reader.result()
+
+    def _dialog_control(self, action: str) -> dict[str, Any]:
+        """Query the dialog monitor over the control channel, keeping this call's metadata.
+
+        A read-only probe: dropped at its 3 s deadline. A bridge without the dialog
+        monitor is remembered per pipe and not asked again.
+        """
+        pipe = (self._bound_target or {}).get("target_pipe")
+        if pipe and pipe in self._no_dialog_watch:
+            return {}
+        saved = getattr(self._local, "last_response", None), getattr(self._local, "last_error", None)
+        try:
+            response = self._send_control_command(json.dumps({"action": action}), "native:max_dialogs", 3.0,
+                                                  probe=True)
+            result = json.loads(response.get("result") or "{}")
+            return result if isinstance(result, dict) else {}
+        except MaxBridgeError as exc:
+            if pipe and "unknown command type" in exc.bridge_message.lower():
+                self._no_dialog_watch.add(pipe)
+            raise
+        finally:
+            self._local.last_response, self._local.last_error = saved
+
+    def _dialogs_blocking(self, request_id: str) -> list[dict[str, Any]]:
+        """Main-thread dialogs holding this request: its own, or any while it is queued."""
+        try:
+            status = self._dialog_control("status")
+            dialogs = [d for d in status.get("dialogs", []) if d.get("main_thread")]
+            state = next((r.get("state") for r in status.get("requests", [])
+                          if r.get("request_id") == request_id), None)
+            if state == "running":
+                dialogs = [d for d in dialogs if request_id in d.get("during_requests", [])]
+            elif state != "queued":
+                return []
+            tool_windows = [d for d in dialogs if _NOT_DIALOG_TITLE.match(str(d.get("title", "")))]
+            dialogs = [d for d in dialogs if d not in tool_windows]
+            if not dialogs:
+                return []
+            if tool_windows:
+                return dialogs  # inspect would read those windows too: report the summaries only
+            wanted = {d.get("dialog_id") for d in dialogs}
+            inspected = self._dialog_control("inspect").get("dialogs", [])
+            return [d for d in inspected if d.get("dialog_id") in wanted] or dialogs
+        except Exception:
+            return []
+
+    def blocked_request_ids(self) -> list[str]:
+        """Request ids of BLOCKED_BY_DIALOG calls still waiting in Max. Never consumes results."""
+        with self._blocked_lock:
+            return [rid for rid, entry in self._blocked.items() if not entry["reader"].done.is_set()]
+
+    def blocked_calls(self, wait: float = 0.0) -> list[dict[str, Any]]:
+        """Report calls that returned BLOCKED_BY_DIALOG; completed ones are reported once.
+
+        wait: seconds to wait for the blocked calls to complete. Waiting stops
+        early when one of them is blocked by a dialog again.
+        """
+        deadline = time.perf_counter() + max(0.0, wait)
+        while True:
+            with self._blocked_lock:
+                pending = list(self._blocked.items())
+            waiting = [(rid, entry) for rid, entry in pending if not entry["reader"].done.is_set()]
+            if not waiting or time.perf_counter() >= deadline:
+                break
+            waiting[0][1]["reader"].done.wait(min(0.5, max(0.0, deadline - time.perf_counter())))
+            if any(self._dialogs_blocking(rid) for rid, entry in waiting if not entry["reader"].done.is_set()):
+                break
+        report = []
+        for request_id, entry in pending:
+            reader = entry["reader"]
+            item: dict[str, Any] = {"request_id": request_id, "command": entry["command"]}
+            if not reader.done.is_set():
+                item.update(status="waiting", waiting_s=round(time.perf_counter() - entry["blocked_at"], 1))
+                report.append(item)
+                continue
+            with self._blocked_lock:
+                self._blocked.pop(request_id, None)
+            try:
+                response = self._parse_response(reader.result(), request_id, entry["blocked_at"])
+                raw = response.get("result", "")
+                try:
+                    value = json.loads(raw) if isinstance(raw, str) and raw[:1] in ("{", "[") else raw
+                except ValueError:
+                    value = raw
+                item.update(status="completed", ok=True, result=value)
+            except MaxBridgeError as exc:
+                item.update(status="completed", ok=False, error=exc.bridge_message)
+            except Exception as exc:
+                item.update(status="completed", ok=False, error=str(exc))
+            if _QUEUE_TIMEOUT_MARKER in str(item.get("error", "")).lower():
+                item["executed"] = False  # the bridge cancelled it before it started
+            report.append(item)
+        return report
 
     # ── TCP transport (legacy) ───────────────────────────────────
     def _send_via_tcp(self, request: str, timeout: float) -> bytes:

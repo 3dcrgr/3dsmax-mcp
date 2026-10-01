@@ -97,8 +97,8 @@ public:
     // Health bookkeeping, kept apart from WorkItem so the pending list never
     // owns a WorkItem: destroying one destroys its callback and captures, which
     // must not happen on a pipe thread under s_stats_mutex_. phase is atomic
-    // because RunWorkItem holds the item mutex for the whole callback and
-    // GetHealth must never block on it.
+    // so GetHealth never takes an item mutex: it must answer while Max is hung,
+    // whatever any waiter or the main thread is doing with the item.
     struct Ticket {
         WorkLabel label;
         std::chrono::steady_clock::time_point posted_at{};
@@ -109,8 +109,11 @@ public:
         std::function<std::string()> work;
         std::string result;
         bool completed = false;
+        bool started = false;
+        bool cancelled = false;
         bool error = false;
         std::string error_message;
+        std::string request_id, command_type;
         std::mutex mutex;
         std::condition_variable cv;
         std::shared_ptr<Ticket> ticket = std::make_shared<Ticket>();
@@ -125,8 +128,9 @@ private:
     static long long SteadyNowMs();
     // Thread-pool timer callback: posts one heartbeat beat to the executor window.
     static void CALLBACK HeartbeatTimerProc(PTP_CALLBACK_INSTANCE, PVOID context, PTP_TIMER);
-    // Completes an item with an error and wakes its waiter. No-op if the item
-    // already finished (or timed out), so it is safe to call twice.
+    // Completes a queued item with an error and wakes its waiter. No-op if the
+    // item already started, finished, or was cancelled, so it is safe to call
+    // twice and never touches work that is running.
     static void FailWorkItem(const std::shared_ptr<WorkItem>& item, const char* message);
     // Main thread only. Fails s_deferred_ and any WM_MCP_EXECUTE still queued,
     // deleting the heap shared_ptr each message owns (DestroyWindow would

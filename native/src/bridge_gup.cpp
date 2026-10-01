@@ -4,6 +4,8 @@
 #include "mcp_bridge/gdiplus_runtime.h"
 #include "mcp_bridge/scene_journal.h"
 #include "mcp_bridge/agent_viewport.h"
+#include "mcp_bridge/dialog_watch.h"
+#include "mcp_bridge/qt_dialogs.h"
 #include <maxapi.h>
 #include <notify.h>
 #include <shlobj.h>
@@ -187,6 +189,8 @@ DWORD MCPBridgeGUP::Start() {
     instance_id_ = "pid-" + std::to_string(GetCurrentProcessId());
     pipe_name_utf8_ = "\\\\.\\pipe\\3dsmax-mcp-" + instance_id_;
 
+    // Before the pipe: control requests rely on the monitor and its lane.
+    DialogWatch::Start({QtDialogs::Snapshot, QtDialogs::Click});
     StartPipe();
     SceneJournal::Register();
 
@@ -214,6 +218,7 @@ void MCPBridgeGUP::Stop() {
     NativeHandlers::UnregisterRenderNotifications();
 
     StopPipe();
+    DialogWatch::Stop();
     GdiPlusRuntime::Shutdown();
     UnregisterInstance();
     executor_.Shutdown();

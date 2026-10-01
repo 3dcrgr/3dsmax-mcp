@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 
 from .. import process_health
-from ..max_client import (HANG_ADVICE, MaxClient, MaxHealthError, RequestOutcomeUnknown, mark_settling,
-                          release_settling)
+from ..max_client import (_NOT_DIALOG_TITLE, HANG_ADVICE, DialogBlocked, MaxClient, MaxHealthError,
+                          RequestOutcomeUnknown, mark_settling, release_settling)
 
 from .cosmos_client import Cosmos, CosmosError, asset_id as normalize_id
 
@@ -40,13 +40,23 @@ _BROWSER_MESSAGE_TIMEOUT_MS = 500
 # True when the Compact or the Slate Material Editor is open (both render slots with renderers.medit).
 _EDITOR_OPEN = "((try(MatEditor.isOpen())catch(true)) or (try(SME.isOpen())catch(false)))"
 _WAIT_ADVICE = HANG_ADVICE + " Do not open or close the Material Editor meanwhile."
+# A call that did not come back: Max hung or busy, outcome unknown, or held by a
+# modal dialog (BLOCKED_BY_DIALOG: it keeps running and finishes once answered).
+_LOST = (MaxHealthError, RequestOutcomeUnknown, DialogBlocked)
+_DIALOG_ADVICE = ("Read the dialog with max_dialogs(action='inspect') and ask the user how to answer it (answer it "
+                  "yourself only when the user authorized unattended work). max_dialogs reports the waiting call's "
+                  "result once the dialog is closed. Do not open or close the Material Editor meanwhile.")
+# The browser action was verified live with Max's quiet mode off; quiet mode is
+# the bridge's default since 1.7.5 and may stop an action from showing its UI.
+_NOT_QUIET = {"quiet": False}
 
 
-def _max(client, command, cmd_type="maxscript", timeout=None, probe=False):
+def _max(client, command, cmd_type="maxscript", timeout=None, probe=False, request_fields=None):
+    extra = {"request_fields": request_fields} if request_fields else {}
     if probe:  # read-only: may be dropped at its deadline instead of waiting out a stall
-        response = client.send_command(command, cmd_type=cmd_type, timeout=timeout, probe=True)
+        response = client.send_command(command, cmd_type=cmd_type, timeout=timeout, probe=True, **extra)
     else:
-        response = client.send_command(command, cmd_type=cmd_type, timeout=timeout)
+        response = client.send_command(command, cmd_type=cmd_type, timeout=timeout, **extra)
     result = response.get("result", {})
     return json.loads(result) if isinstance(result, str) else result
 
@@ -675,7 +685,7 @@ def _ensure_browser(client, pid, renderer, state):
     call runs the renderer's Cosmos browser action, then an OS-level wait.
     Returns (record, warnings, state); record["refused"] when the fresh check
     found a hung separate-thread browser (no action sent). Lost calls and transport
-    errors (MaxHealthError, RequestOutcomeUnknown, OSError) propagate.
+    errors (MaxHealthError, RequestOutcomeUnknown, DialogBlocked, OSError) propagate.
     """
     had_other = any(not w["main_thread"] for w in state.get("windows") or [])
     action = None
@@ -689,8 +699,8 @@ def _ensure_browser(client, pid, renderer, state):
         state = _wait_main_browser(pid)
     else:
         try:
-            action = _max(client, _open_browser_script(renderer))
-        except (MaxHealthError, RequestOutcomeUnknown, OSError):
+            action = _max(client, _open_browser_script(renderer), request_fields=_NOT_QUIET)
+        except _LOST + (OSError,):
             raise
         except Exception as exc:
             action = {"found": False, "executed": False, "error": str(exc)}
@@ -799,7 +809,7 @@ def _wait_import(client, asset, before, renderer, pid, timeout=_DETECT_TIMEOUT_S
                 probe = _asset_snapshot(client, asset, light=True, renderer=renderer,
                                         scan_classes=elapsed >= 4 and timing["polls"] % 2 == 0,
                                         timeout=_POLL_TIMEOUT_S, probe=True, known=before.get("known"))
-            except (MaxHealthError, RequestOutcomeUnknown) as exc:
+            except _LOST as exc:
                 timing["error"] = exc
                 timing["after_s"] = round(time.monotonic() - started, 1)
                 return timing
@@ -998,16 +1008,32 @@ def _slot_record(response, prep, fin, warnings, ran):
 
 def _health_failure(exc):
     details = getattr(exc, "details", None) or {}
-    return {"code": getattr(exc, "code", None), "message": str(exc),
-            "process": details.get("process"), "request_sent": details.get("request_sent")}
+    failure = {"code": getattr(exc, "code", None), "message": str(exc),
+               "process": details.get("process"), "request_sent": details.get("request_sent")}
+    if isinstance(exc, DialogBlocked):  # still running in Max, waiting on the dialog
+        failure.update(request_sent=True, request_id=exc.request_id, dialogs=exc.dialogs)
+    return failure
+
+
+def _open_main_dialogs(client):
+    """Dialogs holding Max's main thread, from the bridge's dialog monitor (window-manager
+    state only, over the control channel; nothing reaches Max's main thread). [] when the
+    bridge has no monitor. Cosmos browser, Material Editor and viewport windows never count."""
+    try:
+        status = client._dialog_control("status")
+        return [d for d in status.get("dialogs", []) if isinstance(d, dict) and d.get("main_thread")
+                and not _NOT_DIALOG_TITLE.match(str(d.get("title", "")))]
+    except Exception:
+        return []
 
 
 def _prepare_failed(base, pid, exc, restore_medit_renderer, swap=True, step="preparation"):
     """A pre-dispatch call was sent but its result was lost: nothing was dispatched.
     preparation: the selection may be cleared (and, with swap, medit switched to
     Scanline). browser: only the Cosmos browser action may have run."""
-    lost = isinstance(exc, (MaxHealthError, RequestOutcomeUnknown))
-    if lost:
+    lost = isinstance(exc, _LOST)
+    dialog = isinstance(exc, DialogBlocked)
+    if lost and not dialog:  # a dialog does not hang windows: nothing for the guard to watch
         windows = _guard_windows(pid, None)
         if windows:
             mark_settling(pid, windows, "a Cosmos import", "%s call lost" % step, _SETTLING_GUARD_S)
@@ -1022,9 +1048,14 @@ def _prepare_failed(base, pid, exc, restore_medit_renderer, swap=True, step="pre
                        _SLOT_ACTIVE_RESTORE,
                        "Once Max responds, run pending_restore.maxscript once (it reports nothing_to_restore "
                        "if nothing was switched). " if restore_medit_renderer else ""))
+    if dialog:
+        warning = ("A dialog in Max holds the %s call; it runs once the dialog is answered. " % step) + warning
     response = {**base, "state": "not_imported", "dispatched": False, "safe_to_edit": not lost,
                 "message": str(exc), "warnings": [warning],
-                "next": "Nothing was imported. " + (_WAIT_ADVICE if lost else "Retry the import.")}
+                "next": "Nothing was imported. " + (_DIALOG_ADVICE if dialog else
+                                                    _WAIT_ADVICE if lost else "Retry the import.")}
+    if dialog:
+        response["dialogs"] = exc.dialogs
     if lost:
         response["health"] = _health_failure(exc)
     if restore_medit_renderer:
@@ -1061,6 +1092,9 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
             return _busy_refusal({**result, "renderer": importer["renderer"], "max_pid": pid}, pid, browser_state,
                                  pre, _browser_record(browser_state, False))
         operation_client = MaxClient()
+        shared = getattr(client, "_blocked", None)
+        if isinstance(shared, dict):  # max_dialogs (server client) reports this import's interrupted calls
+            operation_client._blocked, operation_client._blocked_lock = shared, client._blocked_lock
         operation_client.select_max_instance(pid)
         client = operation_client
         if client.get_selected_max_instance().get("target_pid") != pid:
@@ -1070,7 +1104,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         base = {**result, "renderer": importer["renderer"], "max_pid": pid, "repeat_safe": False}
         try:
             browser, warnings, ensured_state = _ensure_browser(client, pid, importer["renderer"], browser_state)
-        except (MaxHealthError, RequestOutcomeUnknown) as exc:
+        except _LOST as exc:
             if (getattr(exc, "details", None) or {}).get("request_sent") is False:
                 raise  # nothing was sent, so nothing changed
             return {**_prepare_failed(base, pid, exc, restore_medit_renderer, step="browser"),
@@ -1085,7 +1119,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         swap_mode = "requested" if swap_medit_renderer else ("fallback" if swap else "off")
         try:
             prepared = _max(client, _prepare_script(asset, swap))
-        except (MaxHealthError, RequestOutcomeUnknown, ValueError) as exc:
+        except _LOST + (ValueError,) as exc:
             if (getattr(exc, "details", None) or {}).get("request_sent") is False:
                 raise  # nothing was sent, so nothing changed
             return {**_prepare_failed(base, pid, exc, restore_medit_renderer, swap), "cosmos_browser": browser}
@@ -1123,7 +1157,13 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         also = ((" and Material Editor renderer" if restore_medit else "")
                 + (" and Material Editor slot" if slot_prep.get("keep") else ""))
         quiet = bool(settle.get("quiet") or settle.get("windows_quiet"))
-        after = finished = lost = None
+        after = finished = lost = dialog = None
+        if quiet:
+            # A modal dialog keeps the windows responsive, so settle passes; confirm and
+            # restore would then run inside the dialog's loop, mid-import. Wait for it.
+            open_dialogs = _open_main_dialogs(client)
+            if open_dialogs:
+                dialog, quiet = {"dialogs": open_dialogs, "step": "confirm", "sent": False}, False
         if quiet:
             if not settle.get("quiet"):
                 warnings.append("Max's windows respond, but its CPU was still busy (%s cores) after %s s; "
@@ -1133,6 +1173,9 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                 after = _asset_snapshot(client, asset, known=before.get("known"))
                 step = "restore"
                 finished = _max(client, pending["maxscript"])
+            except DialogBlocked as exc:  # still running in Max; finishes once the dialog is answered
+                health, failure, quiet = _health_failure(exc), str(exc), False
+                dialog = {"dialogs": exc.dialogs, "step": step, "sent": True}
             except (MaxHealthError, RequestOutcomeUnknown) as exc:  # Max stopped responding again
                 health, failure, lost, quiet = _health_failure(exc), str(exc), step, False
             except Exception as exc:
@@ -1148,7 +1191,8 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
             response["message"] = failure
         if not quiet:
             # Refuse further requests (nothing sent) while a remembered window stays hung.
-            windows = _guard_windows(pid, settle)
+            # A dialog hangs nothing: max_dialogs and the user answer it.
+            windows = _guard_windows(pid, settle) if dialog is None else None
             if windows:
                 mark_settling(pid, windows, "a Cosmos import", process_health.describe_windows(settle),
                               _SETTLING_GUARD_S)
@@ -1157,6 +1201,23 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                 response.update(_resources(before, seen))
                 _primary(response, asset, detection.get("probe"))
             _slot_guard(response, slot_prep, None, warnings, ran=False)
+            if dialog is not None:
+                created = any(i.get("created") for i in response.get(_EXPECTED.get(asset["kind"]) or "", []))
+                if dialog["step"] == "restore":
+                    warnings.append("The selection%s restore call waits on the dialog and runs once it is "
+                                    "answered; run pending_restore.maxscript once only if max_dialogs reports "
+                                    "that call failed." % also)
+                else:
+                    warnings.append("Selection%s not restored yet: once the dialog is closed, run "
+                                    "pending_restore.maxscript once with execute_maxscript." % also)
+                titles = ", ".join(repr(d.get("title", "")) for d in dialog["dialogs"]) or "a dialog"
+                response.update(state="dialog_open", detected=bool(detection.get("detected")) or created,
+                                safe_to_edit=False, pending_restore=pending, warnings=warnings,
+                                dialogs=dialog["dialogs"],
+                                next="Max is waiting on %s, so the import was not confirmed%s. Do not edit the "
+                                     "scene yet. %s" % (titles, "" if dialog["sent"] else
+                                                        " (nothing more was sent)", _DIALOG_ADVICE))
+                return response
             warnings.append("Selection%s not restored yet: once get_bridge_status reports Max responding, run "
                             "pending_restore.maxscript once with execute_maxscript." % also)
             why = ("Max is still busy after the import (%s)." % process_health.describe_windows(settle)

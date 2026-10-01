@@ -15,8 +15,11 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from maxmcp import max_client, process_health, tool_response  # noqa: E402
 from maxmcp.max_client import (  # noqa: E402
+    DialogBlocked,
+    MaxBridgeError,
     MaxBusyError,
     MaxClient,
+    MaxImportSettlingError,
     MaxNotRespondingAfterDispatch,
     MaxNotRespondingError,
     RequestOutcomeUnknown,
@@ -28,8 +31,12 @@ PID = 4242
 PIPE = rf"\\.\pipe\3dsmax-mcp-pid-{PID}"
 HANDLE = 777
 REPLY = b'{"success": true, "result": "late", "requestId": ""}\n'
-QUEUE_TIMEOUT = (b'{"success": false, "error": "Internal bridge error: Main thread execution timed out", '
-                 b'"requestId": ""}\n')
+# Bridges since 1.7.5 cancel queued work with this text; older bridges said only "...timed out".
+QUEUE_TIMEOUT = (b'{"success": false, "error": "Internal bridge error: Main thread execution timed out before '
+                 b'starting; queued work cancelled", "requestId": ""}\n')
+QUEUE_TIMEOUT_OLD = (b'{"success": false, "error": "Internal bridge error: Main thread execution timed out", '
+                     b'"requestId": ""}\n')
+DIALOG = {"dialog_id": "4242:1", "title": "Save Changes", "main_thread": True, "during_requests": []}
 
 
 class FakeClock:
@@ -51,36 +58,22 @@ class FakeClock:
 class FakeKernel:
     """Stands in for kernel32: reply chunks become readable at given clock times."""
 
-    def __init__(self, clock: FakeClock, chunks: list[tuple[float, bytes]] | None = None,
-                 empty_polls: int = 0) -> None:
+    def __init__(self, clock: FakeClock, chunks: list[tuple[float, bytes]] | None = None) -> None:
         self.clock = clock
         self.chunks = list(chunks or [])
-        self.empty_polls = empty_polls
-        self.polls = 0
         self.closed: list[int] = []
         self.writes = 0
         self.broken = False
+        self.readers: list["FakeReader"] = []
 
-    def _ready(self) -> bytes | None:
-        if self.polls <= self.empty_polls or not self.chunks:
-            return None
-        at, data = self.chunks[0]
-        return data if self.clock.now >= at else None
-
-    def PeekNamedPipe(self, handle, buf, size, read, avail, left):
-        self.polls += 1
-        if self.broken:
-            ctypes.set_last_error(max_client._ERROR_BROKEN_PIPE)
-            return 0
-        data = self._ready()
-        avail._obj.value = len(data) if data else 0
-        return 1
-
-    def ReadFile(self, handle, buf, size, read, overlapped):
-        _, data = self.chunks.pop(0)
-        ctypes.memmove(buf, data, len(data))
-        read._obj.value = len(data)
-        return 1
+    def ready_at(self) -> float | None:
+        """Clock time at which a complete (newline-terminated) reply is readable; None: never."""
+        at = None
+        for when, data in self.chunks:
+            at = when if at is None else max(at, when)
+            if b"\n" in data:
+                return at
+        return None
 
     def WriteFile(self, handle, data, size, written, overlapped):
         self.writes += 1
@@ -99,6 +92,71 @@ class FakeKernel:
 
     def GetNamedPipeServerProcessId(self, handle, pid):
         return 0
+
+
+class FakeReader:
+    """Stands in for max_client._PipeReader on the fake clock: wait(t) advances the
+    clock to the reply time or by t. Closes its handle only when detached and done,
+    like the real reader (never under a pending read)."""
+
+    kernel: FakeKernel
+    clock: FakeClock
+
+    def __init__(self, handle: int) -> None:
+        self.handle = handle
+        self.detached = False
+        self.data = b""
+        self.error: BaseException | None = None
+        self._done = False
+        self.done = self
+        self.kernel.readers.append(self)
+
+    def _poll(self) -> None:
+        if self._done:
+            return
+        if self.kernel.broken:
+            self.error = BrokenPipeError("Pipe closed while reading response.")
+        else:
+            at = self.kernel.ready_at()
+            if at is None or self.clock.now < at:
+                return
+            data = b""
+            while b"\n" not in data:
+                data += self.kernel.chunks.pop(0)[1]
+            self.data = data
+        self._done = True
+        if self.detached:
+            self.kernel.CloseHandle(self.handle)
+
+    def is_set(self) -> bool:
+        self._poll()
+        return self._done
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self._poll()
+        if self._done:
+            return True
+        at = None if self.kernel.broken else self.kernel.ready_at()
+        if timeout is None:
+            if at is None:
+                raise AssertionError("unbounded wait on a reply that never comes")
+            self.clock.now = max(self.clock.now, at)
+        elif at is not None and at <= self.clock.now + timeout:
+            self.clock.now = max(self.clock.now, at)
+        else:
+            self.clock.now += timeout
+        self._poll()
+        return self._done
+
+    def detach(self) -> None:
+        self.detached = True
+        if self._done:
+            self.kernel.CloseHandle(self.handle)
+
+    def result(self) -> bytes:
+        if self.error is not None:
+            raise self.error
+        return self.data
 
 
 def diag(state: str, **extra) -> dict:
@@ -128,6 +186,7 @@ class _ClientCase(unittest.TestCase):
             p = mock.patch.object(max_client, target, value)
             p.start()
             self.addCleanup(p.stop)
+        self.dialog_check = self.no_dialogs()
 
     def _diagnose(self, pid, cpu_sample_s=1.0):
         state = self.states.pop(0) if len(self.states) > 1 else (self.states[0] if self.states else "unknown")
@@ -136,38 +195,48 @@ class _ClientCase(unittest.TestCase):
         return diag(state)
 
     def use_kernel(self, kernel: FakeKernel) -> FakeKernel:
-        p = mock.patch.object(max_client, "_kernel32", kernel)
-        p.start()
-        self.addCleanup(p.stop)
+        reader = type("BoundFakeReader", (FakeReader,), {"kernel": kernel, "clock": self.clock})
+        for target, value in (("_kernel32", kernel), ("_PipeReader", reader)):
+            p = mock.patch.object(max_client, target, value)
+            p.start()
+            self.addCleanup(p.stop)
         return kernel
+
+    def no_dialogs(self) -> mock.Mock:
+        """The 1 s dialog check finds nothing (and opens no control connection)."""
+        p = mock.patch.object(MaxClient, "_dialogs_blocking", return_value=[])
+        check = p.start()
+        self.addCleanup(p.stop)
+        return check
 
     def pinned_client(self) -> MaxClient:
         return MaxClient(transport="pipe", pipe_name=PIPE)
 
 
 class ReadLoopTests(_ClientCase):
-    def test_returns_data_after_several_empty_polls(self):
-        kernel = self.use_kernel(FakeKernel(self.clock, [(0, b'{"a":'), (0, b' 1}\n')], empty_polls=5))
-        client = self.pinned_client()
-        deadline = self.clock.now + 5
-        self.assertEqual(client._read_pipe_response(HANDLE, deadline, 5, PID), b'{"a": 1}\n')
-        self.assertGreaterEqual(kernel.polls, 7)
-        self.assertEqual(self.diagnoses, [])
-        self.assertLessEqual(self.clock.sleeps, 6)
+    def await_response(self, client: MaxClient, timeout: float = 5.0, request_id: str = "") -> bytes:
+        return client._await_response(HANDLE, request_id, "maxscript", deadline=self.clock.now + timeout,
+                                      timeout=timeout, pid=PID)
 
-    def test_poll_backoff_is_bounded(self):
+    def test_returns_chunked_reply(self):
         start = self.clock.now
-        self.use_kernel(FakeKernel(self.clock, [(start + 3.0, REPLY)]))
-        client = self.pinned_client()
-        client._read_pipe_response(HANDLE, start + 60, 60, PID)
-        # Reply visible within one max poll interval of becoming available.
-        self.assertLess(self.clock.now - (start + 3.0), max_client._POLL_MAX_S + 1e-9)
+        self.use_kernel(FakeKernel(self.clock, [(start + 0.2, b'{"a":'), (start + 0.4, b' 1}\n')]))
+        self.assertEqual(self.await_response(self.pinned_client()), b'{"a": 1}\n')
+        self.assertEqual(self.diagnoses, [])
+
+    def test_dialog_check_runs_every_second_and_never_delays_the_reply(self):
+        start = self.clock.now
+        self.use_kernel(FakeKernel(self.clock, [(start + 3.5, REPLY)]))
+        self.assertEqual(self.await_response(self.pinned_client(), timeout=60, request_id="r1"), REPLY)
+        self.assertEqual(self.clock.now, start + 3.5)
+        self.assertEqual(self.dialog_check.call_count, 3)  # at 1, 2 and 3 s
+        self.dialog_check.assert_called_with("r1")
 
     def test_broken_pipe_while_reading(self):
         kernel = self.use_kernel(FakeKernel(self.clock))
         kernel.broken = True
         with self.assertRaises(BrokenPipeError):
-            self.pinned_client()._read_pipe_response(HANDLE, self.clock.now + 5, 5, PID)
+            self.await_response(self.pinned_client())
 
     def test_broken_pipe_after_dispatch_is_outcome_unknown(self):
         kernel = self.use_kernel(FakeKernel(self.clock))
@@ -176,7 +245,7 @@ class ReadLoopTests(_ClientCase):
         with self.assertRaises(RequestOutcomeUnknown) as ctx:
             client.send_command("x", timeout=5)
         self.assertNotIsInstance(ctx.exception, MaxNotRespondingError)
-        self.assertIn(HANDLE, kernel.closed)
+        self.assertIn(HANDLE, kernel.closed)  # the read had returned, so closing was safe
 
 
 class DeadlineTests(_ClientCase):
@@ -191,7 +260,7 @@ class DeadlineTests(_ClientCase):
         self.assertEqual(kernel.closed, [])
         self.assertIsNone(client._inflight)
 
-    def test_blocked_twice_aborts_and_closes_handle(self):
+    def test_blocked_twice_aborts_and_hands_the_handle_to_the_reader(self):
         kernel = self.use_kernel(FakeKernel(self.clock))
         self.states = ["blocked"]
         client = self.pinned_client()
@@ -202,7 +271,10 @@ class DeadlineTests(_ClientCase):
         self.assertEqual(exc.code, "MAX_NOT_RESPONDING")
         self.assertFalse(exc.retryable)
         self.assertEqual(self.diagnoses, ["blocked", "blocked"])
-        self.assertIn(HANDLE, kernel.closed)
+        # Never CloseHandle under a pending ReadFile (it would wait for Max): the reader owns it.
+        self.assertNotIn(HANDLE, kernel.closed)
+        self.assertTrue(kernel.readers[-1].detached)
+        self.assertIsNone(client._pipe_handle)
         self.assertTrue(exc.details["request_sent"])
         self.assertEqual(exc.details["inflight"]["cmd_type"], "maxscript")
         self.assertGreaterEqual(exc.details["blocked_for_s"], max_client._BLOCKED_CONFIRM_S)
@@ -227,7 +299,8 @@ class DeadlineTests(_ClientCase):
         with self.assertRaises(MaxNotRespondingAfterDispatch) as ctx:
             client.send_command("x", timeout=1.0)
         self.assertEqual(self.diagnoses, ["exited"])
-        self.assertIn(HANDLE, kernel.closed)
+        self.assertNotIn(HANDLE, kernel.closed)
+        self.assertTrue(kernel.readers[-1].detached)
         self.assertIn("exited", str(ctx.exception))
         self.assertNotIn(PID, client._hung_pids)
 
@@ -289,6 +362,29 @@ class DeadlineTests(_ClientCase):
         self.assertEqual(self.diagnoses, [])
         self.assertEqual(kernel.writes, 1)
 
+    def test_reply_during_diagnosis_is_returned_not_abandoned(self):
+        start = self.clock.now
+        # Diagnosis starts at deadline + grace (1 + 10 s) and takes 1 s; the reply lands within it.
+        kernel = self.use_kernel(FakeKernel(self.clock, [(start + 11.5, REPLY)]))
+        self.states = ["exited"]
+        client = self.pinned_client()
+        self.assertEqual(client.send_command("x", timeout=1.0)["result"], "late")
+        self.assertEqual(self.diagnoses, ["exited"])
+        self.assertFalse(kernel.readers[-1].detached)
+        self.assertNotIn(PID, client._hung_pids)
+
+    def test_detached_reader_closes_the_handle_once_the_late_reply_arrives(self):
+        start = self.clock.now
+        kernel = self.use_kernel(FakeKernel(self.clock, [(start + 500.0, REPLY)]))
+        self.states = ["blocked"]
+        with self.assertRaises(MaxNotRespondingAfterDispatch):
+            self.pinned_client().send_command("x", timeout=1.0)
+        reader = kernel.readers[-1]
+        self.assertEqual(kernel.closed, [])
+        self.clock.now = start + 501.0
+        self.assertTrue(reader.done.is_set())
+        self.assertEqual(kernel.closed, [HANDLE])
+
     def test_reply_clears_stale_verdict(self):
         self.use_kernel(FakeKernel(self.clock, [(0, REPLY)]))
         client = self.pinned_client()
@@ -335,6 +431,13 @@ class QueueTimeoutTests(_ClientCase):
         self.assertTrue(ctx.exception.retryable)
         self.assertEqual(client._hung_pids, {})
 
+    def test_pre_1_7_5_queue_timeout_text_is_still_recognised(self):
+        self.use_kernel(FakeKernel(self.clock, [(0, QUEUE_TIMEOUT_OLD)]))
+        self.states = ["busy"]
+        with self.assertRaises(MaxBusyError) as ctx:
+            self.pinned_client().send_command("x", timeout=120.0)
+        self.assertFalse(ctx.exception.details["executed"])
+
     def test_responsive_keeps_bridge_error(self):
         self.use_kernel(FakeKernel(self.clock, [(0, QUEUE_TIMEOUT)]))
         self.states = ["responsive"]
@@ -361,7 +464,8 @@ class ProbeTests(_ClientCase):
         self.assertNotIsInstance(ctx.exception, RequestOutcomeUnknown)
         self.assertLess(self.clock.now - start, 5.0 + max_client._CPU_SAMPLE_S + 0.5)
         self.assertEqual(self.diagnoses, ["blocked"])
-        self.assertIn(HANDLE, kernel.closed)
+        self.assertNotIn(HANDLE, kernel.closed)
+        self.assertTrue(kernel.readers[-1].detached)
         self.assertEqual(client._hung_pids, {})  # one sample is not a remembered verdict
         self.assertFalse(client._pipe_lock.locked())
 
@@ -389,12 +493,184 @@ class ProbeTests(_ClientCase):
         self.assertEqual(payload["process"]["state"], "blocked")
         self.assertLess(self.clock.now - start, 10.0)
 
+    def test_probe_reply_during_its_diagnosis_is_returned(self):
+        start = self.clock.now
+        self.use_kernel(FakeKernel(self.clock, [(start + 5.5, b'{"success": true, "result": "pong"}\n')]))
+        self.states = ["blocked"]
+        self.assertEqual(self.pinned_client().send_command("", cmd_type="ping", timeout=5.0)["result"], "pong")
+
+    def test_control_channel_probe_is_bounded_and_never_watched(self):
+        start = self.clock.now
+        self.use_kernel(FakeKernel(self.clock))
+        self.states = ["busy"]
+        control = self.pinned_client()
+        control._control_channel = True
+        with self.assertRaises(MaxBusyError):
+            control.send_command('{"action":"status"}', cmd_type="native:max_dialogs", timeout=3.0, probe=True)
+        self.assertLess(self.clock.now - start, 3.0 + max_client._CPU_SAMPLE_S + 0.5)
+        self.dialog_check.assert_not_called()
+
     def test_maxscript_is_not_a_probe(self):
         start = self.clock.now
         self.use_kernel(FakeKernel(self.clock, [(start + 8.0, REPLY)]))
         self.states = ["blocked"]
         self.assertEqual(self.pinned_client().send_command("x", timeout=5.0)["result"], "late")
         self.assertEqual(self.diagnoses, [])
+
+
+class DialogTests(_ClientCase):
+    """BLOCKED_BY_DIALOG: Max runs the dialog's loop, so it is not a hang."""
+
+    def dialog_after(self, calls: int) -> None:
+        results = iter([[]] * (calls - 1) + [[dict(DIALOG)]])
+        self.dialog_check.side_effect = lambda request_id: next(results, [dict(DIALOG)])
+
+    def test_dialog_releases_the_call_without_diagnosis(self):
+        start = self.clock.now
+        kernel = self.use_kernel(FakeKernel(self.clock, [(start + 30.0, REPLY)]))
+        self.states = ["blocked"]
+        self.dialog_after(1)
+        client = self.pinned_client()
+        with self.assertRaises(DialogBlocked) as ctx:
+            client.send_command("queryBox \"Save?\"", timeout=1.0)
+        exc = ctx.exception
+        self.assertEqual((exc.code, exc.retryable), ("BLOCKED_BY_DIALOG", False))
+        self.assertEqual(json.loads(exc.bridge_message)["code"], "BLOCKED_BY_DIALOG")
+        self.assertAlmostEqual(self.clock.now - start, max_client.DIALOG_CHECK_AFTER)
+        self.assertEqual(self.diagnoses, [])
+        self.assertFalse(client._pipe_lock.locked())
+        self.assertIsNone(client._inflight)
+        self.assertIsNone(client._pipe_handle)
+        self.assertTrue(kernel.readers[-1].detached)
+        self.assertNotIn(HANDLE, kernel.closed)
+        self.assertEqual(client._hung_pids, {})
+        self.assertEqual(client.blocked_request_ids(), [exc.request_id])
+        self.assertEqual(client.blocked_request_ids(), [exc.request_id])  # not consumed
+
+        self.clock.now = start + 31.0  # the dialog was answered and the call finished
+        self.assertEqual(client.blocked_request_ids(), [])
+        report = client.blocked_calls()
+        self.assertEqual(report[0]["status"], "completed")
+        self.assertEqual(report[0]["result"], "late")
+        self.assertEqual(client.blocked_calls(), [])  # reported once
+        self.assertEqual(kernel.closed, [HANDLE])  # the reader closed it after the reply
+
+    def test_dialog_beats_the_deadline_diagnosis(self):
+        self.use_kernel(FakeKernel(self.clock))
+        self.states = ["blocked"]
+        self.dialog_after(12)  # after deadline + grace (1 + 10 s) and its first diagnosis
+        with self.assertRaises(DialogBlocked):
+            self.pinned_client().send_command("x", timeout=1.0)
+        self.assertEqual(self.diagnoses, ["blocked"])  # one sample: not yet abandoned
+
+    def test_dialog_beats_a_probe_drop(self):
+        self.use_kernel(FakeKernel(self.clock))
+        self.states = ["blocked"]
+        self.dialog_after(2)
+        with self.assertRaises(DialogBlocked):
+            self.pinned_client().send_command("", cmd_type="ping", timeout=5.0)
+        self.assertEqual(self.diagnoses, [])
+
+    def test_pre_send_refusals_never_check_dialogs(self):
+        kernel = self.use_kernel(FakeKernel(self.clock))
+        client = self.pinned_client()
+        client._hung_pids[PID] = {"state": "blocked", "process": diag("blocked"), "inflight": None,
+                                  "source": "abandoned", "started": 1}
+        max_client.quick_hung_check.return_value = True
+        self.states = ["blocked"]
+        with self.assertRaises(MaxNotRespondingError):
+            client.send_command("x", timeout=1.0)
+        entry = max_client.mark_settling(PID, {}, "a Cosmos import", owner=object())
+        self.addCleanup(max_client.release_settling, PID, entry)
+        client._hung_pids.clear()
+        with self.assertRaises(MaxImportSettlingError):
+            client.send_command("x", timeout=1.0)
+        self.assertEqual(kernel.writes, 0)
+        self.dialog_check.assert_not_called()
+
+    def test_queue_cancelled_blocked_call_reports_it_never_ran(self):
+        start = self.clock.now
+        self.use_kernel(FakeKernel(self.clock, [(start + 120.0, QUEUE_TIMEOUT)]))
+        self.dialog_after(1)
+        client = self.pinned_client()
+        with self.assertRaises(DialogBlocked):
+            client.send_command("x", timeout=1.0)
+        self.clock.now = start + 121.0
+        report = client.blocked_calls()
+        self.assertFalse(report[0]["ok"])
+        self.assertIs(report[0]["executed"], False)
+
+
+class DialogCheckTests(unittest.TestCase):
+    """_dialogs_blocking: what counts as a dialog holding a request."""
+
+    def setUp(self) -> None:
+        self.client = MaxClient(transport="pipe", pipe_name=PIPE)
+        self.client._bound_target = self.client._target(PIPE, "explicit")
+        self.status = {"dialogs": [], "requests": [{"request_id": "r1", "state": "queued"}]}
+        self.inspect = {"dialogs": []}
+        self.actions: list[str] = []
+
+        def control(command, cmd_type, timeout, probe=False):
+            action = json.loads(command)["action"]
+            self.actions.append(action)
+            self.assertTrue(probe)
+            return {"result": json.dumps(self.status if action == "status" else self.inspect)}
+
+        p = mock.patch.object(self.client, "_send_control_command", side_effect=control)
+        self.control = p.start()
+        self.addCleanup(p.stop)
+
+    def test_cosmos_and_material_editor_windows_are_never_dialogs_or_inspected(self):
+        self.status["dialogs"] = [
+            {"dialog_id": "1", "title": "Chaos Cosmos Browser", "main_thread": True},
+            {"dialog_id": "2", "title": "Material Editor - 01 - Default", "main_thread": True},
+            {"dialog_id": "3", "title": "Slate Material Editor", "main_thread": True},
+            {"dialog_id": "4", "title": "AGENT VIEWPORT (do not close or minimize while agent is working)",
+             "main_thread": True},
+        ]
+        self.assertEqual(self.client._dialogs_blocking("r1"), [])
+        self.assertEqual(self.actions, ["status"])
+
+    def test_a_real_dialog_beside_a_tool_window_is_reported_without_inspect(self):
+        self.status["dialogs"] = [{"dialog_id": "1", "title": "Material Editor - 01 - Default", "main_thread": True},
+                                  {"dialog_id": "2", "title": "Missing External Files", "main_thread": True}]
+        found = self.client._dialogs_blocking("r1")
+        self.assertEqual([d["dialog_id"] for d in found], ["2"])
+        self.assertEqual(self.actions, ["status"])
+
+    def test_queued_request_is_held_by_a_main_thread_dialog_and_inspected(self):
+        self.status["dialogs"] = [dict(DIALOG), {"dialog_id": "9", "title": "Other thread", "main_thread": False}]
+        self.inspect["dialogs"] = [{**DIALOG, "buttons": [{"label": "Yes"}]}]
+        found = self.client._dialogs_blocking("r1")
+        self.assertEqual(found[0]["buttons"], [{"label": "Yes"}])
+        self.assertEqual(self.actions, ["status", "inspect"])
+
+    def test_running_request_is_held_only_by_its_own_dialog(self):
+        self.status["requests"] = [{"request_id": "r1", "state": "running"}]
+        self.status["dialogs"] = [dict(DIALOG)]
+        self.assertEqual(self.client._dialogs_blocking("r1"), [])
+        self.status["dialogs"] = [{**DIALOG, "during_requests": ["r1"]}]
+        self.assertEqual(len(self.client._dialogs_blocking("r1")), 1)
+
+    def test_bridge_without_the_monitor_is_asked_once(self):
+        self.control.side_effect = MaxBridgeError("Unknown command type: native:max_dialogs", {"success": False})
+        self.assertEqual(self.client._dialogs_blocking("r1"), [])
+        self.assertEqual(self.client._dialogs_blocking("r1"), [])
+        self.assertEqual(self.control.call_count, 1)
+
+    def test_a_dropped_status_probe_is_no_dialog(self):
+        self.control.side_effect = MaxBusyError("busy", {})
+        self.assertEqual(self.client._dialogs_blocking("r1"), [])
+
+    def test_max_dialogs_routes_over_the_control_channel(self):
+        self.assertIn("native:max_dialogs", max_client._CONTROL_CMD_TYPES)
+        self.control.side_effect = None
+        self.control.return_value = {"result": "{}"}
+        client = MaxClient(transport="pipe", pipe_name=PIPE)
+        with mock.patch.object(client, "_send_control_command", return_value={"result": "{}"}) as control:
+            client.send_command('{"action":"inspect"}', cmd_type="native:max_dialogs", timeout=5.0, probe=True)
+        control.assert_called_once_with('{"action":"inspect"}', "native:max_dialogs", 5.0, probe=True)
 
 
 class LockTimeoutTests(_ClientCase):
@@ -492,6 +768,26 @@ class ToolResponseTests(unittest.TestCase):
         self.assertFalse(error["retryable"])
         self.assertTrue(error["details"]["request_sent"])
 
+    def test_dialog_blocked_envelope(self):
+        exc = DialogBlocked("r1", "maxscript", [dict(DIALOG)])
+        error = tool_response.envelope_exception(exc, elapsed_ms=1.0)["error"]
+        self.assertEqual(error["code"], "BLOCKED_BY_DIALOG")
+        self.assertFalse(error["retryable"])
+        self.assertEqual(error["details"]["request_id"], "r1")
+
+    def test_dialog_warning_on_any_reply(self):
+        envelope = tool_response._add_dialog_warning({"ok": True}, {"open_dialogs": [DIALOG]}, "query_scene")
+        self.assertIn("max_dialogs", envelope["warnings"][0])
+        self.assertNotIn("warnings", tool_response._add_dialog_warning({}, {"open_dialogs": [DIALOG]},
+                                                                       "max_dialogs"))
+
+    def test_health_errors_keep_their_codes(self):
+        for exc, code, retryable in ((MaxBusyError("b", {}), "MAX_BUSY", True),
+                                     (MaxNotRespondingError("n", {}), "MAX_NOT_RESPONDING", False),
+                                     (MaxImportSettlingError("s", {}), "IMPORT_SETTLING", True)):
+            error = tool_response._error_from_exception(exc)
+            self.assertEqual((error["code"], error["retryable"]), (code, retryable))
+
     def test_plain_exception_has_no_details(self):
         error = tool_response._error_from_exception(TimeoutError("named pipe timed out"))
         self.assertEqual(error["code"], "BRIDGE_DOWN")
@@ -505,6 +801,9 @@ class ToolResponseTests(unittest.TestCase):
         self.assertIn(tool_response.ErrorCode.MAX_BUSY, tool_response._RETRYABLE_CODES)
         self.assertEqual(tool_response._classify_error_code("Main thread execution timed out"),
                          tool_response.ErrorCode.BRIDGE_DOWN)
+        self.assertEqual(tool_response._classify_error_code(
+            "Main thread execution timed out before starting; queued work cancelled"),
+            tool_response.ErrorCode.BRIDGE_DOWN)
         self.assertNotIn(tool_response.ErrorCode.MAX_NOT_RESPONDING, tool_response._RETRYABLE_CODES)
 
 
@@ -565,9 +864,45 @@ class BridgeStatusTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "Windows named pipes")
 class RealPipeTests(unittest.TestCase):
-    """Exercise the real kernel32 polling path against a pipe served by this test process."""
+    """Exercise the real _PipeReader against a pipe served by this test process."""
 
     def test_round_trip_with_delayed_chunked_reply(self):
+        self.round_trip(delay=0.2)
+
+    def test_reply_after_the_first_dialog_check(self):
+        with mock.patch.object(MaxClient, "_dialogs_blocking", return_value=[]) as check:
+            self.round_trip(delay=1.5)
+        check.assert_called()
+
+    def test_detached_reader_closes_the_handle_after_a_late_reply(self):
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreatePipe.argtypes = [ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(wintypes.HANDLE),
+                                   wintypes.LPVOID, wintypes.DWORD]
+        k32.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
+                                  ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        k32.GetHandleInformation.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        read, write = wintypes.HANDLE(), wintypes.HANDLE()
+        self.assertTrue(k32.CreatePipe(ctypes.byref(read), ctypes.byref(write), None, 0))
+        try:
+            reader = max_client._PipeReader(read.value)
+            reader.detach()  # the caller stopped waiting (dialog or abandoned)
+            flags = wintypes.DWORD()
+            self.assertTrue(k32.GetHandleInformation(read, ctypes.byref(flags)))  # still open
+            got = wintypes.DWORD()
+            k32.WriteFile(write, b"late\n", 5, ctypes.byref(got), None)
+            self.assertTrue(reader.done.wait(5))
+            self.assertEqual(reader.result(), b"late\n")
+            for _ in range(50):
+                if not k32.GetHandleInformation(read, ctypes.byref(flags)):
+                    break
+                threading.Event().wait(0.02)
+            self.assertFalse(k32.GetHandleInformation(read, ctypes.byref(flags)))  # closed by the reader
+        finally:
+            k32.CloseHandle(write)
+
+    def round_trip(self, delay: float) -> None:
         from ctypes import wintypes
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateNamedPipeW.restype = wintypes.HANDLE
@@ -598,7 +933,7 @@ class RealPipeTests(unittest.TestCase):
             received["request"] = json.loads(data)
             reply = json.dumps({"success": True, "result": "x" * 100000,
                                 "requestId": received["request"]["requestId"]}).encode() + b"\n"
-            threading.Event().wait(0.2)
+            threading.Event().wait(delay)
             for part in (reply[:70000], reply[70000:]):
                 k32.WriteFile(pipe, part, len(part), ctypes.byref(got), None)
                 threading.Event().wait(0.05)

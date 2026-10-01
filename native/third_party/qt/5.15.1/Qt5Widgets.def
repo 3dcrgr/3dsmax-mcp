@@ -1,0 +1,44 @@
+LIBRARY Qt5Widgets.dll
+EXPORTS
+    ?accessibleName@QWidget@@QEBA?AVQString@@XZ
+    ?buttonRole@QMessageBox@@QEBA?AW4ButtonRole@1@PEAVQAbstractButton@@@Z
+    ?click@QAbstractButton@@QEAAXXZ
+    ?currentText@QComboBox@@QEBA?AVQString@@XZ
+    ?defaultButton@QMessageBox@@QEBAPEAVQPushButton@@XZ
+    ?detailedText@QMessageBox@@QEBA?AVQString@@XZ
+    ?echoMode@QLineEdit@@QEBA?AW4EchoMode@1@XZ
+    ?escapeButton@QMessageBox@@QEBAPEAVQAbstractButton@@XZ
+    ?find@QWidget@@SAPEAV1@_K@Z
+    ?focusPolicy@QWidget@@QEBA?AW4FocusPolicy@Qt@@XZ
+    ?isCheckable@QAbstractButton@@QEBA_NXZ
+    ?isChecked@QAbstractButton@@QEBA_NXZ
+    ?isDefault@QPushButton@@QEBA_NXZ
+    ?isEnabled@QWidget@@QEBA_NXZ
+    ?isModal@QWidget@@QEBA_NXZ
+    ?isReadOnly@QLineEdit@@QEBA_NXZ
+    ?isReadOnly@QPlainTextEdit@@QEBA_NXZ
+    ?isReadOnly@QTextEdit@@QEBA_NXZ
+    ?isVisible@QWidget@@QEBA_NXZ
+    ?isVisibleTo@QWidget@@QEBA_NPEBV1@@Z
+    ?mapTo@QWidget@@QEBA?AVQPoint@@PEBV1@AEBV2@@Z
+    ?parentWidget@QWidget@@QEBAPEAV1@XZ
+    ?staticMetaObject@QAbstractButton@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QCheckBox@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QComboBox@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QLabel@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QLineEdit@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QMessageBox@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QPlainTextEdit@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QPushButton@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QRadioButton@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QTextEdit@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QToolButton@@2UQMetaObject@@B DATA
+    ?staticMetaObject@QWidget@@2UQMetaObject@@B DATA
+    ?text@QAbstractButton@@QEBA?AVQString@@XZ
+    ?text@QLabel@@QEBA?AVQString@@XZ
+    ?text@QLineEdit@@QEBA?AVQString@@XZ
+    ?toPlainText@QPlainTextEdit@@QEBA?AVQString@@XZ
+    ?toPlainText@QTextEdit@@QEBA?AVQString@@XZ
+    ?toolTip@QWidget@@QEBA?AVQString@@XZ
+    ?window@QWidget@@QEBAPEAV1@XZ
+    ?windowTitle@QWidget@@QEBA?AVQString@@XZ
