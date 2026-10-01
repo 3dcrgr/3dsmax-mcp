@@ -1,6 +1,6 @@
 # When 3ds Max hangs: a diagnosis instead of timeouts
 
-Fork issues #4 and #6, and the executor shutdown fix. Commits `25ac1ed`, `6e9188b`, `f8d4e6f`, `d971a56`, `91c8662`, `1dab496` and `5466a32`.
+Fork issues #4 and #6, and the executor shutdown fix. Commits `25ac1ed`, `6e9188b`, `7ff1cec`, `f8d4e6f`, `d971a56`, `91c8662`, `1dab496`, `5466a32` and `e58464a`.
 
 ## What happened
 
@@ -18,21 +18,23 @@ When Max's main thread hung, every tool returned the MCP client's generic "Reque
 
 ### Client side (`6e9188b`)
 
-- **The pipe lock has a timeout.** A request that can't get the lock fails with `MAX_BUSY` and isn't sent. The idea comes from the stoxsss111 fork.
-- **Replies are polled with a real deadline.** The client uses `PeekNamedPipe` instead of a blocking `ReadFile`. Past the deadline it checks the target process: are its top-level windows hung (`IsHungAppWindow`), and how much CPU does it use over a one-second sample?
-  - **Healthy but long work:** the client keeps waiting.
-  - **Max has exited, or is confirmed blocked:** the request is abandoned with `MAX_NOT_RESPONDING`. It's never replayed, because it may already have run.
+- **The pipe lock has a timeout.** A request waits for the lock for up to its own timeout (120 s by default). If it still can't get it, nothing is sent. It fails with `MAX_BUSY`, or with `MAX_NOT_RESPONDING` if Max has exited, or is blocked while the request holding the lock is past its own timeout plus grace (the larger of 10 s and 10 % of that timeout). The idea comes from the stoxsss111 fork.
+- **Replies are polled with a real deadline.** The client uses `PeekNamedPipe` instead of a blocking `ReadFile`. Past the deadline plus grace it checks the target process: are its top-level windows hung (`IsHungAppWindow`), and how much CPU does it use over a one-second sample? A hung window with under 0.05 CPU-s/s counts as blocked.
+  - **Anything short of exited or confirmed blocked** (responsive, hung but still using CPU, or a state it can't read): the client keeps waiting and checks again every 15 s, so a slow result still arrives. There's no upper limit. If the client can't tell Max's PID, it can't check at all and just keeps waiting.
+  - **Max has exited, or is blocked on two checks 20 s apart:** the request is abandoned with `MAX_NOT_RESPONDING`. It's never replayed, because it may already have run.
   - **Read-only probes** (`ping`, `health`): dropped at their deadline.
 - **A hung PID is remembered.** Later calls to it fail fast, with nothing sent, until its window pumps messages again.
-- **The messages give bounded advice:** "wait up to about 10 minutes, re-checking with `get_bridge_status`; still blocked after that means a deadlock, and the user must end Max".
+- **The messages give bounded advice** (`7ff1cec`): "wait up to about 10 minutes, re-checking with `get_bridge_status`; still blocked after that means a deadlock, and the user must end Max". Errors that say Max is not responding or still settling also get a `hint` with the same 10-minute wait, suggesting `capture_hang_diagnostics` and `get_bridge_status` (`91c8662`, `1dab496`).
 
 Error codes:
 
 | Code | Meaning | Retry |
 |---|---|---|
-| `MAX_BUSY` | Max (or this client's pipe) is occupied. The request was not sent. | Yes, later. |
-| `MAX_NOT_RESPONDING` | Max is hung or has exited. `request_sent` says whether the request reached Max before it was abandoned. | No. Wait, then check with `get_bridge_status`. Never replay a request that was sent. |
-| `IMPORT_SETTLING` | A native import (Cosmos) left a Max window hung. The request was not sent. | Yes, after Max settles. |
+| `MAX_BUSY` | Max (or this client's pipe) is occupied. Usually nothing was sent. A `ping`/`health` probe dropped at its deadline, or a request the bridge cancelled before it ran (`executed: false`), has `request_sent: true` but changed nothing. | Yes, later. |
+| `MAX_NOT_RESPONDING` | Max is hung or has exited. `request_sent` says whether the request reached Max before it was abandoned. `executed: false` means the bridge cancelled it after 120 s in the queue, before it ran. | No. Wait, then check with `get_bridge_status`. Never replay a request that was sent, unless `executed` is false. |
+| `IMPORT_SETTLING` | A Cosmos import from this server is still running, or a Max or Cosmos browser window stayed hung after one ran or was refused. The request was not sent. The guard lifts when the import returns or the hung windows respond again, and after 15 minutes at most. | Yes, after Max settles. |
+
+These errors carry their evidence in `error.details`: `request_sent`, and where known `inflight` (the stuck request), `process` (state, window hung, CPU-s/s) or `settling`.
 
 ### Bridge health from a pipe thread (`f8d4e6f`, reviewed in `d971a56`)
 
@@ -44,18 +46,18 @@ The native bridge now answers a `health` command on the pipe thread that receive
 | `mainThread.heartbeatAgeMs` | Age of the last heartbeat. Every second, a thread-pool timer posts one beat message to the executor's hidden window (at most one is outstanding), and the main thread records the time when it picks it up. Posted messages are taken in turn with the bridge's own work, so an age above about 3 s means the main thread isn't pumping. The first version used `WM_TIMER`, but Windows starves `WM_TIMER` under steady posted traffic, which made a pumping main thread look stalled. The review caught this. |
 | `mainThread.windowHung` | `IsHungAppWindow` on the executor window |
 | `executor.running` | The running request's command type, client id, `requestId`, and how long it has run |
-| `executor.queued`, `oldestQueuedMs`, `oldestQueuedCmd` | Work waiting for the main thread, with the oldest item's ids |
+| `executor.queued`, `oldestQueuedMs`, `oldestQueuedCmd`, `oldestQueuedRequestId` | Work waiting for the main thread: how many items, and the oldest one's age, command type and `requestId` (no client id) |
 | `clients.connected`, `clients.inflight[]` | Connected pipe clients (this also covers #6) and each client's request: client id, `requestId`, command type, elapsed time. Nested probes that the bridge dispatches itself are flagged `internal`. The count includes the client asking. |
 
 `get_bridge_status` asks for `health` first, over the control channel, so another request's pipe lock can't delay it:
 
-- **Main thread responsive, or `unknown`:** the usual `ping` follows. The result gains a compact `health` block.
-- **`busy_mcp` for at least 2 s, or `busy_other`:** it returns `pong: false` at once, without queueing a `ping` behind the main thread.
-  - It says who holds the main thread: this server's request, another MCP client's request, or work outside the bridge. The holder is matched by `requestId` and client id, so it's never guessed from the command type. A request this server already abandoned is still recognised as its own.
-  - CPU is sampled only when the main thread isn't pumping.
-  - The result is called `not_responding` only after the main thread has been idle in a wait for 20 s or more. Then it points to `capture_hang_diagnostics`.
-- **A Cosmos import settle guard is active:** `IMPORT_SETTLING` wins over everything else.
-- **Not even the pipe threads answer:** the probe's own busy/hung verdict is returned, instead of waiting out a second timeout.
+- **Main thread `responsive`, `unknown`, `not_initialized` or `shutting_down`, or a bridge request younger than 2 s:** the usual `ping` follows. The result gains a compact `health` block.
+- **`busy_mcp` for at least 2 s, or `busy_other`:** it returns `pong: false` without queueing a `ping` behind the main thread.
+  - It says who holds the main thread (`main_thread.running.owner`): this server's request, another MCP client's request, a bridge request it can't attribute (`unknown`), or, with nothing running, work outside the bridge. The holder is matched by `requestId`; a `healthVersion` 1 reply, which has no request ids, falls back to command type and age. The client id only marks the bridge's own internal probes, which never count as another client. A request this server already abandoned is still recognised as its own.
+  - CPU is sampled for 1 s, only when the main thread isn't pumping (always the case for `busy_other`). If no bridge work is running and no Max window is flagged hung yet, it pings after all. `IsHungAppWindow` takes about 5 s to flag a window, so this happens early in a stall.
+  - The result is called `not_responding` when Max has exited, or when the main thread hasn't pumped for 20 s or more and the sample says blocked. If the request holding it is this server's own, it must also be past its timeout plus grace. Then it points to `capture_hang_diagnostics`. That rule covers only the verdict built from `health`. When it pings, a ping unanswered after 5 s is called `not_responding` if a Max window is hung with idle CPU by then. In the live test below, that took about 6 s.
+- **A Cosmos import settle guard is active:** the busy/not-responding verdict from `health` is skipped, and the `ping` is refused with `IMPORT_SETTLING`. A silent health probe, a held pipe lock or a remembered hung PID is still reported first.
+- **Not even the pipe threads answer within 3 s:** the probe's own busy/hung verdict is returned, instead of waiting out a second timeout.
 - **TCP transport, or a bridge older than this fork:** `health` is skipped, or answered with "Unknown command type" at once. `get_bridge_status` then falls back to `ping` as before.
 
 ### `capture_hang_diagnostics`
@@ -78,21 +80,25 @@ capture_hang_diagnostics(pid=None, all_threads=False, depth=48, save=True)
     - Every exit path calls `release_all()` before `os._exit`, which itself runs in a `finally`. The exit paths are the parent watchdog and its fallback timer, the exit after stdin closes, and `atexit`.
     - `release_all()` blocks new pauses, waits up to 0.5 s for active walks, then resumes anything still paused itself.
     - Here only a hard kill of the server (`TerminateProcess`) can skip the guard.
-  - The result's `pause_methods` says which method was used.
+  - `pause_methods` in the saved `.json` (and the command line's `--json` output) says which method was used.
   - Before pausing, a thread id is checked with `GetProcessIdOfThread`, so a reused id that now belongs to another process is never paused.
-- **Finding the target.** It uses `pid` if given, otherwise the Max this server is talking to (read from memory, without the pipe lock), otherwise the only running `3dsmax.exe`. If none of those works, it lists the candidates instead of guessing.
-- **The main thread** is the thread that owns Max's main window.
-- **What it returns:**
+- **Finding the target.** It uses `pid` if given, which must be a running `3dsmax.exe`. Otherwise it uses the Max this server is talking to (read from memory, without the pipe lock), and only if none is selected, the only running `3dsmax.exe`. It never falls back past a choice that fails, and lists the running PIDs instead of guessing:
+  - `BAD_PARAM`: `pid` isn't a positive number;
+  - `NOT_FOUND`: the given or selected PID isn't a running Max (even if another one is, e.g. after a restart), or no Max is running;
+  - `AMBIGUOUS`: several are running and none is selected.
+- **The main thread** is the thread that owns the visible window whose title contains "Autodesk 3ds Max". Without one, it's the owner of the largest visible top-level window, and with no visible window, the oldest thread. `main_thread.source` (`title`, `largest_window` or `first_thread`) says which rule picked it.
+- **What it returns** (or `DIAGNOSTICS_FAILED` if no stack could be read):
   - `main_thread`: its top modules, a `blocked_in` sentence, and the first frames as `module+0xoffset`;
+  - `threads`: how many there are, were kept and were left out, and the longest pause (`max_suspended_ms`);
   - `findings` from a small rule table;
   - `hung_windows`;
   - process health;
   - the paths of the files it saved.
 - **Saved files.** With `save=true`, the full stacks go to `%LOCALAPPDATA%\3dsmax-mcp\diagnostics\hang-<pid>-<timestamp>.txt` and `.json`, for bug reports to Autodesk or Chaos. Only the newest 20 captures are kept.
 - **Not marked read-only.** It pauses threads and writes files, so it doesn't claim the MCP `readOnlyHint`.
-- **Which threads are kept.** By default it keeps the main thread, threads that own a window, threads in application code, and any thread inside a watched module such as `galaxyimporter`. Use `all_threads=true` to keep every thread.
-- **Command line:** `python -m maxmcp.diagnostics.stackdump <pid> [--all] [--depth N] [--json]`.
-- **A new tool needs a new client session.** MCP clients cache the tool list, and a restarted server doesn't refresh it (there's no `tools/list_changed`). So after an update, `capture_hang_diagnostics` appears only in a new session; in the Claude desktop app that's a new Code-tab session. Until then, use the command line above with the installed runtime.
+- **Which threads are kept.** By default it keeps the main thread, threads that own a window, threads whose top frame is application code (not waiting in a Windows or C runtime DLL), and any thread with a watched module such as `galaxyimporter` on its stack. A worker blocked in a kernel wait is left out unless it matches one of these. Use `all_threads=true` to keep every thread.
+- **Command line:** `python -m maxmcp.diagnostics.stackdump <pid> [tid ...] [--all] [--depth N] [--json]`. Thread ids after the PID dump only those threads.
+- **A new tool needs a new client session.** MCP clients cache the tool list, and a restarted server doesn't refresh it (there's no `tools/list_changed`). So after an update, `capture_hang_diagnostics` appears only in a new session; in the Claude desktop app that's a new Code-tab session. Until then, use the command line above with the installed runtime. It only prints; it saves no files.
 
 The rules (`RULES` in `maxmcp/diagnostics/stackdump.py`; add a dict to add a rule):
 
@@ -102,13 +108,15 @@ The rules (`RULES` in `maxmcp/diagnostics/stackdump.py`; add a dict to add a rul
 | `cross_thread_window_deadlock` | The main thread is in a USER32 call (not an idle message loop) while another thread, in a kernel wait, owns a hung window. The finding names that window, thread and module. |
 | `cosmos_importer` | `galaxyimporter` is on any thread's stack |
 | `mcp_bridge_call` | The main thread is running a bridge request |
-| `maxscript` | `MAXScrpt` near the top of the main thread: a long-running script |
+| `maxscript` | Fallback, checked only when neither `medit_vray_render` nor `cross_thread_window_deadlock` matched: `MAXScrpt` among the main thread's first eight non-system frames, meaning a long-running script |
 | `main_thread_modules` | Fallback: the top three non-system modules on the main thread |
 
-When a test replays the two real hang dumps from this investigation, the first gives `medit_vray_render`. The second gives `cross_thread_window_deadlock` with the "Chaos Cosmos Browser" window, plus `cosmos_importer`.
+If the main thread can't be found or read, the findings say so (`main_thread_unknown`, `main_thread_unreadable`).
+
+The tests build synthetic captures from frames of the two real hang dumps from this investigation; the dump files themselves aren't read. The first gives `medit_vray_render`. The second gives `cross_thread_window_deadlock` with the "Chaos Cosmos Browser" window, plus `cosmos_importer` and `mcp_bridge_call`, because the stuck `MatEditor.Close()` came through the bridge.
 
 Limitations:
-- **No symbols:** frames are `module+offset`. Names are resolved only inside the Windows system DLLs, which is enough to tell a wait from a `SendMessage`. No symbol server is ever contacted while a thread is paused.
+- **No symbols:** frames are `module+offset`. Function names are shown only in the core Windows DLLs (`ntdll`, `kernelbase`, `kernel32`, `win32u`, `user32`, near an export) and in modules with a PDB next to them. That's enough to tell a wait from a `SendMessage`. Other system DLLs, such as the C runtime, stay `module+offset`. No symbol server is ever contacted while a thread is paused.
 - **Same user and integrity level:** the server must run as the same user, at the same integrity level, as Max. An elevated Max needs an elevated server.
 - **x64 targets only.**
 - **Hung-window lag:** `IsHungAppWindow` only reports a window as hung after about 5 s.
@@ -124,7 +132,7 @@ The original script set `SizeOfStruct` wrong for `SYMBOL_INFOW` (90 instead of 8
 
 On Windows, a child process outlives its parent. So a crashed or killed MCP client used to leave its `maxmcp.server` running, and that server could still hold a pipe connection to Max. Four such servers were found running at once.
 
-The server now exits when its parent client exits. If the parent is a pass-through launcher (a venv `python.exe` stub, `py.exe`, `uv`, the `3dsmax-mcp.exe` console script, or `cmd.exe`), the launcher's own ancestors are watched too. The server also exits after stdin closes. To turn the watchdog off, set `MAXMCP_PARENT_WATCHDOG=0`.
+The server now exits when its parent client exits. If the parent is a pass-through launcher (a venv `python.exe` stub, `py.exe`/`pyw.exe`, `uv`/`uvx`, the `3dsmax-mcp.exe` console script, or `cmd.exe`), the launcher's own ancestors are watched too. The server also exits after stdin closes. To turn the watchdog off, set `MAXMCP_PARENT_WATCHDOG=0`.
 
 The bridge side of #6, reporting how many clients are connected, is the `clients` block of `health` above.
 
@@ -134,19 +142,20 @@ The bridge side of #6, reporting how many clients are connected, is the `clients
 - **Client side, tested live:** a 20 s `sleep` was run from a second process, and `get_bridge_status` was called from the MCP.
   - The status came back in about 6 s with `bridge_state: "not_responding"`, the in-flight probe, and process evidence (window hung, 0.03 CPU-s/s).
   - After the sleep, the next status was `pong: true` in 2.6 ms, so the fail-fast latch clears.
-  - Without the `health` command, a legitimate long call from another client looks like a deadlock from outside. That's the gap the `health` command closes.
-- **`health`:** unit-tested only so far. The live test is pending deployment of the rebuilt bridge.
-- **`capture_hang_diagnostics`:** run against child processes started by the tests. Their frames resolve inside `ntdll`, every thread was confirmed resumed afterwards, and the child still answered. It has also replayed the two real hang dumps. It hasn't yet been pointed at a real hung Max with the packaged tool; the original script it comes from was.
+  - Without the `health` command, a legitimate long call from another client looks like a deadlock from outside. The `health` command narrows that gap: it names the other client's request and reports it busy. A call that keeps the main thread from pumping for 20 s or more with almost no CPU, such as a long `sleep`, is still reported `not_responding`.
+- **`health`, tested live:** with the rebuilt bridge loaded in Max 2026 on 2026-10-01. Idle, `get_bridge_status` returned `pong: true` with the `health` block. During an 8 s `sleep` sent from another process, it answered at once with `bridge_state: "busy"`, `MAX_BUSY`, `busy_mcp` and owner `other_client`. The 20 s `not_responding` path hasn't been exercised live.
+- **`capture_hang_diagnostics`:** run against child processes started by the tests. Their frames resolve inside `ntdll`, every thread was confirmed resumed afterwards, and the child still answered. Its rules are also unit-tested on synthetic captures built from frames of the two real hang dumps. It hasn't yet been pointed at a real hung Max with the packaged tool; the original script it comes from was.
 
 Tests:
 - `tests/test_hang_diagnosis.py`: lock timeout, deadlines, probes, the hung-PID latch, status payloads.
 - `tests/test_parent_watchdog.py`
 - `tests/test_bridge_health.py`
-- `tests/test_hang_capture.py`: 42 cases, covering rules, main-thread identification, PID resolution, and live captures of spawned processes.
+- `tests/test_hang_capture.py`: 46 cases, covering rules, main-thread identification, PID resolution, and live captures of spawned processes.
+- `tests/test_suspend_guard.py`: every pause is resumed exactly once, `release_all()` and the exit paths, the 250 ms cut-off, state-change pauses and reused thread ids.
 - Native, SDK-independent: `native/tests/executor_tests.cpp` and `native/tests/health_tests.cpp`. The second covers the heartbeat, queued and running visibility without blocking, expired items, and the client registry.
 
 ## Upstream status
 
 None of this is fixed upstream as of 2026-10-01. Related work:
 - Upstream PR 32 (executor cancellation, closed unmerged) was deliberately not ported. Its contributor's fork has been deleted.
-- The lock timeout idea comes from stoxsss111's fork, and `_process_alive` and the executor drain from Geddart's.
+- The lock timeout idea comes from stoxsss111's fork. From Geddart's come the executor drain and the process-exit check (`_process_alive` there, rewritten here in `maxmcp/process_health.py`).

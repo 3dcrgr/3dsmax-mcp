@@ -10,7 +10,7 @@ On a Revit scene with Hebrew names, `replace_material` was asked to swap a plast
 
 It wasn't an encoding problem. In the native handler, `source_material` is the material to **apply**, and `target_material` is the material being **replaced**. The handler looks for objects whose material is named `target_material` and gives them `source_material`. The agent had passed the two names the other way round. The tool's docstring didn't say which was which; upstream had trimmed an older docstring that did. The Hebrew name matched fine: an unmatched source name throws "not found", and this call didn't.
 
-Three other limitations made the tool fail quietly on real scenes:
+Three other limitations made the tool fail on real scenes. The first two failed quietly; the third failed with a misleading "not found" error:
 
 - **A success status with zero replacements**, which hid the mistake.
 - **Only top-level object materials were matched.** A target inside a Multi/Sub-Object material was never replaced, and Revit and ATF imports produce Multi/Sub materials all the time.
@@ -18,22 +18,22 @@ Three other limitations made the tool fail quietly on real scenes:
 
 ## What changed
 
-**The direction is documented** (`6e9188b`). Both docstrings say: source = the material to apply, target = the material to replace. The skill guide says the same.
+**The direction is documented** (`6e9188b`). Both docstrings say: source = the material to apply, target = the material to replace. The skill guide says the same, and lists where the source can come from, `blocked`, and the batch order.
 
 **Nothing matched → `no_match`; everything skipped → `blocked`** (`6e9188b`, refined in `9f520ba` and `3bebe55`).
 - **`no_match`:** no object and no sub-material slot uses the target. The warning explains the direction and where the source can come from.
-- **`blocked`:** the target *is* used, but every match was skipped by the loop guard (see below). This holds in preview too. The warning lists the skips by reason and deliberately gives no "swap the arguments" hint: swapping would apply the target over the source's users.
-- Batch entries behave the same way. A batch entry whose matches were all skipped also reports `blocked`, not `no_objects`.
+- **`blocked`:** the target *is* used, but every match was skipped (see `skipped` below). This holds in preview too. The warning lists the skips by reason and deliberately gives no "swap the arguments" hint: swapping would apply the target over the source's users.
+- Batch entries get the same statuses, but their warnings go on the batch result, not on the entry. One combined `no_match` warning names every missed target; the per-entry details (skips, an ambiguous source, `blocked`) start with `'source' -> 'target':`.
 
 **Sub-material slots are matched** (`9f520ba`). The new parameter `include_sub_materials` defaults to `true`.
-- Every Multi/Sub-Object slot, or any other material's sub-material slot, that holds a material named `target_material` gets the source.
+- Every Multi/Sub-Object slot, or any other material's sub-material slot, that holds a material named `target_material` gets the source, as long as it sits inside an object's material. A Multi/Sub that is only in the Material Editor or a library isn't changed.
 - A material shared by many objects is changed once.
 - A material named like the target is replaced as a whole, and isn't searched inside.
-- Slots that would create a reference loop are skipped and listed in `skipped` with a reason:
+- Slots left unchanged are listed in `skipped`, each with a `reason`. The first three come from the loop guard and show up in preview too:
   - `parent_is_source`;
   - `source_contains_parent`;
-  - `reference_loop`, from the SDK's `TestForLoop`;
-  - `set_failed`, when a plugin material ignored the change.
+  - `reference_loop`, from the SDK's `TestForLoop` (native handler only);
+  - `set_failed`, real runs only, when a plugin material ignored the change.
 
 **The source is found outside the scene** (`9f520ba`). The search runs in this order:
 1. object materials;
@@ -42,9 +42,9 @@ Three other limitations made the tool fail quietly on real scenes:
 4. the scene materials;
 5. the current material library.
 
-The result reports `source_found_in`. If several different materials share the name, the first one found wins, and the result adds `source_ambiguous: true`, `source_candidates` and a warning.
+The result reports `source_found_in`: `node`, `sub_material`, `material_editor`, `scene_materials` or `material_library`. If several different materials share the name, the first one found wins, and the result adds `source_ambiguous: true`, `source_candidates` and a warning.
 
-**`source_from` picks where the source comes from** (`3bebe55`). It takes one of `node`, `sub_material`, `material_editor`, `scene_materials` or `material_library`, and limits the search to that place.
+**`source_from` picks where the source comes from** (`3bebe55`). It takes one of those five places and limits the search to it.
 - Typical use: you re-imported a Cosmos material, and the copy in the Material Editor has the same name as the one already on objects. `source_from="material_editor"` applies the new copy.
 - An invalid value fails before anything is sent to Max.
 - A bridge older than this fix ignores `source_from`. The result then carries a warning that the bridge may have searched everywhere.
@@ -59,20 +59,21 @@ New result fields:
 | `replaced_slots` / `affected_slots` | `{parent_material, parent_class, slot_index, slot_name}` per slot. `slot_index` is 1-based, like MAXScript; for a Multi/Sub it's the position in `materialList`, not the material ID. |
 | `replaced_slot_count` / `affected_slot_count` | Number of slots |
 | `source_exists`, `source_found_in` | Where the source was found |
-| `source_ambiguous`, `source_candidates` | Only when the name isn't unique |
+| `source_ambiguous`, `source_candidates` | Only when the name isn't unique. `source_candidates` is the number of materials with that name, not a list |
 | `skipped` | Slots left alone, each with a `reason` |
 | `include_sub_materials`, `source_from` | Echo of the parameters |
-| `depends_on_entries` | Batch only: earlier entries this one depends on (see below) |
+| `depends_on_entries` | Batch only: 1-based numbers of earlier entries this one depends on (see below) |
 
-`replaced_count` and `replaced_objects` still count objects only, as before.
+`replaced_count` and `replaced_objects` still count objects only, as before. A `replace_material` preview has `preview: true` and no `status` unless it is `no_match` or `blocked`. Native `batch_replace_materials` entries that ran use the `replaced_*` keys even in a preview, where their status is `"preview"` unless it is `no_match` or `blocked`. They list objects as `{name, handle, class, layer}`. The batch result adds `total_replaced_slots`.
 
 **Batch entries now run in order.** In `batch_replace_materials`, each entry sees the scene as the previous entries left it.
 - Before, the handler took one snapshot up front and kept raw material pointers between entries. A material whose last user was reassigned by an earlier entry could be auto-deleted by Max while the batch still held it.
-- Side effect: a pair like `A→B, B→A` no longer swaps two materials. To swap, go through a temporary material: `A→Tmp`, `B→A`, `Tmp→B`.
+- Side effect: the pair `{source: "A", target: "B"}`, `{source: "B", target: "A"}` no longer swaps two materials: both groups end up with the same one (B if the second entry still finds B, otherwise that entry fails and A stays everywhere). To swap, go through a temporary material, in this order: `{source: "Tmp", target: "A"}`, `{source: "A", target: "B"}`, `{source: "B", target: "Tmp"}`.
+- Each entry looks its source up again when it runs, and at that moment each of the three sources is on no object. Put Tmp, A and B in Material Editor slots first. Otherwise an entry can fail with "source material not found", and the rest of the batch still runs and leaves the swap half done.
 - **Preview can't see this ordering.** It plans every entry against the current scene. So an entry that reuses a name an earlier entry applies or removes gets `depends_on_entries` and a warning, because its real run can differ from its preview (`3bebe55`).
 - `source_from` works as a batch-wide default, or per entry with a `source_from` key.
 
-**The MAXScript fallback matches the native handler.** This is the fallback used when the native bridge isn't available. It has the same lookup order, slot matching and result keys, and it runs inside one undo step. Its `status` on success is still `"success"`, where native returns `"replaced"`.
+**The MAXScript fallback matches the native handler.** This is the fallback used when the native bridge isn't available. It has the same lookup order and slot matching, and a single call returns the same keys and runs inside one undo step. Its `status` on success is still `"success"`, where native returns `"replaced"`. Its loop guard has no `TestForLoop` check, so it never reports `reference_loop`. In `batch_replace_materials` it runs each entry as its own call and undo step, so its entries keep the single-call shape: `affected_*` keys in a preview, and objects listed by name.
 
 ## Examples
 
@@ -94,9 +95,10 @@ replace_material(source_material="Plaster", target_material="Cosmos_Plaster")   
 - **The direction docs and `no_match`** (`6e9188b`) were verified live on 2026-10-01.
   - `replace_material(source="Glass", target="NoSuchMaterial_xyz", preview=True)` returned `no_match` with the direction warning.
   - The correct direction still listed the affected objects.
-- **Sub-material matching, the source search, `source_from`, `blocked` and the loop guard** (`9f520ba`, `3bebe55`) are unit-tested on the Python side (`tests/test_material_replace.py`). An adversarial review covered native undo, reference lifetimes, the `TestForLoop` direction, and search side effects. The Python side was deployed on 2026-10-01. The native handler is in the rebuilt 2026 bridge (sha256 `5f49226e…`), which is staged for the next Max restart. It hasn't been run in Max yet.
-  - The live test plan includes Multi/Sub, nested Multi/Sub, a source that's only in the Material Editor, the loop guard, Hebrew names, batch, and plugin parents such as VRayBlendMtl and Shell_Material.
-  - One check matters most: a normal Multi/Sub replacement must not be reported as `reference_loop`. If it is, the meaning of the SDK's `TestForLoop` result is inverted.
+- **Sub-material matching, the source search, `source_from`, `blocked` and the loop guard** (`9f520ba`, `3bebe55`) have Python unit tests in `tests/test_material_replace.py`, but they mock the bridge. They check the payload, the text of the generated MAXScript and the Python post-processing (`no_match`, `blocked`, the `source_from` checks, warnings, `depends_on_entries`). The matching, the source search and the loop guard only run inside Max, so the unit tests don't cover them. An adversarial review covered native undo, reference lifetimes, the `TestForLoop` direction, and search side effects. The Python side was deployed on 2026-10-01. The native handler is in the rebuilt 2026 bridge (sha256 `5f49226e…`, shipped in `1692571`), deployed the same day.
+  - The native handler was checked live at 12:30 on a Multi/Sub whose source was only in the Material Editor. The preview gave `source_found_in` "material_editor", one affected slot and an empty `skipped`. The real run replaced the slot, and `undo_last` put it back.
+  - That empty `skipped` was the check that mattered most: a normal Multi/Sub slot isn't reported as `reference_loop`, so the SDK's `TestForLoop` result is read the right way round.
+  - Not run in Max yet: nested Multi/Sub, the loop guard's skips, `source_from`, `blocked`, Hebrew names, batch, plugin parents such as VRayBlendMtl and Shell_Material, and the MAXScript fallback.
 
 ## Upstream status
 

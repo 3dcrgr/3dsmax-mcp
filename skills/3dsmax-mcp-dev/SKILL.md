@@ -113,7 +113,7 @@ Debugging:
 - Multi/Sub: `set_sub_material`
 - Textures: `create_texture_map`, `set_texture_map_properties`
 - Dual pipeline: `create_shell_material`, `replace_material`, `batch_replace_materials`
-  - Direction: `source_material` = material to apply (already on an object), `target_material` = material being replaced; top-level node materials only. `status: "no_match"` means no object uses the target: check the direction before retrying. To apply an unassigned material use `assign_material`.
+  - Direction: `source_material` = material to apply, `target_material` = material being replaced. The source can be on an object, in a sub-material, a Material Editor slot or a material library (`source_found_in` says where; `source_from` picks one, e.g. `"material_editor"` for a re-imported Cosmos copy). Sub-material slots of object materials are replaced too (`include_sub_materials`). `status: "no_match"` means nothing uses the target: check the direction before retrying. `"blocked"` means every match was skipped (`skipped[].reason`): do not swap the arguments. Batch entries apply in order, so A->B, B->A does not swap.
 - OSL: `write_osl_shader`
 
 ### Material notes

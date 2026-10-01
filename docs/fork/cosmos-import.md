@@ -16,7 +16,7 @@ Native stack dumps showed two separate problems. Both are inside Chaos code, and
    - Any main-thread call that makes Windows send a synchronous message to that window then blocks forever. Closing or activating a window does this; `MatEditor.Close()` is one example.
    - This one never recovered: Max was killed after 13 minutes.
 
-If the Cosmos browser is opened through its V-Ray or Corona action *first*, its window belongs to Max's main thread, and neither problem occurs. In about 40 imports done that way, each import took about 10 s of real work. Assignments, undo holds and `MatEditor.Close()` all worked afterwards.
+If the Cosmos browser is opened through its V-Ray or Corona action *first*, its window belongs to Max's main thread, and neither problem occurs. In the one logged test done that way, with V-Ray still the Material Editor renderer, Max was busy for about 10 s (the preview render) and then answered again. Assigning the material, an undo hold and `MatEditor.Close()` all worked afterwards.
 
 The MCP made both problems worse in three ways:
 - `_wait_import` returned as soon as a new material handle appeared, while the importer still had work queued.
@@ -28,32 +28,40 @@ The MCP made both problems worse in three ways:
 `cosmos_import` now runs these steps:
 
 1. **Make sure a main-thread Cosmos browser exists.** This check is done from the OS, with no bridge call.
-   - If there's no responsive browser window owned by Max's main thread, it runs the renderer's "Cosmos browser" action. The action is looked up by name in the action tables, never by index. It then waits up to 15 s for the window.
+   - If no browser window belongs to Max's main thread, it runs the renderer's "Cosmos browser" action. The action is looked up by name in the action tables, never by index. It then waits up to 15 s for the window.
+   - If a browser is already on the main thread but doesn't answer because Max's main thread is busy, it doesn't run the action. It only waits, from the OS, up to 15 s for the window to answer.
    - If a browser on another thread is already hung, it refuses and sends nothing. The result is `state: "browser_hung"` with code `IMPORT_SETTLING`.
-2. **Prepare.** One bridge call takes a scene snapshot and clears the selection, remembering it first. The native importer otherwise auto-assigns the new material to whatever is selected.
+2. **Prepare.** One bridge call records what already exists for this asset: nodes tagged with its Cosmos ID, and materials and maps whose names or file names match. That's how the import's new resources are told apart later. The same call records the Material Editor renderer and, when the swap is on, switches it to Default Scanline. Last, it clears the selection, remembering it first. The native importer otherwise auto-assigns the new material to whatever is selected.
+   - Just before this call, it waits up to 15 s for Max's main window to answer. If it doesn't, nothing more is sent. The result is `state: "not_imported"` with code `IMPORT_SETTLING`.
 3. **Dispatch the import**, then poll lightly for the result (#2). The polls are read-only and back off. They're also probes: they're never sent into a main window that's already hung, and they're dropped at their deadline.
 4. **Wait for Max to settle**, judged from the OS. The main window and every Cosmos browser window, hidden ones included, must answer for a streak longer than 6 s. (`IsHungAppWindow` only reports a window as hung after about 5 s.)
+   - Max's CPU use must also fall back near its level before the import. If the windows answer but the CPU stays busy, it stops waiting 10 s later and adds a warning that textures may still be loading.
 5. **Restore the selection.** It never calls `MatEditor.Close()` or `MatEditor.Open()`.
-6. **If Max is still busy after `settle_seconds`**, the result says `safe_to_edit: false` and includes a `pending_restore` script to run later.
-   - It also arms an `IMPORT_SETTLING` guard. Until that Max's windows pump messages again, further calls to it fail fast and aren't sent. The guard expires after 15 minutes at most.
+6. **If Max is still busy after `settle_seconds`**, the result has `state: "settling"` and `safe_to_edit: false`. Once `get_bridge_status` reports Max responding, run `pending_restore.maxscript` once with `execute_maxscript`.
+   - It also arms an `IMPORT_SETTLING` guard. Until that Max's windows pump messages again, further calls from this server to it fail fast and aren't sent. The guard expires after 15 minutes at most.
+
+The same guard covers the import itself: while it runs, other calls from this server to that Max fail at once with `IMPORT_SETTLING`. It's also armed when step 1 or 2 refuses the import as described above.
 
 New parameters:
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `swap_medit_renderer` | `false` | Use Default Scanline as the Material Editor renderer during the import. This is turned on automatically when the browser can't be opened. |
-| `restore_medit_renderer` | `true` | Put the original Material Editor renderer back once Max is idle and the editor is closed. |
+| `swap_medit_renderer` | `false` | Use Default Scanline as the Material Editor renderer during the import. This is turned on automatically when step 1 ends without a responsive browser on Max's main thread. |
+| `restore_medit_renderer` | `true` | Put the original Material Editor renderer back once Max is idle and the editor is closed. If the editor is open, it stays Scanline and a warning gives the restore script. |
 | `settle_seconds` | `90` (0–300, at least 8 used) | How long to wait for Max to settle before returning `safe_to_edit: false`. |
 
 New result fields:
-- `cosmos_browser`: `ensured`, `opened`, `windows`, `warning`.
-- `medit_renderer.swap`: `off`, `requested` or `fallback`.
-- `safe_to_edit`, `next`, `pending_restore`.
+- `state` can also be `settling` (dispatched, but Max is still busy; `detected` says whether the new resource was seen), `browser_hung` or `not_imported` (nothing imported, `dispatched: false`).
+- `cosmos_browser`: `ensured`, `opened`, `main_thread`, `windows`, `warning`, plus `action` when it looked up the browser action.
+- `medit_renderer`: `class`, `locked`, `editor_open`, `swapped`, and `swap` (`off`, `requested` or `fallback`).
+- `import_timing`: `detected`, `after_s`, `polls`, `skipped_hung`, `pre_dispatch` and `settle`.
+- `safe_to_edit`, `next`, `warnings`, and `pending_restore` (`selection`, `restore_medit_renderer`, `maxscript`).
 
 `cosmos_search` (#7) no longer needs Max's main thread:
 - The target PID comes from the selected instance, with no bridge call.
 - When exactly one Cosmos importer is registered for that PID, the renderer follows from the importer. So a search works even while Max is busy.
-- With both V-Ray and Corona installed, it still reads `renderers.current` once.
+- When more than one importer is registered for that PID (V-Ray and Corona, say) and `renderer` is `"current"` (the default), it reads `renderers.current` once. Pass `renderer="vray"` or `"corona"` to skip that. Max is also asked when the selected instance can't be reached or no importer matches.
+- The result's `renderer_source` says where the renderer came from: `explicit`, `only_importer` (the scene renderer wasn't checked) or `scene`.
 
 ## How it was verified
 
@@ -62,9 +70,9 @@ Live on 3ds Max 2026 with V-Ray 7 update 4 hotfix 2 (GPU production renderer), o
 - **Action lookup:** found both `V-Ray | Chaos Cosmos browser` and `Chaos Corona | Corona Open Cosmos Browser`.
 - **Import with default settings:**
   - The browser was ensured (it already existed on the main thread), and the Material Editor renderer wasn't swapped.
-  - It returned `imported` and `safe_to_edit: true` after about 20 s.
+  - It detected the new material 19.8 s after dispatch, with 8 polls skipped while Max was hung. The settle check then passed with a quiet streak of 7, and it returned `imported` and `safe_to_edit: true`.
   - The user's selection came back, and the material wasn't auto-assigned to it.
-- **`cosmos_search`:** answered with `renderer_source: "scene"` (two importers are installed on that machine).
+- **`cosmos_search`:** answered with `renderer_source: "scene"`, because V-Ray and Corona both registered an importer for that Max.
 - **Not yet run:** an import on a freshly started Max with the browser closed, which exercises the "open the browser" path.
 
 Unit tests are in `tests/test_cosmos_import.py`. They use fake windows to cover a hung browser, a missing browser, settle streaks, the guard expiring, and the Scanline fallback.
@@ -81,4 +89,4 @@ Unit tests are in `tests/test_cosmos_import.py`. They use fake windows to cover 
 
 ## Upstream status
 
-Not fixed upstream as of 2026-10-01. None of the 47 forks touches `cosmos.py`.
+Not fixed upstream as of 2026-10-01. None of the 45 reachable forks touches `cosmos.py`. The other two of the 47, `rocksek` and `mseep-ai`, are deleted.
