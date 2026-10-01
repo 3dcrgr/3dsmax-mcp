@@ -153,7 +153,7 @@ The bridge side of #6, reporting how many clients are connected, is the `clients
 
 ### Upstream 1.7.5's dialog handling, fixed on the merge
 
-Commits `8a8b26c`, `ffccbab`, `f70b0cc` and `34a7ce5`, after the merge itself (`a07ef93`). The 2026 bridge built with them is `3f9f7d44…`, from `1cf40f3`. The native fixes are only in that bridge. Upstream's bridges, which the fork ships for 2023–2025 and 2027, get the Python half only.
+Commits `8a8b26c`, `ffccbab`, `f70b0cc` and `34a7ce5`, after the merge itself (`a07ef93`). The 2026 bridge built with them is `8b7453a6…`, from `1cf40f3`. The native fixes are only in that bridge. Upstream's bridges, which the fork ships for 2023–2025 and 2027, get the Python half only.
 
 Merging 1.7.5 brought its blocking-dialog handling: `BLOCKED_BY_DIALOG`, `max_dialogs`, `MAX_DIALOG_ERROR` and quiet mode. Where upstream already solved the same problem, the merge kept its mechanism (the reader thread, the queue cancellation) and fitted the fork's diagnosis around it. How the error codes rank is under [Client side](#client-side-a9d2a0d), and `get_bridge_status`'s dialog step under [Bridge health](#bridge-health-from-a-pipe-thread-2ce5928-reviewed-in-011e547). The Cosmos import's dialog handling and the windows the dialog monitor must never treat as dialogs (`6e03f99`) are in cosmos-import.md: [Dialogs during an import](cosmos-import.md#dialogs-during-an-import-upstream-175) and [Windows that are never dialogs](cosmos-import.md#windows-that-are-never-dialogs-6e03f99).
 
@@ -179,7 +179,7 @@ Not changed: the native tool-window rule matches by title only, so a real messag
   - Without the `health` command, a legitimate long call from another client looks like a deadlock from outside. The `health` command narrows that gap: it names the other client's request and reports it busy. A call that keeps the main thread from pumping for 20 s or more with almost no CPU, such as a long `sleep`, is still reported `not_responding`.
 - **`health`, tested live:** with the rebuilt bridge loaded in Max 2026 on 2026-10-01. Idle, `get_bridge_status` returned `pong: true` with the `health` block. During an 8 s `sleep` sent from another process, it answered at once with `bridge_state: "busy"`, `MAX_BUSY`, `busy_mcp` and owner `other_client`. The 20 s `not_responding` path hasn't been exercised live.
 - **`capture_hang_diagnostics`:** run against child processes started by the tests. Their frames resolve inside `ntdll`, every thread was confirmed resumed afterwards, and the child still answered. Its rules are also unit-tested on synthetic captures built from frames of the two real hang dumps. It hasn't yet been pointed at a real hung Max with the packaged tool; the original script it comes from was.
-- **The 1.7.5 merge:** the live tests above ran on the fork's 1.7.3-based build, before the merge replaced the client's read loop. The merge and its dialog fixes have unit tests only. Its 2026 bridge (`3f9f7d44…`) isn't deployed, so none of the dialog handling has been tested live here yet.
+- **The 1.7.5 merge:** the live tests above ran on the fork's 1.7.3-based build, before the merge replaced the client's read loop. The merge and its dialog fixes have unit tests only. Its 2026 bridge (`8b7453a6…`) isn't deployed, so none of the dialog handling has been tested live here yet.
 
 Tests:
 - `tests/test_hang_diagnosis.py`: lock timeout, deadlines, probes, the hung-PID latch, status payloads, a dialog ahead of the deadline diagnosis, a dialog on a main thread that stopped pumping, detached readers.

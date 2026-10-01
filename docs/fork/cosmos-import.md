@@ -140,7 +140,7 @@ The fork's monitor:
 
 With upstream's bridges, the client applies the same titles: replies don't list these windows, the automatic inspect doesn't run while one is open, and `cosmos_import`'s dialog checks ignore them. Only titles are matched, so a real message box titled exactly like one of these windows wouldn't be reported.
 
-**Status.** Unit tested in `native/tests/dialog_watch_tests.cpp`, which counts every message the monitor sends these windows, and on the client side in `tests/test_hang_diagnosis.py` and `tests/test_cosmos_import.py`. It's in the 2026 bridge built from the merge (`3f9f7d44…`), which isn't deployed or tested live yet.
+**Status.** Unit tested in `native/tests/dialog_watch_tests.cpp`, which counts every message the monitor sends these windows, and on the client side in `tests/test_hang_diagnosis.py` and `tests/test_cosmos_import.py`. It's in the 2026 bridge built from the merge (`8b7453a6…`), which isn't deployed or tested live yet.
 
 ## How it was verified
 
