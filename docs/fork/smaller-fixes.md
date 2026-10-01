@@ -27,3 +27,5 @@ Commit `e1dbabe`.
 **What happened.** `inspect_curve` refused objects of class `line` with "Editable spline base required". A Line is an editable spline: it supports all the spline functions.
 
 **What changed.** One shared MAXScript check (SplineShape *or* line) now decides "editable spline base" everywhere spline data is read or edited. Parametric shapes such as Rectangle, Circle and Text still need an explicit conversion, and NURBS curves are still rejected.
+
+**Verified live** on 2026-10-01: `inspect_curve` reads Line objects.

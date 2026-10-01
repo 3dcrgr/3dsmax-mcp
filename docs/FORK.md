@@ -23,7 +23,7 @@ The worst of these problems hung Max and lost unsaved work. Everything here is m
 | `replace_material` "replaces" nothing and reports success | Direction documented, `no_match` warning, sub-material slots matched, sources found outside the scene | [replace-material.md](fork/replace-material.md) | Direction and `no_match` verified live; sub-material matching reviewed, native bridge staged |
 | Revit (Autodesk Bitmap) texture paths read as empty | Read bitmap-asset parameters; flag unreadable paths | [autodesk-bitmap-paths.md](fork/autodesk-bitmap-paths.md) | Verified live; duplicate VRayBitmap row fix staged |
 | `execute_maxscript` calls an interrupted script (e.g. `quitMax`) a "parse error" | Re-compile to tell syntax errors from interruptions; new code `MAXSCRIPT_INTERRUPTED` | [smaller-fixes.md](fork/smaller-fixes.md) | Reviewed; Python deployed, native bridge staged |
-| Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Deployed |
+| Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Verified live |
 
 What the status words mean:
 - **Verified live:** the fix was exercised in a real Max 2026 session, against the scene that showed the problem, on 2026-10-01.
@@ -46,6 +46,8 @@ uv run python install.py
 ```
 
 Close 3ds Max and your AI clients first, as upstream's README says.
+
+After updating, start a new client session. MCP clients cache the tool list, so new tools such as `capture_hang_diagnostics` don't appear in sessions that were already open, even after the server restarts.
 
 **The native bridge:** `install.py` copies the prebuilt bridges from `native/bin/`.
 - In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available. It's the same build that's staged on the production machine (sha256 `5f49226e2341e5ad…`).

@@ -92,6 +92,7 @@ capture_hang_diagnostics(pid=None, all_threads=False, depth=48, save=True)
 - **Not marked read-only.** It pauses threads and writes files, so it doesn't claim the MCP `readOnlyHint`.
 - **Which threads are kept.** By default it keeps the main thread, threads that own a window, threads in application code, and any thread inside a watched module such as `galaxyimporter`. Use `all_threads=true` to keep every thread.
 - **Command line:** `python -m maxmcp.diagnostics.stackdump <pid> [--all] [--depth N] [--json]`.
+- **A new tool needs a new client session.** MCP clients cache the tool list, and a restarted server doesn't refresh it (there's no `tools/list_changed`). So after an update, `capture_hang_diagnostics` appears only in a new session; in the Claude desktop app that's a new Code-tab session. Until then, use the command line above with the installed runtime.
 
 The rules (`RULES` in `maxmcp/diagnostics/stackdump.py`; add a dict to add a rule):
 
