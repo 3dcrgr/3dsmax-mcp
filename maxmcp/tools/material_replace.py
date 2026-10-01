@@ -314,8 +314,8 @@ def batch_replace_materials(
     """Run several replace_material swaps in order: replacements=[{"source": apply, "target": remove}, ...].
 
     Same rules as replace_material (source lookup, sub-material slots); each entry sees the
-    scene left by the previous ones. Zero-match entries get status "no_match" plus one
-    combined warning.
+    scene left by the previous ones, so A->B then B->A does not swap (go through a temporary
+    material). Zero-match entries get status "no_match" plus one combined warning.
     """
     preview = preview or dry_run
     if client.native_available:
