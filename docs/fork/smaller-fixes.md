@@ -60,4 +60,4 @@ Fork issue #11. Commit `8330c2c`.
 - `release` restores the panel's previous name, and clears the tag only if this process held the window.
 - `status` reports `reclaimable`, the window and `next_action: "open"`, and errors name the stale window.
 
-**Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32. It's in the 2026 bridge in `native/bin/`, built from the 1.7.5 merge (sha256 `53ccb4df…`); an earlier build with it (sha256 `1cf0f9d8…`) was staged for the next Max restart. Unit tested in `tests/test_agent_viewport_reclaim.py`; not tested live yet.
+**Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32. It's in the 2026 bridge in `native/bin/`, built from the 1.7.5 merge (sha256 `e275e129…`); an earlier build with it (sha256 `1cf0f9d8…`) was staged for the next Max restart. Unit tested in `tests/test_agent_viewport_reclaim.py`; not tested live yet.

@@ -136,6 +136,21 @@ The server now exits when its parent client exits. If the parent is a pass-throu
 
 The bridge side of #6, reporting how many clients are connected, is the `clients` block of `health` above.
 
+### Upstream 1.7.5's dialog handling, fixed on the merge
+
+Merging 1.7.5 brought its blocking-dialog handling (`BLOCKED_BY_DIALOG`, `max_dialogs`, `MAX_DIALOG_ERROR`, quiet mode). A review of the merged branch found these problems, all fixed:
+- **A hung Max with a dialog on screen was called "blocked by a dialog".** The client raised `BLOCKED_BY_DIALOG` for any main-thread dialog, even while Max's main thread had stopped pumping, so the deadline diagnosis and the hung-PID latch never ran. The dialog monitor's status now reports `main_thread_pumping` (the heartbeat rule `health` uses); while it is false, a call is diagnosed like any other and gives `MAX_NOT_RESPONDING`. `get_bridge_status` already applied that rule.
+- **`get_bridge_status` crashed** (`'NoneType' object has no attribute 'get'`, returned as `BAD_PARAM`) when this server's `BLOCKED_BY_DIALOG` call was still running and Max had then been blocked for 20 s. The overdue rule now uses that call's own record (`blocked_call`): `not_responding` once it is past its timeout plus grace, `busy` before.
+- **A transacted call could commit before its acknowledged error was recorded.** The monitor posts the OK click, then publishes the error, so the operation could resume and commit first. `ThrowIfDismissed` now waits (at most 3 s) for the publish, so such a call is always rolled back.
+- **A Qt press could click after `respond` reported it failed.** When Max's main thread had started the press but not finished it within 1.5 s, `respond` returned a retryable `MAIN_THREAD_BUSY` and the click followed. It now returns `DIALOG_OUTCOME_UNKNOWN` (not retryable: inspect again). A press the main thread never started is withdrawn, so `MAIN_THREAD_BUSY` means nothing was pressed.
+- **A direct-mode read could leave Max in quiet mode.** `get_wired_params`, `get_state_sets` and `get_camera_sequence` run their scripts on a pipe thread, and their save/restore of Max's single quiet-mode flag could interleave with a main-thread one. Quiet mode now changes only on the main thread.
+- **A Qt MAXScript error box seen while the main thread didn't pump was never acknowledged**, so its call returned `BLOCKED_BY_DIALOG` instead of `MAX_DIALOG_ERROR`. It's read again once the main thread pumps.
+- **Render cleanup stopped halfway after an acknowledged error**, leaving the agent viewport's leased V-Ray settings modified. The cleanup now finishes; the call still fails with `MAX_DIALOG_ERROR`.
+- **Cosmos imports:** `MAX_DIALOG_ERROR` on the preparation call returns `not_imported` with the restore scripts instead of escaping; on the browser action it still waits for the browser; a dialog already holding Max's main thread stops the import before anything is sent.
+- Tool windows (Cosmos browser, Material Editor, viewports) of any thread now stop the automatic inspect, and replies never list them as open dialogs, also with upstream's bridges. The `BLOCKED_BY_DIALOG` registry drops probes before real calls when full.
+
+Not changed: the native tool-window rule matches by title only, so a real message box captioned exactly like the Material Editor would not be reported. A class-based exception was considered, but the Compact Material Editor itself may be a `#32770` dialog, which would make it a "dialog" again; that can't be checked without Max.
+
 ## How it was verified
 
 - **Executor fixes:** loaded in Max 2026 on 2026-10-01. Ping, read and mutating calls all OK. Quitting Max while a call is queued hasn't been exercised live yet.
@@ -153,6 +168,7 @@ Tests:
 - `tests/test_hang_capture.py`: 46 cases, covering rules, main-thread identification, PID resolution, and live captures of spawned processes.
 - `tests/test_suspend_guard.py`: every pause is resumed exactly once, `release_all()` and the exit paths, the 250 ms cut-off, state-change pauses and reused thread ids.
 - Native, SDK-independent: `native/tests/executor_tests.cpp` and `native/tests/health_tests.cpp`. The second covers the heartbeat, queued and running visibility without blocking, expired items, and the client registry.
+- `native/tests/dialog_watch_tests.cpp`: the monitor's window rules, plus the 1.7.5 fixes above (publish before resume, withdrawn and unknown-outcome presses, the pumping flag, the Qt error-box retry, the deferred cleanup scope). The publish race is reproduced by pinning the test to one CPU: without the fix, 4 of 5 runs resumed before the error was published. None of these 1.7.5 fixes is tested live yet.
 
 ## Upstream status
 
