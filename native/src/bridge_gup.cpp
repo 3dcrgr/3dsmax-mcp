@@ -198,6 +198,13 @@ DWORD MCPBridgeGUP::Start() {
 }
 
 void MCPBridgeGUP::Stop() {
+    // FIRST: close the executor gate and fail everything already queued. A
+    // client thread in Dispatch -> ExecuteSync waits for a WM_MCP_EXECUTE the
+    // main thread can no longer pump once StopPipe() is inside join(), which
+    // stalled Max's exit for up to the executor timeout per in-flight request.
+    // executor_.Shutdown() still runs last to destroy the window.
+    executor_.BeginShutdown();
+
     AgentViewport::Shutdown(true);
     SceneJournal::Unregister();
     NativeHandlers::UnregisterRenderNotifications();
