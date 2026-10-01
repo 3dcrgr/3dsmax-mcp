@@ -385,13 +385,128 @@ _MEDIT_SWAP = r"""if scanline!=undefined do (
   )
  )"""
 
+# Issue #10: the native importer writes into the ACTIVE Compact Material Editor slot.
+# A slot is "free" (safe to overwrite) only when its material is an untouched default:
+# named "NN - Default", no sub-materials, no maps, on no scene node and every property
+# equal to a new instance of its class (an edited but unnamed slot is not free; the new
+# instance is never put in a slot). Anything else in the active slot is worth keeping.
+# Never throws; any doubt means "not free".
+_SLOT_FNS = r"""fn mcpLooksFree m = (
+  local ok=false
+  try(
+   if m!=undefined and (matchPattern (m.name as string) pattern:"?? - Default") and (getNumSubMtls m)==0 and (refs.dependentNodes m).count==0 do (
+    ok=true
+    for j=1 to (getNumSubTexmaps m) while ok do if (getSubTexmap m j)!=undefined do ok=false
+    if ok do (
+     local d=(classof m)()
+     for p in (getPropNames m) while ok do if ((try(getProperty m p)catch(#mcpErr)) as string)!=((try(getProperty d p)catch(#mcpErr)) as string) do ok=false
+    )
+   )
+  )catch(ok=false)
+  ok
+ )
+ fn mcpFreeSlot skip = (
+  local s=0
+  try(for i=1 to meditMaterials.count while s==0 do if (findItem skip i)==0 and (mcpLooksFree meditMaterials[i]) do s=i)catch(s=0)
+  s
+ )
+ fn mcpSlotRef m = (
+  if m==undefined then "null" else "{\"handle\":\""+(try(formattedPrint ((getHandleByAnim m) as integer64) format:"d")catch(""))+"\",\"name\":\""+(MCP_Server.escapeJsonString(try(m.name as string)catch("")))+"\"}"
+ )"""
+
+# In _PREPARE (after the baseline snapshot): if the active slot holds a material
+# worth keeping, remember it (the global's reference also keeps it alive if the
+# importer displaces it) and make a free slot active so the importer writes there.
+# An earlier import's unfinished record (stale) is kept alive and its switch undone.
+# Changing activeMeditSlot can make an open Compact editor render that slot's sample.
+_SLOT_PREPARE = r"""try(
+  if mcp_cosmosMeditSlot!=undefined do (
+   slotStale=true
+   local old=mcp_cosmosMeditSlot
+   if mcp_cosmosMeditDisplaced==undefined do mcp_cosmosMeditDisplaced=#()
+   try(appendIfUnique mcp_cosmosMeditDisplaced old[2])catch()
+   try(if old[3]>0 and activeMeditSlot==old[3] do activeMeditSlot=old[1])catch()
+   mcp_cosmosMeditSlot=undefined
+  )
+  slotA=activeMeditSlot
+  slotMat=meditMaterials[slotA]
+  slotKeep=slotMat!=undefined and not (mcpLooksFree slotMat)
+  if slotKeep do (
+   mcp_cosmosMeditSlot=#(slotA, slotMat, 0, maxFilePath+maxFileName)
+   slotFree=mcpFreeSlot #(slotA)
+   if slotFree>0 do (
+    mcp_cosmosMeditSlot[3]=slotFree
+    activeMeditSlot=slotFree
+    slotSwitched=(activeMeditSlot==slotFree)
+   )
+  )
+ )catch(slotErr=getCurrentException())"""
+
+# In _FINALIZE (only after the OS-only settle was quiet): if the kept material was
+# displaced anyway by a material newer than every pre-dispatch handle (the import),
+# move that one to a free slot and put the kept one back; else keep the kept one
+# alive in mcp_cosmosMeditDisplaced. Then make the user's slot active again.
+# With no free slot before dispatch, moving the import needs a slot freed meanwhile;
+# usually the result is the warning. An open undo transaction (busy) leaves the record
+# for pending_restore; a deleted material or another scene file (stale) leaves the
+# slots as they are. Slot assignments can make the editor render sample slots (V-Ray:
+# on the main thread), as when the user does it by hand. Never throws.
+_SLOT_RESTORE = r"""(
+  local out="null"
+  try(
+   local b=mcp_cosmosMeditSlot
+   if b!=undefined and theHold.Holding() then (out="{\"busy\":true}") else if b!=undefined and ((try(isDeleted b[2])catch(true)) or (try(b[4]!=(maxFilePath+maxFileName))catch(true))) then (
+    mcp_cosmosMeditSlot=undefined
+    local kept=false
+    if not (try(isDeleted b[2])catch(true)) do (
+     if mcp_cosmosMeditDisplaced==undefined do mcp_cosmosMeditDisplaced=#()
+     try(appendIfUnique mcp_cosmosMeditDisplaced b[2]; kept=true)catch()
+    )
+    out="{\"stale\":true,\"original\":"+(try(b[1] as string)catch("0"))+",\"material\":"+(if kept then mcpSlotRef b[2] else "null")+"}"
+   ) else if b!=undefined do (
+    local a=b[1], m=b[2], f=b[3]
+    local cur=try(meditMaterials[a])catch(undefined)
+    local displaced=(cur!=undefined and cur!=m)
+    local fresh=displaced and (__FRESH_TEST__)
+    local movedTo=0, restored=false, keptAlive=false, activeRestored=undefined, err=""
+    if fresh do (
+     movedTo=if f>0 and (mcpLooksFree (try(meditMaterials[f])catch(undefined))) then f else (mcpFreeSlot #(a))
+     if movedTo>0 do try(
+      meditMaterials[movedTo]=cur
+      meditMaterials[a]=m
+      restored=(meditMaterials[a]==m)
+     )catch(err=getCurrentException())
+    )
+    if displaced and not restored do (
+     if mcp_cosmosMeditDisplaced==undefined do mcp_cosmosMeditDisplaced=#()
+     try(appendIfUnique mcp_cosmosMeditDisplaced m; keptAlive=true)catch()
+    )
+    if f>0 do try(
+     if activeMeditSlot!=a do activeMeditSlot=a
+     activeRestored=(activeMeditSlot==a)
+    )catch(activeRestored=false; if err=="" do err=getCurrentException())
+    mcp_cosmosMeditSlot=undefined
+    out="{\"original\":"+(a as string)+",\"switched_to\":"+(f as string)+",\"displaced\":"+(if displaced then mcpSlotRef m else "null")+",\"occupant\":"+(if displaced then mcpSlotRef cur else "null")+",\"imported_occupant\":"+(if fresh then "true" else "false")+",\"moved_to\":"+(movedTo as string)+",\"restored\":"+(if restored then "true" else "false")+",\"kept_alive\":"+(if keptAlive then "true" else "false")+",\"active_restored\":"+(if activeRestored==true then "true" else if activeRestored==false then "false" else "null")+",\"error\":\""+(MCP_Server.escapeJsonString(err as string))+"\"}"
+   )
+  )catch(out="{\"error\":\""+(MCP_Server.escapeJsonString(getCurrentException() as string))+"\"}")
+  out
+ )"""
+
+# Undo only the pre-dispatch slot switch (prepare lost; nothing was dispatched).
+_SLOT_ACTIVE_RESTORE = ('(global mcp_cosmosMeditSlot; local b=mcp_cosmosMeditSlot; if b==undefined then '
+                        '"nothing_to_restore" else (try(if b[3]>0 and activeMeditSlot!=b[1] do activeMeditSlot=b[1])'
+                        'catch(); mcp_cosmosMeditSlot=undefined; "restored"))')
+
 # ONE bridge call before dispatch: baseline snapshot, selection, Material Editor
 # renderer state, then (only with swap) the swap to Scanline (V-Ray rendering the
-# imported material's slot preview blocked Max's main thread for minutes).
+# imported material's slot preview blocked Max's main thread for minutes), then
+# the active-slot guard (#10).
 _PREPARE = r"""(
  global mcp_cosmosMeditBackup
+ global mcp_cosmosMeditSlot, mcp_cosmosMeditDisplaced
  if theHold.Holding() do throw "USER_BUSY"
  local snap=__SNAPSHOT__
+ __SLOT_FNS__
  fn jsonBool v = (if v==true then "true" else if v==false then "false" else "null")
  fn jsonStr v = ("\"" + (MCP_Server.escapeJsonString(v as string)) + "\"")
  local sel=selection as array
@@ -409,23 +524,30 @@ _PREPARE = r"""(
  local swapError=""
  local leftover=false
  __SWAP__
+ local slotA=0, slotMat=undefined, slotKeep=false, slotFree=0, slotSwitched=false, slotStale=false, slotErr=""
+ local slotMode=try((MatEditor.mode) as string)catch("")
+ __SLOT__
  clearSelection()
- "{\"before\":"+snap+",\"selection\":"+selJSON+",\"medit\":{\"class\":"+(jsonStr meditClass)+",\"instance\":"+(jsonStr meditName)+",\"locked\":"+(jsonBool locked)+",\"editor_open\":"+(jsonBool editorOpen)+",\"scanline_available\":"+(jsonBool (scanline!=undefined))+",\"swapped\":"+(jsonBool swapped)+",\"backup_pending\":"+(jsonBool pending)+",\"leftover_backup\":"+(jsonBool leftover)+",\"error\":"+(jsonStr swapError)+"}}"
+ "{\"before\":"+snap+",\"selection\":"+selJSON+",\"medit\":{\"class\":"+(jsonStr meditClass)+",\"instance\":"+(jsonStr meditName)+",\"locked\":"+(jsonBool locked)+",\"editor_open\":"+(jsonBool editorOpen)+",\"scanline_available\":"+(jsonBool (scanline!=undefined))+",\"swapped\":"+(jsonBool swapped)+",\"backup_pending\":"+(jsonBool pending)+",\"leftover_backup\":"+(jsonBool leftover)+",\"error\":"+(jsonStr swapError)+"},\"medit_slot\":{\"active\":"+(slotA as string)+",\"material\":"+(mcpSlotRef slotMat)+",\"keep\":"+(jsonBool slotKeep)+",\"free_slot\":"+(slotFree as string)+",\"switched\":"+(jsonBool slotSwitched)+",\"mode\":"+(jsonStr slotMode)+",\"stale\":"+(jsonBool slotStale)+",\"error\":"+(jsonStr slotErr)+"}}"
 )"""
 
 # After Max is quiet: restore the selection, then (only if the Material
-# Editor is closed) the recorded Material Editor renderer. Never opens,
-# closes or activates any window. Safe to run twice.
+# Editor is closed) the recorded Material Editor renderer, then the user's
+# Material Editor slot (#10). Never opens, closes or activates any window.
+# Safe to run twice.
 _FINALIZE = r"""(
  global mcp_cosmosMeditBackup
+ global mcp_cosmosMeditSlot, mcp_cosmosMeditDisplaced
+ __SLOT_FNS__
  local restoredSelection=false
  if not theHold.Holding() do (
   select (for h in #(__HANDLES__) where (maxOps.getNodeByHandle h)!=undefined collect (maxOps.getNodeByHandle h))
   restoredSelection=true
  )
  local medit=if __RESTORE__ then __MEDIT_RESTORE__ else "not_requested"
+ local slotJSON=__SLOT_RESTORE__
  local editorOpen=try(__EDITOR_OPEN__)catch(undefined)
- "{\"selection_restored\":"+(if restoredSelection then "true" else "false")+",\"medit\":\""+(MCP_Server.escapeJsonString(medit as string))+"\",\"editor_open\":"+(if editorOpen==true then "true" else if editorOpen==false then "false" else "null")+"}"
+ "{\"selection_restored\":"+(if restoredSelection then "true" else "false")+",\"medit\":\""+(MCP_Server.escapeJsonString(medit as string))+"\",\"editor_open\":"+(if editorOpen==true then "true" else if editorOpen==false then "false" else "null")+",\"medit_slot\":"+slotJSON+"}"
 )"""
 
 
@@ -468,14 +590,27 @@ def _open_browser_script(renderer):
 
 def _prepare_script(asset, swap=True):
     return (_PREPARE.replace("__SWAP__", _MEDIT_SWAP if swap else _MEDIT_LEFTOVER)
-            .replace("__SNAPSHOT__", _snapshot_script(asset, record=True)).replace("__EDITOR_OPEN__", _EDITOR_OPEN))
+            .replace("__SNAPSHOT__", _snapshot_script(asset, record=True)).replace("__EDITOR_OPEN__", _EDITOR_OPEN)
+            .replace("__SLOT_FNS__", _SLOT_FNS).replace("__SLOT__", _SLOT_PREPARE))
 
 
-def _finalize_script(handles, restore_medit):
+def _newest_known(before):
+    """Highest pre-dispatch material handle (-1: none recorded). Handles only grow, and
+    the record scan gave every existing material one, so a higher handle is new."""
+    return max(_handle_ints(((before or {}).get("known") or {}).get("materials")), default=-1)
+
+
+def _finalize_script(handles, restore_medit, newest_known=-1):
+    """newest_known: a slot occupant above this handle counts as the import's (-1: none
+    does, so a displaced slot material is kept alive and reported, not swapped back)."""
     values = ",".join(str(int(h)) for h in handles)
+    fresh = ("false" if int(newest_known) < 0
+             else "try(((getHandleByAnim cur) as integer64)>(%dL))catch(false)" % int(newest_known))
     return (_FINALIZE.replace("__HANDLES__", values)
             .replace("__RESTORE__", "true" if restore_medit else "false")
             .replace("__MEDIT_RESTORE__", _MEDIT_RESTORE)
+            .replace("__SLOT_FNS__", _SLOT_FNS)
+            .replace("__SLOT_RESTORE__", _SLOT_RESTORE.replace("__FRESH_TEST__", fresh))
             .replace("__EDITOR_OPEN__", _EDITOR_OPEN))
 
 
@@ -770,6 +905,97 @@ def _primary(response, asset, probe=None):
                                      len(top), expected, reason, expected))
 
 
+def _set_slot(response, handle, slot):
+    """Correct the reported medit_slot of the listed material with this handle."""
+    for item in (response.get("materials") or []) + [response.get("primary_material") or {}]:
+        if handle is not None and str(item.get("handle")) == str(handle):
+            item["medit_slot"] = slot or None
+
+
+def _slot_guard(response, prep, fin, warnings, ran=True):
+    """Issue #10: report the active Material Editor slot guard and the primary material's
+    final medit_slot. prep/fin: the medit_slot records of _PREPARE/_FINALIZE; ran=False
+    when finalize has not run yet."""
+    _slot_record(response, prep, fin, warnings, ran)
+    primary = response.get("primary_material")
+    if primary:
+        response["medit_slot"] = primary.get("medit_slot")
+
+
+def _slot_record(response, prep, fin, warnings, ran):
+    if not prep:
+        return
+    switched = prep.get("free_slot") if prep.get("switched") else None
+    record = {"original": prep.get("active") or None, "material": prep.get("material"),
+              "kept": bool(prep.get("keep")), "switched_to": switched, "mode": prep.get("mode") or None}
+    response["medit_active_slot"] = record
+    if prep.get("error"):
+        warnings.append("Could not check the active Material Editor slot: %s" % prep["error"])
+    if prep.get("stale"):
+        warnings.append("An earlier import's Material Editor slot record was never finalized; its slot switch was "
+                        "undone and its material kept alive in the MAXScript global mcp_cosmosMeditDisplaced.")
+    if not prep.get("keep"):
+        record["state"] = "not_needed"  # the active slot held an unused default material
+        return
+    if not ran:
+        record["state"] = "pending"
+        return
+    if not fin:
+        record["state"] = "no_record"
+        if switched:
+            warnings.append("The active Material Editor slot may still be %s; set it back with execute_maxscript: "
+                            "activeMeditSlot = %s" % (switched, prep.get("active")))
+        return
+    if fin.get("busy"):
+        record["state"] = "pending"  # an undo transaction was open; the record is kept
+        warnings.append("The Material Editor slot was not restored yet (an undo transaction was open): run "
+                        "pending_restore.maxscript once with execute_maxscript.")
+        return
+    if fin.get("stale"):
+        record["state"] = "stale"
+        kept = fin.get("material")
+        warnings.append("The scene changed since the import (reset or another file), so the Material Editor slots "
+                        "were left as they are%s." % (
+                            "; '%s' is kept alive in the MAXScript global mcp_cosmosMeditDisplaced" % kept.get("name")
+                            if kept else ""))
+        return
+    if "original" not in fin:
+        record["state"] = "error"
+        warnings.append("Could not restore the Material Editor slot (%s)%s." % (
+            fin.get("error"), "; set the active slot back with execute_maxscript: activeMeditSlot = %s"
+            % prep.get("active") if switched else ""))
+        return
+    original, displaced = fin["original"], fin.get("displaced")
+    record["active_restored"] = fin.get("active_restored")
+    error = fin.get("error") or ""
+    record["state"] = "kept"
+    if displaced:
+        response["displaced_material"] = {**displaced, "slot": original}
+        response["medit_slot_restored"] = bool(fin.get("restored"))
+        occupant = fin.get("occupant") or {}
+        if fin.get("restored"):
+            record["state"] = "restored"
+            _set_slot(response, occupant.get("handle"), fin.get("moved_to"))
+            _set_slot(response, displaced.get("handle"), original)
+        else:
+            record["state"] = "displaced"
+            why = (error or ("no free (unused default) slot for the imported material" if fin.get("imported_occupant")
+                             else "the slot's new material is not recognised as this import's"))
+            handle = str(displaced.get("handle") or "")
+            how = ("meditMaterials[%s] = getAnimByHandle %sL" % (original, handle) if handle.isdigit()
+                   else "meditMaterials[%s] = <its entry in mcp_cosmosMeditDisplaced>" % original)
+            warnings.append(
+                "The importer replaced '%s' in Material Editor slot %s with '%s'; it was not put back (%s). It is kept "
+                "alive in the MAXScript global mcp_cosmosMeditDisplaced. To restore it, first assign or re-slot '%s' "
+                "(an unassigned material removed from every slot can be deleted), then run with execute_maxscript: "
+                "%s" % (displaced.get("name"), original, occupant.get("name"), why, occupant.get("name"), how))
+    if fin.get("switched_to") and fin.get("active_restored") is False:
+        warnings.append("Could not make Material Editor slot %s active again%s; run with execute_maxscript: "
+                        "activeMeditSlot = %s" % (original, " (%s)" % error if error else "", original))
+    elif error and record["state"] != "displaced":
+        warnings.append("Material Editor slot restore reported: %s" % error)
+
+
 def _health_failure(exc):
     details = getattr(exc, "details", None) or {}
     return {"code": getattr(exc, "code", None), "message": str(exc),
@@ -789,9 +1015,11 @@ def _prepare_failed(base, pid, exc, restore_medit_renderer, swap=True, step="pre
     if step == "browser":
         warning = "The Cosmos browser action may have run; nothing else was changed."
     else:
-        warning = ("The preparation call may have run: the selection may be cleared%s. %sInspect the scene before "
+        warning = ("The preparation call may have run: the selection may be cleared%s and the active Material "
+                   "Editor slot switched (undo that once with execute_maxscript: %s). %sInspect the scene before "
                    "retrying the import." % (
                        " and the Material Editor renderer switched to Scanline" if swap else "",
+                       _SLOT_ACTIVE_RESTORE,
                        "Once Max responds, run pending_restore.maxscript once (it reports nothing_to_restore "
                        "if nothing was switched). " if restore_medit_renderer else ""))
     response = {**base, "state": "not_imported", "dispatched": False, "safe_to_edit": not lost,
@@ -862,6 +1090,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                 raise  # nothing was sent, so nothing changed
             return {**_prepare_failed(base, pid, exc, restore_medit_renderer, swap), "cosmos_browser": browser}
         before, selected, medit = prepared["before"], prepared["selection"], prepared["medit"]
+        slot_prep = prepared.get("medit_slot") or {}
         failure, health = None, None
         if swap and not medit.get("scanline_available"):
             warnings.append("Default_Scanline_Renderer is unavailable, so the Material Editor renderer was not "
@@ -890,7 +1119,9 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         settle = _settle(pid, settle_seconds, baseline_cpu)
         restore_medit = restore_medit_renderer and restore_pending
         pending = {"selection": selected, "restore_medit_renderer": restore_medit,
-                   "maxscript": _finalize_script(selected, restore_medit)}
+                   "maxscript": _finalize_script(selected, restore_medit, _newest_known(before))}
+        also = ((" and Material Editor renderer" if restore_medit else "")
+                + (" and Material Editor slot" if slot_prep.get("keep") else ""))
         quiet = bool(settle.get("quiet") or settle.get("windows_quiet"))
         after = finished = lost = None
         if quiet:
@@ -925,14 +1156,14 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
             if seen:
                 response.update(_resources(before, seen))
                 _primary(response, asset, detection.get("probe"))
+            _slot_guard(response, slot_prep, None, warnings, ran=False)
             warnings.append("Selection%s not restored yet: once get_bridge_status reports Max responding, run "
-                            "pending_restore.maxscript once with execute_maxscript."
-                            % (" and Material Editor renderer" if restore_medit else ""))
+                            "pending_restore.maxscript once with execute_maxscript." % also)
             why = ("Max is still busy after the import (%s)." % process_health.describe_windows(settle)
                    if lost is None else "Max stopped responding while %s." % (
                        "confirming the import" if lost == "confirm" else
-                       "restoring the selection/Material Editor renderer; that restore may already have run "
-                       "(running pending_restore once more is harmless)"))
+                       "restoring the selection/Material Editor renderer and slot; that restore may already "
+                       "have run (running pending_restore once more is harmless)"))
             created = any(i.get("created") for i in response.get(_EXPECTED.get(asset["kind"]) or "", []))
             response.update(state="settling", detected=bool(detection.get("detected")) or created,
                             safe_to_edit=False, pending_restore=pending, warnings=warnings,
@@ -948,7 +1179,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         if finished is None:
             response["pending_restore"] = pending
             warnings.append("Selection%s not restored: run pending_restore.maxscript once with execute_maxscript."
-                            % (" and Material Editor renderer" if restore_medit else ""))
+                            % also)
         else:
             if not finished.get("selection_restored"):
                 warnings.append("The previous selection was not restored (an undo transaction was open).")
@@ -963,6 +1194,10 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                               }.get(medit_state, medit_state)
                     warnings.append("The Material Editor renderer is still Scanline (%s). Once the Material Editor "
                                     "is closed, restore it with execute_maxscript: %s" % (reason, _MEDIT_RESTORE))
+        slot_fin = None if finished is None else finished.get("medit_slot")
+        _slot_guard(response, slot_prep, slot_fin, warnings, ran=finished is not None)
+        if (slot_fin or {}).get("busy"):
+            response["pending_restore"] = pending
         response.update(state="imported" if observed else ("import_unknown" if failure or after is None
                                                            else "imported_unverified"),
                         safe_to_edit=True)

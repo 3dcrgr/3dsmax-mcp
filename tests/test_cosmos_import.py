@@ -774,6 +774,224 @@ class HandleDiffTests(_FlowCase):
         self.assertNotIn("medit_slot", response["maps"][0])
 
 
+def slot_prep(active=13, keep=True, free_slot=4, switched=True, **extra):
+    return {"active": active, "material": {"handle": "2", "name": "Steel_Blurry"}, "keep": keep,
+            "free_slot": free_slot, "switched": switched, "mode": "basic", "stale": False, "error": "", **extra}
+
+
+def slot_fin(original=13, switched_to=4, displaced=None, occupant=None, fresh=False, moved_to=0, restored=False,
+             kept_alive=False, active_restored=True, error=""):
+    return {"original": original, "switched_to": switched_to, "displaced": displaced, "occupant": occupant,
+            "imported_occupant": fresh, "moved_to": moved_to, "restored": restored, "kept_alive": kept_alive,
+            "active_restored": active_restored, "error": error}
+
+
+USER_MAT = {"handle": "2", "name": "Steel_Blurry"}
+IMPORTED = {"handle": "77", "name": "Steel_Polished #0"}
+
+
+class ActiveSlotTests(_FlowCase):
+    """Issue #10: the importer writes into the ACTIVE Compact Material Editor slot."""
+
+    def use(self, prep, fin, imported_slot):
+        self.flow["prepare"] = {**prepared(), "before": KNOWN_BEFORE, "medit_slot": prep}
+        after = {"nodes": [], "materials": [slotted(2, "Steel_Blurry", 0 if imported_slot == 13 else 13),
+                                            slotted(77, "Steel_Polished #0", imported_slot)], "maps": []}
+        self.light_results = [after]
+        self.flow["full"] = after
+        self.flow["finalize"] = {"selection_restored": True, "medit": "restored", "editor_open": True,
+                                 "medit_slot": fin}
+
+    def slots(self, result):
+        return {m["handle"]: m["medit_slot"] for m in result["materials"]}
+
+    def test_used_active_slot_switched_before_dispatch_and_restored_after(self):
+        self.use(slot_prep(), slot_fin(), imported_slot=4)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertNotIn("warnings", result)
+        self.assertEqual(result["medit_active_slot"], {
+            "original": 13, "material": USER_MAT, "kept": True, "switched_to": 4, "mode": "basic",
+            "active_restored": True, "state": "kept"})
+        self.assertEqual(result["medit_slot"], 4)
+        self.assertEqual(self.slots(result), {"2": 13, "77": 4})
+        self.assertNotIn("displaced_material", result)
+        self.assertNotIn("medit_slot_restored", result)
+        # The switch rides in the one prepare call; the restore in the one finalize call after quiet.
+        kinds = self.bridge_kinds("operation")
+        self.assertEqual(kinds[0], "prepare")
+        self.assertEqual(kinds[-2:], ["full", "finalize"])
+        self.assertLessEqual(set(kinds), {"prepare", "light", "full", "finalize"})
+        dispatch, end = self.index(("dispatch",)), self.index(("settle_end",))
+        start = next(i for i, e in enumerate(self.events) if e[0] == "settle_start")
+        self.assertFalse([e for e in self.events[start:end] if e[0] == "bridge"])
+        prepare = self.op_client.commands[0][1]
+        self.assertLess(self.events.index(("bridge", "operation", "prepare")), dispatch)
+        self.assertLess(prepare.index("local snap="), prepare.index("activeMeditSlot=slotFree"))
+        self.assertLess(prepare.index("activeMeditSlot=slotFree"), prepare.index("clearSelection()"))
+        finalize = self.op_client.commands[-1][1]
+        self.assertGreater(self.events.index(("bridge", "operation", "finalize")), end)
+        self.assertIn("activeMeditSlot=a", finalize)
+        self.assertIn(">(3L)", finalize)  # newest pre-dispatch material handle from KNOWN_BEFORE
+
+    def test_free_slot_appeared_after_prepare_displaced_material_restored(self):
+        # No free slot before dispatch, but one was freed meanwhile (e.g. by hand); otherwise the
+        # no-free-slot case ends in the warning below.
+        fin = slot_fin(switched_to=0, displaced=USER_MAT, occupant=IMPORTED, fresh=True, moved_to=5, restored=True,
+                       active_restored=None)
+        self.use(slot_prep(free_slot=0, switched=False), fin, imported_slot=13)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertNotIn("warnings", result)
+        self.assertEqual(result["displaced_material"], {**USER_MAT, "slot": 13})
+        self.assertTrue(result["medit_slot_restored"])
+        self.assertEqual(result["medit_active_slot"]["state"], "restored")
+        self.assertIsNone(result["medit_active_slot"]["switched_to"])
+        self.assertEqual(result["medit_slot"], 5)
+        self.assertEqual(result["primary_material"]["medit_slot"], 5)
+        self.assertEqual(self.slots(result), {"2": 13, "77": 5})
+
+    def test_no_free_slot_displaced_material_not_restorable_is_warned(self):
+        fin = slot_fin(switched_to=0, displaced=USER_MAT, occupant=IMPORTED, fresh=True, kept_alive=True,
+                       active_restored=None)
+        self.use(slot_prep(free_slot=0, switched=False), fin, imported_slot=13)
+        result = self.run_import()
+        self.assertTrue(result["safe_to_edit"])
+        self.assertFalse(result["medit_slot_restored"])
+        self.assertEqual(result["medit_active_slot"]["state"], "displaced")
+        self.assertEqual(result["medit_slot"], 13)
+        [warning] = result["warnings"]
+        for needle in ("'Steel_Blurry'", "slot 13", "'Steel_Polished #0'", "no free (unused default) slot",
+                       "mcp_cosmosMeditDisplaced", "meditMaterials[13] = getAnimByHandle 2L"):
+            self.assertIn(needle, warning)
+
+    def test_switched_but_displaced_anyway_uses_the_free_slot(self):
+        fin = slot_fin(displaced=USER_MAT, occupant=IMPORTED, fresh=True, moved_to=4, restored=True)
+        self.use(slot_prep(), fin, imported_slot=13)
+        result = self.run_import()
+        self.assertNotIn("warnings", result)
+        self.assertTrue(result["medit_slot_restored"])
+        self.assertEqual(self.slots(result), {"2": 13, "77": 4})
+        self.assertTrue(result["medit_active_slot"]["active_restored"])
+
+    def test_active_slot_not_restored_is_warned(self):
+        self.use(slot_prep(), slot_fin(active_restored=False, error="boom"), imported_slot=4)
+        result = self.run_import()
+        [warning] = result["warnings"]
+        self.assertIn("activeMeditSlot = 13", warning)
+        self.assertIn("boom", warning)
+
+    def test_active_slot_already_free_no_switch(self):
+        self.use(slot_prep(keep=False, free_slot=0, switched=False), None, imported_slot=13)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertNotIn("warnings", result)
+        self.assertEqual(result["medit_active_slot"]["state"], "not_needed")
+        self.assertIsNone(result["medit_active_slot"]["switched_to"])
+        self.assertNotIn("displaced_material", result)
+        self.assertEqual(result["medit_slot"], 13)
+
+    def test_settling_keeps_slot_restore_pending(self):
+        self.use(slot_prep(), slot_fin(), imported_slot=4)
+        self.settle = settle_result(False, hung_browser=True)
+        result = self.run_import()
+        self.assertEqual(result["state"], "settling")
+        self.assertEqual(result["medit_active_slot"]["state"], "pending")
+        self.assertIn("Selection and Material Editor slot not restored yet", " ".join(result["warnings"]))
+        self.assertIn("activeMeditSlot=a", result["pending_restore"]["maxscript"])
+        end = self.index(("settle_end",))
+        self.assertFalse([e for e in self.events[end:] if e[0] == "bridge"])
+
+    def test_stale_record_and_prepare_error_warned(self):
+        self.use(slot_prep(keep=False, free_slot=0, switched=False, stale=True, error="no medit"), None, 13)
+        result = self.run_import()
+        text = " ".join(result["warnings"])
+        self.assertIn("never finalized", text)
+        self.assertIn("no medit", text)
+
+    def test_finalize_slot_error_warns_with_active_slot_script(self):
+        self.use(slot_prep(), {"error": "bad"}, imported_slot=4)
+        result = self.run_import()
+        self.assertEqual(result["medit_active_slot"]["state"], "error")
+        self.assertIn("activeMeditSlot = 13", result["warnings"][0])
+
+    def test_prepare_lost_warns_with_active_slot_undo(self):
+        self.flow["prepare"] = MaxNotRespondingAfterDispatch(
+            "3ds Max (PID 4242) is not responding", {"process": {"state": "blocked"}, "request_sent": True})
+        result = self.run_import()
+        self.assertIn(cosmos._SLOT_ACTIVE_RESTORE, result["warnings"][0])
+        self.assertNotIn(("dispatch",), self.events)
+
+    def test_finalize_in_undo_transaction_keeps_slot_restore_pending(self):
+        self.use(slot_prep(), {"busy": True}, imported_slot=4)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(result["medit_active_slot"]["state"], "pending")
+        self.assertIn("activeMeditSlot=a", result["pending_restore"]["maxscript"])
+        [warning] = result["warnings"]
+        self.assertIn("undo transaction", warning)
+        self.assertIn("pending_restore.maxscript", warning)
+        self.assertNotIn("displaced_material", result)
+
+    def test_stale_finalize_record_leaves_slots_as_they_are(self):
+        self.use(slot_prep(), {"stale": True, "original": 13, "material": USER_MAT}, imported_slot=4)
+        result = self.run_import()
+        self.assertEqual(result["medit_active_slot"]["state"], "stale")
+        [warning] = result["warnings"]
+        self.assertIn("scene changed", warning)
+        self.assertIn("'Steel_Blurry' is kept alive", warning)
+        self.assertNotIn("getAnimByHandle", warning)
+        self.assertNotIn("displaced_material", result)
+        self.assertNotIn("pending_restore", result)
+
+    def test_displaced_without_handle_has_no_broken_snippet(self):
+        fin = slot_fin(switched_to=0, displaced={"handle": "", "name": ""}, occupant=IMPORTED, fresh=True,
+                       kept_alive=True, active_restored=None)
+        self.use(slot_prep(free_slot=0, switched=False), fin, imported_slot=13)
+        [warning] = self.run_import()["warnings"]
+        self.assertNotIn("getAnimByHandle", warning)
+        self.assertIn("meditMaterials[13] = <its entry in mcp_cosmosMeditDisplaced>", warning)
+
+    def test_slot_scripts_shape(self):
+        asset = {"id": ASSET_ID, "name": "Plaster White", "kind": "material"}
+        prepare, finalize = cosmos._prepare_script(asset, False), cosmos._finalize_script([5], False)
+        for script in (prepare, finalize, cosmos._SLOT_ACTIVE_RESTORE):
+            self.assertIsNone(CLOSE_OR_OPEN.search(script))
+            self.assertNotIn("mateditor.close", script.lower())
+            self.assertNotIn("__", script.replace("__KEY__", ""))
+            self.assertEqual(script.count("("), script.count(")"))
+        for block in (cosmos._SLOT_FNS, cosmos._SLOT_PREPARE, cosmos._SLOT_RESTORE):
+            self.assertNotIn("SME.", block)  # activeMeditSlot only; Slate is left alone
+        # Every slot change is inside try/catch; neither block can throw out of its script.
+        self.assertTrue(cosmos._SLOT_PREPARE.startswith("try("))
+        self.assertTrue(cosmos._SLOT_PREPARE.endswith(")catch(slotErr=getCurrentException())"))
+        restore = cosmos._SLOT_RESTORE
+        self.assertLess(restore.index("try("), restore.index("meditMaterials[movedTo]=cur"))
+        self.assertIn(")catch(out=", restore)
+        self.assertLess(restore.index("if f>0 do try("), restore.index("activeMeditSlot=a"))
+        self.assertIn("catch(ok=false)", cosmos._SLOT_FNS)
+        self.assertIn('pattern:"?? - Default"', cosmos._SLOT_FNS)
+        self.assertIn("refs.dependentNodes m", cosmos._SLOT_FNS)
+        # The switch is recorded before it is made, so finalize can undo a partial switch.
+        self.assertLess(prepare.index("mcp_cosmosMeditSlot[3]=slotFree"), prepare.index("activeMeditSlot=slotFree"))
+        self.assertLess(finalize.index("select (for h"), finalize.index("meditMaterials[a]=m"))
+        self.assertIn("displaced and (false)", finalize)  # nothing recorded: no occupant counts as the import
+        self.assertNotIn(">(-1L)", finalize)
+        self.assertIn("displaced and (try(((getHandleByAnim cur) as integer64)>(3L))catch(false))",
+                      cosmos._finalize_script([], False, 3))
+        # Free means pristine: every property equals a new instance of its class.
+        self.assertIn("local d=(classof m)()", cosmos._SLOT_FNS)
+        self.assertIn("for p in (getPropNames m) while ok do", cosmos._SLOT_FNS)
+        # Finalize leaves slots alone during an undo transaction or after a scene change.
+        self.assertIn("mcp_cosmosMeditSlot=#(slotA, slotMat, 0, maxFilePath+maxFileName)", prepare)
+        self.assertLess(restore.index("theHold.Holding()"), restore.index("meditMaterials[movedTo]=cur"))
+        self.assertLess(restore.index("isDeleted b[2]"), restore.index("meditMaterials[movedTo]=cur"))
+        self.assertLess(restore.index("b[4]!=(maxFilePath+maxFileName)"), restore.index("local a=b[1]"))
+        self.assertEqual(cosmos._newest_known(KNOWN_BEFORE), 3)
+        self.assertEqual(cosmos._newest_known(BEFORE), -1)
+        self.assertIn(">(3000000000L)", cosmos._finalize_script([], False, 3000000000))
+
+
 class BrowserEnsureTests(_FlowCase):
     """Main-thread Cosmos browser before _PREPARE: the decision table."""
 

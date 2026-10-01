@@ -60,7 +60,9 @@ def cosmos_import(
     restore_medit_renderer. Waits up to settle_seconds (0-300, at least 8) for Max to
     settle; other calls get IMPORT_SETTLING meanwhile. If safe_to_edit is false,
     follow next and run pending_restore later. Never open or close the Material
-    Editor right after.
+    Editor right after. The importer fills the active Material Editor slot: a used
+    one is swapped for a free slot first and made active again after (medit_active_slot;
+    displaced_material/medit_slot_restored if it was replaced anyway).
     """
     return impl.import_asset(client, asset_id, wait_seconds, renderer, settle_seconds, restore_medit_renderer,
                              swap_medit_renderer)
