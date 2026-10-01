@@ -76,6 +76,8 @@ class FakeClient:
             value = value.pop(0)
         if isinstance(value, BaseException):
             raise value
+        if isinstance(value, RawResult):
+            return {"result": str(value)}
         return {"result": json.dumps(value)}
 
     def get_selected_max_instance(self):
@@ -91,6 +93,10 @@ class FakeClient:
         return {"target_pid": PID, "available": True}
 
 
+class RawResult(str):
+    """A bridge result passed through as is (not JSON-encoded), e.g. a MAXScript runtime error."""
+
+
 def classify(command):
     if "actionMan.executeAction" in command:
         return "browser"
@@ -100,6 +106,8 @@ def classify(command):
         return "prepare"
     if "maxOps.getNodeByHandle" in command:
         return "finalize"
+    if "mcp_cosmosLastFinalize" in command:
+        return "last_finalize"
     if "for c in material.classes do" in command:
         return "full"
     if "cosmosAssetId" in command:
@@ -523,7 +531,7 @@ class DialogTests(_FlowCase):
         self.assertIn("only if max_dialogs reports that call failed", " ".join(result["warnings"]))
 
     def test_open_dialog_after_settle_skips_confirm_and_finalize(self):
-        self.op_client._dialog_control = mock.Mock(side_effect=[{"dialogs": []}, {"dialogs": [
+        self.op_client._dialog_control = mock.Mock(side_effect=[{"dialogs": []}, {"dialogs": []}, {"dialogs": [
             {"dialog_id": "1", "title": "Chaos Cosmos Browser", "main_thread": True},
             {"dialog_id": "2", "title": "Material Editor - 01 - Default", "main_thread": True},
             dict(SAVE)]}])
@@ -534,7 +542,24 @@ class DialogTests(_FlowCase):
         self.assertNotIn("full", self.bridge_kinds("operation"))
         self.assertNotIn("finalize", self.bridge_kinds("operation"))
         self.assertIn("nothing more was sent", result["next"])
-        self.assertEqual(self.op_client._dialog_control.call_args_list, [mock.call("status")] * 2)
+        # Before the browser action, right before prepare, and after the settle.
+        self.assertEqual(self.op_client._dialog_control.call_args_list, [mock.call("status")] * 3)
+
+    def test_dialog_after_the_browser_action_stops_before_prepare(self):
+        # The action runs with quiet mode off, and the OS-only waits after it can't see a modal dialog.
+        self.browsers = []
+        self.op_client._dialog_control = mock.Mock(side_effect=[{"dialogs": []}, {"dialogs": [dict(SAVE)]}])
+        result = self.run_import()
+        self.assertEqual(result["state"], "not_imported")
+        self.assertFalse(result["dispatched"])
+        self.assertTrue(result["safe_to_edit"])
+        self.assertEqual([d["title"] for d in result["dialogs"]], ["Missing External Files"])
+        self.assertEqual(self.bridge_kinds("operation"), ["browser"])  # no prepare
+        self.assertNotIn(("dispatch",), self.events)
+        self.assertTrue(result["cosmos_browser"]["opened"])
+        self.assertIn("only the Cosmos browser action was sent", result["next"])
+        self.assertIn("max_dialogs", result["next"])
+        self.assertIsNone(max_client.settling_state(PID))
 
     def test_open_dialog_before_dispatch_sends_nothing(self):
         # A modal dialog keeps the windows responsive: without this check the browser action,
@@ -577,10 +602,69 @@ class DialogTests(_FlowCase):
         self.assertNotIn(("dispatch",), self.events)
         self.assertIsNone(max_client.settling_state(PID))  # an acknowledged error box hangs nothing
 
-    def test_other_bridge_errors_on_prepare_still_raise(self):
-        self.flow["prepare"] = MaxBridgeError("Unknown command type: maxscript", {"success": False})
-        with self.assertRaises(MaxBridgeError):
-            self.run_import()
+    def test_user_busy_on_prepare_changes_nothing_and_raises(self):
+        # Prepare throws USER_BUSY before it changes anything. MAXScript returns the throw as a
+        # runtime-error result; a bridge refusal comes as a USER_BUSY payload.
+        busy = {"type": "NativeError", "code": "USER_BUSY", "retryable": True,
+                "message": "3ds Max has an open undo operation."}
+        for reply in (RawResult("__MCP_MS_ERR__:-- Runtime error: USER_BUSY"),
+                      MaxBridgeError(json.dumps(busy), {"success": False})):
+            with self.subTest(reply=type(reply).__name__):
+                self.flow["prepare"] = reply
+                with self.assertRaises(CosmosError) as ctx:
+                    self.run_import()
+                self.assertEqual(ctx.exception.code, "USER_BUSY")
+                self.assertTrue(ctx.exception.retryable)
+                self.assertIn("nothing was changed", str(ctx.exception))
+                self.assertIsNone(max_client.settling_state(PID))
+        self.assertNotIn(("dispatch",), self.events)
+
+    def test_bridge_error_after_the_prepare_changes_is_reported_not_raised(self):
+        # E.g. Esc during the baseline snapshot: try/catch can't catch it, and the Scanline swap and
+        # the slot switch before the snapshot are already made.
+        abort = {"type": "NativeError", "code": "BAD_PARAM", "retryable": False,
+                 "message": "MAXScript execution failed: the script did not complete (escape/abort)."}
+        self.flow["prepare"] = MaxBridgeError(json.dumps(abort), {"success": False})
+        result = self.run_import(swap_medit_renderer=True)
+        self.assertEqual(result["state"], "not_imported")
+        self.assertFalse(result["dispatched"])
+        self.assertIn("did not complete", result["message"])
+        self.assertIn("preparation call may have run", result["warnings"][0])
+        self.assertIn(cosmos._SLOT_ACTIVE_RESTORE, result["warnings"][0])
+        self.assertEqual(result["pending_restore"]["maxscript"], cosmos._MEDIT_RESTORE)
+        self.assertNotIn(("dispatch",), self.events)
+
+    def test_runtime_error_in_prepare_reports_the_maxscript_error(self):
+        self.flow["prepare"] = RawResult("__MCP_MS_ERR__:-- Runtime error: getSubTexmap failed")
+        result = self.run_import(swap_medit_renderer=True)
+        self.assertEqual(result["state"], "not_imported")
+        self.assertIn("getSubTexmap failed", result["message"])
+        self.assertIn(cosmos._SLOT_ACTIVE_RESTORE, result["warnings"][0])
+        self.assertTrue(result["pending_restore"]["restore_medit_renderer"])
+        self.assertNotIn(("dispatch",), self.events)
+
+    def test_dialog_error_on_confirm_takes_the_snapshot_once_more(self):
+        replies = [dialog_error(), AFTER]
+        self.flow["full"] = lambda: replies.pop(0)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertTrue(result["safe_to_edit"])
+        self.assertEqual(result["code"], "MAX_DIALOG_ERROR")
+        self.assertEqual(result["dialogs"][0]["title"], "MAXScript Callback script Exception")
+        self.assertEqual(self.bridge_kinds("operation")[-3:], ["full", "full", "finalize"])
+        self.assertIn("taken once more", " ".join(result["warnings"]))
+        self.assertNotIn("pending_restore", result)
+
+    def test_dialog_error_on_finalize_without_slot_reads_its_result_back(self):
+        self.flow["last_finalize"] = self.flow["finalize"]
+        self.flow["finalize"] = [dialog_error()]
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(result["code"], "MAX_DIALOG_ERROR")
+        self.assertNotIn("pending_restore", result)
+        self.assertEqual(self.bridge_kinds("operation")[-3:], ["full", "finalize", "last_finalize"])
+        [warning] = result["warnings"]
+        self.assertIn("read back", warning)
 
     def test_dialog_error_on_browser_action_still_waits_for_its_browser(self):
         self.browsers = []
@@ -1429,6 +1513,143 @@ class ActiveSlotTests(_FlowCase):
         self.assertEqual(cosmos._newest_known(KNOWN_BEFORE), 3)
         self.assertEqual(cosmos._newest_known(BEFORE), -1)
         self.assertIn(">(3000000000L)", cosmos._finalize_script([], False, 3000000000))
+
+    def test_finalize_keeps_its_result_for_a_read_back(self):
+        finalize = cosmos._finalize_script([5], False, 3, "0f1e")
+        read = cosmos._LAST_FINALIZE.replace("__TOKEN__", "0f1e")
+        self.assertIn("global mcp_cosmosMeditSlot, mcp_cosmosMeditDisplaced, mcp_cosmosLastFinalize", finalize)
+        self.assertIn('mcp_cosmosLastFinalize=#("0f1e", out)\n out\n)', finalize)  # the last thing it does
+        self.assertIn('if (try(r[1]=="0f1e")catch(false)) then r[2] else "null"', read)
+        for script in (finalize, read):
+            self.assertNotIn("__", script)
+            self.assertEqual(script.count("("), script.count(")"))
+        self.assertNotIn("meditMaterials", read)  # read-only
+
+
+class SlotDialogTests(_FlowCase):
+    """#10's slot guard on the dialog paths (BLOCKED_BY_DIALOG, MAX_DIALOG_ERROR, an open dialog)."""
+
+    use = ActiveSlotTests.use
+
+    def dialog_after_dispatch(self):
+        """The monitor reports a dialog once the import was dispatched (however often it is asked before)."""
+        self.op_client._dialog_control = mock.Mock(
+            side_effect=lambda action: {"dialogs": [dict(SAVE)] if ("dispatch",) in self.events else []})
+
+    def test_open_dialog_after_settle_keeps_the_slot_restore_pending(self):
+        over = {"handle": "40", "name": "Placeholder"}
+        self.use(slot_prep(free_slot_material=over), slot_fin(), imported_slot=4)
+        self.dialog_after_dispatch()
+        result = self.run_import()
+        self.assertEqual(result["state"], "dialog_open")
+        record = result["medit_active_slot"]
+        self.assertEqual((record["state"], record["switched_to"], record["switched_over"]), ("pending", 4, over))
+        text = " ".join(result["warnings"])
+        self.assertIn("'Placeholder'", text)
+        self.assertIn("Selection and Material Editor slot not restored yet", text)
+        script = result["pending_restore"]["maxscript"]
+        self.assertIn("activeMeditSlot=a", script)
+        self.assertIn(">(3L)", script)  # the import's material is told apart by handle
+        self.assertNotIn("finalize", self.bridge_kinds("operation"))
+
+    def test_dialog_on_confirm_keeps_the_slot_restore_pending(self):
+        self.use(slot_prep(), slot_fin(), imported_slot=4)
+        self.flow["full"] = [blocked("full")]
+        result = self.run_import()
+        self.assertEqual(result["state"], "dialog_open")
+        self.assertEqual(result["medit_active_slot"]["state"], "pending")
+        self.assertIn("Selection and Material Editor slot not restored yet", " ".join(result["warnings"]))
+        self.assertIn("activeMeditSlot=a", result["pending_restore"]["maxscript"])
+
+    def test_dialog_on_finalize_keeps_the_slot_state_pending(self):
+        self.use(slot_prep(), slot_fin(), imported_slot=4)
+        self.flow["finalize"] = [blocked("finalize")]
+        result = self.run_import()
+        self.assertEqual(result["state"], "dialog_open")
+        self.assertEqual(result["medit_active_slot"]["state"], "pending")
+        self.assertIn("The selection and Material Editor slot restore call waits on the dialog",
+                      " ".join(result["warnings"]))
+        self.assertIn("activeMeditSlot=a", result["pending_restore"]["maxscript"])
+
+    def test_dialog_on_prepare_gives_the_slot_undo(self):
+        self.use(slot_prep(), slot_fin(), imported_slot=4)
+        for reply in (blocked("prepare"), dialog_error()):
+            with self.subTest(reply=type(reply).__name__):
+                self.flow["prepare"] = reply
+                result = self.run_import()
+                self.assertEqual(result["state"], "not_imported")
+                self.assertIn(cosmos._SLOT_ACTIVE_RESTORE, result["warnings"][0])
+        self.assertNotIn(("dispatch",), self.events)
+
+    def test_dialog_error_on_finalize_reads_the_displaced_slot_back(self):
+        # The finalize's select fired a failing selection callback; the bridge acknowledged the box and
+        # replaced the result. The finalize ran: it cleared the record and kept the user's material alive.
+        fin = slot_fin(switched_to=0, displaced=USER_MAT, occupant=IMPORTED, fresh=True, kept_alive=True,
+                       active_restored=None)
+        self.use(slot_prep(free_slot=0, switched=False), fin, imported_slot=13)
+        self.flow["last_finalize"] = self.flow["finalize"]
+        self.flow["finalize"] = [dialog_error()]
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(result["code"], "MAX_DIALOG_ERROR")
+        self.assertEqual(result["dialogs"][0]["title"], "MAXScript Callback script Exception")
+        self.assertEqual(result["medit_active_slot"]["state"], "displaced")
+        self.assertEqual(result["displaced_material"], {**USER_MAT, "slot": 13})
+        self.assertNotIn("pending_restore", result)  # it ran; running it again restores nothing
+        text = " ".join(result["warnings"])
+        self.assertIn("meditMaterials[13] = getAnimByHandle 2L", text)
+        self.assertIn("read back", text)
+        kinds = self.bridge_kinds("operation")
+        self.assertEqual(kinds[-3:], ["full", "finalize", "last_finalize"])
+        self.assertEqual(kinds.count("finalize"), 1)
+        finalize, read = self.op_client.commands[-2][1], self.op_client.commands[-1][1]
+        token = re.search(r'mcp_cosmosLastFinalize=#\("([0-9a-f]{32})", out\)', finalize).group(1)
+        self.assertIn('r[1]=="%s"' % token, read)  # only this import's result
+        self.assertTrue(self.op_client.probes[-1])
+
+    def test_dialog_error_on_finalize_without_its_result_is_unknown_not_rerun(self):
+        self.use(slot_prep(), slot_fin(), imported_slot=4)
+        self.flow["finalize"] = [dialog_error()]
+        self.flow["last_finalize"] = None  # not found (e.g. the finalize stopped before its end)
+        result = self.run_import(swap_medit_renderer=True)
+        self.assertEqual(result["state"], "imported")
+        self.assertTrue(result["safe_to_edit"])
+        self.assertEqual(result["code"], "MAX_DIALOG_ERROR")
+        self.assertEqual(result["medit_active_slot"]["state"], "unknown")
+        self.assertNotIn("pending_restore", result)
+        text = " ".join(result["warnings"])
+        self.assertIn("may have stopped before its end", text)
+        self.assertIn("slot 13 is active", text)
+        self.assertIn("getAnimByHandle 2L", text)
+        self.assertIn("mcp_cosmosMeditDisplaced", text)
+        self.assertIn(cosmos._MEDIT_RESTORE, text)  # the renderer restore is safe to run again
+        self.assertNotIn("run pending_restore", text)
+        self.assertEqual(self.bridge_kinds("operation").count("finalize"), 1)
+
+    def test_lost_read_back_is_unknown(self):
+        self.use(slot_prep(), slot_fin(), imported_slot=4)
+        self.flow["finalize"] = [dialog_error()]
+        self.flow["last_finalize"] = [dialog_error()]
+        result = self.run_import()
+        self.assertEqual(result["medit_active_slot"]["state"], "unknown")
+        self.assertEqual(len(result["dialogs"]), 1)  # the read's own error is not the import's
+        self.assertNotIn("pending_restore", result)
+
+    def test_dialog_error_twice_on_confirm_stops_before_the_restore(self):
+        self.use(slot_prep(), slot_fin(), imported_slot=4)
+        self.flow["full"] = lambda: dialog_error()
+        result = self.run_import()
+        self.assertEqual(result["state"], "import_unknown")
+        self.assertFalse(result["safe_to_edit"])
+        self.assertEqual(result["code"], "MAX_DIALOG_ERROR")
+        self.assertEqual(len(result["dialogs"]), 2)
+        kinds = self.bridge_kinds("operation")
+        self.assertEqual(kinds.count("full"), 2)
+        self.assertNotIn("finalize", kinds)
+        self.assertEqual(result["medit_active_slot"]["state"], "pending")
+        self.assertIn("activeMeditSlot=a", result["pending_restore"]["maxscript"])
+        self.assertIn("pending_restore", result["next"])
+        self.assertIn("dialogs", result["next"])
 
 
 class BrowserEnsureTests(_FlowCase):

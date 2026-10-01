@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from .. import process_health
@@ -54,17 +55,52 @@ _DIALOG_ADVICE = ("Read the dialog with max_dialogs(action='inspect') and ask th
 _NOT_QUIET = {"quiet": False}
 
 
-def _dialog_error(exc):
-    """The bridge's MAX_DIALOG_ERROR payload, else None. The call ran to its end, but Max showed an
-    error box during it (acknowledged by the bridge, listed in details.dialogs) and the bridge
-    replaced the call's result with this error; a MAXScript call is not rolled back."""
+_MXS_ERROR = "__MCP_MS_ERR__:"  # the bridge's prefix for a MAXScript error caught in the call
+
+
+class _ScriptError(ValueError):
+    """A MAXScript runtime error in the call. The bridge returns it as the result (prefixed with
+    __MCP_MS_ERR__:); the script stopped there, and what ran before stays done."""
+
+    def __init__(self, text):
+        super().__init__("MAXScript error: " + text)
+
+
+def _bridge_payload(exc):
+    """A MaxBridgeError's structured payload (code, message, details), else None."""
     if not isinstance(exc, MaxBridgeError):
         return None
     try:
         payload = json.loads(exc.bridge_message)
     except (TypeError, ValueError):
         return None
-    return payload if isinstance(payload, dict) and payload.get("code") == "MAX_DIALOG_ERROR" else None
+    return payload if isinstance(payload, dict) else None
+
+
+def _dialog_error(exc):
+    """The bridge's MAX_DIALOG_ERROR payload, else None. The call ran, maybe not to its end (it can
+    stop at a MAXScript error), and Max showed an error box during it (acknowledged by the bridge,
+    listed in details.dialogs); the bridge replaced the call's result with this error. A MAXScript
+    call is not rolled back."""
+    payload = _bridge_payload(exc)
+    return payload if (payload or {}).get("code") == "MAX_DIALOG_ERROR" else None
+
+
+def _acknowledged(payload):
+    """The error boxes a MAX_DIALOG_ERROR payload says the bridge acknowledged."""
+    return (payload.get("details") or {}).get("dialogs") or []
+
+
+def _titles(dialogs, default="a dialog"):
+    return ", ".join(repr(d.get("title", "")) for d in dialogs) or default
+
+
+def _refused_busy(exc):
+    """USER_BUSY: _PREPARE throws it as its first statement (an undo operation is open), so
+    nothing was changed."""
+    if isinstance(exc, _ScriptError):
+        return "USER_BUSY" in str(exc)
+    return (_bridge_payload(exc) or {}).get("code") == "USER_BUSY"
 
 
 def _max(client, command, cmd_type="maxscript", timeout=None, probe=False, request_fields=None):
@@ -74,6 +110,8 @@ def _max(client, command, cmd_type="maxscript", timeout=None, probe=False, reque
     else:
         response = client.send_command(command, cmd_type=cmd_type, timeout=timeout, **extra)
     result = response.get("result", {})
+    if isinstance(result, str) and result.startswith(_MXS_ERROR):
+        raise _ScriptError(result[len(_MXS_ERROR):].strip())
     return json.loads(result) if isinstance(result, str) else result
 
 
@@ -615,10 +653,13 @@ _PREPARE = r"""(
 # After Max is quiet: restore the selection, then (only if the Material
 # Editor is closed) the recorded Material Editor renderer, then the user's
 # Material Editor slot (#10). Never opens, closes or activates any window.
-# Safe to run twice.
+# Safe to run twice. Its result is also kept, with this import's token, in
+# mcp_cosmosLastFinalize: when Max shows an error box during the call (e.g. a
+# selection callback failing), the bridge reports MAX_DIALOG_ERROR instead of
+# the result, and _LAST_FINALIZE reads it back.
 _FINALIZE = r"""(
  global mcp_cosmosMeditBackup
- global mcp_cosmosMeditSlot, mcp_cosmosMeditDisplaced
+ global mcp_cosmosMeditSlot, mcp_cosmosMeditDisplaced, mcp_cosmosLastFinalize
  __SLOT_FNS__
  local restoredSelection=false
  if not theHold.Holding() do (
@@ -628,8 +669,14 @@ _FINALIZE = r"""(
  local medit=if __RESTORE__ then __MEDIT_RESTORE__ else "not_requested"
  local slotJSON=__SLOT_RESTORE__
  local editorOpen=try(__EDITOR_OPEN__)catch(undefined)
- "{\"selection_restored\":"+(if restoredSelection then "true" else "false")+",\"medit\":\""+(MCP_Server.escapeJsonString(medit as string))+"\",\"editor_open\":"+(if editorOpen==true then "true" else if editorOpen==false then "false" else "null")+",\"medit_slot\":"+slotJSON+"}"
+ local out="{\"selection_restored\":"+(if restoredSelection then "true" else "false")+",\"medit\":\""+(MCP_Server.escapeJsonString(medit as string))+"\",\"editor_open\":"+(if editorOpen==true then "true" else if editorOpen==false then "false" else "null")+",\"medit_slot\":"+slotJSON+"}"
+ mcp_cosmosLastFinalize=#("__TOKEN__", out)
+ out
 )"""
+
+# Read-only: what this import's _FINALIZE returned ("null" if it did not reach its end).
+_LAST_FINALIZE = ('(global mcp_cosmosLastFinalize; local r=mcp_cosmosLastFinalize; '
+                  'if (try(r[1]=="__TOKEN__")catch(false)) then r[2] else "null")')
 
 
 # ONE bridge call when no responsive main-thread Cosmos browser exists: find the
@@ -692,9 +739,10 @@ def _newest_known(before):
     return max(known, default=-1)
 
 
-def _finalize_script(handles, restore_medit, newest_known=-1):
+def _finalize_script(handles, restore_medit, newest_known=-1, token=""):
     """newest_known: a slot occupant above this handle counts as the import's (-1: none
-    does, so a displaced slot material is kept alive and reported, not swapped back)."""
+    does, so a displaced slot material is kept alive and reported, not swapped back).
+    token: this import's (hex), stored with the result for _read_finalize."""
     values = ",".join(str(int(h)) for h in handles)
     newest = int(newest_known)
     fresh = ("false" if newest < 0
@@ -706,7 +754,35 @@ def _finalize_script(handles, restore_medit, newest_known=-1):
             .replace("__MEDIT_RESTORE__", _MEDIT_RESTORE)
             .replace("__SLOT_FNS__", _SLOT_FNS)
             .replace("__SLOT_RESTORE__", restore)
-            .replace("__EDITOR_OPEN__", _EDITOR_OPEN))
+            .replace("__EDITOR_OPEN__", _EDITOR_OPEN)
+            .replace("__TOKEN__", re.sub(r"[^0-9a-f]", "", token)))
+
+
+def _read_finalize(client, token):
+    """After MAX_DIALOG_ERROR on the finalize call (it ran, maybe not to its end): its own result,
+    read back from Max with one read-only probe. None when it is not there (the call stopped
+    before its end) or cannot be read."""
+    try:
+        result = _max(client, _LAST_FINALIZE.replace("__TOKEN__", token), timeout=_POLL_TIMEOUT_S, probe=True)
+    except Exception:
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _confirm(client, asset, before, acknowledged, warnings):
+    """The confirming full snapshot. It only reads, so after a MAX_DIALOG_ERROR (an error box
+    the bridge acknowledged, added to acknowledged) it is taken once more; a second error propagates."""
+    try:
+        return _asset_snapshot(client, asset, known=before.get("known"))
+    except MaxBridgeError as exc:
+        failed = _dialog_error(exc)
+        if failed is None:
+            raise
+        acknowledged.extend(_acknowledged(failed))
+        warnings.append("The bridge acknowledged an error dialog in Max (%s) during the confirming snapshot and "
+                        "reported MAX_DIALOG_ERROR instead of the snapshot. The snapshot only reads the scene, so it "
+                        "was taken once more." % _titles(_acknowledged(failed), "unnamed"))
+    return _asset_snapshot(client, asset, known=before.get("known"))
 
 
 def _browser_state(pid):
@@ -791,7 +867,7 @@ def _ensure_browser(client, pid, renderer, state):
             failed = _dialog_error(exc)
             if failed is None:
                 action = {"found": False, "executed": False, "error": str(exc)}
-            else:  # the action ran to its end; its report was replaced by MAX_DIALOG_ERROR
+            else:  # the action ran (maybe not to its end); its report was replaced by MAX_DIALOG_ERROR
                 action = {"found": None, "executed": None, "error": failed.get("message") or str(exc),
                           "dialog_error": (failed.get("details") or {}).get("dialogs") or []}
         # Some actions report not executed after doing their work; a dialog error hides the report.
@@ -1052,11 +1128,11 @@ def _set_slot(response, handle, slot):
             item["medit_slot"] = slot or None
 
 
-def _slot_guard(response, prep, fin, warnings, ran=True):
+def _slot_guard(response, prep, fin, warnings, ran=True, lost=False):
     """Issue #10: report the active Material Editor slot guard and the primary material's
     final medit_slot. prep/fin: the medit_slot records of _PREPARE/_FINALIZE; ran=False
-    when finalize has not run yet."""
-    _slot_record(response, prep, fin, warnings, ran)
+    when finalize has not run yet; lost=True when it ran but its result is unknown."""
+    _slot_record(response, prep, fin, warnings, ran, lost)
     primary = response.get("primary_material")
     if primary:
         response["medit_slot"] = primary.get("medit_slot")
@@ -1069,7 +1145,7 @@ def _kept_alive_hint(ref):
         " (getAnimByHandle %sL)" % handle if handle.isdigit() else ""))
 
 
-def _slot_record(response, prep, fin, warnings, ran):
+def _slot_record(response, prep, fin, warnings, ran, lost=False):
     if not prep:
         return
     switched = prep.get("free_slot") if prep.get("switched") else None
@@ -1092,6 +1168,15 @@ def _slot_record(response, prep, fin, warnings, ran):
                         "it there.%s" % (switched, over.get("name"), _kept_alive_hint(over)))
     if not ran:
         record["state"] = "pending"
+        return
+    if lost:  # the restore ran (its record is cleared), but what it did is not known
+        record["state"] = "unknown"
+        material = prep.get("material") or {}
+        handle = str(material.get("handle") or "")
+        warnings.append("The Material Editor slot restore ran, but its result was lost. Check that slot %s %sholds "
+                        "'%s'%s again; the MAXScript global mcp_cosmosMeditDisplaced keeps any material the importer "
+                        "replaced." % (prep.get("active"), "is active and " if switched else "", material.get("name"),
+                                       " (getAnimByHandle %sL)" % handle if handle.isdigit() else ""))
         return
     if not fin:
         record["state"] = "no_record"
@@ -1180,13 +1265,28 @@ def _open_main_dialogs(client):
         return []
 
 
+def _dialog_refusal(base, pre, dialogs, browser=None):
+    """Nothing dispatched: a dialog holds Max's main thread. A modal dialog keeps Max's windows
+    responsive, so the OS-level checks pass, and whatever is sent next runs inside its loop."""
+    sent = ("Nothing was imported (only the Cosmos browser action was sent)" if "action" in (browser or {})
+            else "Nothing was sent or imported")
+    response = {**base, "state": "not_imported", "dispatched": False, "safe_to_edit": True, "retryable": True,
+                "dialogs": dialogs, "import_timing": {"pre_dispatch": pre},
+                "next": "%s: Max is waiting on %s. Read it with max_dialogs(action='inspect') and ask the user how "
+                        "to answer it (answer it yourself only when the user authorized unattended work), then retry "
+                        "the import." % (sent, _titles(dialogs))}
+    if browser is not None:
+        response["cosmos_browser"] = browser
+    return response
+
+
 def _prepare_failed(base, pid, exc, restore_medit_renderer, swap=True, step="preparation"):
     """A pre-dispatch call was sent but its result was lost: nothing was dispatched.
     preparation: the selection may be cleared (and, with swap, medit switched to
     Scanline). browser: only the Cosmos browser action may have run."""
     lost = isinstance(exc, _LOST)
     dialog = isinstance(exc, DialogBlocked)
-    dialog_error = _dialog_error(exc)  # ran to its end; Max showed an error box meanwhile
+    dialog_error = _dialog_error(exc)  # ran, maybe not to its end; Max showed an error box meanwhile
     if lost and not dialog:  # a dialog does not hang windows: nothing for the guard to watch
         windows = _guard_windows(pid, None)
         if windows:
@@ -1271,12 +1371,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         # browser action, preparation and import would all run inside its loop.
         open_dialogs = _open_main_dialogs(client)
         if open_dialogs:
-            titles = ", ".join(repr(d.get("title", "")) for d in open_dialogs)
-            return {**base, "state": "not_imported", "dispatched": False, "safe_to_edit": True, "retryable": True,
-                    "dialogs": open_dialogs, "import_timing": {"pre_dispatch": pre},
-                    "next": "Nothing was sent or imported: Max is waiting on %s. Read it with "
-                            "max_dialogs(action='inspect') and ask the user how to answer it (answer it yourself "
-                            "only when the user authorized unattended work), then retry the import." % titles}
+            return _dialog_refusal(base, pre, open_dialogs)
         try:
             browser, warnings, ensured_state = _ensure_browser(client, pid, importer["renderer"], browser_state)
         except _LOST as exc:
@@ -1289,19 +1384,24 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         gate, main_busy = _dispatch_gate(pid)  # the checks above predate the action and its wait
         if _hung_elsewhere(gate) or main_busy:
             return _busy_refusal(base, pid, gate, pre, browser, main_busy)
+        # Again: the browser action (quiet mode off) and the OS-level waits since the first check
+        # can take 30 s, and none of them sees a modal dialog.
+        open_dialogs = _open_main_dialogs(client)
+        if open_dialogs:
+            return _dialog_refusal(base, pre, open_dialogs, browser)
         # Not ensured means the hidden-browser path: Scanline avoids the V-Ray slot-preview stall there.
         swap = bool(swap_medit_renderer) or not browser["ensured"]
         swap_mode = "requested" if swap_medit_renderer else ("fallback" if swap else "off")
         try:
             prepared = _max(client, _prepare_script(asset, swap))
-        except _LOST + (ValueError,) as exc:
+        except _LOST + (ValueError, MaxBridgeError) as exc:
             if (getattr(exc, "details", None) or {}).get("request_sent") is False:
                 raise  # nothing was sent, so nothing changed
-            return {**_prepare_failed(base, pid, exc, restore_medit_renderer, swap), "cosmos_browser": browser}
-        except MaxBridgeError as exc:
-            if _dialog_error(exc) is None:
-                raise
-            # Prepare ran to its end (selection cleared, medit renderer and slot as it left them).
+            if _refused_busy(exc):
+                raise CosmosError("3ds Max has an open undo operation, so nothing was changed or imported. Finish or "
+                                  "cancel that operation, then retry the import.", "USER_BUSY", True) from exc
+            # Ran (a MAXScript error, an abort, MAX_DIALOG_ERROR) or may have run (lost): the Scanline
+            # swap and the slot switch come before the baseline snapshot, which can fail.
             return {**_prepare_failed(base, pid, exc, restore_medit_renderer, swap), "cosmos_browser": browser}
         before, selected, medit = prepared["before"], prepared["selection"], prepared["medit"]
         slot_prep = prepared.get("medit_slot") or {}
@@ -1332,12 +1432,16 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
             failure, health = str(poll_error), _health_failure(poll_error)
         settle = _settle(pid, settle_seconds, baseline_cpu)
         restore_medit = restore_medit_renderer and restore_pending
+        token = uuid.uuid4().hex
         pending = {"selection": selected, "restore_medit_renderer": restore_medit,
-                   "maxscript": _finalize_script(selected, restore_medit, _newest_known(before))}
+                   "maxscript": _finalize_script(selected, restore_medit, _newest_known(before), token)}
         also = ((" and Material Editor renderer" if restore_medit else "")
                 + (" and Material Editor slot" if slot_prep.get("keep") else ""))
         quiet = bool(settle.get("quiet") or settle.get("windows_quiet"))
         after = finished = lost = dialog = None
+        # MAX_DIALOG_ERROR on confirm/restore: the error boxes the bridge acknowledged; the
+        # import left unconfirmed (twice on the snapshot); the restore ran but its result is lost.
+        acknowledged, unconfirmed, restore_lost = [], False, False
         if quiet:
             # A modal dialog keeps the windows responsive, so settle passes; confirm and
             # restore would then run inside the dialog's loop, mid-import. Wait for it.
@@ -1350,7 +1454,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                                 "textures may still be loading." % (settle.get("cpu_cores"), settle.get("waited_s")))
             step = "confirm"
             try:
-                after = _asset_snapshot(client, asset, known=before.get("known"))
+                after = _confirm(client, asset, before, acknowledged, warnings)
                 step = "restore"
                 finished = _max(client, pending["maxscript"])
             except DialogBlocked as exc:  # still running in Max; finishes once the dialog is answered
@@ -1359,7 +1463,30 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
             except (MaxHealthError, RequestOutcomeUnknown) as exc:  # Max stopped responding again
                 health, failure, lost, quiet = _health_failure(exc), str(exc), step, False
             except Exception as exc:
-                warnings.append("Could not confirm the import or restore the selection: %s" % exc)
+                failed = _dialog_error(exc)
+                if failed is None:
+                    warnings.append("Could not confirm the import or restore the selection: %s" % exc)
+                elif step == "confirm":
+                    acknowledged.extend(_acknowledged(failed))
+                    unconfirmed = True
+                    warnings.append("The bridge acknowledged an error dialog in Max (%s) during the confirming "
+                                    "snapshot again, so the import was not confirmed and the restore call was not "
+                                    "sent." % _titles(_acknowledged(failed), "unnamed"))
+                else:  # the restore ran, maybe not to its end (a MAXScript call is not rolled back)
+                    acknowledged.extend(_acknowledged(failed))
+                    finished = _read_finalize(client, token)
+                    restore_lost = finished is None
+                    warnings.append("The bridge acknowledged an error dialog in Max (%s) during the restore call "
+                                    "and reported MAX_DIALOG_ERROR instead of its result. %s"
+                                    % (_titles(_acknowledged(failed), "unnamed"),
+                                       "The call reached its end, and its result was read back from Max."
+                                       if finished is not None else
+                                       "The call ran but may have stopped before its end, and its result could not "
+                                       "be read back, so whether the selection%s was restored is unknown. Check the "
+                                       "scene rather than running the call again." % also))
+                    if restore_lost and restore_medit:
+                        warnings.append("If the Material Editor renderer is still Scanline, restore it once the "
+                                        "Material Editor is closed with execute_maxscript: %s" % _MEDIT_RESTORE)
         timing = {k: v for k, v in detection.items() if k != "probe"}
         response = {**base, "import_timing": {**timing, "pre_dispatch": pre, "settle": _settle_summary(settle)},
                     "medit_renderer": {k: medit.get(k) for k in ("class", "locked", "editor_open", "swapped")}
@@ -1390,12 +1517,11 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                 else:
                     warnings.append("Selection%s not restored yet: once the dialog is closed, run "
                                     "pending_restore.maxscript once with execute_maxscript." % also)
-                titles = ", ".join(repr(d.get("title", "")) for d in dialog["dialogs"]) or "a dialog"
                 response.update(state="dialog_open", detected=bool(detection.get("detected")) or created,
                                 safe_to_edit=False, pending_restore=pending, warnings=warnings,
                                 dialogs=dialog["dialogs"],
                                 next="Max is waiting on %s, so the import was not confirmed%s. Do not edit the "
-                                     "scene yet. %s" % (titles, "" if dialog["sent"] else
+                                     "scene yet. %s" % (_titles(dialog["dialogs"]), "" if dialog["sent"] else
                                                         " (nothing more was sent)", _DIALOG_ADVICE))
                 return response
             warnings.append("Selection%s not restored yet: once get_bridge_status reports Max responding, run "
@@ -1411,6 +1537,8 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                             next="%s Do not edit the scene yet; requests to this Max are refused with "
                                  "IMPORT_SETTLING (nothing sent) while a window stays hung. %s" % (why, _WAIT_ADVICE))
             return response
+        if acknowledged:  # the import went on: those boxes are already closed
+            response.update(code="MAX_DIALOG_ERROR", dialogs=acknowledged)
         expected = _EXPECTED.get(asset["kind"])
         observed = False
         if after is not None:
@@ -1418,9 +1546,10 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
             _primary(response, asset, detection.get("probe"))
             observed = bool(expected) and any(item["created"] for item in response[expected])
         if finished is None:
-            response["pending_restore"] = pending
-            warnings.append("Selection%s not restored: run pending_restore.maxscript once with execute_maxscript."
-                            % also)
+            if not restore_lost:
+                response["pending_restore"] = pending
+                warnings.append("Selection%s not restored: run pending_restore.maxscript once with "
+                                "execute_maxscript." % also)
         else:
             if not finished.get("selection_restored"):
                 warnings.append("The previous selection was not restored (an undo transaction was open).")
@@ -1436,13 +1565,18 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                     warnings.append("The Material Editor renderer is still Scanline (%s). Once the Material Editor "
                                     "is closed, restore it with execute_maxscript: %s" % (reason, _MEDIT_RESTORE))
         slot_fin = None if finished is None else finished.get("medit_slot")
-        _slot_guard(response, slot_prep, slot_fin, warnings, ran=finished is not None)
+        _slot_guard(response, slot_prep, slot_fin, warnings, ran=finished is not None or restore_lost,
+                    lost=restore_lost)
         if (slot_fin or {}).get("busy"):
             response["pending_restore"] = pending
         response.update(state="imported" if observed else ("import_unknown" if failure or after is None
                                                            else "imported_unverified"),
-                        safe_to_edit=True)
-        if not observed and (failure or after is None):
+                        safe_to_edit=not unconfirmed)
+        if unconfirmed:
+            response["next"] = ("Max showed an error dialog each time the import was confirmed (see dialogs). Read "
+                                "the error, inspect the requested asset in Max, then run pending_restore.maxscript "
+                                "once with execute_maxscript.")
+        elif not observed and (failure or after is None):
             response["next"] = "Inspect the requested asset in Max before retrying."
         if warnings:
             response["warnings"] = warnings
