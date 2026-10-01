@@ -1,5 +1,6 @@
 #include "mcp_bridge/command_dispatcher.h"
 #include "mcp_bridge/bridge_health.h"
+#include "mcp_bridge/quiet_policy.h"
 #include "mcp_bridge/bridge_gup.h"
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/main_thread_executor.h"
@@ -319,6 +320,10 @@ static std::string WideToUtf8(const wchar_t* w) {
     return s;
 }
 
+// Set on the pipe thread while dispatching one request; BuildResponse reports
+// it so callers can see that a script ran with Max's quiet mode off (#12).
+static thread_local std::string tl_quiet_override;
+
 // ── Build JSON response ─────────────────────────────────────────
 static std::string BuildResponse(
     bool success,
@@ -344,6 +349,7 @@ static std::string BuildResponse(
     // Every response reports dialogs blocking Max, whoever opened them.
     json dialogs = DialogWatch::OpenDialogs();
     if (!dialogs.empty()) resp["meta"]["openDialogs"] = std::move(dialogs);
+    if (!tl_quiet_override.empty()) resp["meta"]["quietOverride"] = tl_quiet_override;
     return resp.dump();
 }
 
@@ -554,6 +560,7 @@ std::string CommandDispatcher::Dispatch(
     std::string command = req.value("command", "");
     std::string cmd_type = req.value("type", "maxscript");
     std::string request_id = req.value("requestId", "");
+    tl_quiet_override.clear();
 
     // health runs here on the pipe thread, ahead of every main-thread path and
     // outside both request registries (it would only ever report itself).
@@ -604,7 +611,15 @@ std::string CommandDispatcher::Dispatch(
             if (command.empty()) {
                 throw std::runtime_error("Empty MAXScript command");
             }
-            result = HandleMaxScript(command, gup, req.value("quiet", true));
+            // Quiet mode unless the caller chose, or the script could prompt
+            // to save or discard the scene (#12: quiet would answer for them).
+            int explicitQuiet = -1;
+            if (req.contains("quiet") && req["quiet"].is_boolean())
+                explicitQuiet = req["quiet"].get<bool>() ? 1 : 0;
+            bool overridden = false;
+            const bool quiet = QuietPolicy::ResolveQuiet(command, explicitQuiet, &overridden);
+            if (overridden) tl_quiet_override = "file_command";
+            result = HandleMaxScript(command, gup, quiet);
         // Native handlers
         } else if (cmd_type == "native:scene_info") {
             result = NativeHandlers::SceneInfo(command, gup);

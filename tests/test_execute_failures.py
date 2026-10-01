@@ -124,6 +124,38 @@ class QuietRequestFieldTests(unittest.TestCase):
     def test_quiet_false_is_sent(self):
         self.assertEqual(self._sent(quiet=False)["request_fields"], {"quiet": False})
 
+    def test_explicit_quiet_true_is_sent(self):
+        # #12: only an explicit quiet=True may force quiet mode on a script that
+        # mentions a scene file command; the default lets the bridge decide.
+        self.assertEqual(self._sent(quiet=True)["request_fields"], {"quiet": True})
+
+    def test_docstring_names_the_file_command_rule(self):
+        doc = _load_execute(mock.Mock()).execute_maxscript.__doc__
+        self.assertIn("resetMaxFile", doc)
+        self.assertIn("BLOCKED_BY_DIALOG", doc)
+
+
+class QuietPolicySourceTests(unittest.TestCase):
+    """#12: the bridge never runs a scene file command in Max's quiet mode by default."""
+
+    ROOT = Path(__file__).resolve().parent.parent / "native"
+
+    def test_dispatcher_resolves_quiet_per_script(self):
+        body = (self.ROOT / "src" / "command_dispatcher.cpp").read_text(encoding="utf-8")
+        self.assertIn("QuietPolicy::ResolveQuiet(command, explicitQuiet", body)
+        self.assertIn('resp["meta"]["quietOverride"]', body)
+
+    def test_hybrid_tools_skip_quiet_for_file_commands(self):
+        body = (self.ROOT / "include" / "mcp_bridge" / "handler_helpers.h").read_text(encoding="utf-8")
+        self.assertIn("QuietPolicy::MentionsSceneFileCommand(script)", body)
+
+    def test_policy_lists_the_risky_commands_only(self):
+        body = (self.ROOT / "include" / "mcp_bridge" / "quiet_policy.h").read_text(encoding="utf-8")
+        for name in ("resetmaxfile", "loadmaxfile", "fetchmaxfile", "quitmax", "checkforsave",
+                     "max reset file", "max file new", "max file open"):
+            self.assertIn(f'"{name}"', body)
+        self.assertNotIn('"mergemaxfile"', body)
+
 
 class PlainMessageClassificationTests(unittest.TestCase):
     """Fallback for unstructured text (e.g. an older bridge): goes through _classify_error_code."""

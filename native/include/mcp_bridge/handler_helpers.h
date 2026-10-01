@@ -24,6 +24,7 @@
 #include <CoreFunctions.h>
 #include "mcp_bridge/color_value.h"
 #include "mcp_bridge/dialog_watch.h"
+#include "mcp_bridge/quiet_policy.h"
 #include "mcp_bridge/main_thread_executor.h"
 
 class MCPBridgeGUP;
@@ -441,8 +442,11 @@ inline std::string RunMAXScript(const std::string& script) {
     // one process-wide flag that TempQuietMode saves and restores, so only
     // Max's main thread changes it: a direct-mode read on a pipe thread
     // overlapping a main-thread save/restore could leave Max quiet for good.
+    // Never quiet for a script that could prompt to save or discard the
+    // scene (#12): its prompt must reach the agent, not take a default.
     std::optional<TempQuietMode> quiet;
-    if (!MainThreadExecutor::IsDirectMode()) quiet.emplace(TRUE);
+    if (!MainThreadExecutor::IsDirectMode() && !QuietPolicy::MentionsSceneFileCommand(script))
+        quiet.emplace(TRUE);
     std::wstring wcmd = WrapForErrorCapture(Utf8ToWide(script));
     FPValue fpv;
     BOOL ok = FALSE;
