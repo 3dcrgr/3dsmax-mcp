@@ -2,7 +2,9 @@
 
 Nothing is written to the target: each thread is suspended only while its
 context is read and its stack walked (milliseconds) and is always resumed;
-frames are resolved after it runs again. No debugger and no symbol server:
+frames are resolved after it runs again. On Windows 11 / Server 2022 and later
+the suspension goes through a thread state-change object, which the kernel
+reverts if this process dies, even by TerminateProcess. No debugger and no symbol server:
 frames are module+offset, plus the export name inside core OS modules (or
 any name a local PDB gives). Needs the same user and integrity level as the
 target. Windows only; importing is safe anywhere, and calls report error
@@ -41,6 +43,9 @@ _PROCESS_VM_READ = 0x0010
 _THREAD_SUSPEND_RESUME = 0x0002
 _THREAD_GET_CONTEXT = 0x0008
 _THREAD_QUERY_INFORMATION = 0x0040
+_THREAD_SET_INFORMATION = 0x0020  # NtCreateThreadStateChange needs it on the thread handle
+_THREAD_STATE_CHANGE_ALL_ACCESS = 0x001F0001
+_THREAD_STATE_CHANGE_SUSPEND, _THREAD_STATE_CHANGE_RESUME = 0, 1
 _THREAD_QUERY_LIMITED_INFORMATION = 0x0800
 _TH32CS_SNAPTHREAD = 0x00000004
 _IMAGE_FILE_MACHINE_AMD64 = 0x8664
@@ -55,10 +60,13 @@ _INVALID_HANDLE = ctypes.c_void_p(-1).value
 _CONTEXT_SIZE = 1232
 _CONTEXT_FULL = 0x0010000B
 _CTX_FLAGS, _CTX_RSP, _CTX_RBP, _CTX_RIP = 0x30, 0x98, 0xA0, 0xF8
-# UNDNAME | DEFERRED_LOADS | IGNORE_CVREC | FAIL_CRITICAL_ERRORS | IGNORE_NT_SYMPATH | NO_PROMPTS.
-# Module loads happen during the walk, so never chase a build-machine/UNC PDB path
-# or a symbol server (_NT_SYMBOL_PATH) while a thread is suspended.
-_SYM_OPTIONS = 0x2 | 0x4 | 0x80 | 0x200 | 0x1000 | 0x80000
+# UNDNAME | IGNORE_CVREC | FAIL_CRITICAL_ERRORS | IGNORE_NT_SYMPATH | NO_PROMPTS, and no
+# DEFERRED_LOADS: SymInitialize loads every module up front while all threads run, so
+# StackWalk64's callbacks only read cached data while a thread is suspended. Never
+# chase a build-machine/UNC PDB path or a symbol server (_NT_SYMBOL_PATH); the search
+# path is empty (not the CWD), so only a PDB next to its image is used.
+_SYM_OPTIONS = 0x2 | 0x80 | 0x200 | 0x1000 | 0x80000
+_SYM_SEARCH_PATH = ""
 _SYM_REAL_TYPES = (2, 3, 7)  # SymCv, SymPdb, SymDia: names are exact at any displacement
 _EXPORT_MAX_DISPLACEMENT = 0x800  # farther from an export the name is a guess: keep module+offset only
 _MAX_SYMBOL_NAME = 511
@@ -176,6 +184,7 @@ class _Api:
         self.OpenThread = proto(k32.OpenThread, handle, dword, boolean, dword)
         self.CloseHandle = proto(k32.CloseHandle, boolean, handle)
         self.SuspendThread = proto(k32.SuspendThread, dword, handle)
+        self.GetProcessIdOfThread = proto(k32.GetProcessIdOfThread, dword, handle)
         self.ResumeThread = proto(k32.ResumeThread, dword, handle)
         self.GetThreadContext = proto(k32.GetThreadContext, boolean, handle, vp)
         self.GetThreadTimes = proto(k32.GetThreadTimes, boolean, handle, *[ctypes.POINTER(_FILETIME)] * 4)
@@ -191,6 +200,15 @@ class _Api:
         self.SymFromAddrW = proto(dbg.SymFromAddrW, boolean, handle, u64, ctypes.POINTER(u64), vp)
         self.SymGetModuleInfoW64 = proto(dbg.SymGetModuleInfoW64, boolean, handle, u64,
                                          ctypes.POINTER(_IMAGEHLP_MODULEW64))
+        # Thread state-change objects (Windows 11 / Server 2022+): None where ntdll lacks them.
+        nt = ctypes.WinDLL("ntdll")
+        try:
+            self.NtCreateThreadStateChange = proto(nt.NtCreateThreadStateChange, ctypes.c_int32,
+                                                   ctypes.POINTER(handle), dword, vp, handle, u64)
+            self.NtChangeThreadState = proto(nt.NtChangeThreadState, ctypes.c_int32, handle, handle, dword, vp,
+                                             ctypes.c_size_t, u64)
+        except AttributeError:
+            self.NtCreateThreadStateChange = self.NtChangeThreadState = None
         self.StackWalk64 = proto(dbg.StackWalk64, boolean, dword, handle, handle, ctypes.POINTER(_STACKFRAME64),
                                  vp, vp, vp, vp, vp)
         proto(dbg.SymFunctionTableAccess64, vp, handle, u64)
@@ -505,69 +523,132 @@ def _image_name(api: Any, hproc: Any) -> str | None:
     return None
 
 
-def _walk(api: Any, hproc: Any, tid: int, depth: int) -> tuple[list[int], float | None, dict[str, Any] | None]:
+class _Pause:
+    """How one thread is suspended and resumed.
+
+    Prefers a thread state-change object: the kernel reverts its suspension
+    when the handle is closed, including when this process dies by any means.
+    Falls back to SuspendThread/ResumeThread where that is unavailable.
+    """
+
+    def __init__(self, api: Any, hthread: Any) -> None:
+        self.api, self.hthread = api, hthread
+        self.handle: Any = None
+        self.method = "suspend_thread"
+        self.suspend_error: str | None = None
+        self.resume_error: str | None = None
+        create = getattr(api, "NtCreateThreadStateChange", None)
+        if create is not None and getattr(api, "NtChangeThreadState", None) is not None:
+            handle = ctypes.c_void_p()
+            try:
+                status = create(ctypes.byref(handle), _THREAD_STATE_CHANGE_ALL_ACCESS, None, hthread, 0)
+            except Exception:
+                status = -1
+            if status >= 0 and handle.value:
+                self.handle, self.method = handle.value, "state_change"
+
+    def suspend(self) -> bool:
+        if self.handle is not None:
+            status = self.api.NtChangeThreadState(self.handle, self.hthread, _THREAD_STATE_CHANGE_SUSPEND, None, 0, 0)
+            if status >= 0:
+                return True
+            self.suspend_error = f"NtChangeThreadState(suspend) failed: NTSTATUS 0x{status & 0xFFFFFFFF:08X}"
+            return False
+        if self.api.SuspendThread(self.hthread) != _SUSPEND_FAILED:
+            return True
+        code = ctypes.get_last_error()
+        self.suspend_error = _error("SuspendThread", code)["message"]
+        return False
+
+    def resume(self) -> None:
+        if self.handle is not None:
+            status = self.api.NtChangeThreadState(self.handle, self.hthread, _THREAD_STATE_CHANGE_RESUME, None, 0, 0)
+            if status < 0:
+                self.resume_error = (f"NtChangeThreadState(resume) failed: NTSTATUS 0x{status & 0xFFFFFFFF:08X}; "
+                                     "closing the state-change handle resumes the thread")
+        elif self.api.ResumeThread(self.hthread) == _SUSPEND_FAILED:
+            code = ctypes.get_last_error()
+            self.resume_error = (_error("ResumeThread", code)["message"]
+                                 + "; the thread may still be suspended (resume it with Process Explorer)")
+
+    def close(self) -> None:
+        if self.handle is not None:
+            handle, self.handle = self.handle, None
+            self.api.CloseHandle(handle)  # reverts a suspension that is somehow still in effect
+
+
+def _walk(api: Any, hproc: Any, pid: int, tid: int, depth: int,
+          methods: dict[str, int] | None = None) -> tuple[list[int], float | None, dict[str, Any] | None]:
     """Return addresses of one thread's stack: (pcs, suspended_ms, error).
 
     The thread is suspended only for GetThreadContext and StackWalk64, at most
-    about _MAX_SUSPEND_S, and nothing is symbolized meanwhile. Suspension goes
-    through suspend_guard, which resumes it exactly once and keeps this process
-    from exiting (watchdog, stdin EOF, atexit) while it is suspended.
+    about _MAX_SUSPEND_S, and nothing is symbolized or loaded meanwhile.
+    Suspension goes through suspend_guard, which resumes it exactly once and
+    keeps this process from exiting (watchdog, stdin EOF, atexit) while it is
+    suspended; `methods` counts how each thread was paused.
     """
     access = _THREAD_GET_CONTEXT | _THREAD_SUSPEND_RESUME | _THREAD_QUERY_INFORMATION
-    hthread = api.OpenThread(access, False, tid)
+    hthread = api.OpenThread(access | _THREAD_SET_INFORMATION, False, tid) or api.OpenThread(access, False, tid)
     if not hthread:
         return [], None, _error("OpenThread", ctypes.get_last_error(), tid)
     pcs: list[int] = []
     error: dict[str, Any] | None = None
     suspended_ms: float | None = None
-    raw = ctypes.create_string_buffer(_CONTEXT_SIZE + 16)
-    ctx = ctypes.addressof(raw) + (-ctypes.addressof(raw)) % 16
-    ctypes.c_uint32.from_address(ctx + _CTX_FLAGS).value = _CONTEXT_FULL  # set before suspending
-    started = time.perf_counter()
-    suspend_error: list[int] = []
-
-    def suspend() -> bool:
-        if api.SuspendThread(hthread) != _SUSPEND_FAILED:
-            return True
-        suspend_error.append(ctypes.get_last_error())
-        return False
-
+    pause: _Pause | None = None
     try:
-        with suspend_guard.suspended(suspend, lambda: api.ResumeThread(hthread)) as ok:
-            if not ok:
-                error = _error("SuspendThread", suspend_error[0] if suspend_error else 0, tid)
-            elif not api.GetThreadContext(hthread, ctx):
-                error = _error("GetThreadContext", ctypes.get_last_error(), tid)
-            else:
-                rip = ctypes.c_uint64.from_address(ctx + _CTX_RIP).value
-                frame = _STACKFRAME64()
-                frame.AddrPC.Offset, frame.AddrPC.Mode = rip, _ADDR_MODE_FLAT
-                frame.AddrFrame.Offset = ctypes.c_uint64.from_address(ctx + _CTX_RBP).value
-                frame.AddrFrame.Mode = _ADDR_MODE_FLAT
-                frame.AddrStack.Offset = ctypes.c_uint64.from_address(ctx + _CTX_RSP).value
-                frame.AddrStack.Mode = _ADDR_MODE_FLAT
-                last = None
-                for _ in range(depth):
-                    if time.perf_counter() - started > _MAX_SUSPEND_S:
-                        error = _error("StackWalk64", tid=tid,
-                                       message=f"stack walk stopped after {_MAX_SUSPEND_S * 1000:.0f} ms "
-                                               "to keep the thread's pause short (stack truncated)")
-                        break
-                    if not api.StackWalk64(_IMAGE_FILE_MACHINE_AMD64, hproc, hthread, ctypes.byref(frame), ctx,
-                                           None, api.function_table_access, api.get_module_base, None):
-                        break
-                    pc, sp = frame.AddrPC.Offset, frame.AddrStack.Offset
-                    if not pc or (pc, sp) == last:
-                        break
-                    last = (pc, sp)
-                    pcs.append(pc)
-                if not pcs and rip:
-                    pcs.append(rip)  # the walk failed: keep at least the current instruction
-        if ok:
-            suspended_ms = round((time.perf_counter() - started) * 1000.0, 3)
-    except suspend_guard.ExitingError as exc:
-        error = _error("SuspendThread", tid=tid, message=str(exc))
+        # The TID came from an earlier snapshot: if that thread has exited, the ID can
+        # already name a thread of another process (or of this one). Never suspend it.
+        owner = api.GetProcessIdOfThread(hthread)
+        if owner != pid or owner == os.getpid():
+            return [], None, _error("OpenThread", tid=tid,
+                                    message=f"thread {tid} no longer belongs to PID {pid} (it exited)")
+        raw = ctypes.create_string_buffer(_CONTEXT_SIZE + 16)
+        ctx = ctypes.addressof(raw) + (-ctypes.addressof(raw)) % 16
+        ctypes.c_uint32.from_address(ctx + _CTX_FLAGS).value = _CONTEXT_FULL  # set before suspending
+        pause = _Pause(api, hthread)
+        if methods is not None:
+            methods[pause.method] = methods.get(pause.method, 0) + 1
+        started = time.perf_counter()
+        try:
+            with suspend_guard.suspended(pause.suspend, pause.resume) as ok:
+                if not ok:
+                    error = _error("SuspendThread", tid=tid, message=pause.suspend_error or "SuspendThread failed")
+                elif not api.GetThreadContext(hthread, ctx):
+                    error = _error("GetThreadContext", ctypes.get_last_error(), tid)
+                else:
+                    rip = ctypes.c_uint64.from_address(ctx + _CTX_RIP).value
+                    frame = _STACKFRAME64()
+                    frame.AddrPC.Offset, frame.AddrPC.Mode = rip, _ADDR_MODE_FLAT
+                    frame.AddrFrame.Offset = ctypes.c_uint64.from_address(ctx + _CTX_RBP).value
+                    frame.AddrFrame.Mode = _ADDR_MODE_FLAT
+                    frame.AddrStack.Offset = ctypes.c_uint64.from_address(ctx + _CTX_RSP).value
+                    frame.AddrStack.Mode = _ADDR_MODE_FLAT
+                    last = None
+                    for _ in range(depth):
+                        if time.perf_counter() - started > _MAX_SUSPEND_S:
+                            error = _error("StackWalk64", tid=tid,
+                                           message=f"stack walk stopped after {_MAX_SUSPEND_S * 1000:.0f} ms "
+                                                   "to keep the thread's pause short (stack truncated)")
+                            break
+                        if not api.StackWalk64(_IMAGE_FILE_MACHINE_AMD64, hproc, hthread, ctypes.byref(frame), ctx,
+                                               None, api.function_table_access, api.get_module_base, None):
+                            break
+                        pc, sp = frame.AddrPC.Offset, frame.AddrStack.Offset
+                        if not pc or (pc, sp) == last:
+                            break
+                        last = (pc, sp)
+                        pcs.append(pc)
+                    if not pcs and rip:
+                        pcs.append(rip)  # the walk failed: keep at least the current instruction
+            if ok:
+                suspended_ms = round((time.perf_counter() - started) * 1000.0, 3)
+        except suspend_guard.ExitingError as exc:
+            error = _error("SuspendThread", tid=tid, message=str(exc))
+        if pause.resume_error:
+            error = _error("ResumeThread", tid=tid, message=pause.resume_error)
     finally:
+        if pause is not None:
+            pause.close()
         api.CloseHandle(hthread)
     return pcs, suspended_ms, error
 
@@ -622,7 +703,13 @@ def capture_stacks(pid: int, tids: Iterable[int] | None = None, all_threads: boo
     whose top frame is application code, and threads in watched modules.
     Returns {pid, image, captured_at, mode, depth, thread_count, main_thread,
     main_thread_source, threads: [{tid, is_main, state_hint, frames:
-    [{module, offset, symbol?}], windows, suspended_ms, error?}], omitted, errors}.
+    [{module, offset, symbol?}], windows, suspended_ms, error?}], omitted, errors,
+    pause_methods: {state_change|suspend_thread: count}}.
+
+    The capture runs on its own (non-daemon) thread: signals such as Ctrl+C are
+    delivered to the main thread only, so a KeyboardInterrupt can never land
+    between suspending a thread and registering its resume. If the caller is
+    interrupted, the capture still finishes, and resumes every thread, in the background.
     """
     try:
         depth = max(1, min(int(depth), MAX_DEPTH))
@@ -637,7 +724,7 @@ def capture_stacks(pid: int, tids: Iterable[int] | None = None, all_threads: boo
         "pid": pid, "image": None, "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "mode": "tids" if wanted else ("all" if all_threads else "selected"), "depth": depth,
         "thread_count": 0, "main_thread": None, "main_thread_source": None, "threads": [], "omitted": 0,
-        "errors": [], "elapsed_ms": None,
+        "errors": [], "elapsed_ms": None, "pause_methods": {},
     }
     errors = result["errors"]
     if bad_tids:
@@ -661,11 +748,17 @@ def capture_stacks(pid: int, tids: Iterable[int] | None = None, all_threads: boo
     except (OSError, AttributeError) as exc:
         errors.append(_error("load", message=f"could not load kernel32/dbghelp: {exc}"))
         return result
-    with _capture_lock:
-        try:
-            _capture(api, pid, wanted, all_threads, depth, result)
-        except Exception as exc:  # a diagnosis must never take the caller down
-            errors.append(_error("internal", message=f"{type(exc).__name__}: {exc}"))
+
+    def run() -> None:
+        with _capture_lock:
+            try:
+                _capture(api, pid, wanted, all_threads, depth, result)
+            except Exception as exc:  # a diagnosis must never take the caller down
+                errors.append(_error("internal", message=f"{type(exc).__name__}: {exc}"))
+
+    worker = threading.Thread(target=run, name="maxmcp-stackdump")
+    worker.start()
+    worker.join()
     result["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
     return result
 
@@ -709,11 +802,11 @@ def _capture(api: Any, pid: int, wanted: list[int] | None, all_threads: bool, de
             targets = sorted(all_tids, key=lambda t: (t != main_tid, t not in owned))
 
         api.SymSetOptions(_SYM_OPTIONS)
-        if not api.SymInitializeW(hproc, None, True):
+        if not api.SymInitializeW(hproc, _SYM_SEARCH_PATH, True):
             errors.append(_error("SymInitialize", ctypes.get_last_error()))
             return
         try:
-            walked = [(tid, *_walk(api, hproc, tid, depth)) for tid in targets]
+            walked = [(tid, *_walk(api, hproc, pid, tid, depth, result["pause_methods"])) for tid in targets]
             cache: dict[int, dict[str, Any]] = {}
             for tid, pcs, suspended_ms, error in walked:  # every thread runs again before symbolizing
                 frames = [_describe(api, hproc, pc, cache) for pc in pcs]

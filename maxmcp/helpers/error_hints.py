@@ -123,7 +123,8 @@ _MESSAGE_HINT_RULES: tuple[tuple[re.Pattern[str], ToolHint], ...] = (
             "message": (
                 "3ds Max is hung or still settling. Wait up to ~10 min, re-checking with get_bridge_status: "
                 "V-Ray preview stalls cleared in 5-8 min, the post-Cosmos-import deadlock never did. "
-                "capture_hang_diagnostics (OS-only, safe now) shows what blocks its main thread."
+                "capture_hang_diagnostics (OS-only, pauses each Max thread for milliseconds) "
+                "shows what blocks its main thread."
             ),
             "suggested_tools": ["capture_hang_diagnostics", "get_bridge_status"],
         },

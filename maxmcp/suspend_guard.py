@@ -1,14 +1,15 @@
 """Never let this process exit while it holds a 3ds Max thread suspended.
 
 capture_hang_diagnostics suspends Max threads for milliseconds to read their
-stacks. A thread suspended by a process that then dies stays suspended for
-good, which would freeze Max. So every suspension goes through `suspended()`,
-which suspends and registers in one step under the guard lock, and every exit
-path (the parent watchdog's os._exit, server.main's os._exit, and atexit)
-calls `release_all()` first: it stops new suspensions, waits briefly for the
-active ones, then resumes whatever is still registered itself.
-
-Only a hard kill (TerminateProcess) can still skip this.
+stacks. Where the OS supports it (Windows 11 / Server 2022 and later) the
+suspension is made through a thread state-change object, which the kernel
+reverts when its handle closes, so even a hard kill of this process
+(TerminateProcess) resumes the thread. The plain SuspendThread fallback has no
+such safety net, so every suspension also goes through `suspended()`, which
+suspends and registers in one step under the guard lock, and every exit path
+(the parent watchdog's os._exit, server.main's os._exit, and atexit) calls
+`release_all()` first: it stops new suspensions, waits briefly for the active
+ones, then resumes whatever is still registered itself.
 """
 
 from __future__ import annotations
@@ -33,6 +34,13 @@ class ExitingError(RuntimeError):
 
 
 def _once(resume: Callable[[], object]) -> Callable[[], None]:
+    """`resume` at most once; a concurrent second caller waits until it has returned.
+
+    resume() runs under the lock (resuming never blocks), so "done" means the
+    thread really runs again: nobody can close the thread handle or exit the
+    process between a first caller deciding to resume and the resume itself.
+    A resume() that raises is not marked done, so release_all can retry it.
+    """
     lock = threading.Lock()
     done = False
 
@@ -41,10 +49,17 @@ def _once(resume: Callable[[], object]) -> Callable[[], None]:
         with lock:
             if done:
                 return
+            resume()
             done = True
-        resume()
 
     return call
+
+
+def _quietly(fn: Callable[[], object]) -> None:
+    try:
+        fn()
+    except Exception:
+        pass
 
 
 @contextmanager
@@ -52,21 +67,30 @@ def suspended(suspend: Callable[[], bool], resume: Callable[[], object]) -> Iter
     """Run `suspend()` (True on success) and guarantee exactly one `resume()` after it.
 
     Yields whether the suspension took effect. Raises ExitingError, without
-    calling `suspend`, once release_all() has started.
+    calling `suspend`, once release_all() has started. If an exception (such
+    as a KeyboardInterrupt) escapes between the OS suspending the thread and
+    the registration, `resume()` is called before it propagates: resuming a
+    thread that is not suspended is a no-op.
     """
     resume_once = _once(resume)
-    token = None
+    token = next(_ids)
+    registered = False
     with _cond:
         if _closing:
             raise ExitingError("this process is exiting; no thread was suspended")
         # Under the lock, so an exit cannot begin between suspending and registering.
-        if suspend():
-            token = next(_ids)
-            _active[token] = resume_once
+        try:
+            if suspend():
+                _active[token] = resume_once
+                registered = True
+        except BaseException:
+            _active.pop(token, None)
+            _quietly(resume_once)
+            raise
     try:
-        yield token is not None
+        yield registered
     finally:
-        if token is not None:
+        if registered:
             try:
                 resume_once()
             finally:
@@ -75,27 +99,41 @@ def suspended(suspend: Callable[[], bool], resume: Callable[[], object]) -> Iter
                     _cond.notify_all()
 
 
+def _snapshot() -> list[Callable[[], None]]:
+    for _ in range(5):
+        try:
+            return list(_active.values())
+        except RuntimeError:  # changed size while copying
+            continue
+    return []
+
+
 def release_all(wait_s: float = RELEASE_WAIT_S) -> int:
     """Block new suspensions, wait up to `wait_s` for active ones, resume the rest.
 
-    Returns how many suspensions had to be resumed here. Never raises.
+    Returns how many suspensions had to be resumed here. Never raises and never
+    blocks much longer than `wait_s`, even if another thread holds the guard
+    lock: it then resumes a lock-free snapshot of the registered suspensions.
     """
     global _closing
     try:
-        deadline = time.monotonic() + max(0.0, wait_s)
-        with _cond:
-            _closing = True
-            while _active:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                _cond.wait(remaining)
-            leftovers = list(_active.values())
-        for resume in leftovers:
+        _closing = True  # before taking the lock: no new suspension may start
+        wait_s = max(0.0, wait_s)
+        deadline = time.monotonic() + wait_s
+        if _cond.acquire(True, wait_s):
             try:
-                resume()
-            except Exception:
-                pass
+                while _active:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    _cond.wait(remaining)
+                leftovers = list(_active.values())
+            finally:
+                _cond.release()
+        else:
+            leftovers = _snapshot()
+        for resume in leftovers:
+            _quietly(resume)
         return len(leftovers)
     except Exception:
         return 0

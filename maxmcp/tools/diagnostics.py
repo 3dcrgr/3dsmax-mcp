@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,9 @@ from ..diagnostics import stackdump
 from ..server import client, mcp
 
 MAX_IMAGES = ("3dsmax.exe",)
+# Saved captures kept in the diagnostics folder (a .txt/.json pair each); older ones are pruned.
+MAX_SAVED_CAPTURES = 20
+_SAVED_RE = re.compile(r"^hang-\d+-\d{8}-\d{6}(?:-\d+)?\.(?:txt|json)$")
 
 
 def diagnostics_dir() -> Path:
@@ -70,7 +74,32 @@ def _save(pid: int, capture: dict[str, Any], summary: dict[str, Any], process: d
     text_path.write_text(text, encoding="utf-8")
     json_path.write_text(json.dumps({"capture": capture, "summary": summary, "process": process},
                                     indent=2, ensure_ascii=False), encoding="utf-8")
+    _prune(folder, keep={text_path.name, json_path.name})
     return {"text": str(text_path), "json": str(json_path)}
+
+
+def _prune(folder: Path, keep: set[str], limit: int | None = None) -> None:
+    """Delete the oldest saved captures beyond `limit` pairs; never the ones in `keep`, never raises."""
+    limit = MAX_SAVED_CAPTURES if limit is None else limit
+    try:
+        captures: dict[str, list[Path]] = {}
+        for path in folder.iterdir():
+            if _SAVED_RE.match(path.name) and path.is_file():
+                captures.setdefault(path.stem, []).append(path)
+
+        def newest(stem: str) -> float:
+            return max((p.stat().st_mtime for p in captures[stem]), default=0.0)
+
+        stems = sorted(captures, key=newest, reverse=True)
+        for stem in stems[max(limit, 1):]:
+            for path in captures[stem]:
+                if path.name not in keep:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+    except OSError:
+        pass
 
 
 @mcp.tool()
@@ -79,13 +108,15 @@ def capture_hang_diagnostics(pid: int | None = None, all_threads: bool = False, 
     """Explain a hung 3ds Max from native thread stacks (what blocks the main thread).
 
     OS-only: never sends anything to Max, so it is safe while Max is hung; each
-    thread is paused for a few milliseconds while its stack is read.
+    thread is paused for a few milliseconds while its stack is read (on Windows 11
+    the OS resumes it even if this server is killed meanwhile).
     Use when: a tool returned MAX_NOT_RESPONDING or IMPORT_SETTLING, or
     get_bridge_status reports not_responding.
     Not when: Max is responsive; this is not a profiler.
     pid defaults to the selected Max, else the only running one. all_threads=True
     dumps every thread (default: main thread, window owners, busy threads).
-    save writes the full .txt/.json under %LOCALAPPDATA%/3dsmax-mcp/diagnostics.
+    save writes the full .txt/.json under %LOCALAPPDATA%/3dsmax-mcp/diagnostics
+    (the newest 20 captures are kept).
     Returns findings, the main-thread stack preview, hung windows and process health.
     """
     target = resolve_pid(pid)

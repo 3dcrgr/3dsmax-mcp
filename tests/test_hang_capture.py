@@ -410,6 +410,29 @@ class ToolTests(unittest.TestCase):
         second, _ = self.run_tool(cosmos_deadlock_capture())  # same second: a new file, not an overwrite
         self.assertNotEqual(second["saved"]["text"], result["saved"]["text"])
 
+    def test_saved_captures_are_pruned_to_the_newest(self):
+        folder = Path(self.tmp.name) / "3dsmax-mcp" / "diagnostics"
+        folder.mkdir(parents=True)
+        old = []
+        for i in range(5):
+            for ext in ("txt", "json"):
+                path = folder / f"hang-4242-2026010{i}-120000.{ext}"
+                path.write_text("old", encoding="utf-8")
+                os.utime(path, (1_000_000 + i, 1_000_000 + i))
+                old.append(path)
+        other = folder / "notes.txt"
+        other.write_text("keep", encoding="utf-8")
+        with mock.patch.object(self.tool, "MAX_SAVED_CAPTURES", 3):
+            result, _ = self.run_tool(vray_medit_capture())
+        names = sorted(p.name for p in folder.iterdir())
+        self.assertIn(Path(result["saved"]["text"]).name, names)
+        self.assertIn(Path(result["saved"]["json"]).name, names)
+        self.assertIn("notes.txt", names)  # only its own captures are pruned
+        # The new capture plus the two newest old ones survive, as pairs.
+        self.assertEqual(sorted(p.name for p in old if p.exists()),
+                         sorted(p.name for p in old[-4:]))
+        self.assertEqual(len(names), 3 * 2 + 1)
+
     def test_no_save(self):
         result, captured = self.run_tool(vray_medit_capture(), all_threads=True, depth=12, save=False)
         captured.assert_called_once_with(4242, all_threads=True, depth=12)
@@ -439,7 +462,8 @@ class RegistrationTests(unittest.TestCase):
         from maxmcp.tool_discovery import ProgressiveToolCatalog
 
         self.assertIn("diagnostics", server.CORE_TOOL_MODULES)
-        self.assertEqual(server._tool_annotations("capture_hang_diagnostics"), {"readOnlyHint": True})
+        # It pauses Max threads and writes files: not advertised as read-only (no auto-approval).
+        self.assertEqual(server._tool_annotations("capture_hang_diagnostics"), {})
         catalog = ProgressiveToolCatalog(package="maxmcp", tools_dir=REPO_ROOT / "maxmcp" / "tools",
                                          hidden_mcp=mock.Mock(),
                                          allowed_modules=server.CORE_TOOL_MODULES + server.SPECIALTY_TOOL_MODULES)
@@ -490,6 +514,25 @@ class GuardTests(unittest.TestCase):
         result = stackdump.capture_stacks(4242, tids=["x"], depth="deep")
         self.assertEqual((result["threads"], result["depth"]), ([], stackdump.DEFAULT_DEPTH))
         self.assertIn("tids", result["errors"][0]["message"])
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows")
+    def test_capture_runs_off_the_calling_thread(self):
+        # Signals (Ctrl+C) only reach the main thread: the suspensions happen elsewhere.
+        seen = []
+
+        def fake_capture(api, pid, wanted, all_threads, depth, result):
+            seen.append(threading.current_thread())
+
+        with mock.patch.object(stackdump, "_load_api", return_value=object()), \
+                mock.patch.object(stackdump, "_capture", side_effect=fake_capture):
+            stackdump.capture_stacks(4)
+        self.assertEqual(len(seen), 1)
+        self.assertIsNot(seen[0], threading.current_thread())
+        self.assertEqual(seen[0].name, "maxmcp-stackdump")
+
+    def test_symbols_are_loaded_before_any_thread_is_suspended(self):
+        self.assertFalse(stackdump._SYM_OPTIONS & 0x4, "SYMOPT_DEFERRED_LOADS loads modules mid-walk")
+        self.assertEqual(stackdump._SYM_SEARCH_PATH, "")  # not None, which means the CWD
 
     @unittest.skipUnless(IS_WINDOWS, "Windows")
     def test_refuses_own_process(self):
@@ -565,6 +608,8 @@ class LiveCaptureTests(unittest.TestCase):
         self.assertEqual(main["state_hint"], "kernel_wait")
         self.assertTrue(any(m.lower().startswith("python") for m in modules if m), modules)
         self.assertTrue(all(t["suspended_ms"] < 1000 for t in result["threads"]))
+        if stackdump._load_api().NtCreateThreadStateChange is not None:  # Windows 11 / Server 2022+
+            self.assertEqual(list(result["pause_methods"]), ["state_change"])
         self.assertIsNone(child.poll())
         self.assert_none_suspended(child.pid)
         summary = stackdump.summarize(result)
@@ -623,6 +668,52 @@ class LiveCaptureTests(unittest.TestCase):
         self.assertEqual(result["threads"][0]["windows"][0]["title"], "Untitled - Autodesk 3ds Max 2026")
         self.assertIn("does not belong", result["errors"][0]["message"])
         self.assertEqual(stackdump.summarize(result)["hung_windows"][0]["main_thread"], True)
+
+    def test_killed_capture_never_leaves_a_thread_suspended(self):
+        # A server killed (TerminateProcess) in the middle of a walk: the kernel
+        # reverts the state-change suspension, so the target thread runs again.
+        api = stackdump._load_api()
+        if api.NtCreateThreadStateChange is None:
+            self.skipTest("thread state-change objects need Windows 11 / Server 2022")
+        child = self.spawn("-c", "import sys, time; print('ready', flush=True); time.sleep(30)")
+        self.assertEqual((self.readline(child) or "").strip(), "ready")
+        tid = stackdump._oldest_thread(api, stackdump._thread_ids(api, child.pid))
+        holder_code = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "from maxmcp.diagnostics import stackdump\n"
+            "api = stackdump._load_api()\n"
+            "def stuck(*args):\n"
+            "    print('walking', flush=True)\n"
+            "    time.sleep(60)\n"
+            "    return False\n"
+            "api.StackWalk64 = stuck\n"
+            "stackdump.capture_stacks(int(sys.argv[1]), tids=[int(sys.argv[2])], depth=4)\n")
+        holder = self.spawn("-c", holder_code, str(child.pid), str(tid))
+        self.assertEqual((self.readline(holder) or "").strip(), "walking")
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenThread.restype = ctypes.c_void_p
+        k32.SuspendThread.argtypes = k32.ResumeThread.argtypes = k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.SuspendThread.restype = k32.ResumeThread.restype = ctypes.c_uint32
+        handle = k32.OpenThread(0x0002, False, tid)
+        self.assertTrue(handle)
+        try:
+            previous = k32.SuspendThread(handle)
+            k32.ResumeThread(handle)
+            self.assertEqual(previous, 1, "the holder should have the thread suspended")
+            holder.kill()  # TerminateProcess: no atexit, no release_all
+            holder.wait(10)
+            deadline = time.monotonic() + 5
+            while True:
+                previous = k32.SuspendThread(handle)
+                k32.ResumeThread(handle)
+                if previous == 0 or time.monotonic() > deadline:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(previous, 0, "the killed capture left the thread suspended")
+        finally:
+            k32.CloseHandle(handle)
+        self.assertIsNone(child.poll())
 
     def test_exited_process_is_an_error_entry(self):
         child = self.spawn("-c", "pass")

@@ -183,7 +183,7 @@ def _busy_from_health(health: dict) -> str | None:
         state, code = "not_responding", MaxNotRespondingError.code
         message = (f"3ds Max (PID {pid}) is not responding: {what}; {describe_process(process)}. "
                    f"Max is blocked: {BLOCKED_CAUSE}. Nothing was sent. {HANG_ADVICE} "
-                   "capture_hang_diagnostics shows where it is stuck without touching Max.")
+                   "capture_hang_diagnostics shows where it is stuck (OS-only; pauses each Max thread for milliseconds).")
     else:
         state, code = "busy", MaxBusyError.code
         evidence = f" ({describe_process(process)})" if process else ""

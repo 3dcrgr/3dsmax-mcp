@@ -27,7 +27,6 @@ _READ_ONLY_TOOLS = {
     "cosmos_search",
     "material_roles",
     "get_bridge_status",
-    "capture_hang_diagnostics",
     "get_plugin_capabilities",
     "lighting_capabilities",
     "query_scene",
@@ -414,16 +413,18 @@ def main():
     mcp.run(transport="stdio")
     # Client closed stdin: exit even if non-daemon threads linger, but never
     # while a diagnostics capture holds a Max thread suspended.
-    from .suspend_guard import release_all
+    try:
+        from .suspend_guard import release_all
 
-    release_all()
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            if stream is not None:
-                stream.flush()
-        except Exception:
-            pass
-    os._exit(0)
+        release_all()
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if stream is not None:
+                    stream.flush()
+            except Exception:
+                pass
+    finally:
+        os._exit(0)
 
 
 if __name__ == "__main__":
