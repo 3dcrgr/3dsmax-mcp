@@ -11,6 +11,8 @@ Connect AI agents to Autodesk 3ds Max through the [Model Context Protocol](https
 
 Automate everything!
 
+> **This is a fork.** It carries stability fixes for problems found in production use: Cosmos imports that hung V-Ray scenes, timeouts with no diagnosis when Max hangs, and silent failures on Revit materials. See [docs/FORK.md](docs/FORK.md) for what changed, how it was verified, and how to install it. Upstream: [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax-mcp).
+
 **Current release: 1.7.2** — see [CHANGELOG.md](docs/CHANGELOG.md).
 
 ## Features
