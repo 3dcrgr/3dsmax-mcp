@@ -4,6 +4,8 @@ Four problems that came up during the same production work. None was dangerous, 
 
 ## `execute_maxscript` reported interrupted scripts as parse errors
 
+Kept in the 1.7.5 merge: upstream has no such check.
+
 Commit `011e547`.
 
 **What happened.** `quitMax #noPrompt` returned "MAXScript execution failed (parse error)", although it has no syntax error. `try (quitMax #noPrompt quiet:true) catch ()` worked.
@@ -17,15 +19,19 @@ Commit `011e547`.
 - **No re-check during shutdown.** While Max or the bridge is shutting down, the check is skipped and the reply is "MAXScript did not complete: 3ds Max is shutting down ...", also with `MAXSCRIPT_INTERRUPTED`.
 - **If the check itself can't run,** the reply says the failure is either a parse error or an interruption, with code `BAD_PARAM`.
 - **Hybrid native handlers** return the same explicit code, so keyword matching on the message can't mislabel them.
+- **Max's own error text** (since the 1.7.5 merge). Upstream 1.7.5 reads the error text Max returns with the failure. The fork's messages keep their wording and add that text as "Max reported: ...". A parse error uses it as its detail only when the compiler gives none.
 - **The skill guide** says how to quit Max: `try (quitMax #noPrompt quiet:true) catch ()`, and to expect the bridge connection to drop.
 
 Tests: `tests/test_execute_failures.py`. They cover how the Python server classifies the bridge's messages, not the re-compile itself.
 
-**Status.** The check is in the native bridge, and only the rebuilt 2026 bridge in `native/bin/` has it. With upstream's 1.7.5 bridges (2023, 2024, 2025 and 2027), an interrupted script is reported as "MAXScript execution failed: <Max's error text>" with `BAD_PARAM`. Since the 1.7.5 merge, this fork's bridge appends Max's own error text to its messages ("Max reported: ..."). The syntax-error path was verified live on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message. Quitting with `try (quitMax #noPrompt quiet:true) catch ()` was also run live: the bridge connection dropped and Max exited cleanly. A bare `quitMax`, which should give `MAXSCRIPT_INTERRUPTED`, hasn't been tested yet.
+**Status.** The check is in the native bridge, and only the 2026 bridge in `native/bin/` has it. With upstream's 1.7.5 bridges (2023, 2024, 2025 and 2027), an interrupted script gets the same reply as a syntax error: "MAXScript execution failed: <Max's error text>", with a code picked from keywords in that text, usually `BAD_PARAM`.
+- **Verified live** on 2026-10-01 with the fork's 1.7.3-based 2026 bridge: `(1 +` returned `BAD_PARAM` with the compiler's message. Quitting with `try (quitMax #noPrompt quiet:true) catch ()` was also run live: the bridge connection dropped and Max exited cleanly.
+- **Not tested live yet:** the 2026 bridge built from the 1.7.5 merge (sha256 `e275e129…`), and a bare `quitMax #noPrompt`, which should give `MAXSCRIPT_INTERRUPTED`. Run that check with the merged bridge, on a throwaway Max.
+- Since the merge, `execute_maxscript` runs in Max's quiet mode by default. Without `#noPrompt`, quiet mode may answer Max's save prompt on its own and lose unsaved work (fork issue #12, not tested yet).
 
 ## Failed agent scripts printed errors in the user's Listener
 
-Fixed upstream in 1.7.5 (`5c44e76`) by the same change; the fork's copy was dropped in the merge.
+Superseded by upstream 1.7.5 (`5c44e76`), which made the same quiet-errors change and also runs agent scripts in Max's quiet mode. The fork dropped its own lines in the merge (`a07ef93`).
 
 Fork issue #8. Commit `6552786`.
 
@@ -33,7 +39,9 @@ Fork issue #8. Commit `6552786`.
 
 **What changed.** `execute_maxscript`, and the native tools that run MAXScript internally, now run scripts with quiet errors. Compile errors and aborts go to Max's log, not the Listener, and the compile-only check behind the parse-error detail prints nothing either. The caller gets the same results as before: `BAD_PARAM` "MAXScript execution failed (parse error): <detail>", `MAXSCRIPT_INTERRUPTED`, and runtime errors with their message. A script's own output, such as `print`, still reaches the Listener.
 
-**Status.** This is in the native bridge. Upstream's 1.7.5 bridges have the same change. Verified live with the fork's 1.7.3-based 2026 bridge (sha256 `c621db10…`) on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message and left the Listener unchanged, and `print "hello"; 42` returned `42` with only `"hello"` added to the Listener.
+**Status.** This is in the native bridge. All of upstream's 1.7.5 bridges have the same change, and so does the 2026 bridge built from the merge. Verified live with the fork's 1.7.3-based 2026 bridge (sha256 `c621db10…`) on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message and left the Listener unchanged, and `print "hello"; 42` returned `42` with only `"hello"` added to the Listener. Not checked live yet with the merged bridge (sha256 `e275e129…`).
+
+Upstream's quiet mode makes prompts take their default answer; `execute_maxscript(quiet=False)` doesn't set it. The fork changes quiet mode only on Max's main thread (`8a8b26c`, see [hung-max.md](hung-max.md#upstream-175s-dialog-handling-fixed-on-the-merge)).
 
 ## Curve tools rejected Line objects
 

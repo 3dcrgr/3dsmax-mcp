@@ -1,6 +1,6 @@
 # Cosmos imports that stall or deadlock 3ds Max
 
-Fork issues #1, #2, #7, #9 and #10. Commits `25bb1fc`, `ed1fb1c`, `2853b1c` (#9), `c1e09a7` (#10) and `c88975e` (#9, #10). Dialog handling came with the upstream 1.7.5 merge: `a07ef93`, `6e03f99` and `f70b0cc`.
+Fork issues #1, #2, #7, #9 and #10. Commits `25bb1fc`, `ed1fb1c`, `2853b1c` (#9), `c1e09a7` (#10) and `c88975e` (#9, #10). Dialog handling came with the upstream 1.7.5 merge: `a07ef93`, `6e03f99`, `f70b0cc` and `34a7ce5`.
 
 ## What happened
 
@@ -111,7 +111,7 @@ New result fields:
 
 ### Dialogs during an import (upstream 1.7.5)
 
-Upstream 1.7.5 (`5c44e76`) added blocking-dialog handling: a call held by a modal dialog returns `BLOCKED_BY_DIALOG`, `max_dialogs` reads and answers the dialog, and a recognised MAXScript error box during a call is acknowledged and fails that call with `MAX_DIALOG_ERROR`. A modal dialog keeps Max's windows answering, so the OS checks above can't see it. Since the merge (`a07ef93`, `f70b0cc`), `cosmos_import` handles it:
+Upstream 1.7.5 (`5c44e76`) added blocking-dialog handling: a call held by a modal dialog returns `BLOCKED_BY_DIALOG`, `max_dialogs` reads and answers the dialog, and a recognised MAXScript error box during a call is acknowledged and fails that call with `MAX_DIALOG_ERROR`. A modal dialog keeps Max's windows answering, so the OS checks above can't see it. Since the merge (`a07ef93`, `f70b0cc`, `34a7ce5`), `cosmos_import` handles it:
 
 - **A dialog before step 1.** It asks the bridge's dialog monitor, which answers from a pipe thread without touching Max's main thread. If a dialog holds Max's main thread, nothing else is sent and nothing is imported: `state: "not_imported"`, `dispatched: false`, `safe_to_edit: true`, and the `dialogs`. Answer the dialog, then retry. Otherwise the browser action, the preparation and the import would all run inside the dialog's loop.
   - A dialog doesn't count while the monitor reports that Max's main thread stopped pumping. That's a hang, and the OS checks handle it. A bridge without the monitor skips this check.
