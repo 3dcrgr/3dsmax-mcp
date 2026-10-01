@@ -37,7 +37,7 @@ def encode(data):
 def functions():
     from .loft import LOFT_FUNCTIONS
     return MESH_FUNCTIONS+CURVE_FUNCTIONS+LOFT_FUNCTIONS+r'''
-fn cmToken obj = (if isKindOf obj.baseobject SplineShape then cvToken obj else lfToken obj)
+fn cmToken obj = (if cvIsSpline obj.baseobject then cvToken obj else lfToken obj)
 '''
 
 

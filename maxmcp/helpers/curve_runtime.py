@@ -14,7 +14,11 @@ from .mesh import MESH_FUNCTIONS, target_script
 
 FINGERPRINT = re.compile(r"[0-9A-F]{2}(?:-[0-9A-F]{2}){31}")
 
-CURVE_FUNCTIONS = r'''
+# Editable spline bases: SplineShape and Line (classOf ``line``, which isKindOf
+# SplineShape does not report). Parametric shapes and NURBS stay excluded.
+SPLINE_BASE_FUNCTION = "fn cvIsSpline b = (isKindOf b SplineShape or isKindOf b line)\n"
+
+CURVE_FUNCTIONS = SPLINE_BASE_FUNCTION + r'''
 fn cvHash text = (
     local sha = (dotNetClass "System.Security.Cryptography.SHA256").Create()
     local bytes = (dotNetClass "System.Text.Encoding").UTF8.GetBytes text
@@ -22,7 +26,7 @@ fn cvHash text = (
     sha.Dispose(); result as string
 )
 fn cvBase obj = (
-    if not isKindOf obj.baseobject SplineShape do throw "Editable spline base required; no automatic conversion"
+    if not cvIsSpline obj.baseobject do throw "Editable spline base required; no automatic conversion"
     if numSplines obj > 128 or numKnots obj > 2000 do throw "Curve inspection limit: 128 splines / 2000 knots"
     obj
 )

@@ -17,6 +17,7 @@ from typing import Any, Optional
 from ..coerce import DictList
 from ..helpers.maxscript import safe_string
 from ..helpers.curves import add, sub, mul, length
+from ..helpers.curve_runtime import SPLINE_BASE_FUNCTION
 from ..server import client, mcp
 
 KNOT_TYPES = {
@@ -222,8 +223,9 @@ def _parse_summary(raw: str) -> dict[str, Any] | None:
 
 def _editable_guard(convert: bool) -> str:
     return (
-        "local wasConverted = false\n"
-        "if not (isKindOf obj.baseObject SplineShape) do (\n"
+        SPLINE_BASE_FUNCTION
+        + "local wasConverted = false\n"
+        "if not (cvIsSpline obj.baseObject) do (\n"
         + ("" if convert else 'if obj.modifiers.count > 0 do throw "Editable spline base required; convert=true explicitly collapses the stack"\n')
         + "convertToSplineShape obj; wasConverted = true\n)\n"
     )
@@ -272,7 +274,8 @@ def draw_spline(
 
     Edits target the spline BASE, preserving Surface, CrossSection, Sweep, etc.
     A parametric base with modifiers requires convert=true to collapse explicitly;
-    bare parametric shapes still convert automatically. Coordinates are world-space.
+    bare parametric shapes still convert automatically. Line objects are edited
+    in place without conversion. Coordinates are world-space.
     Pair with modifiers for solids: Extrude, Lathe, Bevel, Sweep on the result.
     Use when: tracing reference profiles/silhouettes, drawing paths, building
     curved forms parametric primitives cannot express, refining spline curves.
@@ -374,8 +377,9 @@ def draw_spline(
     )"""
         script = f"""(
 {guard}(
+    {SPLINE_BASE_FUNCTION}
     local out = stringstream ""
-    format "SHAPE|%|%|%|%\\n" ((classof obj) as string) ((isKindOf obj.baseObject SplineShape) as string) ((classof obj.baseObject) as string) obj.modifiers.count to:out
+    format "SHAPE|%|%|%|%\\n" ((classof obj) as string) ((cvIsSpline obj.baseObject) as string) ((classof obj.baseObject) as string) obj.modifiers.count to:out
     local emitted = 0
     try (
         for s = 1 to (numSplines obj) do (
