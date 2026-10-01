@@ -21,6 +21,7 @@ _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 0x102
 _ERROR_INVALID_PARAMETER = 87
 _GW_OWNER = 4
+_TH32CS_SNAPPROCESS = 0x2
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -60,6 +61,25 @@ if _IS_WINDOWS:
     _user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
     _user32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
                                             wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+    # Neither sends a message to the window's thread.
+    _user32.GetClassNameW.restype = ctypes.c_int
+    _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    _user32.GetWindowRect.restype = wintypes.BOOL
+    _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260)]
+
+    _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _kernel32.Process32FirstW.restype = wintypes.BOOL
+    _kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _kernel32.Process32NextW.restype = wintypes.BOOL
+    _kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
 
 _WM_NULL = 0x0000
 _SMTO_BLOCK = 0x0001
@@ -323,6 +343,72 @@ def thread_windows(pid: int, title: str, timeout_ms: int = 500) -> dict[str, Any
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
+
+
+def list_windows(pid: int) -> list[dict[str, Any]]:
+    """Every top-level window of `pid` (hidden ones too) with the thread that owns it.
+
+    Sends no message, so it is safe against a hung process: title via
+    InternalGetWindowText, class via GetClassNameW, hung via IsHungAppWindow.
+    Each entry: hwnd, tid, title, class, visible, owned, hung, area. [] on error.
+    """
+    if not _IS_WINDOWS or not _valid_pid(pid):
+        return []
+    found: list[dict[str, Any]] = []
+
+    def _callback(hwnd: Any, _lparam: Any) -> bool:
+        try:
+            owner = wintypes.DWORD()
+            tid = _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value != pid:
+                return True
+            cls = ctypes.create_unicode_buffer(256)
+            _user32.GetClassNameW(hwnd, cls, 256)
+            rect = wintypes.RECT()
+            area = 0
+            if _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+            found.append({"hwnd": int(hwnd), "tid": int(tid), "title": _window_title(hwnd), "class": cls.value,
+                          "visible": bool(_user32.IsWindowVisible(hwnd)),
+                          "owned": bool(_user32.GetWindow(hwnd, _GW_OWNER)),
+                          "hung": bool(_user32.IsHungAppWindow(hwnd)), "area": area})
+        except Exception:
+            pass
+        return True
+
+    try:
+        _user32.EnumWindows(_WNDENUMPROC(_callback), 0)
+    except Exception:
+        return []
+    return found
+
+
+def list_processes(image_names: tuple[str, ...] = ("3dsmax.exe",)) -> list[dict[str, Any]]:
+    """Running processes whose image file name is one of `image_names` (case-insensitive).
+
+    Toolhelp snapshot only; nothing is opened or signalled. [] on error.
+    """
+    if not _IS_WINDOWS:
+        return []
+    wanted = {name.casefold() for name in image_names}
+    invalid = wintypes.HANDLE(-1).value
+    snap = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == invalid:
+        return []
+    found: list[dict[str, Any]] = []
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.casefold() in wanted:
+                found.append({"pid": int(entry.th32ProcessID), "image": entry.szExeFile})
+            ok = _kernel32.Process32NextW(snap, ctypes.byref(entry))
+    except Exception:
+        return []
+    finally:
+        _kernel32.CloseHandle(snap)
+    return sorted(found, key=lambda item: item["pid"])
 
 
 def window_hung(hwnd: int) -> bool | None:

@@ -54,6 +54,7 @@ Mutation:
 
 Debugging:
 - `get_bridge_status` — when tools time out or return `MAX_BUSY`/`MAX_NOT_RESPONDING`. It asks the bridge's pipe thread (never Max's main thread, so it answers while Max is hung) whether this server's request, another MCP client's request, or work outside the bridge holds the main thread.
+- `capture_hang_diagnostics` — after `MAX_NOT_RESPONDING`/`IMPORT_SETTLING`, or `get_bridge_status` showing `not_responding`: OS-only native stacks (sends nothing to Max, safe while hung) that name what blocks the main thread, e.g. a V-Ray Material Editor render or a Cosmos importer deadlock; saves .txt/.json for bug reports
 - `walk_references` — trace dependencies from a live object
 - `watch_scene` — track user actions during an interactive session
 - `execute_maxscript` — fallback only when no dedicated tool exists

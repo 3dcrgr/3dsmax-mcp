@@ -338,6 +338,30 @@ class MaxClient:
             target = self._default_target()
         return {**target, "available": self._probe_pipe_available(target["target_pipe"])}
 
+    def selected_pid_nowait(self) -> dict[str, Any]:
+        """PID of the Max this client is talking to, from memory only: {pid, source, pipe}.
+
+        Never takes the pipe lock, opens a pipe or sends, so it is safe while a
+        request is stuck in a hung Max. Order: the in-flight request's target,
+        the bound/pinned target, then the environment. pid is None when unknown.
+        """
+        inflight = self._inflight
+        if inflight and inflight.get("target_pid"):
+            return {"pid": int(inflight["target_pid"]), "source": "inflight", "pipe": inflight.get("target_pipe")}
+        candidates = []
+        if self._pinned_pipe_name is not None:
+            candidates.append((self._pinned_pipe_name, "explicit"))
+        if self._bound_target:
+            candidates.append((self._bound_target.get("target_pipe"), self._bound_target.get("target_source")))
+        if self._startup_pipe:
+            candidates.append((self._startup_pipe, self._startup_source))
+        for pipe, source in candidates:
+            handle = self._pipe_handle if pipe and pipe == self._selected_pipe_name else None
+            pid = self._pid_for_pipe(pipe, handle)
+            if pid:
+                return {"pid": pid, "source": source or "selected", "pipe": pipe}
+        return {"pid": None, "source": None, "pipe": None}
+
     def list_max_instances(self) -> dict[str, Any]:
         with self._instance_lock():
             default = self._default_target()

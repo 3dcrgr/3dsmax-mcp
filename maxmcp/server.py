@@ -27,6 +27,7 @@ _READ_ONLY_TOOLS = {
     "cosmos_search",
     "material_roles",
     "get_bridge_status",
+    "capture_hang_diagnostics",
     "get_plugin_capabilities",
     "lighting_capabilities",
     "query_scene",
@@ -210,6 +211,7 @@ _install_structured_tool_results()
 CORE_TOOL_MODULES = (
     "execute",
     "bridge",
+    "diagnostics",
     "capabilities",
     "session_context",
     "query_scene",

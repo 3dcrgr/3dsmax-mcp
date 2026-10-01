@@ -26,6 +26,7 @@ MODULE_CATEGORY = {
     "curve_edit": "Modeling",
     "contact_check": "Modeling",
     "bridge": "Connection",
+    "diagnostics": "Connection",
     "routing": "Connection",
     "query_scene": "Scene",
     "capabilities": "Connection",
