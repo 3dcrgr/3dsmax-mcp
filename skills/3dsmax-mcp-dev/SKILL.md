@@ -89,7 +89,7 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 - Replies are a `ToolEnvelope` dict (`ok`/`result`/`error`/`hint`), not a JSON string. Tool-authored hints win over automatic ones; `hint.suggested_tools` may list alternatives.
 - Classify raw structured errors by `error`, `code` or `status=error|failed`, never by `message` alone.
 - `USER_BUSY`: Max has an open undo operation and the write was rejected before any change. Continue read-only and retry after it finishes; never bypass it with MAXScript.
-- `MAX_BUSY`, `MAX_NOT_RESPONDING`, `IMPORT_SETTLING`: Max is busy, hung or settling after a Cosmos import. Retry only when `retryable` is true; `request_sent: false` means nothing reached Max. `get_bridge_status` answers while Max is hung and says what holds its main thread; `capture_hang_diagnostics` shows where it is stuck without contacting Max. A modal dialog is not a hang: calls return `BLOCKED_BY_DIALOG` and `get_bridge_status` reports `blocked_by_dialog`.
+- `MAX_BUSY`, `MAX_NOT_RESPONDING`, `IMPORT_SETTLING`: Max is busy, hung or settling after a Cosmos import. Retry only when `retryable` is true; `request_sent: false` means nothing reached Max. `get_bridge_status` answers while Max is hung and says what holds its main thread; `capture_hang_diagnostics` shows where it is stuck without contacting Max. A modal dialog is not a hang while Max's main thread keeps pumping: calls return `BLOCKED_BY_DIALOG` and `get_bridge_status` reports `blocked_by_dialog`.
 
 ## execute_maxscript
 

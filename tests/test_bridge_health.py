@@ -52,12 +52,13 @@ def _process(state, cpu=0.01):
 
 class _StatusCase(unittest.TestCase):
     def status(self, health, *, mine=None, process=None, ping=PING, verdict=None, transport="auto",
-               open_dialogs=None, dialog_status=None, blocked=()):
+               open_dialogs=None, dialog_status=None, blocked=(), blocked_call=None):
         client = mock.Mock()
         client.transport = transport
         client.inflight.return_value = mine
         client.hung_verdict.return_value = verdict
         client.blocked_request_ids.return_value = list(blocked)
+        client.blocked_call.return_value = blocked_call
         client._dialog_control.return_value = dialog_status or {}
         self.client = client
         sent = []
@@ -405,6 +406,46 @@ class DialogStatusTests(_StatusCase):
         mine = {"cmd_type": "maxscript", "request_id": "abc", "running_s": 8.0, "timeout_s": 120.0}
         payload, _, _ = self.status(health, mine=mine, process=_process("busy", cpu=0.9))
         self.assertEqual(payload["other_clients"], [])
+
+    def test_tool_windows_are_never_open_dialogs(self):
+        health = _health("busy_mcp", pumping=False, heartbeat_ms=8000, version=2, running=_running(ms=8000),
+                         inflight=[_entry("pipe-1", "RUN", "maxscript", 8000)])
+        payload, _, _ = self.status(health, open_dialogs=[{"dialog_id": "4242:3", "title": "Chaos Cosmos Browser"},
+                                                          {"dialog_id": "4242:7", "title": "Save Changes"}],
+                                    process=_process("busy", cpu=0.9))
+        self.assertEqual([d["title"] for d in payload["open_dialogs"]], ["Save Changes"])
+
+    def _blocked_call_on_a_hung_max(self, record, mine=None):
+        """This server's BLOCKED_BY_DIALOG call still runs; Max then stopped pumping for 25 s."""
+        health = _health("busy_mcp", pumping=False, heartbeat_ms=25000, version=2,
+                         running=_running(request_id="B1", ms=25000, client_id="pipe-7"),
+                         inflight=[_entry("pipe-7", "B1", "maxscript", 25000)])
+        payload, _, _ = self.status(health, blocked=["B1"], blocked_call=record, mine=mine,
+                                    process=_process("blocked"))
+        return payload
+
+    def test_blocked_call_overdue_on_a_blocked_max_is_not_responding(self):
+        record = {"cmd_type": "maxscript", "request_id": "B1", "timeout_s": 120.0, "running_s": 200.0,
+                  "waiting_s": 199.0}
+        payload = self._blocked_call_on_a_hung_max(record)
+        self.assertEqual(payload["bridge_state"], "not_responding")
+        self.assertEqual(payload["main_thread"]["running"]["owner"], "this_server")
+        self.assertTrue(payload["main_thread"]["running"]["blocked_by_dialog"])
+        self.client.blocked_call.assert_called_once_with("B1")
+
+    def test_blocked_call_within_its_timeout_is_busy_whatever_else_is_in_flight(self):
+        record = {"cmd_type": "maxscript", "request_id": "B1", "timeout_s": 120.0, "running_s": 30.0,
+                  "waiting_s": 29.0}
+        # This server's other call is long overdue; it must not decide for the blocked call.
+        mine = {"cmd_type": "maxscript", "request_id": "OTHER", "running_s": 500.0, "timeout_s": 5.0}
+        payload = self._blocked_call_on_a_hung_max(record, mine=mine)
+        self.assertEqual(payload["bridge_state"], "busy")
+        self.assertEqual(payload["main_thread"]["running"]["owner"], "this_server")
+
+    def test_blocked_call_without_a_record_is_judged_like_any_request(self):
+        payload = self._blocked_call_on_a_hung_max(None)  # the call finished meanwhile; nothing in flight
+        self.assertEqual(payload["bridge_state"], "not_responding")
+        self.assertIn("capture_hang_diagnostics", payload["message"])
 
     def test_blocked_call_still_running_is_ours_when_the_dialog_status_is_unavailable(self):
         health = _health("busy_mcp", pumping=False, heartbeat_ms=8000, version=2,

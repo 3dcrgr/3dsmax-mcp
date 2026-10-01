@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from ..max_client import (_NOT_DIALOG_TITLE, BLOCKED_CAUSE, HANG_ADVICE, DialogBlocked, MaxBusyError,
-                          MaxNotRespondingError, _grace, settling_state)
+                          MaxNotRespondingError, _grace, real_dialogs, settling_state)
 from ..process_health import describe as describe_process, diagnose_process
 from ..server import mcp, client
 
@@ -69,9 +69,9 @@ def _native_health() -> dict | MaxBusyError | MaxNotRespondingError | None:
     if not isinstance(payload, dict) or not isinstance(payload.get("mainThread"), dict):
         return None
     # Bridges from 1.7.5 list the dialogs blocking Max on every reply (window-manager state only).
+    # Cosmos browser, Material Editor and viewport windows are never dialogs (upstream bridges list them).
     meta = response.get("meta") if isinstance(response.get("meta"), dict) else {}
-    dialogs = meta.get("openDialogs")
-    payload["openDialogs"] = dialogs if isinstance(dialogs, list) else []
+    payload["openDialogs"] = real_dialogs(meta.get("openDialogs"))
     return payload
 
 
@@ -270,8 +270,11 @@ def _busy_from_health(health: dict) -> str | None:
         process.get("state") == "blocked" and stuck_s >= _BLOCKED_CONFIRM_S))
     if blocked and owner == "this_server" and process.get("state") != "exited":
         # Same rule as a held pipe lock: this server's own request is hung only once overdue.
-        limit = mine.get("timeout_s")
-        blocked = limit is not None and (mine.get("running_s") or 0) >= limit + _grace(limit)
+        # A call that returned BLOCKED_BY_DIALOG is no longer in flight: use its own record.
+        own = client.blocked_call(running.get("requestId")) if held_by_dialog else mine
+        if isinstance(own, dict):
+            limit = own.get("timeout_s")
+            blocked = limit is not None and (own.get("running_s") or 0) >= limit + _grace(limit)
     if blocked:
         state, code = "not_responding", MaxNotRespondingError.code
         message = (f"3ds Max (PID {pid}) is not responding: {what}; {describe_process(process)}. "

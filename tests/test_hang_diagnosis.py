@@ -26,6 +26,7 @@ from maxmcp.max_client import (  # noqa: E402
 )
 
 assert Path(max_client.__file__).resolve().parent.parent == REPO_ROOT, max_client.__file__
+_REAL_DIALOGS_BLOCKING = MaxClient._dialogs_blocking  # the cases below patch it out by default
 
 PID = 4242
 PIPE = rf"\\.\pipe\3dsmax-mcp-pid-{PID}"
@@ -588,6 +589,78 @@ class DialogTests(_ClientCase):
         self.assertEqual(kernel.writes, 0)
         self.dialog_check.assert_not_called()
 
+    def _monitor(self, client: MaxClient, pumping: bool) -> list[str]:
+        """Use the real dialog check against a bridge status: a main-thread dialog while queued."""
+        actions: list[str] = []
+
+        def control(action):
+            actions.append(action)
+            if action == "inspect":
+                return {"dialogs": [dict(DIALOG)]}
+            request_id = (client._inflight or {}).get("request_id")
+            return {"dialogs": [dict(DIALOG)], "requests": [{"request_id": request_id, "state": "queued"}],
+                    "main_thread_pumping": pumping}
+
+        patcher = mock.patch.object(client, "_dialog_control", side_effect=control)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.dialog_check.side_effect = lambda request_id: _REAL_DIALOGS_BLOCKING(client, request_id)
+        return actions
+
+    def test_dialog_on_a_main_thread_that_stopped_pumping_is_diagnosed_as_a_hang(self):
+        # A dialog is visible but Max's main thread does not pump: that is a hang, as get_bridge_status says.
+        self.use_kernel(FakeKernel(self.clock))
+        self.states = ["blocked"]
+        client = self.pinned_client()
+        actions = self._monitor(client, pumping=False)
+        with self.assertRaises(MaxNotRespondingAfterDispatch):
+            client.send_command("x", timeout=1.0)
+        self.assertEqual(self.diagnoses, ["blocked", "blocked"])
+        self.assertIn(PID, client._hung_pids)  # later calls fail fast
+        self.assertNotIn("inspect", actions)
+        self.assertEqual(client.blocked_request_ids(), [])
+
+    def test_dialog_on_a_pumping_main_thread_is_blocked_by_dialog(self):
+        self.use_kernel(FakeKernel(self.clock))
+        self.states = ["blocked"]
+        client = self.pinned_client()
+        actions = self._monitor(client, pumping=True)
+        with self.assertRaises(DialogBlocked):
+            client.send_command("x", timeout=1.0)
+        self.assertEqual(self.diagnoses, [])
+        self.assertEqual(actions, ["status", "inspect"])
+
+    def test_blocked_call_record_for_status(self):
+        start = self.clock.now
+        self.use_kernel(FakeKernel(self.clock, [(start + 30.0, REPLY)]))
+        self.dialog_after(1)
+        client = self.pinned_client()
+        with self.assertRaises(DialogBlocked) as ctx:
+            client.send_command("x", timeout=60.0)
+        self.clock.now = start + 10.0
+        record = client.blocked_call(ctx.exception.request_id)
+        self.assertEqual((record["cmd_type"], record["timeout_s"]), ("maxscript", 60.0))
+        self.assertEqual(record["running_s"], 10.0)
+        self.assertEqual(record["waiting_s"], 9.0)
+        self.assertIsNone(client.blocked_call("unknown"))
+        self.clock.now = start + 31.0
+        self.assertIsNone(client.blocked_call(ctx.exception.request_id))  # finished
+
+    def test_probes_are_evicted_before_real_blocked_calls(self):
+        self.use_kernel(FakeKernel(self.clock))
+        client = self.pinned_client()
+        waiting = types.SimpleNamespace(done=threading.Event())
+        for i in range(max_client.MAX_BLOCKED_CALLS):
+            client._blocked[f"r{i}"] = {"command": "ping" if i == 5 else "maxscript", "reader": waiting,
+                                       "blocked_at": self.clock.now, "probe": i == 5}
+        self.dialog_after(1)
+        with self.assertRaises(DialogBlocked) as ctx:
+            client.send_command("x", timeout=1.0)
+        self.assertNotIn("r5", client._blocked)
+        self.assertIn("r0", client._blocked)  # the oldest real call keeps its reportable result
+        self.assertIn(ctx.exception.request_id, client._blocked)
+        self.assertEqual(len(client._blocked), max_client.MAX_BLOCKED_CALLS)
+
     def test_queue_cancelled_blocked_call_reports_it_never_ran(self):
         start = self.clock.now
         self.use_kernel(FakeKernel(self.clock, [(start + 120.0, QUEUE_TIMEOUT)]))
@@ -666,6 +739,29 @@ class DialogCheckTests(unittest.TestCase):
         self.assertEqual(self.client._dialogs_blocking("r1"), [])
         self.assertEqual(self.client._dialogs_blocking("r1"), [])
         self.assertEqual(self.control.call_count, 1)
+
+    def test_a_main_thread_that_stopped_pumping_has_no_blocking_dialog(self):
+        self.status["dialogs"] = [dict(DIALOG)]
+        self.status["main_thread_pumping"] = False
+        self.assertEqual(self.client._dialogs_blocking("r1"), [])
+        self.assertEqual(self.actions, ["status"])
+
+    def test_a_tool_window_on_another_thread_still_stops_inspect(self):
+        # Upstream bridges read every listed dialog on inspect, other threads' included.
+        self.status["dialogs"] = [dict(DIALOG), {"dialog_id": "9", "title": "Chaos Cosmos Browser",
+                                                 "main_thread": False}]
+        found = self.client._dialogs_blocking("r1")
+        self.assertEqual([d["dialog_id"] for d in found], [DIALOG["dialog_id"]])
+        self.assertEqual(self.actions, ["status"])
+
+    def test_reply_metadata_never_lists_tool_windows(self):
+        self.client._local.last_response = {"requestId": "r", "meta": {"openDialogs": [
+            {"dialog_id": "1", "title": "Material Editor - 01 - Default"},
+            {"dialog_id": "2", "title": "Save Changes"}]}}
+        self.assertEqual([d["title"] for d in self.client.get_last_transport()["open_dialogs"]], ["Save Changes"])
+        self.client._local.last_response = {"requestId": "r", "meta": {"openDialogs": [
+            {"dialog_id": "1", "title": "Chaos Cosmos Browser"}]}}
+        self.assertNotIn("open_dialogs", self.client.get_last_transport())
 
     def test_a_dropped_status_probe_is_no_dialog(self):
         self.control.side_effect = MaxBusyError("busy", {})

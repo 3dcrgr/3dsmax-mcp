@@ -18,8 +18,8 @@ sys.path.insert(0, str(REPO_ROOT))
 from maxmcp import max_client, process_health, tool_response  # noqa: E402
 from maxmcp.helpers import cosmos  # noqa: E402
 from maxmcp.helpers.cosmos_client import CosmosError  # noqa: E402
-from maxmcp.max_client import (DialogBlocked, MaxBusyError, MaxClient, MaxImportSettlingError,  # noqa: E402
-                               MaxNotRespondingAfterDispatch)
+from maxmcp.max_client import (DialogBlocked, MaxBridgeError, MaxBusyError, MaxClient,  # noqa: E402
+                               MaxImportSettlingError, MaxNotRespondingAfterDispatch)
 
 assert Path(cosmos.__file__).resolve().parents[2] == REPO_ROOT, cosmos.__file__
 
@@ -454,6 +454,16 @@ def blocked(kind="maxscript"):
     return DialogBlocked("rid-" + kind, "maxscript", [dict(SAVE)])
 
 
+def dialog_error(title="MAXScript Callback script Exception"):
+    """The bridge's reply when Max showed (and the bridge acknowledged) an error box during a call."""
+    payload = {"type": "NativeError", "code": "MAX_DIALOG_ERROR", "retryable": False,
+               "message": "Max displayed an error dialog during the operation.",
+               "details": {"dialogs": [{"action": "acknowledged_error", "title": title,
+                                        "text": "-- Runtime error: callback"}],
+                           "scene_state": "verification_required"}}
+    return MaxBridgeError(json.dumps(payload), {"success": False})
+
+
 class DialogTests(_FlowCase):
     """BLOCKED_BY_DIALOG (upstream 1.7.5) inside the import: a lost call, never an action failure."""
 
@@ -511,10 +521,10 @@ class DialogTests(_FlowCase):
         self.assertIn("only if max_dialogs reports that call failed", " ".join(result["warnings"]))
 
     def test_open_dialog_after_settle_skips_confirm_and_finalize(self):
-        self.op_client._dialog_control = mock.Mock(return_value={"dialogs": [
+        self.op_client._dialog_control = mock.Mock(side_effect=[{"dialogs": []}, {"dialogs": [
             {"dialog_id": "1", "title": "Chaos Cosmos Browser", "main_thread": True},
             {"dialog_id": "2", "title": "Material Editor - 01 - Default", "main_thread": True},
-            dict(SAVE)]})
+            dict(SAVE)]}])
         result = self.run_import()
         self.assertEqual(result["state"], "dialog_open")
         self.assertFalse(result["safe_to_edit"])
@@ -522,7 +532,73 @@ class DialogTests(_FlowCase):
         self.assertNotIn("full", self.bridge_kinds("operation"))
         self.assertNotIn("finalize", self.bridge_kinds("operation"))
         self.assertIn("nothing more was sent", result["next"])
-        self.op_client._dialog_control.assert_called_once_with("status")
+        self.assertEqual(self.op_client._dialog_control.call_args_list, [mock.call("status")] * 2)
+
+    def test_open_dialog_before_dispatch_sends_nothing(self):
+        # A modal dialog keeps the windows responsive: without this check the browser action,
+        # preparation and import would run inside its loop.
+        self.op_client._dialog_control = mock.Mock(return_value={"dialogs": [dict(SAVE)],
+                                                                 "main_thread_pumping": True})
+        result = self.run_import()
+        self.assertEqual(result["state"], "not_imported")
+        self.assertFalse(result["dispatched"])
+        self.assertTrue(result["safe_to_edit"])
+        self.assertEqual([d["title"] for d in result["dialogs"]], ["Missing External Files"])
+        self.assertIn("Nothing was sent", result["next"])
+        self.assertIn("max_dialogs", result["next"])
+        self.assertEqual(self.bridge_kinds("operation"), [])
+        self.assertNotIn(("dispatch",), self.events)
+        self.assertIsNone(max_client.settling_state(PID))
+        self.assertTrue(cosmos._import_lock.acquire(blocking=False))
+        cosmos._import_lock.release()
+
+    def test_a_main_thread_that_stopped_pumping_is_not_held_by_a_dialog(self):
+        self.op_client._dialog_control = mock.Mock(return_value={"dialogs": [dict(SAVE)],
+                                                                 "main_thread_pumping": False})
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(self.bridge_kinds("operation")[-2:], ["full", "finalize"])
+
+    def test_dialog_error_on_prepare_reports_that_it_ran(self):
+        self.flow["prepare"] = dialog_error()
+        result = self.run_import(swap_medit_renderer=True)
+        self.assertEqual(result["state"], "not_imported")
+        self.assertFalse(result["dispatched"])
+        self.assertFalse(result["safe_to_edit"])
+        self.assertEqual(result["code"], "MAX_DIALOG_ERROR")
+        self.assertEqual(result["dialogs"][0]["title"], "MAXScript Callback script Exception")
+        self.assertTrue(result["pending_restore"]["restore_medit_renderer"])
+        self.assertEqual(result["pending_restore"]["maxscript"], cosmos._MEDIT_RESTORE)
+        self.assertIn("preparation call ran", result["warnings"][0])
+        self.assertIn(cosmos._SLOT_ACTIVE_RESTORE, result["warnings"][0])
+        self.assertIn("inspect the scene", result["next"])
+        self.assertNotIn(("dispatch",), self.events)
+        self.assertIsNone(max_client.settling_state(PID))  # an acknowledged error box hangs nothing
+
+    def test_other_bridge_errors_on_prepare_still_raise(self):
+        self.flow["prepare"] = MaxBridgeError("Unknown command type: maxscript", {"success": False})
+        with self.assertRaises(MaxBridgeError):
+            self.run_import()
+
+    def test_dialog_error_on_browser_action_still_waits_for_its_browser(self):
+        self.browsers = []
+        self.flow["browser"] = lambda: (self._open_browser(), dialog_error())[1]
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        browser = result["cosmos_browser"]
+        self.assertTrue(browser["ensured"])
+        self.assertEqual(browser["action"]["dialog_error"][0]["title"], "MAXScript Callback script Exception")
+        self.assertEqual(result["medit_renderer"]["swap"], "off")
+
+    def test_dialog_error_on_browser_action_without_a_browser_falls_back(self):
+        self.browsers = []
+        self.browser_appears = None
+        self.flow["browser"] = lambda: (self._open_browser(), dialog_error())[1]
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertFalse(result["cosmos_browser"]["ensured"])
+        self.assertIn("its action ran, but Max showed an error dialog", result["warnings"][0])
+        self.assertEqual(result["medit_renderer"]["swap"], "fallback")
 
     def test_cosmos_and_material_editor_windows_do_not_stop_the_finalize(self):
         self.op_client._dialog_control = mock.Mock(return_value={"dialogs": [

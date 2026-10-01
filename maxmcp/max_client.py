@@ -217,6 +217,11 @@ _NOT_DIALOG_TITLE = re.compile(r"^(?:Chaos Cosmos Browser$|Material Editor(?:$| 
                                r"AGENT VIEWPORT|Floating Viewport)")
 
 
+def real_dialogs(dialogs: Any) -> list[dict[str, Any]]:
+    """The listed dialogs without modeless tool windows (_NOT_DIALOG_TITLE), for bridges that list them."""
+    return [d for d in dialogs or [] if isinstance(d, dict) and not _NOT_DIALOG_TITLE.match(str(d.get("title", "")))]
+
+
 def _grace(timeout: float) -> float:
     return max(10.0, 0.1 * timeout)
 
@@ -345,8 +350,9 @@ class MaxClient:
                 "fallback_error": meta.get("fallbackError"),
                 **meta.get("target", {}),
             }
-            if meta.get("openDialogs"):
-                transport["open_dialogs"] = meta["openDialogs"]
+            dialogs = real_dialogs(meta.get("openDialogs"))
+            if dialogs:
+                transport["open_dialogs"] = dialogs
             return transport
         error = getattr(self._local, "last_error", None)
         if isinstance(error, dict):
@@ -1031,6 +1037,7 @@ class MaxClient:
         control channel's included.
         """
         reader = _PipeReader(handle)
+        sent_at = time.perf_counter()
         watch = bool(request_id) and not self._control_channel
         next_dialog = time.perf_counter() + DIALOG_CHECK_AFTER if watch else float("inf")
         next_check = deadline if probe else deadline + _grace(timeout)
@@ -1045,9 +1052,13 @@ class MaxClient:
                     self._release_reader(reader)
                     with self._blocked_lock:
                         while len(self._blocked) >= MAX_BLOCKED_CALLS:
-                            self._blocked.pop(next(iter(self._blocked)))
+                            # Read-only probes go first: a real call's result must stay reportable.
+                            victim = next((rid for rid, entry in self._blocked.items() if entry.get("probe")),
+                                          next(iter(self._blocked)))
+                            self._blocked.pop(victim)
                         self._blocked[request_id] = {"command": cmd_type, "reader": reader,
-                                                     "blocked_at": time.perf_counter()}
+                                                     "blocked_at": time.perf_counter(), "sent_at": sent_at,
+                                                     "timeout_s": timeout, "probe": probe}
                     raise DialogBlocked(request_id, cmd_type, dialogs)
                 next_dialog = time.perf_counter() + DIALOG_POLL_INTERVAL
             now = time.perf_counter()
@@ -1099,18 +1110,26 @@ class MaxClient:
             self._local.last_response, self._local.last_error = saved
 
     def _dialogs_blocking(self, request_id: str) -> list[dict[str, Any]]:
-        """Main-thread dialogs holding this request: its own, or any while it is queued."""
+        """Main-thread dialogs holding this request: its own, or any while it is queued.
+
+        Nothing while the bridge reports that Max's main thread stopped pumping: it
+        is then busy or hung whatever dialog is open (the rule get_bridge_status
+        applies), and the deadline diagnosis decides.
+        """
         try:
             status = self._dialog_control("status")
-            dialogs = [d for d in status.get("dialogs", []) if d.get("main_thread")]
+            if status.get("main_thread_pumping") is False:
+                return []
+            listed = [d for d in status.get("dialogs", []) if isinstance(d, dict)]
+            # Of any thread: inspect on a bridge without the native exclusion would read them too.
+            tool_windows = [d for d in listed if _NOT_DIALOG_TITLE.match(str(d.get("title", "")))]
+            dialogs = [d for d in listed if d.get("main_thread") and d not in tool_windows]
             state = next((r.get("state") for r in status.get("requests", [])
                           if r.get("request_id") == request_id), None)
             if state == "running":
                 dialogs = [d for d in dialogs if request_id in d.get("during_requests", [])]
             elif state != "queued":
                 return []
-            tool_windows = [d for d in dialogs if _NOT_DIALOG_TITLE.match(str(d.get("title", "")))]
-            dialogs = [d for d in dialogs if d not in tool_windows]
             if not dialogs:
                 return []
             if tool_windows:
@@ -1125,6 +1144,18 @@ class MaxClient:
         """Request ids of BLOCKED_BY_DIALOG calls still waiting in Max. Never consumes results."""
         with self._blocked_lock:
             return [rid for rid, entry in self._blocked.items() if not entry["reader"].done.is_set()]
+
+    def blocked_call(self, request_id: str) -> dict[str, Any] | None:
+        """A BLOCKED_BY_DIALOG call still waiting in Max, shaped like inflight(): cmd_type,
+        request_id, timeout_s, running_s (since it was sent), waiting_s (since it was released)."""
+        with self._blocked_lock:
+            entry = self._blocked.get(request_id)
+            if entry is None or entry["reader"].done.is_set():
+                return None
+            now = time.perf_counter()
+            return {"cmd_type": entry["command"], "request_id": request_id, "timeout_s": entry.get("timeout_s"),
+                    "running_s": round(now - entry.get("sent_at", entry["blocked_at"]), 1),
+                    "waiting_s": round(now - entry["blocked_at"], 1)}
 
     def blocked_calls(self, wait: float = 0.0) -> list[dict[str, Any]]:
         """Report calls that returned BLOCKED_BY_DIALOG; completed ones are reported once.
