@@ -1,4 +1,5 @@
 #include "mcp_bridge/command_dispatcher.h"
+#include "mcp_bridge/bridge_health.h"
 #include "mcp_bridge/bridge_gup.h"
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/main_thread_executor.h"
@@ -286,6 +287,18 @@ struct DirectModeGuard {
     }
 };
 
+// RAII guard — names the main-thread work this request submits (health shows
+// the cmd type of what is queued or running). Restores the outer label so a
+// nested Dispatch does not clear it.
+struct ExecutorLabelGuard {
+    std::string previous;
+    explicit ExecutorLabelGuard(const std::string& label)
+        : previous(MainThreadExecutor::ThreadLabel()) {
+        MainThreadExecutor::SetThreadLabel(label);
+    }
+    ~ExecutorLabelGuard() { MainThreadExecutor::SetThreadLabel(previous); }
+};
+
 // ── UTF-8 <-> Wide helpers ──────────────────────────────────────
 static std::wstring Utf8ToWide(const std::string& s) {
     if (s.empty()) return {};
@@ -426,6 +439,75 @@ static std::string HandlePing(MCPBridgeGUP* gup) {
     });
 }
 
+// ── Health handler (pipe thread only) ───────────────────────────
+// Answers from bookkeeping alone: never posts to the main thread and never
+// calls into the scene (Get3DSMAXVersion is a compile-time constant). Unlike
+// ping it still answers while the main thread is hung, and it says whether an
+// MCP request (this client's or another's) or something outside the bridge
+// holds the main thread.
+static constexpr long long kHeartbeatStaleMs = 3LL * MainThreadExecutor::kHeartbeatMs;
+
+static std::string HandleHealth(MCPBridgeGUP* gup, const std::string& client_session_id) {
+    const MainThreadExecutor::Health ex = gup->GetExecutor().GetHealth();
+    const BridgeHealth::ClientsSnapshot clients = BridgeHealth::Snapshot();
+
+    const bool heartbeatStale = ex.heartbeat_age_ms < 0 || ex.heartbeat_age_ms > kHeartbeatStaleMs;
+    std::string state;
+    if (!ex.initialized) state = "not_initialized";
+    else if (ex.shutting_down) state = "shutting_down";
+    else if (ex.running) state = "busy_mcp";        // a bridge request is executing on it
+    else if (heartbeatStale) state = "busy_other";  // stopped pumping outside the bridge
+    else state = "responsive";
+
+    json result;
+    result["server"] = "3dsmax-mcp-native";
+#ifdef MCP_BRIDGE_VERSION
+    result["bridgeVersion"] = MCP_BRIDGE_VERSION;
+#endif
+    result["healthVersion"] = 1;
+    result["protocolVersion"] = 2;
+    result["transport"] = "namedpipe";
+    result["pid"] = static_cast<unsigned long>(GetCurrentProcessId());
+    DWORD v = Get3DSMAXVersion();
+    result["maxVersion"] = 1998 + (HIWORD(v) / 1000);
+    result["mainThread"] = {
+        {"state", state},
+        {"pumping", !heartbeatStale},
+        {"heartbeatAgeMs", ex.heartbeat_age_ms < 0 ? json(nullptr) : json(ex.heartbeat_age_ms)},
+        {"heartbeatPeriodMs", MainThreadExecutor::kHeartbeatMs},
+        {"windowHung", ex.executor_window_hung},
+    };
+    json running = nullptr;
+    if (ex.running) {
+        running = {{"cmdType", ex.running_label}, {"runningMs", ex.running_ms}};
+    }
+    result["executor"] = {
+        {"running", running},
+        {"queued", ex.queued},
+        {"oldestQueuedMs", ex.queued ? json(ex.oldest_queued_ms) : json(nullptr)},
+        {"oldestQueuedCmd", ex.queued ? json(ex.oldest_queued_label) : json(nullptr)},
+        {"completed", ex.completed},
+        {"shuttingDown", ex.shutting_down},
+    };
+    json inflight = json::array();
+    for (const auto& r : clients.inflight) {
+        inflight.push_back({
+            {"clientId", r.client_id},
+            {"requestId", r.request_id},
+            {"cmdType", r.cmd_type},
+            {"elapsedMs", r.elapsed_ms},
+            {"nested", r.nested},
+        });
+    }
+    result["clients"] = {
+        {"connected", clients.connected},  // includes the client asking
+        {"totalConnections", clients.total_connections},
+        {"requestingClient", client_session_id},
+        {"inflight", inflight},
+    };
+    return result.dump();
+}
+
 // ── Dispatcher ──────────────────────────────────────────────────
 std::string CommandDispatcher::Dispatch(
     const std::string& json_request,
@@ -445,6 +527,22 @@ std::string CommandDispatcher::Dispatch(
     std::string command = req.value("command", "");
     std::string cmd_type = req.value("type", "maxscript");
     std::string request_id = req.value("requestId", "");
+
+    // health runs here on the pipe thread, ahead of every main-thread path and
+    // outside the in-flight registry (it would only ever report itself).
+    if (cmd_type == "health") {
+        DirectModeGuard pipeThread(true);  // reported as threadMode "direct"
+        try {
+            std::string result = HandleHealth(gup, client_session_id);
+            int ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            return BuildResponse(true, result, "", request_id, cmd_type, ms);
+        } catch (const std::exception& e) {
+            return BuildResponse(false, "", NormalizeNativeError(e.what()), request_id, cmd_type, 0);
+        }
+    }
+    BridgeHealth::RequestScope inflight(client_session_id, request_id, cmd_type);
+    ExecutorLabelGuard label(cmd_type);
 
     // Route to handler — read-only handlers run directly on pipe thread
     // _forceMainThread flag allows benchmarking the same handler both ways

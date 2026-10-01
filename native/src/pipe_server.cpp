@@ -1,4 +1,5 @@
 #include "mcp_bridge/pipe_server.h"
+#include "mcp_bridge/bridge_health.h"
 #include "mcp_bridge/bridge_gup.h"
 #include "mcp_bridge/command_dispatcher.h"
 #include "mcp_bridge/native_handlers.h"
@@ -125,6 +126,7 @@ void PipeServer::HandleClient(HANDLE pipe) {
     static std::atomic<unsigned long long> next_client_id{1};
     const std::string client_id =
         "pipe-" + std::to_string(next_client_id.fetch_add(1));
+    BridgeHealth::ClientConnected(client_id);
 
     while (running_.load()) {
         std::string request = ReadRequest(pipe);
@@ -151,6 +153,7 @@ void PipeServer::HandleClient(HANDLE pipe) {
     }
 
     NativeHandlers::ReleaseSceneDeltaSession(client_id);
+    BridgeHealth::ClientDisconnected(client_id);
 }
 
 std::string PipeServer::ReadRequest(HANDLE pipe) {

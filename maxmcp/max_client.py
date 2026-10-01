@@ -172,7 +172,12 @@ _BLOCKED_CONFIRM_S = 20.0
 _CPU_SAMPLE_S = 1.0
 _RECHECK_SAMPLE_S = 0.25
 # Read-only probes: safe to drop at their deadline instead of waiting out a hung Max.
-_PROBE_CMD_TYPES = frozenset({"ping"})
+_PROBE_CMD_TYPES = frozenset({"ping", "health"})
+# Answered on a bridge pipe thread without touching Max's main thread. Sent on the
+# control channel so a stuck request holding the pipe lock cannot delay them.
+_MAIN_THREAD_FREE_CMD_TYPES = frozenset({"health"})
+_CONTROL_CMD_TYPES = frozenset({"native:render_cancel", "native:render_cancel_capture",
+                                "native:capture_screen"}) | _MAIN_THREAD_FREE_CMD_TYPES
 # Native ExecuteSync cancels work the main thread never started after 120 s.
 _QUEUE_TIMEOUT_MARKER = "main thread execution timed out"
 
@@ -379,6 +384,10 @@ class MaxClient:
             yield
         finally:
             self._pipe_lock.release()
+
+    def inflight(self) -> dict[str, Any] | None:
+        """This client's in-flight request (cmd_type, request_id, target, running_s), if any."""
+        return self._inflight_snapshot()
 
     def _inflight_snapshot(self) -> dict[str, Any] | None:
         inflight = self._inflight
@@ -595,8 +604,9 @@ class MaxClient:
     def _send_control_command(self, command: str, cmd_type: str, timeout: Optional[float]) -> dict[str, Any]:
         """Bypass an in-flight request's pipe lock, without changing Max targets.
 
-        Only cancellation and pure desktop capture use this channel. It cannot
-        fall back to TCP or re-resolve another Max after a claim/environment change.
+        Only cancellation, pure desktop capture and the main-thread-free health
+        probe use this channel. It cannot fall back to TCP or re-resolve another
+        Max after a claim/environment change.
         """
         acquired = self._pipe_lock.acquire(blocking=False)
         try:
@@ -636,8 +646,7 @@ class MaxClient:
 
         probe=True marks a read-only command that may be dropped at its deadline.
         """
-        if (cmd_type in {"native:render_cancel", "native:render_cancel_capture", "native:capture_screen"}
-                and self.transport != "tcp" and not self._control_channel):
+        if cmd_type in _CONTROL_CMD_TYPES and self.transport != "tcp" and not self._control_channel:
             return self._send_control_command(command, cmd_type, timeout)
         effective_timeout = timeout or self.timeout
         request_id = uuid4().hex

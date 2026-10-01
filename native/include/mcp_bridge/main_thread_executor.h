@@ -8,6 +8,8 @@
 #include <memory>
 #include <stdexcept>
 #include <atomic>
+#include <chrono>
+#include <list>
 
 // Executes work on the 3ds Max main thread from a background thread.
 // Uses a hidden Win32 window + WM_USER message to marshal calls.
@@ -49,6 +51,37 @@ public:
     static void DisableDirectMode() { tl_direct_mode_ = false; }
     static bool IsDirectMode()      { return tl_direct_mode_; }
 
+    // Names the work items this thread submits (the dispatcher uses the
+    // request's cmd type) so health snapshots can say what is queued/running.
+    static void SetThreadLabel(const std::string& label) { tl_label_ = label; }
+    static const std::string& ThreadLabel() { return tl_label_; }
+
+    // Main-thread heartbeat period. WM_TIMER is only generated when the main
+    // thread's queue is otherwise empty, so a heartbeat older than a few
+    // periods means the main thread stopped pumping messages (busy or blocked).
+    static constexpr UINT kHeartbeatMs = 1000;
+
+    // Snapshot for the pipe-thread "health" command. Never waits on the main
+    // thread or on a running item's mutex, so it answers while Max is hung.
+    struct Health {
+        bool initialized = false;
+        bool shutting_down = false;
+        size_t queued = 0;                 // posted or deferred, not started
+        long long oldest_queued_ms = -1;   // -1: nothing queued
+        std::string oldest_queued_label;
+        bool running = false;
+        std::string running_label;
+        long long running_ms = -1;
+        long long heartbeat_age_ms = -1;   // -1: no heartbeat yet
+        bool executor_window_hung = false; // IsHungAppWindow on the hidden window
+        unsigned long long completed = 0;
+    };
+    Health GetHealth() const;
+
+    static constexpr int kQueued = 0;
+    static constexpr int kRunning = 1;
+    static constexpr int kDone = 2;
+
     struct WorkItem {
         std::function<std::string()> work;
         std::string result;
@@ -57,11 +90,20 @@ public:
         std::string error_message;
         std::mutex mutex;
         std::condition_variable cv;
+        // Health bookkeeping. phase is atomic because RunWorkItem holds `mutex`
+        // for the whole callback and GetHealth must never block on it.
+        std::string label;
+        std::chrono::steady_clock::time_point posted_at{};
+        std::atomic<int> phase{kQueued};
     };
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     static void RunWorkItem(const std::shared_ptr<WorkItem>& item);
+    // Health bookkeeping: remember a posted item / which item is running.
+    static void TrackPending(const std::shared_ptr<WorkItem>& item);
+    static void SetRunning(const WorkItem* item);
+    static long long SteadyNowMs();
     // Completes an item with an error and wakes its waiter. No-op if the item
     // already finished (or timed out), so it is safe to call twice.
     static void FailWorkItem(const std::shared_ptr<WorkItem>& item, const char* message);
@@ -76,7 +118,23 @@ private:
     DWORD main_thread_id_ = 0;
 
     static thread_local bool tl_direct_mode_;
+    static thread_local std::string tl_label_;
     static constexpr UINT WM_MCP_EXECUTE = WM_USER + 0x4D43;
+    static constexpr UINT_PTR kHeartbeatTimerId = 0x4D43;
+
+    // Health state. s_pending_ holds weak refs to posted items and is pruned
+    // lazily; the running fields describe the item RunWorkItem is executing.
+    // Guarded by s_stats_mutex_, which is only ever taken for short reads and
+    // writes (never while waiting on anything else).
+    static std::mutex s_stats_mutex_;
+    static std::list<std::weak_ptr<WorkItem>> s_pending_;
+    static bool s_running_;
+    static std::string s_running_label_;
+    static std::chrono::steady_clock::time_point s_running_since_;
+    static std::atomic<unsigned long long> s_completed_;
+    static std::atomic<long long> s_heartbeat_ms_;   // SteadyNowMs(); 0 = none yet
+    // Copy of hwnd_ readable from pipe threads (hwnd_ itself is main-thread state).
+    std::atomic<HWND> health_hwnd_{nullptr};
 
     // Re-entrancy guard. SDK calls inside a work item can run nested message
     // pumps (progress UI, redraws, deferred plugin loads); without this guard

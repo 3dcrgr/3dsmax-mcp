@@ -53,6 +53,7 @@ Mutation:
 - Verify after meaningful edits with `query_scene(action=delta)`, re-inspection, or viewport capture.
 
 Debugging:
+- `get_bridge_status` — when tools time out or return `MAX_BUSY`/`MAX_NOT_RESPONDING`. It asks the bridge's pipe thread (never Max's main thread, so it answers while Max is hung) whether this server's request, another MCP client's request, or work outside the bridge holds the main thread.
 - `walk_references` — trace dependencies from a live object
 - `watch_scene` — track user actions during an interactive session
 - `execute_maxscript` — fallback only when no dedicated tool exists

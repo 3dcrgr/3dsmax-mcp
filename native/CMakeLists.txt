@@ -77,6 +77,7 @@ set(SOURCES
     src/pipe_server.cpp
     src/command_dispatcher.cpp
     src/main_thread_executor.cpp
+    src/bridge_health.cpp
     src/gdiplus_runtime.cpp
     src/scene_journal.cpp
     src/handlers/scene_handlers.cpp

@@ -544,7 +544,13 @@ class BridgeStatusTests(unittest.TestCase):
     def test_legacy_ping_path_still_works(self):
         client = mock.Mock()
         legacy = {"result": json.dumps({"pong": True}), "requestId": "r", "meta": {}}
-        client.send_command.side_effect = [RuntimeError("Unknown command type: ping"), legacy]
+
+        def send(command, cmd_type="maxscript", timeout=None):
+            if cmd_type in ("health", "ping"):
+                raise RuntimeError(f"Unknown command type: {cmd_type}")
+            return legacy
+
+        client.send_command.side_effect = send
         payload = json.loads(_load_bridge(client).get_bridge_status())
         self.assertTrue(payload["pong"])
         self.assertTrue(payload["legacyTransport"])
