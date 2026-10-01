@@ -378,10 +378,12 @@ static std::string HandleMaxScript(
         BOOL ok = FALSE;
 
         try {
+            // Quiet: a parse error or abort goes to the MAXScript log, not the
+            // user's Listener; the caller gets the detail from the classification.
             ok = ExecuteMAXScriptScript(
                 wcmd.c_str(),
                 MAXScript::ScriptSource::NonEmbedded,
-                FALSE,   // quietErrors
+                TRUE,    // quietErrors
                 &fpv,    // result goes here
                 TRUE     // logQuietErrors
             );

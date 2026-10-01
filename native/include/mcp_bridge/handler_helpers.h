@@ -319,6 +319,8 @@ inline std::wstring WrapForErrorCapture(const std::wstring& wcmd) {
 // the two apart. Main thread only; skipped during shutdown or direct mode.
 // A parse error's detail comes from the unwrapped user text when that also
 // fails, so line numbers and quoted code are the user's, not the wrapper's.
+// Silent: compiler output goes to a private StringStream and CompileError is
+// caught here, so nothing reaches the Listener.
 // Sets *code to "BAD_PARAM" or "MAXSCRIPT_INTERRUPTED". Never throws.
 inline std::string MaxScriptFailureMessage(const std::wstring& wcmd, std::string* code = nullptr) {
     static const char* kUnclassified =
@@ -418,10 +420,11 @@ inline std::string RunMAXScript(const std::string& script) {
     BOOL ok = FALSE;
 
     try {
+        // Quiet: errors go to the MAXScript log, not the user's Listener.
         ok = ExecuteMAXScriptScript(
             wcmd.c_str(),
             MAXScript::ScriptSource::NonEmbedded,
-            FALSE,   // quietErrors
+            TRUE,    // quietErrors
             &fpv,    // result
             TRUE     // logQuietErrors
         );

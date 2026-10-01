@@ -104,5 +104,29 @@ class PlainMessageClassificationTests(unittest.TestCase):
             self.assertFalse(error["retryable"])
 
 
+class QuietListenerSourceTests(unittest.TestCase):
+    """Issue #8: agent scripts must not print compile errors into the user's Listener."""
+
+    NATIVE = Path(__file__).resolve().parent.parent / "native"
+
+    def _call_args(self, rel_path, function):
+        text = (self.NATIVE / rel_path).read_text(encoding="utf-8")
+        start = text.index(function)
+        call = text.index("ExecuteMAXScriptScript(", start)
+        args = text[call:text.index(");", call)]
+        return [line.split("//")[0].strip().rstrip(",") for line in args.splitlines()[1:]]
+
+    def test_agent_scripts_run_with_quiet_errors(self):
+        for rel_path, function in (
+            ("src/command_dispatcher.cpp", "static std::string HandleMaxScript("),
+            ("include/mcp_bridge/handler_helpers.h", "inline std::string RunMAXScript("),
+        ):
+            with self.subTest(function=function):
+                args = self._call_args(rel_path, function)
+                # (script, source, quietErrors, fpv, logQuietErrors): log file only, never Listener.
+                self.assertEqual(args[2], "TRUE")
+                self.assertEqual(args[4], "TRUE")
+
+
 if __name__ == "__main__":
     unittest.main()
