@@ -27,7 +27,7 @@ Tests: `tests/test_execute_failures.py`. They cover how the Python server classi
 **Status.** The check is in the native bridge, and only the 2026 bridge in `native/bin/` has it. With upstream's 1.7.5 bridges (2023, 2024, 2025 and 2027), an interrupted script gets the same reply as a syntax error: "MAXScript execution failed: <Max's error text>", with a code picked from keywords in that text, usually `BAD_PARAM`.
 - **Verified live** on 2026-10-01 with the fork's 1.7.3-based 2026 bridge: `(1 +` returned `BAD_PARAM` with the compiler's message. Quitting with `try (quitMax #noPrompt quiet:true) catch ()` was also run live: the bridge connection dropped and Max exited cleanly.
 - **Not tested live yet:** the 2026 bridge built from the 1.7.5 merge (sha256 `3f9f7d44…`), and a bare `quitMax #noPrompt`, which should give `MAXSCRIPT_INTERRUPTED`. Run that check with the merged bridge, on a throwaway Max.
-- Since the merge, `execute_maxscript` runs in Max's quiet mode by default. Without `#noPrompt`, quiet mode may answer Max's save prompt on its own and lose unsaved work (fork issue #12, not tested yet).
+- Since the merge, `execute_maxscript` runs in Max's quiet mode by default, except for scripts that mention a scene file command (see [#12](#quiet-mode-could-discard-unsaved-work) below).
 
 ## Failed agent scripts printed errors in the user's Listener
 
@@ -71,3 +71,20 @@ Fork issue #11. Commit `8330c2c`.
 **Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32. It's in the 2026 bridge in `native/bin/`, built from the 1.7.5 merge (sha256 `3f9f7d44…`). An earlier build with it (sha256 `1cf0f9d8…`) was deployed on 2026-10-01. Unit tested in `tests/test_agent_viewport_reclaim.py`.
 - **The first live test was inconclusive.** After the restart, `open` worked, but it couldn't reclaim the restored panel, because that Hold was written by the old bridge, which never tagged it. Closing the stale panel let agent captures work again.
 - A Hold taken with the new bridge is waiting for the next restart.
+
+## Quiet mode could discard unsaved work
+
+Fork issue #12. Commit `aa3d91d`.
+
+**What happened.** Upstream 1.7.5 runs MAXScript from the bridge in Max's quiet mode, where every prompt takes its default answer. For `resetMaxFile`, `loadMaxFile`, `fetchMaxFile` or `quitMax` without `#noPrompt`, that prompt is "save changes?", and its default can throw away unsaved work without anyone seeing it. This was found in review, before it happened to anyone.
+
+**What changed.**
+- A script that mentions `resetMaxFile`, `loadMaxFile`, `fetchMaxFile`, `quitMax`, `checkForSave`, `max reset file`, `max file new` or `max file open` is never run in quiet mode by default. Its prompt reaches the agent as `BLOCKED_BY_DIALOG`, to answer with `max_dialogs` or hand to the user.
+- The check is deliberately blunt: anywhere in the text, case-insensitive, strings and comments included. A false alarm only leaves a prompt visible, and `#noPrompt` or `quiet:true` arguments still suppress it. A miss could lose a scene.
+- Merging isn't listed, because it never asks to save.
+- `execute_maxscript(quiet=True)` still forces quiet mode, and `quiet=False` always shows prompts. When the rule turned quiet mode off, the response says so in `meta.quietOverride` (`"file_command"`).
+- Native tools that run MAXScript internally follow the same rule. The `manage_scene` fallbacks (`resetMaxFile #noPrompt`, `fetchMaxFile quiet:true`) still run without a prompt.
+- **Limits:** a command name built from pieces at runtime (`execute ("reset" + "MaxFile()")`), or a file action run through `actionMan`, isn't seen.
+
+**Status.** Unit tested (`native/tests/quiet_policy_tests.cpp`, `tests/test_execute_failures.py`). It's in the 2026 bridge built from the 1.7.5 merge; not tested live yet. The live check: on a throwaway scene with unsaved changes, `resetMaxFile()` should return `BLOCKED_BY_DIALOG` with the save prompt, not reset.
+
