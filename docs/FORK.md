@@ -24,13 +24,13 @@ The worst of these problems hung Max and lost unsaved work. Everything here is m
 | Revit (Autodesk Bitmap) texture paths read as empty | Read bitmap-asset parameters; flag unreadable paths | [autodesk-bitmap-paths.md](fork/autodesk-bitmap-paths.md) | Verified live, including the duplicate VRayBitmap row fix |
 | `execute_maxscript` calls an interrupted script (e.g. `quitMax`) a "parse error" | Re-compile to tell syntax errors from interruptions; new code `MAXSCRIPT_INTERRUPTED` | [smaller-fixes.md](fork/smaller-fixes.md) | Syntax errors verified live; `MAXSCRIPT_INTERRUPTED` (e.g. `quitMax`) isn't tested live yet |
 | A Cosmos material whose package name differs from the asset name isn't found | Detect what the import created by handle, whatever its name; report both names | [cosmos-import.md](fork/cosmos-import.md#finding-what-the-import-created-9-2853b1c) | Deployed; live test pending |
-| Failed agent scripts print raw compile errors in the user's Listener | Run agent scripts with quiet errors; the caller still gets the detail | [smaller-fixes.md](fork/smaller-fixes.md#failed-agent-scripts-printed-errors-in-the-users-listener) | Reviewed; native bridge staged, not in `native/bin/` yet |
+| Failed agent scripts print raw compile errors in the user's Listener | Run agent scripts with quiet errors; the caller still gets the detail | [smaller-fixes.md](fork/smaller-fixes.md#failed-agent-scripts-printed-errors-in-the-users-listener) | Reviewed and deployed; live test pending |
 | Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Verified live |
 
 What the status words mean:
 - **Verified live:** the fix was exercised in a real Max 2026 session on the production machine, on 2026-10-01. Some checks used a stand-in for the original failure, such as a 20 s `sleep` instead of a real hang.
 - **Reviewed:** an adversarial code review was run before deployment.
-- **Deployed:** the fix runs on the production machine. Native fixes are in the rebuilt 2026 bridge (sha256 `5f49226e…`).
+- **Deployed:** the fix runs on the production machine. Native fixes are in the rebuilt 2026 bridge (sha256 `c621db10…`).
 
 The details pages say exactly what was and wasn't tested.
 
@@ -50,7 +50,7 @@ Close 3ds Max and your AI clients first, as upstream's README says.
 After updating, start a new client session. MCP clients cache the tool list, so new tools such as `capture_hang_diagnostics` don't appear in sessions that were already open, even after the server restarts.
 
 **The native bridge:** `install.py` copies the prebuilt bridges from `native/bin/`.
-- In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available. It's the same build that's deployed on the production machine (sha256 `5f49226e2341e5ad…`).
+- In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available. It's the same build that's deployed on the production machine (sha256 `c621db103b176d77…`).
 - The 2023, 2024, 2025 and 2027 bridges are still upstream's builds. With those, the Python-side fixes work, but the native ones are missing: `health`, the executor fixes, Autodesk Bitmap paths and the duplicate VRayBitmap row fix, `MAXSCRIPT_INTERRUPTED`, and `replace_material`'s sub-material matching and source search.
 - To get them for another Max version, build the bridge yourself (below).
 

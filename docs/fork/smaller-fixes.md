@@ -31,7 +31,7 @@ Fork issue #8. Commit `6552786`.
 
 **What changed.** `execute_maxscript`, and the native tools that run MAXScript internally, now run scripts with quiet errors. Compile errors and aborts go to Max's log, not the Listener, and the compile-only check behind the parse-error detail prints nothing either. The caller gets the same results as before: `BAD_PARAM` "MAXScript execution failed (parse error): <detail>", `MAXSCRIPT_INTERRUPTED`, and runtime errors with their message. A script's own output, such as `print`, still reaches the Listener.
 
-**Status.** This is in the native bridge. The rebuilt 2026 bridge with it (sha256 `c621db10…`) is staged for the next Max restart, and isn't in `native/bin/` yet. Not tested live yet.
+**Status.** This is in the native bridge, so only the rebuilt 2026 bridge in `native/bin/` (sha256 `c621db10…`) has it. It was deployed on 2026-10-01 and hasn't been tested live yet.
 
 ## Curve tools rejected Line objects
 
