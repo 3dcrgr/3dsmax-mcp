@@ -3,7 +3,13 @@
 #include "mcp_bridge/bridge_gup.h"
 
 #include <iparamb2.h>
+#include <pbbitmap.h>
+#include <AssetEnumCallback.h>
+#include <FileEnumConstants.h>
+#include <AssetManagement/AssetUser.h>
 #include <Materials/Mtl.h>
+// BitmapInfo (TYPE_BITMAP paths) lives in bmm.lib, which the target does not list.
+#pragma comment(lib, "bmm.lib")
 #include <Materials/MtlLib.h>
 #include <Materials/Texmap.h>
 
@@ -32,6 +38,7 @@ struct InspectContext {
     TimeValue time = 0;
     bool includeValues = true;
     bool verifyFiles = true;
+    bool readAssetFiles = true;
     std::string scope = "wired";
     int maxDepth = 3;
     int maxNodes = 80;
@@ -333,7 +340,7 @@ static bool IsBlockingIssue(const std::string& code) {
 }
 
 static bool IsWarningIssue(const std::string& code) {
-    return code == "CIRCULAR_REF" || code == "PATH_FORMAT";
+    return code == "CIRCULAR_REF" || code == "PATH_FORMAT" || code == "AUX_FILES_AMBIGUOUS";
 }
 
 static std::string DetectProfile(MtlBase* root) {
@@ -422,8 +429,169 @@ static void AppendFileMeta(json& files, const std::string& path, const std::stri
     files.push_back(f);
 }
 
-static void CollectPB2Values(MtlBase* base, const std::string& nodeId, InspectContext& ctx,
+using MaxSDK::AssetManagement::AssetUser;
+
+// An asset-backed file source; the search-path lookup is deferred until it is needed.
+struct AssetCandidate {
+    AssetUser asset;
+    std::string raw, param;
+};
+
+static std::string AssetRawPath(const AssetUser& asset) {
+    try {
+        const MSTR& raw = asset.GetFileName();
+        return raw.isNull() ? std::string() : WideToUtf8(raw.data());
+    } catch (...) {
+        return "";
+    }
+}
+
+// A search-path lookup probes every map path for a missing file, so each raw path is
+// resolved once per request (main thread only), not once per material sharing it.
+static std::unordered_map<std::string, std::string>* g_resolvedPaths = nullptr;
+
+struct ResolvedPathCacheScope {
+    std::unordered_map<std::string, std::string> cache;
+    const bool owner = g_resolvedPaths == nullptr;
+    ResolvedPathCacheScope() { if (owner) g_resolvedPaths = &cache; }
+    ~ResolvedPathCacheScope() { if (owner) g_resolvedPaths = nullptr; }
+};
+
+static std::string AssetResolvedPath(const AssetUser& asset, const std::string& raw) {
+    std::string key;
+    try { key = std::to_string((int)asset.GetType()) + "|" + Lower(NormalizeBackslashes(raw)); } catch (...) { return ""; }
+    if (g_resolvedPaths) {
+        auto it = g_resolvedPaths->find(key);
+        if (it != g_resolvedPaths->end()) return it->second;
+    }
+    std::string resolved;
+    bool exists = false;
+    if (FsPath(raw).is_absolute() && (FileSizeOrZero(raw, &exists), exists)) {
+        resolved = raw;  // Already a readable absolute path; no search needed.
+    } else {
+        try {
+            MSTR full;
+            if (asset.GetFullFilePath(full) && !full.isNull()) resolved = WideToUtf8(full.data());
+        } catch (...) {}
+    }
+    if (g_resolvedPaths) (*g_resolvedPaths)[key] = resolved;
+    return resolved;
+}
+
+static bool HasFilePath(const json& files, const std::string& path) {
+    const std::string key = Lower(NormalizeBackslashes(path));
+    for (const auto& f : files)
+        if (Lower(NormalizeBackslashes(f.value("path", ""))) == key) return true;
+    return false;
+}
+
+// Asset-backed sources are reported once per node, after the plain string params,
+// so a Bitmap's "bitmap" asset does not duplicate its "fileName" string. Relative
+// paths (common in Revit/ATF imports) resolve through the Max search paths.
+static void AppendAssetFile(json& files, const AssetCandidate& c, const std::string& nodeId, InspectContext& ctx) {
+    if (c.raw.empty() || HasFilePath(files, c.raw)) return;
+    const std::string resolved = AssetResolvedPath(c.asset, c.raw);
+    if (!resolved.empty() && HasFilePath(files, resolved)) return;
+    const std::string& path = resolved.empty() ? c.raw : resolved;
+    if (IsPathLike(path)) AppendFileMeta(files, path, c.param, nodeId, ctx.verifyFiles, ctx.issues);
+}
+
+class BitmapAssetCollector : public AssetEnumCallback {
+public:
+    struct Found { AssetCandidate candidate; int level; };
+    std::vector<Found> found;
+    int level = 0;
+    void RecordAsset(const AssetUser& asset) override {
+        if (found.size() >= 64) return;
+        try {
+            if (asset.GetType() != MaxSDK::AssetManagement::kBitmapAsset) return;
+        } catch (...) {
+            return;
+        }
+        std::string raw = AssetRawPath(asset);
+        if (!raw.empty()) found.push_back({{asset, std::move(raw), "auxFiles"}, level});
+    }
+};
+
+static std::vector<std::pair<MtlBase*, std::string>> PB2Children(MtlBase* base, TimeValue t);
+
+// Fallback for leaf maps that keep their image outside readable paramblock values
+// (e.g. Autodesk Bitmap). Each object enumerates only its own files; we descend at
+// most two levels into helper references, never into materials, nodes or graph maps,
+// so a node never reports a child's files and the cost stays bounded. A leaf's own
+// texmap references are hidden helpers the graph never visits, so they are read.
+// Only the shallowest level that has files counts; several distinct files there are
+// ambiguous (likely a shared helper) and are reported as a warning, not attributed.
+// Returns whether any bitmap asset was found.
+static bool CollectOwnAuxFiles(MtlBase* base, const std::string& nodeId, InspectContext& ctx, json& files) {
+    if (!base || base->SuperClassID() != TEXMAP_CLASS_ID || !files.empty()) return false;
+    for (int i = 0; i < base->NumSubTexmaps(); ++i)
+        if (base->GetSubTexmap(i)) return false;
+    if (!PB2Children(base, ctx.time).empty()) return false;
+    DWORD flags = FILE_ENUM_ALL | FILE_ENUM_DONT_RECURSE;
+#ifdef FILE_ENUM_SKIP_SUB_FILES
+    flags |= FILE_ENUM_SKIP_SUB_FILES;
+#endif
+    BitmapAssetCollector collector;
+    std::vector<std::pair<ReferenceMaker*, int>> pending{{base, 0}};
+    std::set<ReferenceMaker*> visited;
+    while (!pending.empty() && visited.size() < 32) {
+        const auto [maker, level] = pending.back();
+        pending.pop_back();
+        if (!maker || !visited.insert(maker).second) continue;
+        // EnumAuxFiles marks A_WORK1; leave the scratch flag as we found it.
+        const bool hadWork = maker->TestAFlag(A_WORK1);
+        collector.level = level;
+        try { maker->EnumAuxFiles(collector, flags); } catch (...) {}
+        if (!hadWork) maker->ClearAFlag(A_WORK1);
+        if (level >= 2) continue;
+        const int numRefs = maker->NumRefs();
+        for (int r = 0; r < numRefs && r < 64; ++r) {
+            ReferenceTarget* ref = maker->GetReference(r);
+            if (!ref) continue;
+            const SClass_ID sc = ref->SuperClassID();
+            if (sc == MATERIAL_CLASS_ID || sc == BASENODE_CLASS_ID) continue;
+            if (sc == TEXMAP_CLASS_ID && level > 0) continue;
+            pending.push_back({ref, level + 1});
+        }
+    }
+    if (collector.found.empty()) return false;
+    int best = 3;
+    for (const auto& f : collector.found) best = std::min(best, f.level);
+    std::vector<const AssetCandidate*> chosen;
+    std::set<std::string> distinct;
+    for (const auto& f : collector.found) {
+        if (f.level != best) continue;
+        if (distinct.insert(Lower(NormalizeBackslashes(f.candidate.raw))).second) chosen.push_back(&f.candidate);
+    }
+    if (chosen.size() > 1) {
+        AddIssue(ctx.issues, "AUX_FILES_AMBIGUOUS", nodeId, std::to_string(chosen.size()) +
+                 " image files were found through helper references; none is attributed to this map.");
+        return true;
+    }
+    AppendAssetFile(files, *chosen.front(), nodeId, ctx);
+    return true;
+}
+
+// Returns true when the node has file parameters that are all empty (no file
+// assigned), as opposed to a source whose path could not be read.
+static bool CollectPB2Values(MtlBase* base, const std::string& nodeId, InspectContext& ctx,
                              json& values, json& files) {
+    // Asset-backed values (TYPE_BITMAP, TYPE_FILENAME without a readable string).
+    std::vector<AssetCandidate> assets;
+    bool fileParams = false, fileValues = false;
+    auto fileAsset = [&](IParamBlock2* pb, ParamID pid, int i, const std::string& name) {
+        if (!ctx.readAssetFiles) return;
+        try {
+            AssetUser asset = pb->GetAssetUser(pid, ctx.time, i);
+            std::string raw = AssetRawPath(asset);
+            if (raw.empty()) return;
+            fileValues = true;
+            // Images only: an IES, shader or proxy name must not become a texture source.
+            if (asset.GetType() == MaxSDK::AssetManagement::kBitmapAsset || IsPathLike(raw))
+                assets.push_back({asset, std::move(raw), name});
+        } catch (...) {}
+    };
     int numPB = base->NumParamBlocks();
     for (int pbIdx = 0; pbIdx < numPB; ++pbIdx) {
         IParamBlock2* pb = base->GetParamBlock(pbIdx);
@@ -438,14 +606,34 @@ static void CollectPB2Values(MtlBase* base, const std::string& nodeId, InspectCo
             int baseType = BaseParamType(pd.type);
             int count = IsTabParam(pd.type) ? std::max(0, pb->Count(pid)) : 1;
 
+            if (baseType == TYPE_BITMAP) {
+                fileParams = true;
+                for (int i = 0; ctx.readAssetFiles && i < count; ++i) {
+                    PBBitmap* bmp = nullptr;
+                    try { bmp = pb->GetBitmap(pid, ctx.time, i); } catch (...) {}
+                    if (!bmp) continue;
+                    const AssetUser& asset = bmp->bi.GetAsset();
+                    std::string raw = AssetRawPath(asset);
+                    if (raw.empty() && bmp->bi.Name()) raw = WideToUtf8(bmp->bi.Name());
+                    if (raw.empty()) continue;
+                    fileValues = true;
+                    assets.push_back({asset, std::move(raw), name});
+                }
+                continue;
+            }
+
             if (baseType == TYPE_STRING || baseType == TYPE_FILENAME) {
+                fileParams = fileParams || baseType == TYPE_FILENAME;
                 if (IsTabParam(pd.type)) {
                     json arr = json::array();
                     for (int i = 0; i < count; ++i) {
                         std::string val = ReadScalarValue(pb, pid, pd.type, ctx.time, i);
                         arr.push_back(val);
+                        fileValues = fileValues || (baseType == TYPE_FILENAME && !val.empty());
                         if (IsPathLike(val)) {
                             AppendFileMeta(files, val, name, nodeId, ctx.verifyFiles, ctx.issues);
+                        } else if (baseType == TYPE_FILENAME) {
+                            fileAsset(pb, pid, i, name);
                         }
                     }
                     if (ctx.includeValues) values[name] = arr;
@@ -457,15 +645,18 @@ static void CollectPB2Values(MtlBase* base, const std::string& nodeId, InspectCo
 
                 std::string val = ReadScalarValue(pb, pid, pd.type, ctx.time);
                 if (ctx.includeValues) values[name] = val;
+                fileValues = fileValues || (baseType == TYPE_FILENAME && !val.empty());
                 if (IsPathLike(val)) {
                     AppendFileMeta(files, val, name, nodeId, ctx.verifyFiles, ctx.issues);
+                } else if (baseType == TYPE_FILENAME) {
+                    fileAsset(pb, pid, 0, name);
                 }
                 continue;
             }
 
             if (!ctx.includeValues) continue;
             if (baseType == TYPE_TEXMAP || baseType == TYPE_MTL || baseType == TYPE_REFTARG ||
-                baseType == TYPE_INODE || baseType == TYPE_BITMAP || baseType == TYPE_PBLOCK2) {
+                baseType == TYPE_INODE || baseType == TYPE_PBLOCK2) {
                 continue;
             }
 
@@ -482,6 +673,10 @@ static void CollectPB2Values(MtlBase* base, const std::string& nodeId, InspectCo
             }
         }
     }
+    for (const auto& c : assets) AppendAssetFile(files, c, nodeId, ctx);
+    if (!ctx.readAssetFiles) return false;
+    const bool auxFound = CollectOwnAuxFiles(base, nodeId, ctx, files);
+    return fileParams && !fileValues && !auxFound && files.empty();
 }
 
 static std::vector<std::pair<MtlBase*, std::string>> PB2Children(MtlBase* base, TimeValue t) {
@@ -601,9 +796,13 @@ static void TraverseMaterialGraph(MtlBase* base, const std::string& parentId,
         std::string id = "n" + std::to_string(ctx.ids.size());
         ctx.ids[base] = id;
         json values = json::object(), files = json::array();
-        CollectPB2Values(base, id, ctx, values, files);
+        const bool fileUnset = CollectPB2Values(base, id, ctx, values, files);
         json node = {{"id", id}, {"kind", KindName(base)}, {"class", ClassName(base)},
                      {"name", BaseName(base)}, {"handle", std::to_string((uint64_t)Animatable::GetHandleByAnim(base))}};
+        // "class" is the localized UI label; consumers matching class names need the script token.
+        const std::string internalClass = SanitizeScriptName(WideToUtf8(base->ClassName(false).data()));
+        if (internalClass != node["class"].get<std::string>()) node["classInternal"] = internalClass;
+        if (fileUnset) node["fileUnset"] = true;
         if (!parentId.empty()) node["parentId"] = parentId;
         if (!edge.empty()) node["edge"] = edge;
         if (!files.empty()) node["files"] = files;
@@ -738,11 +937,14 @@ static json SplitIssues(const json& issues) {
 static json InspectMaterialGraph(Mtl* root, const std::string& requestedName,
                                  const std::string& resolvedVia, int subMaterialIndex,
                                  int depth, const std::string& scope,
-                                 bool includeValues, bool verifyFiles, int maxNodes) {
+                                 bool includeValues, bool verifyFiles, int maxNodes,
+                                 bool readAssetFiles = true) {
+    ResolvedPathCacheScope resolvedPaths;
     InspectContext ctx;
     ctx.time = GetCOREInterface()->GetTime();
     ctx.includeValues = includeValues;
     ctx.verifyFiles = verifyFiles;
+    ctx.readAssetFiles = readAssetFiles;
     ctx.scope = scope.empty() ? "wired" : Lower(scope);
     ctx.maxDepth = std::min(16, std::max(0, depth));
     ctx.maxNodes = std::min(2000, std::max(1, maxNodes));
@@ -828,6 +1030,7 @@ static void GatherMaterials(Mtl* material, std::vector<Mtl*>& out, std::set<Mtl*
 // A batch is read in one main-thread invocation, using pointers resolved in this
 // scene. In particular, scene scans must not round-trip through material names.
 static json InspectRoleGraphs(const json& p) {
+    ResolvedPathCacheScope resolvedPaths;  // Shared by every material in the batch.
     const bool scan = p.value("scan_scene", false);
     const auto names = p.value("names", std::vector<std::string>{});
     const int limit = p.value("limit", 25), offset = p.value("offset", 0);
@@ -1075,7 +1278,8 @@ static json BuildReplicationPlan(const json& request, Mtl* source, const std::st
         "wired",
         request.value("include_values", false),
         request.value("verify", true),
-        request.value("max_nodes", 160)
+        request.value("max_nodes", 160),
+        false  // Replication remaps string paths only; keep its plan to those.
     );
 
     json plannedFiles = json::array();
@@ -1419,7 +1623,8 @@ std::string NativeHandlers::ReplicateMaterialApply(const std::string& params, MC
                 "wired",
                 p.value("include_values", false),
                 true,
-                p.value("max_nodes", 160)
+                p.value("max_nodes", 160),
+                false  // Verify the same string-param files the plan remapped.
             );
             verification["graph"] = graph;
             bool allFilesExist = true;
