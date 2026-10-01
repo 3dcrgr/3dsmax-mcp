@@ -32,6 +32,7 @@ class ErrorCode(str, Enum):
     USER_BUSY = "USER_BUSY"
     MAX_BUSY = "MAX_BUSY"
     MAX_NOT_RESPONDING = "MAX_NOT_RESPONDING"
+    IMPORT_SETTLING = "IMPORT_SETTLING"
     SAFE_MODE = "SAFE_MODE"
     BAD_PARAM = "BAD_PARAM"
     BAD_NODE_REF = "BAD_NODE_REF"
@@ -77,6 +78,7 @@ _ERROR_SUBSTRINGS = (" not found:",)
 _RETRYABLE_CODES = {
     ErrorCode.BRIDGE_DOWN,
     ErrorCode.MAX_BUSY,
+    ErrorCode.IMPORT_SETTLING,
     ErrorCode.RENDER_BUSY,
     ErrorCode.USER_BUSY,
     ErrorCode.SCENE_CONFLICT,

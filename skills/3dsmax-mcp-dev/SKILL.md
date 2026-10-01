@@ -138,6 +138,7 @@ Debugging:
 - `cosmos_import` downloads if needed, then imports through the renderer and returns asset-scoped nodes/materials/maps with file checks. Selection is preserved.
 - Use returned node refs with existing transform, layer and instance tools. Materials/HDRIs may create editor resources instead of scene nodes.
 - Sign in through Cosmos when requested. If an import returns unknown/unverified, inspect before retrying; repeating a completed model import creates another instance.
+- After `cosmos_import`, edit only when `safe_to_edit` is true. On `settling` or `IMPORT_SETTLING`, wait (V-Ray/Cosmos stalls cleared in 5-8 min), never kill Max, then run `pending_restore.maxscript` once. Never call `MatEditor.Close()`/`Open()` right after an import: that deadlocked Max.
 
 ### External .max files (no scene load)
 - `inspect_max_file`, `search_max_files`, `merge_from_file`, `batch_file_info`

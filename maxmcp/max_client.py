@@ -12,7 +12,7 @@ from typing import Any, Iterator, Optional
 from uuid import uuid4
 
 from .process_health import describe as describe_process
-from .process_health import diagnose_process, process_start_time, quick_hung_check
+from .process_health import diagnose_process, process_start_time, quick_hung_check, window_hung
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -49,6 +49,57 @@ class MaxNotRespondingError(MaxHealthError):
 
 class MaxNotRespondingAfterDispatch(MaxNotRespondingError, RequestOutcomeUnknown):
     """Max stopped responding after the request was written; never replay it."""
+
+
+class MaxImportSettlingError(MaxBusyError):
+    """A native import left Max (or its Cosmos browser window) not responding; nothing was sent."""
+
+    code = "IMPORT_SETTLING"
+
+
+# Import settling guard, shared by every MaxClient (Cosmos imports use their own client).
+SETTLING_MAX_S = 900.0  # hard expiry: the guard can never lock the user out for good
+_settling_lock = threading.Lock()
+_settling: dict[int, dict[str, Any]] = {}
+
+
+def mark_settling(pid: int, windows: dict[int, str], reason: str, evidence: Any = None,
+                  max_seconds: float = SETTLING_MAX_S, owner: Any = None) -> dict[str, Any]:
+    """Refuse requests to `pid` (nothing sent) while any of `windows` {hwnd: title} is hung.
+
+    With `owner` (an import in progress) every other client is refused outright;
+    only the owner client may send. Returns the entry for release_settling.
+    """
+    now = time.perf_counter()
+    entry = {"windows": {int(h): str(t) for h, t in windows.items()}, "reason": reason, "evidence": evidence,
+             "since": now, "until": now + max(1.0, max_seconds), "started": process_start_time(pid),
+             "owner": owner}
+    with _settling_lock:
+        _settling[pid] = entry
+    return entry
+
+
+def release_settling(pid: int, entry: dict[str, Any] | None) -> None:
+    """Drop `entry` only if it is still the PID's guard (a newer one is kept)."""
+    if entry is not None:
+        _drop_settling(pid, entry)
+
+
+def clear_settling(pid: int) -> None:
+    with _settling_lock:
+        _settling.pop(pid, None)
+
+
+def settling_state(pid: int) -> dict[str, Any] | None:
+    with _settling_lock:
+        entry = _settling.get(pid)
+        return dict(entry) if entry else None
+
+
+def _drop_settling(pid: int, entry: dict[str, Any]) -> None:
+    with _settling_lock:
+        if _settling.get(pid) is entry:
+            _settling.pop(pid, None)
 
 
 # Win32 constants for named pipe
@@ -265,6 +316,17 @@ class MaxClient:
         self._local.route_candidate = dict(target)
         return target["target_pipe"]
 
+    def resolve_target(self) -> dict[str, Any]:
+        """The Max the next command would reach. Never binds, takes the lock or sends."""
+        target = self._bound_target
+        if self._pinned_pipe_name is not None:
+            target = self._target(self._pinned_pipe_name, "explicit")
+        if target is None and self._startup_pipe:
+            target = self._target(self._startup_pipe, self._startup_source)
+        if target is None:
+            target = self._default_target()
+        return {**target, "available": self._probe_pipe_available(target["target_pipe"])}
+
     def list_max_instances(self) -> dict[str, Any]:
         with self._instance_lock():
             default = self._default_target()
@@ -395,6 +457,51 @@ class MaxClient:
              "previous_process": verdict.get("process"), "request_sent": False},
         )
 
+    def _check_settling(self, pid: int | None, pipe_name: str) -> None:
+        """Refuse (nothing sent) while a native import left a remembered window hung.
+
+        Fast path: IsHungAppWindow on the remembered hwnds only. Clears itself once
+        they pump again, the process changed, or the guard expired.
+        """
+        if not pid or self._control_channel or not _settling:
+            return
+        with _settling_lock:
+            entry = _settling.get(pid)
+        if entry is None:
+            return
+        now = time.perf_counter()
+        if now >= entry["until"] or entry.get("started") != process_start_time(pid):
+            _drop_settling(pid, entry)
+            return
+        owner = entry.get("owner")
+        if owner is self:
+            return
+        expires = entry["until"] - now
+        details = {"inflight": None, "process": None, "request_sent": False,
+                   "settling": {"reason": entry["reason"], "since_s": round(now - entry["since"], 1),
+                                "expires_in_s": round(expires, 1), "in_progress": owner is not None,
+                                "evidence": entry.get("evidence")}}
+        if owner is not None:
+            raise MaxImportSettlingError(
+                f"{self._label(pid, pipe_name)} is busy with {entry['reason']} ({now - entry['since']:.0f} s so "
+                f"far). Nothing was sent. Retry once it returns (this guard lifts within {expires:.0f} s at the "
+                "latest). Do not open or close the Material Editor meanwhile.",
+                details,
+            )
+        hung = {h: t for h, t in entry["windows"].items() if window_hung(h) is True}
+        if not hung:
+            _drop_settling(pid, entry)
+            return
+        names = ", ".join(sorted({f"'{t}'" if t else "main window" for t in hung.values()}))
+        details["settling"]["hung_windows"] = sorted({t or "main window" for t in hung.values()})
+        raise MaxImportSettlingError(
+            f"{self._label(pid, pipe_name)} is still settling after {entry['reason']}: {names} not responding "
+            f"({now - entry['since']:.0f} s so far; this guard lifts within {expires:.0f} s at the latest). "
+            "Nothing was sent. Wait and retry in a minute; these stalls cleared on their own after 5-8 min. "
+            "Do not end Max, and do not open or close the Material Editor.",
+            details,
+        )
+
     def _probe_pipe_available(self, pipe_name: str | None = None) -> bool:
         """Best-effort probe that treats a busy pipe as available."""
         pipe_name = pipe_name or self.pipe_name
@@ -517,8 +624,13 @@ class MaxClient:
         command: str,
         cmd_type: str = "maxscript",
         timeout: Optional[float] = None,
+        *,
+        probe: bool = False,
     ) -> dict[str, Any]:
-        """Send a command to 3ds Max and return the parsed JSON response."""
+        """Send a command to 3ds Max and return the parsed JSON response.
+
+        probe=True marks a read-only command that may be dropped at its deadline.
+        """
         if (cmd_type in {"native:render_cancel", "native:render_cancel_capture", "native:capture_screen"}
                 and self.transport != "tcp" and not self._control_channel):
             return self._send_control_command(command, cmd_type, timeout)
@@ -538,14 +650,16 @@ class MaxClient:
 
         if self.transport == "pipe":
             transport_used = "namedpipe"
-            response_data = self._send_via_pipe(request, effective_timeout, cmd_type=cmd_type, request_id=request_id)
+            response_data = self._send_via_pipe(request, effective_timeout, cmd_type=cmd_type, request_id=request_id,
+                                                probe=probe)
         elif self.transport == "tcp":
             transport_used = "tcp"
             response_data = self._send_via_tcp(request, effective_timeout)
         else:
             try:
                 transport_used = "namedpipe"
-                response_data = self._send_via_pipe(request, effective_timeout, cmd_type=cmd_type, request_id=request_id)
+                response_data = self._send_via_pipe(request, effective_timeout, cmd_type=cmd_type,
+                                                    request_id=request_id, probe=probe)
             except (AmbiguousMaxInstanceError, MaxBusyError, MaxNotRespondingError):
                 raise
             except (ConnectionError, TimeoutError) as exc:
@@ -587,6 +701,7 @@ class MaxClient:
         *,
         cmd_type: str | None = None,
         request_id: str | None = None,
+        probe: bool = False,
     ) -> bytes:
         deadline = time.perf_counter() + timeout
         data = (request + "\n").encode("utf-8")
@@ -598,11 +713,13 @@ class MaxClient:
                 self._close_pipe_handle()
                 self._selected_pipe_name = pipe_name
             self._check_known_hung(self._pid_for_pipe(pipe_name), pipe_name)
+            self._check_settling(self._pid_for_pipe(pipe_name), pipe_name)
 
             for attempt in range(2):
                 handle = self._ensure_pipe_handle(deadline, pipe_name)
                 pid = self._pid_for_pipe(pipe_name, handle)
                 self._check_known_hung(pid, pipe_name)
+                self._check_settling(pid, pipe_name)
                 if self._bound_target is None:
                     self._bound_target = getattr(self._local, "route_candidate", None) or self._target(pipe_name, "default")
                 self._local.request_target = dict(self._bound_target)
@@ -633,7 +750,7 @@ class MaxClient:
                             )
 
                     reply = self._read_pipe_response(handle, deadline, timeout, pid,
-                                                     probe=cmd_type in _PROBE_CMD_TYPES)
+                                                     probe=probe or cmd_type in _PROBE_CMD_TYPES)
                     if pid:
                         self._hung_pids.pop(pid, None)  # Max answered, so any old verdict is stale
                     self._check_queue_timeout(reply, pid)
