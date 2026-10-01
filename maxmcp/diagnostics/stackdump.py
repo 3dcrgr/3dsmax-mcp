@@ -29,7 +29,7 @@ import time
 from datetime import datetime
 from typing import Any, Iterable
 
-from .. import process_health
+from .. import process_health, suspend_guard
 
 _IS_WINDOWS = sys.platform == "win32"
 MAIN_WINDOW_TITLE = "Autodesk 3ds Max"
@@ -46,6 +46,9 @@ _TH32CS_SNAPTHREAD = 0x00000004
 _IMAGE_FILE_MACHINE_AMD64 = 0x8664
 _ADDR_MODE_FLAT = 3
 _SUSPEND_FAILED = 0xFFFFFFFF
+# Longest a thread stays suspended: the walk stops (stack marked truncated) once
+# this has elapsed; a single StackWalk64 step cannot be interrupted.
+_MAX_SUSPEND_S = 0.25
 _ERROR_ACCESS_DENIED = 5
 _INVALID_HANDLE = ctypes.c_void_p(-1).value
 # x64 CONTEXT: 1232 bytes, 16-byte aligned. Offsets of ContextFlags, Rsp, Rbp, Rip.
@@ -505,8 +508,10 @@ def _image_name(api: Any, hproc: Any) -> str | None:
 def _walk(api: Any, hproc: Any, tid: int, depth: int) -> tuple[list[int], float | None, dict[str, Any] | None]:
     """Return addresses of one thread's stack: (pcs, suspended_ms, error).
 
-    The thread is suspended only for GetThreadContext and StackWalk64 and is
-    resumed in `finally`; nothing is symbolized while it is suspended.
+    The thread is suspended only for GetThreadContext and StackWalk64, at most
+    about _MAX_SUSPEND_S, and nothing is symbolized meanwhile. Suspension goes
+    through suspend_guard, which resumes it exactly once and keeps this process
+    from exiting (watchdog, stdin EOF, atexit) while it is suspended.
     """
     access = _THREAD_GET_CONTEXT | _THREAD_SUSPEND_RESUME | _THREAD_QUERY_INFORMATION
     hthread = api.OpenThread(access, False, tid)
@@ -517,15 +522,21 @@ def _walk(api: Any, hproc: Any, tid: int, depth: int) -> tuple[list[int], float 
     suspended_ms: float | None = None
     raw = ctypes.create_string_buffer(_CONTEXT_SIZE + 16)
     ctx = ctypes.addressof(raw) + (-ctypes.addressof(raw)) % 16
-    suspended = False
+    ctypes.c_uint32.from_address(ctx + _CTX_FLAGS).value = _CONTEXT_FULL  # set before suspending
     started = time.perf_counter()
+    suspend_error: list[int] = []
+
+    def suspend() -> bool:
+        if api.SuspendThread(hthread) != _SUSPEND_FAILED:
+            return True
+        suspend_error.append(ctypes.get_last_error())
+        return False
+
     try:
-        suspended = api.SuspendThread(hthread) != _SUSPEND_FAILED
-        if not suspended:
-            error = _error("SuspendThread", ctypes.get_last_error(), tid)
-        else:
-            ctypes.c_uint32.from_address(ctx + _CTX_FLAGS).value = _CONTEXT_FULL
-            if not api.GetThreadContext(hthread, ctx):
+        with suspend_guard.suspended(suspend, lambda: api.ResumeThread(hthread)) as ok:
+            if not ok:
+                error = _error("SuspendThread", suspend_error[0] if suspend_error else 0, tid)
+            elif not api.GetThreadContext(hthread, ctx):
                 error = _error("GetThreadContext", ctypes.get_last_error(), tid)
             else:
                 rip = ctypes.c_uint64.from_address(ctx + _CTX_RIP).value
@@ -537,6 +548,11 @@ def _walk(api: Any, hproc: Any, tid: int, depth: int) -> tuple[list[int], float 
                 frame.AddrStack.Mode = _ADDR_MODE_FLAT
                 last = None
                 for _ in range(depth):
+                    if time.perf_counter() - started > _MAX_SUSPEND_S:
+                        error = _error("StackWalk64", tid=tid,
+                                       message=f"stack walk stopped after {_MAX_SUSPEND_S * 1000:.0f} ms "
+                                               "to keep the thread's pause short (stack truncated)")
+                        break
                     if not api.StackWalk64(_IMAGE_FILE_MACHINE_AMD64, hproc, hthread, ctypes.byref(frame), ctx,
                                            None, api.function_table_access, api.get_module_base, None):
                         break
@@ -547,10 +563,11 @@ def _walk(api: Any, hproc: Any, tid: int, depth: int) -> tuple[list[int], float 
                     pcs.append(pc)
                 if not pcs and rip:
                     pcs.append(rip)  # the walk failed: keep at least the current instruction
-    finally:
-        if suspended:
-            api.ResumeThread(hthread)
+        if ok:
             suspended_ms = round((time.perf_counter() - started) * 1000.0, 3)
+    except suspend_guard.ExitingError as exc:
+        error = _error("SuspendThread", tid=tid, message=str(exc))
+    finally:
         api.CloseHandle(hthread)
     return pcs, suspended_ms, error
 

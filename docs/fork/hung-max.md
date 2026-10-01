@@ -64,7 +64,11 @@ Timeouts tell you *that* Max is stuck, not *where*. During the Cosmos investigat
 capture_hang_diagnostics(pid=None, all_threads=False, depth=48, save=True)
 ```
 
-- **It sends nothing to Max.** Everything is read from the OS, so it's safe while Max is hung. Each thread is paused only while its context is read and its stack walked: about 0.2–2 ms, or 10–20 ms for the first thread that touches a module. Every thread is resumed in a `finally`.
+- **It sends nothing to Max.** Everything is read from the OS, so it's safe while Max is hung. Each thread is paused only while its context is read and its stack walked: about 0.2–2 ms, or 10–20 ms for the first thread that touches a module. The walk stops at 250 ms, and the stack is then marked truncated.
+- **A paused thread never outlives the server.** A thread suspended by a process that dies stays suspended for good, and that would freeze Max. So every suspension is registered in `maxmcp/suspend_guard.py` in the same step as `SuspendThread`, and it's resumed exactly once.
+  - Every exit path calls `release_all()` first: the parent watchdog's `os._exit` and its fallback timer, the exit after stdin closes, and `atexit`.
+  - `release_all()` blocks new suspensions, waits up to 0.5 s for active walks, then resumes anything still suspended itself.
+  - Only a hard kill of the server (`TerminateProcess`) can skip this.
 - **Finding the target.** It uses `pid` if given, otherwise the Max this server is talking to (read from memory, without the pipe lock), otherwise the only running `3dsmax.exe`. If none of those works, it lists the candidates instead of guessing.
 - **The main thread** is the thread that owns Max's main window.
 - **What it returns:**

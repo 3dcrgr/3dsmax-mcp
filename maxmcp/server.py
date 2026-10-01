@@ -412,7 +412,11 @@ def main():
 
     start_parent_watchdog()
     mcp.run(transport="stdio")
-    # Client closed stdin: exit even if non-daemon threads linger.
+    # Client closed stdin: exit even if non-daemon threads linger, but never
+    # while a diagnostics capture holds a Max thread suspended.
+    from .suspend_guard import release_all
+
+    release_all()
     for stream in (sys.stdout, sys.stderr):
         try:
             if stream is not None:

@@ -195,6 +195,10 @@ def _add_launcher_ancestors(k32, watched: list[tuple[int, object]], created: int
 
 
 def _exit_process() -> None:
+    # A Max thread suspended by capture_hang_diagnostics must never outlive us.
+    from .suspend_guard import release_all
+
+    release_all()
     os._exit(0)
 
 
