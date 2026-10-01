@@ -1,6 +1,6 @@
 # Smaller fixes
 
-Three problems that came up during the same production work. None was dangerous, but each misled the agent or the user.
+Four problems that came up during the same production work. None was dangerous, but each misled the agent or the user.
 
 ## `execute_maxscript` reported interrupted scripts as parse errors
 
@@ -44,3 +44,18 @@ Commit `1261998`.
 Tests: `tests/test_curve_line_support.py`.
 
 **Verified live** on 2026-10-01: `inspect_curve` reads Line objects.
+
+## The agent viewport couldn't be reclaimed after a restart
+
+Fork issue #11. Commit `8330c2c`.
+
+**What happened.** The agent viewport is a floating viewport the bridge opens for its own captures. The steps were: open it, take a Hold, restart Max, then `fetchMaxFile`. The restored layout brought back "Floating Viewport - 3", but the bridge didn't recognise it as its own. `agent_viewport(action="open")` then failed with "All floating viewports are in use", and every `source="agent"` call failed until the window was closed by hand.
+
+**What changed.**
+- The agent's floating slot is tagged in the scene's AppData.
+- `open` reclaims a tagged floating viewport only if it's the same panel window that showed the tagged slot when the scene loaded, or when the bridge first looked after a restart, and only if that window hasn't been hidden or destroyed since. Max's default floating viewport, and a user's own panel, are never taken over.
+- Scene loads (open, reset, new) are watched from the moment the bridge starts, so the first load after a restart counts.
+- `release` restores the panel's previous name, and clears the tag only if this process held the window.
+- `status` reports `reclaimable`, the window and `next_action: "open"`, and errors name the stale window.
+
+**Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32. The rebuilt 2026 bridge with it (sha256 `1cf0f9d8…`) is staged for the next Max restart, and isn't in `native/bin/` yet. Unit tested in `tests/test_agent_viewport_reclaim.py`; not tested live yet.

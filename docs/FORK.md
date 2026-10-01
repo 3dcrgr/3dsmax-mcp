@@ -25,6 +25,8 @@ The worst of these problems hung Max and lost unsaved work. Everything here is m
 | `execute_maxscript` calls an interrupted script (e.g. `quitMax`) a "parse error" | Re-compile to tell syntax errors from interruptions; new code `MAXSCRIPT_INTERRUPTED` | [smaller-fixes.md](fork/smaller-fixes.md) | Syntax errors verified live; `MAXSCRIPT_INTERRUPTED` (e.g. `quitMax`) isn't tested live yet |
 | A Cosmos material whose package name differs from the asset name isn't found | Detect what the import created by handle, whatever its name; report both names | [cosmos-import.md](fork/cosmos-import.md#finding-what-the-import-created-9-2853b1c) | Verified live |
 | Failed agent scripts print raw compile errors in the user's Listener | Run agent scripts with quiet errors; the caller still gets the detail | [smaller-fixes.md](fork/smaller-fixes.md#failed-agent-scripts-printed-errors-in-the-users-listener) | Verified live |
+| A Cosmos import silently replaces the material in the user's active Material Editor slot | Point the importer at a free slot, then put any displaced material back once Max is quiet | [cosmos-import.md](fork/cosmos-import.md#keeping-the-users-material-editor-slot-10-c1e09a7) | Deployed; live test pending |
+| After a restart and Hold/Fetch, the agent viewport can't be reclaimed | Tag the agent's floating viewport in the scene and reclaim exactly that restored window | [smaller-fixes.md](fork/smaller-fixes.md#the-agent-viewport-couldnt-be-reclaimed-after-a-restart) | Reviewed; native bridge staged, not in `native/bin/` yet |
 | Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Verified live |
 
 What the status words mean:

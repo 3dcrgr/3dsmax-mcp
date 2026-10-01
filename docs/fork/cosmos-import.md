@@ -1,6 +1,6 @@
 # Cosmos imports that stall or deadlock 3ds Max
 
-Fork issues #1, #2, #7 and #9. Commits `25bb1fc`, `ed1fb1c` and `2853b1c` (#9).
+Fork issues #1, #2, #7, #9 and #10. Commits `25bb1fc`, `ed1fb1c`, `2853b1c` (#9) and `c1e09a7` (#10).
 
 ## What happened
 
@@ -78,7 +78,25 @@ New result fields:
 
 **Status.** Unit tested in `tests/test_cosmos_import.py`, and verified live on 2026-10-01. Re-importing "Steel Blurry" returned `imported` with `primary_material` "Steel_Polished #0" (`medit_slot` 13, `primary_reason` `only_new`), `asset_name` "Steel Blurry" and the note about the different name. The scene's existing "Steel_Blurry" was correctly not reported as new.
 
-**Watch out.** Chaos's importer puts the new material into the *active* Material Editor slot, replacing whatever material was there. `cosmos_import` reports the slot (`medit_slot`) but doesn't put the previous material back.
+### Keeping the user's Material Editor slot (#10, `c1e09a7`)
+
+**What happened.** Chaos's importer puts the new material into the *active* Compact Material Editor slot, replacing whatever material was there. During the #9 test it displaced the user's "Steel_Blurry" from slot 13, silently.
+
+**What changed.**
+- **Before the import:** the prepare call records the active slot and its material. If that material is worth keeping, the lowest truly free slot becomes active, so the importer writes there instead.
+  - A slot counts as free only if it holds an untouched default material: named "NN - Default", no sub-materials or maps, used by no object, and every property equal to a fresh one.
+  - The kept material is held by a MAXScript global meanwhile, so Max can't auto-delete it.
+- **After a quiet settle:** if a material was still displaced, the finalize call puts it back, moves the import to a free slot, and makes the original slot active again.
+  - This only happens when no undo operation is open and the scene file hasn't changed.
+  - If it can't, a warning names the displaced material and gives the exact MAXScript to restore it.
+- Nothing is done while Max is settling. The Material Editor is never opened or closed, and the Slate editor isn't touched beyond `activeMeditSlot`.
+- **New result fields:**
+  - `medit_active_slot`: `slot`, `material`, `kept`, `switched_to`, `state`;
+  - `displaced_material`;
+  - `medit_slot_restored`;
+  - `medit_slot` now reports where the import ended up.
+
+**Status.** Unit tested and deployed (Python) on 2026-10-01; not tested live yet.
 
 ## How it was verified
 
