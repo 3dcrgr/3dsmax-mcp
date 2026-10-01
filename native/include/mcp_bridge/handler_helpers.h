@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 #include <max.h>
@@ -436,8 +437,12 @@ inline std::string MaxScriptFailureMessage(const std::wstring& wcmd, std::string
 
 // ── MAXScript execution (for hybrid handlers) ───────────────────
 inline std::string RunMAXScript(const std::string& script) {
-    // Tool scripts are batch work: prompts take their defaults.
-    TempQuietMode quiet;
+    // Tool scripts are batch work: prompts take their defaults. Quiet mode is
+    // one process-wide flag that TempQuietMode saves and restores, so only
+    // Max's main thread changes it: a direct-mode read on a pipe thread
+    // overlapping a main-thread save/restore could leave Max quiet for good.
+    std::optional<TempQuietMode> quiet;
+    if (!MainThreadExecutor::IsDirectMode()) quiet.emplace(TRUE);
     std::wstring wcmd = WrapForErrorCapture(Utf8ToWide(script));
     FPValue fpv;
     BOOL ok = FALSE;
