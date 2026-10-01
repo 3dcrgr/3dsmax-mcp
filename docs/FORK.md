@@ -89,8 +89,10 @@ ctest --test-dir native/build-tests -C Release --output-on-failure
 | Branch | Contents |
 |---|---|
 | `master` | Upstream's `master`, unchanged |
-| `fix/fork-fixes` | All the fixes, integrated and deployed together |
-| `fork/*` | One fix each, based on `fix/fork-fixes`, kept separate so each can become its own upstream pull request |
+| `fix/fork-fixes` | The reviewed fixes, deployed and tested together on the production machine |
+| `fork/integration` | `fix/fork-fixes` plus the newest fixes and these docs while they're under review. It's fast-forwarded into `fix/fork-fixes` after review. |
+
+Pull requests to upstream will be cut from upstream's `master`, one per fix, so each can be reviewed on its own.
 
 ## Credits
 
