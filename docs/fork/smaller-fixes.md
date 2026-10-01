@@ -4,7 +4,7 @@ Two problems that came up during the same production work. Neither was dangerous
 
 ## `execute_maxscript` reported interrupted scripts as parse errors
 
-Commit `d971a56`.
+Commit `011e547`.
 
 **What happened.** `quitMax #noPrompt` returned "MAXScript execution failed (parse error)", although it has no syntax error. `try (quitMax #noPrompt quiet:true) catch ()` worked.
 
@@ -25,7 +25,7 @@ Tests: `tests/test_execute_failures.py`. They cover how the Python server classi
 
 ## Curve tools rejected Line objects
 
-Commit `e1dbabe`.
+Commit `1261998`.
 
 **What happened.** `inspect_curve` refused objects of class `line` with "Editable spline base required". A Line is an editable spline: it supports all the spline functions.
 

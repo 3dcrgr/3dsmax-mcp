@@ -1,6 +1,6 @@
 # When 3ds Max hangs: a diagnosis instead of timeouts
 
-Fork issues #4 and #6, and the executor shutdown fix. Commits `25ac1ed`, `6e9188b`, `7ff1cec`, `f8d4e6f`, `d971a56`, `91c8662`, `1dab496`, `5466a32` and `e58464a`.
+Fork issues #4 and #6, and the executor shutdown fix. Commits `adcfd93`, `a9d2a0d`, `ed1fb1c`, `2ce5928`, `011e547`, `f7dbb87`, `03f4d64`, `4ba8059` and `b4dd573`.
 
 ## What happened
 
@@ -16,7 +16,7 @@ When Max's main thread hung, every tool returned the MCP client's generic "Reque
 
 ## What changed
 
-### Client side (`6e9188b`)
+### Client side (`a9d2a0d`)
 
 - **The pipe lock has a timeout.** A request waits for the lock for up to its own timeout (120 s by default). If it still can't get it, nothing is sent. It fails with `MAX_BUSY`, or with `MAX_NOT_RESPONDING` if Max has exited, or is blocked while the request holding the lock is past its own timeout plus grace (the larger of 10 s and 10 % of that timeout). The idea comes from the stoxsss111 fork.
 - **Replies are polled with a real deadline.** The client uses `PeekNamedPipe` instead of a blocking `ReadFile`. Past the deadline plus grace it checks the target process: are its top-level windows hung (`IsHungAppWindow`), and how much CPU does it use over a one-second sample? A hung window with under 0.05 CPU-s/s counts as blocked.
@@ -24,7 +24,7 @@ When Max's main thread hung, every tool returned the MCP client's generic "Reque
   - **Max has exited, or is blocked on two checks 20 s apart:** the request is abandoned with `MAX_NOT_RESPONDING`. It's never replayed, because it may already have run.
   - **Read-only probes** (`ping`, `health`): dropped at their deadline.
 - **A hung PID is remembered.** Later calls to it fail fast, with nothing sent, until its window pumps messages again.
-- **The messages give bounded advice** (`7ff1cec`): "wait up to about 10 minutes, re-checking with `get_bridge_status`; still blocked after that means a deadlock, and the user must end Max". Errors that say Max is not responding or still settling also get a `hint` with the same 10-minute wait, suggesting `capture_hang_diagnostics` and `get_bridge_status` (`91c8662`, `1dab496`).
+- **The messages give bounded advice** (`ed1fb1c`): "wait up to about 10 minutes, re-checking with `get_bridge_status`; still blocked after that means a deadlock, and the user must end Max". Errors that say Max is not responding or still settling also get a `hint` with the same 10-minute wait, suggesting `capture_hang_diagnostics` and `get_bridge_status` (`f7dbb87`, `03f4d64`).
 
 Error codes:
 
@@ -36,7 +36,7 @@ Error codes:
 
 These errors carry their evidence in `error.details`: `request_sent`, and where known `inflight` (the stuck request), `process` (state, window hung, CPU-s/s) or `settling`.
 
-### Bridge health from a pipe thread (`f8d4e6f`, reviewed in `d971a56`)
+### Bridge health from a pipe thread (`2ce5928`, reviewed in `011e547`)
 
 The native bridge now answers a `health` command on the pipe thread that received it. It never posts to the main thread and never touches the scene, so it answers while Max is hung. The reply contains:
 
@@ -62,7 +62,7 @@ The native bridge now answers a `health` command on the pipe thread that receive
 
 ### `capture_hang_diagnostics`
 
-Commits `91c8662`, `1dab496`, `5466a32` and `e58464a` (review fixes).
+Commits `f7dbb87`, `03f4d64`, `4ba8059` and `b4dd573` (review fixes).
 
 Timeouts tell you *that* Max is stuck, not *where*. During the Cosmos investigation ([cosmos-import.md](cosmos-import.md)), a small script that walked native thread stacks with `dbghelp` attributed both hangs within minutes, with no debugger installed. That script is now part of the package.
 
@@ -123,12 +123,12 @@ Limitations:
 
 The original script set `SizeOfStruct` wrong for `SYMBOL_INFOW` (90 instead of 88), so `SymFromAddrW` always failed. That's why the original dumps show offsets only. This version fixes it.
 
-### Native executor (`25ac1ed`, ported from Geddart's fork)
+### Native executor (`adcfd93`, ported from Geddart's fork)
 
 - **Shutdown drain** (Geddart `8e004f7`). `MCPBridgeGUP::Stop()` now closes the executor gate first, then fails every queued and deferred work item, so client threads blocked in `ExecuteSync` wake at once. A background `ExecuteSync` during shutdown fails fast. `Initialize()` reopens the gate.
 - **Expired work never runs** (Geddart `599e6f7`). A work item that timed out while still queued is marked done and its callback dropped. It can't run later against the caller's unwound stack.
 
-### Orphaned servers (#6, `6e9188b`)
+### Orphaned servers (#6, `a9d2a0d`)
 
 On Windows, a child process outlives its parent. So a crashed or killed MCP client used to leave its `maxmcp.server` running, and that server could still hold a pipe connection to Max. Four such servers were found running at once.
 

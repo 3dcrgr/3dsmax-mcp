@@ -1,6 +1,6 @@
 # Cosmos imports that stall or deadlock 3ds Max
 
-Fork issues #1, #2 and #7. Commits `530bc3e` and `7ff1cec`.
+Fork issues #1, #2 and #7. Commits `25bb1fc` and `ed1fb1c`.
 
 ## What happened
 

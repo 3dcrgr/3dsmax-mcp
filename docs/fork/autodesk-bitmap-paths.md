@@ -1,6 +1,6 @@
 # Texture paths missing from Revit (Autodesk) materials
 
-Fork issue #5. Commits `95b17f7`, `3b11fc8` and `c89028e`.
+Fork issue #5. Commits `a5e1e91`, `baafe0a` and `1492831`.
 
 ## What happened
 
@@ -13,8 +13,8 @@ The material graph reader (native `inspect_material_network`, which `material_ro
 ## What changed
 
 Native (`material_network_handlers.cpp`):
-- Paths are also read from `TYPE_BITMAP` parameters (the PBBitmap's asset or name) and from asset-backed `TYPE_FILENAME` parameters. These candidates are used **only when the map has no plain path** (`3b11fc8`).
-- Parameters with an empty internal name are never treated as texture sources (`c89028e`).
+- Paths are also read from `TYPE_BITMAP` parameters (the PBBitmap's asset or name) and from asset-backed `TYPE_FILENAME` parameters. These candidates are used **only when the map has no plain path** (`baafe0a`).
+- Parameters with an empty internal name are never treated as texture sources (`1492831`).
   - Cosmos VRayBitmaps carry a hidden, unnamed paramblock parameter that holds a package-relative copy of the texture path (`<guid>/textures/Diff_4k_srgb.tx`). MAXScript can't see it: `showProperties`, `getPropNames` and `enumerateFiles` don't list it.
   - The graph used to report it as a second file with parameter `""`, next to the real `HDRIMapName` path, which raised a false `FILE_MISSING`. This predates the fork.
   - Such parameters are now named `param_<id>`, and their value is still reported when values are requested.
@@ -37,7 +37,7 @@ Python (`material_roles`):
 Live on 3ds Max 2026, 2026-10-01:
 - **An Autodesk Bitmap on a Revit furniture fabric** now reports its path, from parameter `Parameters_Source`: `C:\Program Files (x86)\Common Files\Autodesk Shared\Materials\Textures\1\Mats\Furnishings.Fabrics.Linen.White.jpg`. It also reports `exists: false`, which is correct, because that texture library isn't installed on the machine.
 - **Unset Autodesk Metal relief and cutout bitmaps** give `FILE_PATH_UNREADABLE`, and the audit reports `complete: false`.
-- **Cosmos VRayBitmaps:** the duplicate package-relative row first showed up in the 10:46 live check. `3b11fc8`, deployed at 11:02 to remove it, didn't (checked at 11:06). At 11:20 the row was traced to the unnamed parameter. The fix (`c89028e`) was deployed with the rebuilt bridge at 12:22. At 12:30 `material_roles` on the Cosmos material `Tiles_B_130cm` gave one row per VRayBitmap (`HDRIMapName`, `exists: true`), no package-relative rows, and `complete: true`.
+- **Cosmos VRayBitmaps:** the duplicate package-relative row first showed up in the 10:46 live check. `baafe0a`, deployed at 11:02 to remove it, didn't (checked at 11:06). At 11:20 the row was traced to the unnamed parameter. The fix (`1492831`) was deployed with the rebuilt bridge at 12:22. At 12:30 `material_roles` on the Cosmos material `Tiles_B_130cm` gave one row per VRayBitmap (`HDRIMapName`, `exists: true`), no package-relative rows, and `complete: true`.
 
 Unit tests: `tests/test_material_roles_files.py`, for the Python warnings. The native path reading has no automated tests.
 
