@@ -1,6 +1,6 @@
 # Cosmos imports that stall or deadlock 3ds Max
 
-Fork issues #1, #2 and #7. Commits `25bb1fc` and `ed1fb1c`.
+Fork issues #1, #2, #7 and #9. Commits `25bb1fc`, `ed1fb1c` and `2853b1c` (#9).
 
 ## What happened
 
@@ -31,7 +31,7 @@ The MCP made both problems worse in three ways:
    - If no browser window belongs to Max's main thread, it runs the renderer's "Cosmos browser" action. The action is looked up by name in the action tables, never by index. It then waits up to 15 s for the window.
    - If a browser is already on the main thread but doesn't answer because Max's main thread is busy, it doesn't run the action. It only waits, from the OS, up to 15 s for the window to answer.
    - If a browser on another thread is already hung, it refuses and sends nothing. The result is `state: "browser_hung"` with code `IMPORT_SETTLING`.
-2. **Prepare.** One bridge call records what already exists for this asset: nodes tagged with its Cosmos ID, and materials and maps whose names or file names match. That's how the import's new resources are told apart later. The same call records the Material Editor renderer and, when the swap is on, switches it to Default Scanline. Last, it clears the selection, remembering it first. The native importer otherwise auto-assigns the new material to whatever is selected.
+2. **Prepare.** One bridge call records what already exists: nodes tagged with the asset's Cosmos ID, materials and maps whose names or file names match, and (since #9) the handles of every existing material and Material Editor slot. That's how the import's new resources are told apart later. The same call records the Material Editor renderer and, when the swap is on, switches it to Default Scanline. Last, it clears the selection, remembering it first. The native importer otherwise auto-assigns the new material to whatever is selected.
    - Just before this call, it waits up to 15 s for Max's main window to answer. If it doesn't, nothing more is sent. The result is `state: "not_imported"` with code `IMPORT_SETTLING`.
 3. **Dispatch the import**, then poll lightly for the result (#2). The polls are read-only and back off. They're also probes: they're never sent into a main window that's already hung, and they're dropped at their deadline.
 4. **Wait for Max to settle**, judged from the OS. The main window and every Cosmos browser window, hidden ones included, must answer for a streak longer than 6 s. (`IsHungAppWindow` only reports a window as hung after about 5 s.)
@@ -62,6 +62,21 @@ New result fields:
 - When exactly one Cosmos importer is registered for that PID, the renderer follows from the importer. So a search works even while Max is busy.
 - When more than one importer is registered for that PID (V-Ray and Corona, say) and `renderer` is `"current"` (the default), it reads `renderers.current` once. Pass `renderer="vray"` or `"corona"` to skip that. Max is also asked when the selected instance can't be reached or no importer matches.
 - The result's `renderer_source` says where the renderer came from: `explicit`, `only_importer` (the scene renderer wasn't checked) or `scene`.
+
+### Finding what the import created (#9, `2853b1c`)
+
+**What happened.** Importing the Cosmos material "Steel Blurry" created a VRayMtl named "Steel_Polished #0" in Material Editor slot 13. The tool polled for 31.5 s, then returned `state: "imported_unverified"` with no materials. The package's `.vrmat` declares the other name: Chaos ships Steel Blurry and Steel Polished as near-identical files. Detection looked for the asset's name, so it never found the material.
+
+**What changed.**
+- **Detection by handle, not by name.** The prepare step now also records the handles that already exist: every material instance and the 24 Material Editor slots, plus bitmaps and HDRI maps for HDRI imports. The polls and the confirming snapshot report anything whose handle wasn't there before, whatever it's called.
+- The existing matching (nodes tagged with the Cosmos ID, names) still runs. A snapshot without the handle list falls back to names.
+- **New result fields.**
+  - Each material carries `medit_slot` and `sub_material`.
+  - `primary_material` or `primary_map` names the main item, and `primary_reason` says how it was chosen: `name`, `detected_during_import`, `top_level`, `medit_slot`, `only_new` or `first`.
+  - `asset_name` comes with `material_name` or `map_name`, plus a `note` when they differ.
+- Nothing is renamed. The behaviour from the steps above is unchanged: no new bridge calls, the OS-only settle, the main-thread browser, the `IMPORT_SETTLING` guard, and never opening or closing the Material Editor.
+
+**Status.** Unit tested in `tests/test_cosmos_import.py`, and deployed (Python) on 2026-10-01. A live re-import of "Steel Blurry" hasn't been run yet.
 
 ## How it was verified
 

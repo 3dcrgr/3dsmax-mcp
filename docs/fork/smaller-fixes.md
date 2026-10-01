@@ -1,6 +1,6 @@
 # Smaller fixes
 
-Two problems that came up during the same production work. Neither was dangerous, but both misled the agent.
+Three problems that came up during the same production work. None was dangerous, but each misled the agent or the user.
 
 ## `execute_maxscript` reported interrupted scripts as parse errors
 
@@ -22,6 +22,16 @@ Commit `011e547`.
 Tests: `tests/test_execute_failures.py`. They cover how the Python server classifies the bridge's messages, not the re-compile itself.
 
 **Status.** The check is in the native bridge, and only the rebuilt 2026 bridge in `native/bin/` has it. With upstream's 2023, 2024, 2025 and 2027 bridges, an interrupted script is still reported as "(parse error)". The syntax-error path was verified live on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message. The quitMax case hasn't been tested yet.
+
+## Failed agent scripts printed errors in the user's Listener
+
+Fork issue #8. Commit `6552786`.
+
+**What happened.** When an agent's script didn't compile, Max printed the raw exception into the MAXScript Listener the user had open, for example `-- MAXScript ExecuteMAXScriptScript Exception: -- Syntax error: at off, expected name`. Nothing had run and the scene hadn't changed, but the user saw red errors, from code they hadn't written, with nothing saying they came from the MCP.
+
+**What changed.** `execute_maxscript`, and the native tools that run MAXScript internally, now run scripts with quiet errors. Compile errors and aborts go to Max's log, not the Listener, and the compile-only check behind the parse-error detail prints nothing either. The caller gets the same results as before: `BAD_PARAM` "MAXScript execution failed (parse error): <detail>", `MAXSCRIPT_INTERRUPTED`, and runtime errors with their message. A script's own output, such as `print`, still reaches the Listener.
+
+**Status.** This is in the native bridge. The rebuilt 2026 bridge with it (sha256 `c621db10…`) is staged for the next Max restart, and isn't in `native/bin/` yet. Not tested live yet.
 
 ## Curve tools rejected Line objects
 
