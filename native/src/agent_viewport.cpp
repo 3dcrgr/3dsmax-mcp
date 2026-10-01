@@ -1,4 +1,5 @@
 #include "mcp_bridge/agent_viewport.h"
+#include "mcp_bridge/bridge_gup.h"
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/spatial_snapshot.h"
 #include "mcp_bridge/scene_journal.h"
@@ -16,9 +17,16 @@
 #include <IPerViewportFilter.h>
 #include <mesh.h>
 #include <notify.h>
+#include <maxheapdirect.h>
+#include <commctrl.h>
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <vector>
+
+#pragma comment(lib, "comctl32.lib")
 
 using json = nlohmann::json;
 using namespace HandlerHelpers;
@@ -28,9 +36,28 @@ constexpr wchar_t kTitle[] = L"AGENT VIEWPORT";
 constexpr wchar_t kWindowTitle[] = L"AGENT VIEWPORT (do not close or minimize while agent is working)";
 constexpr wchar_t kOwner[] = L"3dsmax-mcp.AgentViewport";
 constexpr float kPi = 3.14159265358979323846f;
+// Ownership (the kOwner window property) lives only in this process. Saved
+// layouts and Hold/Fetch restore the floating panel without it, so the panel
+// is also tagged persistently: scene AppData (Interface::GetScenePointer(),
+// saved in .max files and holds) records which floating slot is the agent's.
+// The slot alone does not identify a panel (the user may close it and show
+// that slot again), so a reclaim also requires the exact window that was
+// showing the tagged slot when the scene was loaded (see ObserveRestored).
+constexpr DWORD kTagChunk = 0x4D435641; // "MCVA"
+constexpr char kTagPrefix[] = "3dsmax-mcp.AgentViewport/1 floating=";
+constexpr int kFloatingSlots = 3; // IViewPanelManager::ViewPanelFloatingID
+constexpr UINT_PTR kRestoredSubclass = 0x4D435641;
 int floatingID = 0;
 int viewID = -1;
 HWND panelWindow = nullptr;
+MSTR previousPanelName; // Restored on release: a released panel is the user's again.
+bool restoreName = false;
+// Load-time reclaim candidate: the tagged slot's panel window seen right after
+// a scene load (or, after a restart, when the bridge first looks).
+bool watchingLoads = false;
+bool restorePending = true;
+int restoredID = 0;
+HWND restoredPanel = nullptr, restoredTop = nullptr;
 Point3 orbitTarget(0,0,0);
 unsigned long long generation = 0;
 unsigned long long draws = 0;
@@ -162,6 +189,191 @@ HWND FloatingWindow() {
     if (!Panel()) return nullptr;
     HWND top=GetAncestor(panelWindow,GA_ROOT);
     return top && top!=GetCOREInterface()->GetMAXHWnd() ? top : nullptr;
+}
+
+int ReadTag() {
+    auto* scene=GetCOREInterface()->GetScenePointer();
+    auto* chunk=scene ? scene->GetAppDataChunk(MCP_BRIDGE_CLASS_ID,GUP_CLASS_ID,kTagChunk) : nullptr;
+    const size_t prefix=sizeof(kTagPrefix)-1;
+    if(!chunk || !chunk->data || chunk->length!=prefix+1) return 0;
+    const char* text=static_cast<const char*>(chunk->data);
+    if(std::memcmp(text,kTagPrefix,prefix)!=0) return 0;
+    const int id=text[prefix]-'0';
+    return id>=1 && id<=kFloatingSlots ? id : 0;
+}
+
+void WriteTag(int id) {
+    auto* scene=GetCOREInterface()->GetScenePointer();
+    if(!scene) return;
+    const std::string text=kTagPrefix+std::to_string(id);
+    void* data=MAX_malloc(text.size());
+    if(!data) return;
+    std::memcpy(data,text.data(),text.size());
+    scene->RemoveAppDataChunk(MCP_BRIDGE_CLASS_ID,GUP_CLASS_ID,kTagChunk);
+    scene->AddAppDataChunk(MCP_BRIDGE_CLASS_ID,GUP_CLASS_ID,kTagChunk,static_cast<DWORD>(text.size()),data);
+}
+
+void ClearTag(int id) {
+    auto* scene=GetCOREInterface()->GetScenePointer();
+    if(scene && ReadTag()==id) scene->RemoveAppDataChunk(MCP_BRIDGE_CLASS_ID,GUP_CLASS_ID,kTagChunk);
+}
+
+IViewPanel* SlotPanel(int id) {
+    auto* manager=GetViewPanelManager();
+    const int index=manager ? manager->GetViewPanelIndexFromFloatingID(id) : -1;
+    return index>=0 ? manager->GetViewPanel(index) : nullptr;
+}
+
+bool Shown(IViewPanel* panel) {
+    HWND top=GetAncestor(panel->GetHWnd(),GA_ROOT);
+    return panel->IsViewPanelVisible() || (top && IsIconic(top));
+}
+
+// The only layout the agent creates: one user perspective or orthographic view.
+bool AgentShape(IViewPanel* panel) {
+    if(panel->GetLayout()!=VP_LAYOUT_1) return false;
+    auto& view=panel->GetViewExpByIndex(0);
+    const int type=view.IsAlive() ? view.GetViewType() : -1;
+    return type==VIEW_PERSP_USER || type==VIEW_ISO_USER;
+}
+
+// A scene load resets viewID while this process still owns the panel window.
+// Re-set it only if the loaded layout left it in the agent's shape.
+bool OwnedPanelReusable() {
+    auto* panel=Panel();
+    return panel && viewID==-1 && AgentShape(panel);
+}
+
+LRESULT CALLBACK RestoredWindowProc(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
+
+void ForgetRestored() {
+    if(restoredTop && IsWindow(restoredTop)) RemoveWindowSubclass(restoredTop,RestoredWindowProc,kRestoredSubclass);
+    restoredID=0; restoredPanel=nullptr; restoredTop=nullptr;
+}
+
+// Hiding (the user closing it) or destroying the restored window ends its
+// candidacy: the slot shown again later is the user's own viewport. Hides
+// caused by a minimized owner (lParam SW_PARENTCLOSING) do not count.
+LRESULT CALLBACK RestoredWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    if((message==WM_SHOWWINDOW && !wParam && !lParam) || message==WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd,RestoredWindowProc,kRestoredSubclass);
+        restoredID=0; restoredPanel=nullptr; restoredTop=nullptr; restorePending=false;
+    }
+    return DefSubclassProc(hwnd,message,wParam,lParam);
+}
+
+// Decides the reclaim candidate once per load. atLoad: the load notification,
+// where a restored panel may not be shown yet, so the decision then waits for
+// the bridge's next look instead of rejecting the panel.
+void ObserveRestored(bool atLoad) {
+    if(restoredID) {
+        auto* panel=SlotPanel(restoredID);
+        if(!panel || panel->GetHWnd()!=restoredPanel || !Shown(panel) || ReadTag()!=restoredID) ForgetRestored();
+        return;
+    }
+    if(!restorePending) return;
+    const int tagged=ReadTag();
+    if(!tagged) { restorePending=false; return; }
+    auto* panel=SlotPanel(tagged);
+    if(!panel || !Shown(panel)) { if(!atLoad) restorePending=false; return; }
+    restorePending=false;
+    HWND hwnd=panel->GetHWnd();
+    HWND top=GetAncestor(hwnd,GA_ROOT);
+    if(GetPropW(hwnd,kOwner) || !top || top==GetCOREInterface()->GetMAXHWnd()) return;
+    if(!SetWindowSubclass(top,RestoredWindowProc,kRestoredSubclass,0)) return;
+    restoredID=tagged; restoredPanel=hwnd; restoredTop=top;
+}
+
+void SceneLoaded(void*, NotifyInfo*) {
+    ForgetRestored(); restorePending=true;
+    ObserveRestored(true);
+}
+
+// Registered on first use and kept until Max exits: the bridge must see every
+// later load to know which window was restored by it.
+void WatchLoads() {
+    if(watchingLoads) return;
+    RegisterNotification(SceneLoaded,nullptr,NOTIFY_FILE_POST_OPEN);
+    RegisterNotification(SceneLoaded,nullptr,NOTIFY_SYSTEM_POST_RESET);
+    RegisterNotification(SceneLoaded,nullptr,NOTIFY_SYSTEM_POST_NEW);
+    watchingLoads=true;
+}
+
+struct FloatingSlot {
+    int id=0;
+    IViewPanel* panel=nullptr;
+    bool owned=false, visible=false, minimized=false;
+    bool sceneTag=false, restored=false, agentShape=false;
+    std::string title, name;
+    // Tagged by us, the very window restored with the scene, unowned in this
+    // process, and still the agent's single user/ortho view. Untagged panels,
+    // or a tagged slot the user closed and showed again, are never taken over.
+    bool Reclaimable() const { return !owned && sceneTag && restored && agentShape; }
+    json Describe() const {
+        return {{"floating_id",id},{"window_title",title},{"panel_name",name},{"visible",visible},
+            {"minimized",minimized},{"agent_tag",sceneTag},{"restored_with_scene",restored},
+            {"agent_layout",agentShape}};
+    }
+};
+
+std::vector<FloatingSlot> FloatingSlots() {
+    std::vector<FloatingSlot> slots;
+    auto* manager=GetViewPanelManager();
+    if(!manager) return slots;
+    WatchLoads();
+    ObserveRestored(false);
+    const int tagged=ReadTag();
+    const int count=std::max(kFloatingSlots,manager->GetNumFloatingViewPanels());
+    for(int i=1;i<=count;++i) {
+        const int index=manager->GetViewPanelIndexFromFloatingID(i);
+        auto* panel=index>=0 ? manager->GetViewPanel(index) : nullptr;
+        if(!panel) continue;
+        FloatingSlot slot; slot.id=i; slot.panel=panel;
+        HWND hwnd=panel->GetHWnd();
+        HWND top=GetAncestor(hwnd,GA_ROOT);
+        slot.owned=GetPropW(hwnd,kOwner)!=nullptr;
+        slot.visible=panel->IsViewPanelVisible();
+        slot.minimized=top && IsIconic(top);
+        if(top && top!=GetCOREInterface()->GetMAXHWnd()) {
+            wchar_t title[256]{};
+            GetWindowTextW(top,title,256);
+            slot.title=WideToUtf8(title);
+        }
+        const MSTR& name=panel->GetViewPanelName();
+        slot.name=WideToUtf8(name.data());
+        // The panel name is diagnostic only: it survives release in memory and
+        // it is unknown whether Max saves it, so it never grants a reclaim.
+        slot.sceneTag=tagged==i;
+        slot.restored=i==restoredID && hwnd==restoredPanel;
+        slot.agentShape=AgentShape(panel);
+        slots.push_back(slot);
+    }
+    return slots;
+}
+
+const FloatingSlot* FindReclaimable(const std::vector<FloatingSlot>& slots) {
+    for(const auto& slot:slots) if(slot.Reclaimable()) return &slot;
+    return nullptr;
+}
+
+// Name the panels that block open, so a stale restored agent viewport can be
+// closed by hand when its tag cannot be verified.
+[[noreturn]] void ThrowNoPanel(const std::vector<FloatingSlot>& slots, std::string message) {
+    json blockers=json::array();
+    for(const auto& slot:slots) {
+        if(slot.owned || !(slot.visible || slot.minimized)) continue;
+        blockers.push_back(slot.Describe());
+        message+=" Floating Viewport "+std::to_string(slot.id)+" (\""+slot.title+"\") is open "+
+            (!slot.sceneTag ? "without the AGENT VIEWPORT tag." :
+             !slot.restored ? "with the AGENT VIEWPORT tag, but it is not the window restored with the scene "
+                              "(it was closed or shown again since), so it is treated as yours." :
+                              "with the AGENT VIEWPORT tag, but its layout or view type changed, so it was not reclaimed.");
+    }
+    if(!blockers.empty())
+        message+=" If one of these is a stale AGENT VIEWPORT restored from a saved layout or Hold/Fetch, "
+            "close that floating viewport (its window close button, or post WM_CLOSE to that window) and run agent_viewport open again.";
+    throw std::runtime_error(StructuredErrorPayload("BAD_PARAM",message,{{"floating_viewports",blockers},
+        {"workaround","Close the stale floating viewport window (WM_CLOSE), then agent_viewport open"}}));
 }
 
 // Showing a panel through Max's public API also activates it. Restore the
@@ -447,7 +659,19 @@ json Status() {
     if(floatingID) {
         out["owner"]="agent"; out["label"]="AGENT VIEWPORT";
         out["floating_id"]=floatingID; out["view_id"]=viewID;
-        out["next_action"]=state=="minimized" ? "restore" : "release then open";
+        out["next_action"]=state=="minimized" ? "restore" : OwnedPanelReusable() ? "open" : "release then open";
+    }
+    if(!Panel()) {
+        // Report only: status never takes a panel, so source=auto keeps using
+        // the user's active view until open/reclaim is called. A Hold/Fetch
+        // that recreated our window lands here too (floatingID set, no panel).
+        const auto slots=FloatingSlots();
+        const auto* stale=FindReclaimable(slots);
+        out["reclaimable"]=stale!=nullptr;
+        if(stale) {
+            out["reclaim_floating_id"]=stale->id; out["reclaim_window_title"]=stale->title;
+            out["next_action"]="open";
+        }
     }
     return out;
 }
@@ -622,29 +846,42 @@ std::string Token(ViewExp& view, const RenderState* renderState=nullptr) {
     std::ostringstream out; out << std::hex << hash; return out.str();
 }
 
-void Open(const json& p) {
+// Returns true when an existing agent panel was reclaimed instead of a free one taken.
+bool Open(const json& p, bool reclaimOnly) {
     const int width=static_cast<int>(Number(p,"width",1000,320,4096));
     const int height=static_cast<int>(Number(p,"height",740,240,4096));
     const bool startMinimized=p.value("start_minimized",false);
-    if (Panel()) {
-        if(!View()) throw std::runtime_error("Agent viewport layout changed. Release it before opening a fresh one.");
-        SetMinimized(startMinimized);
-        if(!startMinimized) Redraw();
-        return;
-    }
     auto* manager = GetViewPanelManager();
     if (!manager) throw std::runtime_error("Floating view panels unavailable");
     IViewPanel* candidate = nullptr;
     int candidateID = 0;
-    for (int i=1;i<=manager->GetNumFloatingViewPanels();++i) {
-        int index = manager->GetViewPanelIndexFromFloatingID(i);
-        auto* panel = index>=0 ? manager->GetViewPanel(index) : nullptr;
-        if (panel && !panel->IsViewPanelVisible() &&
-            !IsIconic(GetAncestor(panel->GetHWnd(),GA_ROOT)) && !GetPropW(panel->GetHWnd(),kOwner)) {
-            candidate = panel; candidateID = i; break;
+    bool reclaimed = false;
+    if (auto* owned=Panel()) {
+        if(View()) {
+            if(reclaimOnly) return false;
+            SetMinimized(startMinimized);
+            if(!startMinimized) Redraw();
+            return false;
+        }
+        if(!OwnedPanelReusable()) throw std::runtime_error("Agent viewport layout changed. Release it before opening a fresh one.");
+        candidate = owned; candidateID = floatingID; reclaimed = true;
+    } else {
+        const auto slots=FloatingSlots();
+        if (const auto* stale=FindReclaimable(slots)) {
+            candidate = stale->panel; candidateID = stale->id; reclaimed = true;
+            ForgetRestored(); // Ownership (kOwner) takes over from the load-time candidate.
+        } else if (reclaimOnly) {
+            ThrowNoPanel(slots,"No AGENT VIEWPORT to reclaim: no floating viewport is the tagged AGENT VIEWPORT "
+                "restored with the scene.");
+        } else {
+            for (const auto& slot:slots) {
+                if (!slot.visible && !slot.minimized && !slot.owned) {
+                    candidate = slot.panel; candidateID = slot.id; break;
+                }
+            }
+            if (!candidate) ThrowNoPanel(slots,"All floating viewports are in use; no user viewport was taken over.");
         }
     }
-    if (!candidate) throw std::runtime_error("All floating viewports are in use; no user viewport was taken over");
     RestoreActivation activation;
     Matrix3 seed; GetCOREInterface()->GetActiveViewExp().GetAffineTM(seed);
     bool perspective = GetCOREInterface()->GetActiveViewExp().IsPerspView()!=0;
@@ -653,6 +890,8 @@ void Open(const json& p) {
         floatingID = candidateID;
         panelWindow = candidate->GetHWnd();
         if (!SetPropW(panelWindow,kOwner,reinterpret_cast<HANDLE>(&floatingID))) throw std::runtime_error("Cannot reserve viewport ownership");
+        const MSTR currentName=candidate->GetViewPanelName();
+        if(wcscmp(currentName.data(),kWindowTitle)!=0) { previousPanelName=currentName; restoreName=true; }
         candidate->SetViewPanelName(MSTR(kWindowTitle));
         candidate->SetLayout(VP_LAYOUT_1);
         auto& view = candidate->GetViewExpByIndex(0);
@@ -696,19 +935,33 @@ void Open(const json& p) {
             if((IsIconic(top)!=FALSE)!=startMinimized)
                 throw std::runtime_error("Could not set AGENT VIEWPORT initial minimized state");
         }
+        WriteTag(floatingID);
     } catch (...) {
         Shutdown(); throw;
     }
     // Minimized Nitrous panels cannot produce trustworthy images. The caller
     // explicitly restores this panel before navigation or capture.
     if(!startMinimized) Redraw();
+    return reclaimed;
 }
 }
 
 ViewExp& Get() {
     RequireMainThread();
     auto* view = View();
-    if (!view) throw std::runtime_error("Agent viewport is unavailable or its layout changed; use agent_viewport open/release");
+    if (!view) {
+        // Also reached when a Hold/Fetch recreated our window (floatingID set,
+        // no panel): release would drop the tag, open takes the window back.
+        if (!Panel()) {
+            const auto slots=FloatingSlots();
+            if (const auto* stale=FindReclaimable(slots))
+                throw std::runtime_error("Agent viewport is not open; the stale AGENT VIEWPORT in Floating Viewport "+
+                    std::to_string(stale->id)+" (restored from a saved layout) is reclaimed by agent_viewport open");
+        } else if (OwnedPanelReusable()) {
+            throw std::runtime_error("Agent viewport was reset by a scene load; use agent_viewport open");
+        }
+        throw std::runtime_error("Agent viewport is unavailable or its layout changed; use agent_viewport open/release");
+    }
     const std::string state=WindowState();
     if(state=="minimized") throw std::runtime_error("AGENT VIEWPORT is minimized; use agent_viewport restore before navigation or capture");
     if(state=="hidden") throw std::runtime_error("AGENT VIEWPORT must remain visible for fresh Nitrous captures");
@@ -718,6 +971,8 @@ ViewExp& Get() {
     return *view;
 }
 bool IsOwned() { return floatingID!=0; }
+// GUP Start runs on the main thread, possibly before Max's main window exists.
+void WatchSceneLoads() { if(GetCOREInterface()->GetMAXHWnd()) RequireMainThread(); WatchLoads(); }
 CameraState SaveCamera() {
     auto& view=Get(); CameraState state;
     view.GetAffineTM(state.tm); state.target=orbitTarget; state.fov=view.GetFOV();
@@ -843,9 +1098,14 @@ void Configure(const json& p) {
 json Execute(const json& p) {
     RequireMainThread();
     if(!p.is_object()) throw std::runtime_error("Expected object payload");
+    // After a restart the first look decides which restored window is ours.
+    WatchLoads(); ObserveRestored(false);
     std::string action=p.value("action","status");
     if(action=="release") { Shutdown(); return {{"owned",false}}; }
-    if(action=="open") { Open(p); return Status(); }
+    if(action=="open" || action=="reclaim") {
+        const bool reclaimed=Open(p,action=="reclaim");
+        json out=Status(); out["reclaimed"]=reclaimed; return out;
+    }
     if(action=="status") return Status();
     if(action=="minimize" || action=="restore") {
         SetMinimized(action=="minimize");
@@ -976,6 +1236,18 @@ json Execute(const json& p) {
     return Snapshot();
 }
 void Shutdown(bool processExit) {
+    // Whether this process still holds the panel window. A Hold/Fetch that
+    // recreated the window leaves floatingID set without it; that restored
+    // window keeps the fetched scene's tag so a later open can reclaim it.
+    const bool held=Panel()!=nullptr;
+    if(processExit && watchingLoads) {
+        // The subclass procedure lives in this module: remove it before unload.
+        ForgetRestored();
+        UnRegisterNotification(SceneLoaded,nullptr,NOTIFY_FILE_POST_OPEN);
+        UnRegisterNotification(SceneLoaded,nullptr,NOTIFY_SYSTEM_POST_RESET);
+        UnRegisterNotification(SceneLoaded,nullptr,NOTIFY_SYSTEM_POST_NEW);
+        watchingLoads=false;
+    }
     if(View()) {
         HWND top=FloatingWindow();
         if(top && IsIconic(top)) ShowWindow(top,SW_SHOWNOACTIVATE);
@@ -1002,10 +1274,17 @@ void Shutdown(bool processExit) {
         // as a user-minimized viewport and each release leaks a usable panel.
         HWND top=FloatingWindow();
         if(top && IsIconic(top)) ShowWindow(top,SW_SHOWNOACTIVATE);
+        // A released panel is the user's again: give back its own name.
+        auto* panel=Panel();
+        if(panel && restoreName && !processExit && wcscmp(panel->GetViewPanelName().data(),kWindowTitle)==0)
+            panel->SetViewPanelName(previousPanelName);
         // Show/hide can dispatch Max window callbacks: re-resolve ownership.
         if(Panel()) GetViewPanelManager()->SetFloatingViewPanelVisibility(floatingID,false);
         if(Panel()) RemovePropW(panelWindow,kOwner);
     }
+    // At process exit the scene is going away; leave it untouched.
+    if(floatingID && held && !processExit) ClearTag(floatingID);
     floatingID=0; viewID=-1; panelWindow=nullptr; ++generation;
+    restoreName=false; previousPanelName=MSTR();
 }
 }

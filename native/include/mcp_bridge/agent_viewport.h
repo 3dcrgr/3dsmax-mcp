@@ -23,4 +23,7 @@ CameraState SaveCamera();
 void RestoreCamera(const CameraState& state);
 nlohmann::json Project(const nlohmann::json& points);
 void Shutdown(bool processExit=false);
+// Optional, from GUP Start: lets reclaim see the first scene load after a
+// restart too (otherwise loads are watched from the first agent_viewport call).
+void WatchSceneLoads();
 }

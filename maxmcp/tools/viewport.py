@@ -88,9 +88,14 @@ def agent_viewport(
 ) -> dict[str, Any]:
     """Own a shaded floating AGENT VIEWPORT without moving the user's view.
 
-    action: open | status | release | minimize | restore | frame | orbit | pan |
+    action: open | reclaim | status | release | minimize | restore | frame | orbit | pan |
     zoom | ray | pick | project | render | capture | stop_capture.
-    open reserves an unused floating panel once.
+    open reserves an unused floating panel once. The agent's panel is tagged in the
+    scene, so after a save/Hold/Fetch or restart open (or reclaim, which never takes
+    a free panel) takes back a restored AGENT VIEWPORT and reports reclaimed=true;
+    status reports reclaimable. Only the tagged window restored with the scene is
+    taken: untagged panels, or one the user closed and showed again, never are;
+    the error lists them (close a stale one, then open). release clears the tag.
     render requires mode=shaded|activeshade|vray_ipr|vray_vfb|corona_vfb. ActiveShade uses the assigned
     ActiveShade renderer; renderer_source=production uses the production renderer
     if it supports ActiveShade. vray_ipr uses the current V-Ray CPU/GPU renderer.
@@ -130,7 +135,7 @@ def agent_viewport(
     No scene selection, hiding, camera nodes, or geometry edits. Arbitrary-node
     isolation is not yet supported by this Nitrous panel.
     """
-    if action not in {"open","status","release","minimize","restore","frame","orbit","pan","zoom","ray","pick","project","render","capture","stop_capture"}:
+    if action not in {"open","reclaim","status","release","minimize","restore","frame","orbit","pan","zoom","ray","pick","project","render","capture","stop_capture"}:
         raise ValueError("Unknown agent viewport action")
     _capture_method(capture_method)
     if capture_method != "auto" and action not in {"capture", "stop_capture"}:

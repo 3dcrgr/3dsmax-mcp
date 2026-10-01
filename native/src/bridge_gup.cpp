@@ -194,6 +194,10 @@ DWORD MCPBridgeGUP::Start() {
     // filesystem done-signal at the real completion event (no polling).
     NativeHandlers::RegisterRenderNotifications();
 
+    // Watch scene loads from startup so a restored agent viewport is recognised
+    // on the first load after a restart (Hold/Fetch, file open).
+    try { AgentViewport::WatchSceneLoads(); } catch (...) {}
+
     return GUPRESULT_KEEP;
 }
 
