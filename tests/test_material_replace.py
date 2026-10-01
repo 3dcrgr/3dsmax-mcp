@@ -19,6 +19,17 @@ class ImportTargetTests(unittest.TestCase):
         repo = Path(__file__).resolve().parent.parent
         self.assertEqual(Path(mr.__file__).resolve(), repo / "maxmcp" / "tools" / "material_replace.py")
 
+
+class NativeRegistryTests(unittest.TestCase):
+    def test_replace_tools_are_in_native_registry(self):
+        # gen_tool_registry only scans each tool's own body for cmd_type.
+        from scripts.gen_tool_registry import extract_tools
+
+        tools = {t["name"]: t["cmdType"] for t in extract_tools(Path(mr.__file__))}
+        self.assertEqual(tools.get("replace_material"), "native:replace_material")
+        self.assertEqual(tools.get("batch_replace_materials"), "native:batch_replace_materials")
+
+
 HEBREW = "טיח לבן"
 PLASTER = "Plaster_White_Smooth_300cm #0"
 

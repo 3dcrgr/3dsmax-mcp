@@ -174,7 +174,15 @@ def replace_material(
             _add_warning(result, _no_match_warning([target_material], include_sub_materials))
         return result
 
-    raw = _replace_one(source_material, target_material, preview, include_sub_materials, source_from)
+    if client.native_available:
+        request = {"source_material": source_material, "target_material": target_material,
+                   "preview": preview, "include_sub_materials": include_sub_materials}
+        if source_from:
+            request["source_from"] = source_from
+        response = client.send_command(_json.dumps(request), cmd_type="native:replace_material")
+        raw = response.get("result", "{}")
+    else:
+        raw = _replace_one_maxscript(source_material, target_material, preview, include_sub_materials, source_from)
     return _postprocess(raw, transform)
 
 
@@ -376,17 +384,9 @@ def _replace_maxscript(source_material: str, target_material: str, preview: bool
     return "(\n" + header + _REPLACE_MAXSCRIPT_BODY + ")"
 
 
-def _replace_one(source_material: str, target_material: str, preview: bool,
-                 include_sub_materials: bool = True, source_from: str = "") -> str:
-    """Run one replacement (native or MAXScript) and return the raw result string."""
-    if client.native_available:
-        request = {"source_material": source_material, "target_material": target_material,
-                   "preview": preview, "include_sub_materials": include_sub_materials}
-        if source_from:
-            request["source_from"] = source_from
-        response = client.send_command(_json.dumps(request), cmd_type="native:replace_material")
-        return response.get("result", "{}")
-
+def _replace_one_maxscript(source_material: str, target_material: str, preview: bool,
+                           include_sub_materials: bool = True, source_from: str = "") -> str:
+    """Run one replacement through the MAXScript fallback and return the raw result string."""
     script = _replace_maxscript(source_material, target_material, preview, include_sub_materials, source_from)
     response = client.send_command(script)
     return response.get("result", "{}")
@@ -441,7 +441,7 @@ def batch_replace_materials(
         if not src or not tgt:
             results.append({"source": src, "target": tgt, "status": "skipped", "error": "missing source or target"})
             continue
-        raw = _replace_one(src, tgt, preview, include_sub_materials, entry_from)
+        raw = _replace_one_maxscript(src, tgt, preview, include_sub_materials, entry_from)
         try:
             r = _json.loads(raw)
         except _json.JSONDecodeError:
