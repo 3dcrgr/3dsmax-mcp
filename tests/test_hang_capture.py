@@ -466,7 +466,8 @@ class HintTests(unittest.TestCase):
                                            "'Chaos Cosmos Browser' not responding")):
             hint = self.hint(exc)
             self.assertEqual(hint["suggested_tools"][0], "capture_hang_diagnostics", exc)
-            self.assertIn("Do not end it", hint["message"])
+            self.assertIn("Wait up to ~10 min", hint["message"])
+            self.assertNotIn("Do not end it", hint["message"])
 
     def test_busy_is_not_a_hang(self):
         from maxmcp.max_client import MaxBusyError
