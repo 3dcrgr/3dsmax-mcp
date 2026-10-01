@@ -58,4 +58,6 @@ Fork issue #11. Commit `8330c2c`.
 - `release` restores the panel's previous name, and clears the tag only if this process held the window.
 - `status` reports `reclaimable`, the window and `next_action: "open"`, and errors name the stale window.
 
-**Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32. The rebuilt 2026 bridge with it (sha256 `1cf0f9d8…`) is staged for the next Max restart, and isn't in `native/bin/` yet. Unit tested in `tests/test_agent_viewport_reclaim.py`; not tested live yet.
+**Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32. The rebuilt 2026 bridge with it (sha256 `1cf0f9d8…`) was deployed on 2026-10-01, but isn't in `native/bin/` yet. Unit tested in `tests/test_agent_viewport_reclaim.py`.
+- **The first live test was inconclusive.** After the restart, `open` worked, but it couldn't reclaim the restored panel, because that Hold was written by the old bridge, which never tagged it. Closing the stale panel let agent captures work again.
+- A Hold taken with the new bridge is waiting for the next restart.

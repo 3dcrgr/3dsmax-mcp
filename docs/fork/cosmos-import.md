@@ -70,6 +70,10 @@ New result fields:
 **What changed.**
 - **Detection by handle, not by name.** The prepare step now also records the handles that already exist: every material instance and the 24 Material Editor slots, plus bitmaps and HDRI maps for HDRI imports. The polls and the confirming snapshot report anything whose handle wasn't there before, whatever it's called.
 - The existing matching (nodes tagged with the Cosmos ID, names) still runs. A snapshot without the handle list falls back to names.
+- **Other plugins' new items are kept apart** (`c88975e`). During one live import, Forest Pack regenerated its own materials, and about 200 existing maps were listed as created.
+  - Maps now count as created only if their handle is newer than a marker taken just before the scan.
+  - Materials the import didn't produce go to a separate `other_new_materials` list and never become the primary item. "Didn't produce" means: not on the asset's nodes, not matching its name, not in a Material Editor slot, and not a sub-material of one of those.
+  - When nothing can be tied to the import, for a material or a model asset, the old behaviour is kept, with a warning.
 - **New result fields.**
   - Each material carries `medit_slot` and `sub_material`.
   - `primary_material` or `primary_map` names the main item, and `primary_reason` says how it was chosen: `name`, `detected_during_import`, `top_level`, `medit_slot`, `only_new` or `first`.
@@ -84,7 +88,9 @@ New result fields:
 
 **What changed.**
 - **Before the import:** the prepare call records the active slot and its material. If that material is worth keeping, the lowest truly free slot becomes active, so the importer writes there instead.
-  - A slot counts as free only if it holds an untouched default material: named "NN - Default", no sub-materials or maps, used by no object, and every property equal to a fresh one.
+  - A slot counts as free only if its material is pristine: used by no object, no sub-materials or maps, and every property equal to a fresh one.
+  - Pristine slots with a default-style name come first: "NN - Default", or V-Ray's "Material #N" (`c88975e`; the first live test found only V-Ray slots, so nothing counted as free). If there are none, any pristine slot is used. A pristine material with its own name that gets replaced is kept alive too, and reported (`switched_over`, `moved_over`).
+  - The slot check runs before the baseline snapshot, so the materials it creates for comparison never show up as new.
   - The kept material is held by a MAXScript global meanwhile, so Max can't auto-delete it.
 - **After a quiet settle:** if a material was still displaced, the finalize call puts it back, moves the import to a free slot, and makes the original slot active again.
   - This only happens when no undo operation is open and the scene file hasn't changed.
@@ -96,7 +102,9 @@ New result fields:
   - `medit_slot_restored`;
   - `medit_slot` now reports where the import ended up.
 
-**Status.** Unit tested and deployed (Python) on 2026-10-01; not tested live yet.
+**Status.** Unit tested and deployed (Python) on 2026-10-01.
+- **The first live test (`c1e09a7`) was a partial pass.** The displaced material was kept alive, and the restore hint was right. But slots 16–24 held untouched V-Ray materials named "Material #16" to "Material #24", so no slot counted as free, and the import still landed in the user's active slot.
+- `c88975e` fixes that and was deployed the same day; it hasn't been retested live yet.
 
 ## How it was verified
 
