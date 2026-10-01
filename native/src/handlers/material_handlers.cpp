@@ -3,6 +3,7 @@
 #include "mcp_bridge/bridge_gup.h"
 
 #include <iparamb2.h>
+#include <map>
 #include <set>
 #include <vector>
 
@@ -598,6 +599,210 @@ std::string NativeHandlers::CreateShellMaterial(const std::string& params, MCPBr
     });
 }
 
+// ── replace_material / batch_replace_materials helpers ──────────
+// Source: the first material named `source` found, in this order, in node
+// materials, their sub-material trees, the Compact Material Editor slots, the
+// scene material library and the current material library.
+// Target: node materials named `target` (SetMtl) and, optionally, every
+// sub-material slot holding a material named `target` (SetSubMtl).
+namespace {
+
+constexpr int kReplaceMeditSlotCount = 24;
+constexpr const char* kReplaceSourceScope =
+    "(searched node materials, their sub-materials, Material Editor slots, "
+    "scene materials and the current material library)";
+
+std::string ReplaceMtlName(MtlBase* material) {
+    return material ? WideToUtf8(material->GetName().data()) : std::string();
+}
+
+// Calls visit(parent, slotIndex, subMaterial) for each non-null sub-material
+// slot. Each material is expanded once (guards cycles and shared sub-trees);
+// visit returns true to walk into that sub-material.
+template <typename Visit>
+void WalkSubMaterials(Mtl* parent, std::set<Mtl*>& expanded, Visit& visit) {
+    if (!parent || !expanded.insert(parent).second) return;
+    const int count = parent->NumSubMtls();
+    for (int i = 0; i < count; ++i) {
+        Mtl* sub = parent->GetSubMtl(i);
+        if (sub && visit(parent, i, sub)) WalkSubMaterials(sub, expanded, visit);
+    }
+}
+
+// Distinct node materials in scene order.
+std::vector<Mtl*> UniqueNodeMaterials(const std::vector<INode*>& nodes) {
+    std::vector<Mtl*> roots;
+    std::set<Mtl*> seen;
+    for (INode* node : nodes) {
+        Mtl* material = node->GetMtl();
+        if (material && seen.insert(material).second) roots.push_back(material);
+    }
+    return roots;
+}
+
+struct ReplaceSource {
+    Mtl* mtl = nullptr;
+    const char* foundIn = "";
+    size_t candidates = 0;  // distinct Mtl instances carrying the name
+};
+
+ReplaceSource FindReplaceSource(const std::string& name, const std::vector<Mtl*>& roots, Interface* ip) {
+    ReplaceSource out;
+    std::set<Mtl*> distinct;
+    auto consider = [&](Mtl* material, const char* where) {
+        if (!material || ReplaceMtlName(material) != name || !distinct.insert(material).second) return;
+        if (!out.mtl) {
+            out.mtl = material;
+            out.foundIn = where;
+        }
+    };
+    auto considerBase = [&](MtlBase* material, const char* where) {
+        if (material && material->SuperClassID() == MATERIAL_CLASS_ID)
+            consider(static_cast<Mtl*>(material), where);
+    };
+    auto scanLibrary = [&](MtlBaseLib* library, const char* where) {
+        if (!library) return;
+        for (int i = 0; i < library->Count(); ++i) considerBase((*library)[i], where);
+    };
+
+    for (Mtl* root : roots) consider(root, "node");
+    std::set<Mtl*> expanded;
+    auto visitSub = [&](Mtl*, int, Mtl* sub) -> bool {
+        consider(sub, "sub_material");
+        return true;
+    };
+    for (Mtl* root : roots) WalkSubMaterials(root, expanded, visitSub);
+    for (int slot = 0; slot < kReplaceMeditSlotCount; ++slot)
+        considerBase(ip->GetMtlSlot(slot), "material_editor");
+    scanLibrary(ip->GetSceneMtls(), "scene_materials");
+    scanLibrary(&ip->GetMaterialLibrary(), "material_library");
+
+    out.candidates = distinct.size();
+    return out;
+}
+
+void AddReplaceSourceInfo(json& result, const ReplaceSource& source) {
+    result["source_exists"] = source.mtl != nullptr;
+    if (source.mtl) result["source_found_in"] = source.foundIn;
+    if (source.candidates > 1) {
+        result["source_ambiguous"] = true;
+        result["source_candidates"] = source.candidates;
+    }
+}
+
+struct ReplaceSlotRef {
+    Mtl* parent;
+    int index;  // 0-based SDK index
+};
+
+struct ReplacePlan {
+    std::vector<INode*> nodes;
+    std::vector<ReplaceSlotRef> slots;
+};
+
+ReplacePlan PlanReplacement(const std::string& target, Mtl* source, bool includeSubs,
+                            const std::vector<INode*>& nodes, const std::vector<Mtl*>& roots) {
+    ReplacePlan plan;
+    std::map<Mtl*, bool> rootIsTarget;
+    for (Mtl* root : roots) rootIsTarget[root] = ReplaceMtlName(root) == target;
+    for (INode* node : nodes) {
+        Mtl* material = node->GetMtl();
+        if (material && material != source && rootIsTarget[material]) plan.nodes.push_back(node);
+    }
+    if (!includeSubs) return plan;
+
+    // A target-named material is replaced as a whole, so its own sub-tree is
+    // never walked. Each parent is expanded once even when many nodes share it.
+    std::set<Mtl*> expanded;
+    auto visit = [&](Mtl* parent, int index, Mtl* sub) -> bool {
+        if (ReplaceMtlName(sub) != target) return true;
+        if (sub != source) plan.slots.push_back({parent, index});
+        return false;
+    };
+    for (Mtl* root : roots) {
+        if (!rootIsTarget[root]) WalkSubMaterials(root, expanded, visit);
+    }
+    return plan;
+}
+
+bool SubMaterialTreeContains(Mtl* root, Mtl* wanted) {
+    if (root == wanted) return true;
+    bool found = false;
+    std::set<Mtl*> expanded;
+    auto visit = [&](Mtl*, int, Mtl* sub) -> bool {
+        if (sub == wanted) found = true;
+        return !found;
+    };
+    WalkSubMaterials(root, expanded, visit);
+    return found;
+}
+
+// Why parent->SetSubMtl(i, source) must be skipped, or nullptr when it is safe.
+const char* ReplaceLoopReason(Mtl* source, Mtl* parent) {
+    if (!source) return nullptr;
+    if (parent == source) return "parent_is_source";
+    if (SubMaterialTreeContains(source, parent)) return "source_contains_parent";
+    // Catches loops through non sub-material references (e.g. a map that
+    // references the parent). REF_SUCCEED means the reference is safe.
+    if (source->TestForLoop(FOREVER, parent) != REF_SUCCEED) return "reference_loop";
+    return nullptr;
+}
+
+json ReplaceSlotJson(Mtl* parent, int index) {
+    MSTR label = parent->GetSubMtlSlotName(index, false);
+    return {
+        {"parent_material", ReplaceMtlName(parent)},
+        {"parent_class", MaxScriptVisibleClassName(parent)},
+        {"slot_index", index + 1},
+        {"slot_name", label.data() ? WideToUtf8(label.data()) : std::string()},
+    };
+}
+
+struct ReplaceOutcome {
+    std::vector<INode*> nodes;
+    json slots = json::array();
+    json skipped = json::array();
+};
+
+// Plans against the current scene, then (unless preview) applies slots first
+// and node assignments second. Slots that would loop are reported, not set.
+ReplaceOutcome RunReplacement(const std::string& target, Mtl* source, bool includeSubs, bool preview,
+                              const std::vector<INode*>& nodes) {
+    const std::vector<Mtl*> roots = UniqueNodeMaterials(nodes);
+    ReplacePlan plan = PlanReplacement(target, source, includeSubs, nodes, roots);
+    ReplaceOutcome out;
+    out.nodes = plan.nodes;
+    // Setting a slot to the source never makes the source depend on that
+    // parent, so one loop test per parent holds for all of its slots.
+    std::map<Mtl*, const char*> loopReasons;
+    for (const ReplaceSlotRef& slot : plan.slots) {
+        json entry = ReplaceSlotJson(slot.parent, slot.index);
+        auto cached = loopReasons.find(slot.parent);
+        if (cached == loopReasons.end())
+            cached = loopReasons.emplace(slot.parent, ReplaceLoopReason(source, slot.parent)).first;
+        if (const char* reason = cached->second) {
+            entry["reason"] = reason;
+            out.skipped.push_back(entry);
+            continue;
+        }
+        if (!preview) {
+            slot.parent->SetSubMtl(slot.index, source);
+            if (slot.parent->GetSubMtl(slot.index) != source) {
+                entry["reason"] = "set_failed";
+                out.skipped.push_back(entry);
+                continue;
+            }
+        }
+        out.slots.push_back(entry);
+    }
+    if (!preview) {
+        for (INode* node : plan.nodes) node->SetMtl(source);
+    }
+    return out;
+}
+
+}  // namespace
+
 // ── native:replace_material ─────────────────────────────────────
 std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridgeGUP* gup) {
     return gup->GetExecutor().ExecuteSync([&]() -> std::string {
@@ -605,93 +810,63 @@ std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridge
         std::string sourceName = p.value("source_material", "");
         std::string targetName = p.value("target_material", "");
         bool preview = p.value("preview", false);
+        bool includeSubs = p.value("include_sub_materials", true);
 
         if (sourceName.empty() || targetName.empty())
             throw std::runtime_error("source_material and target_material are required");
 
         Interface* ip = GetCOREInterface();
-        INode* root = ip->GetRootNode();
         std::vector<INode*> all;
-        CollectNodes(root, all);
+        CollectNodes(ip->GetRootNode(), all);
 
-        // Find source and target material instances by scanning all nodes
-        Mtl* sourceMtl = nullptr;
-        Mtl* targetMtl = nullptr;
-        std::vector<INode*> affectedNodes;
+        // Preview reports the target side even without a source.
+        ReplaceSource source = FindReplaceSource(sourceName, UniqueNodeMaterials(all), ip);
+        if (!source.mtl && !preview)
+            throw std::runtime_error("Source material '" + sourceName + "' not found " + kReplaceSourceScope);
 
-        for (INode* node : all) {
-            Mtl* mtl = node->GetMtl();
-            if (!mtl) continue;
-            std::string mtlName = WideToUtf8(mtl->GetName().data());
-            if (mtlName == sourceName) sourceMtl = mtl;
-            if (mtlName == targetName) {
-                targetMtl = mtl;
-                affectedNodes.push_back(node);
-            }
-        }
+        ReplaceOutcome outcome = RunReplacement(targetName, source.mtl, includeSubs, preview, all);
 
-        if (!sourceMtl)
-            throw std::runtime_error("Source material '" + sourceName + "' not found in scene");
-
-        json affectedList = json::array();
-        for (INode* n : affectedNodes) {
-            affectedList.push_back(WideToUtf8(n->GetName()));
-        }
-
-        if (preview) {
-            json result;
-            result["source_material"] = sourceName;
-            result["target_material"] = targetName;
-            result["affected_count"] = (int)affectedNodes.size();
-            result["affected_objects"] = affectedList;
-            result["preview"] = true;
-            return result.dump();
-        }
-
-        // Replace: assign source material to all objects that had target
-        for (INode* n : affectedNodes) {
-            n->SetMtl(sourceMtl);
-        }
-
-        ip->RedrawViews(ip->GetTime());
+        json objects = json::array();
+        for (INode* n : outcome.nodes) objects.push_back(WideToUtf8(n->GetName()));
+        const std::string verb = preview ? "affected" : "replaced";
 
         json result;
         result["source_material"] = sourceName;
         result["target_material"] = targetName;
-        result["replaced_count"] = (int)affectedNodes.size();
-        result["replaced_objects"] = affectedList;
-        result["status"] = "replaced";
+        AddReplaceSourceInfo(result, source);
+        result["include_sub_materials"] = includeSubs;
+        result[verb + "_count"] = (int)outcome.nodes.size();
+        result[verb + "_objects"] = objects;
+        result[verb + "_slot_count"] = (int)outcome.slots.size();
+        result[verb + "_slots"] = outcome.slots;
+        result["skipped"] = outcome.skipped;
+        if (preview) {
+            result["preview"] = true;
+        } else {
+            ip->RedrawViews(ip->GetTime());
+            result["status"] = "replaced";
+        }
         return result.dump();
     });
 }
 
 // ── native:batch_replace_materials ──────────────────────────────
+// Entries run in order; each sees the scene as left by the previous ones.
 std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCPBridgeGUP* gup) {
     return gup->GetExecutor().ExecuteSync([&]() -> std::string {
         json p = json::parse(params);
         auto replacements = p.contains("replacements") && !p["replacements"].is_null()
                             ? p["replacements"] : json::array();
         bool preview = p.value("preview", false) || p.value("dry_run", false);
+        bool includeSubs = p.value("include_sub_materials", true);
 
         Interface* ip = GetCOREInterface();
-        INode* root = ip->GetRootNode();
         std::vector<INode*> all;
-        CollectNodes(root, all);
-
-        // Build material name -> Mtl* map and name -> nodes map
-        std::map<std::string, Mtl*> mtlMap;
-        std::map<std::string, std::vector<INode*>> mtlNodes;
-
-        for (INode* node : all) {
-            Mtl* mtl = node->GetMtl();
-            if (!mtl) continue;
-            std::string name = WideToUtf8(mtl->GetName().data());
-            mtlMap[name] = mtl;
-            mtlNodes[name].push_back(node);
-        }
+        CollectNodes(ip->GetRootNode(), all);
 
         json results = json::array();
         int totalReplaced = 0;
+        int totalSlots = 0;
 
         for (const auto& rep : replacements) {
             std::string src = rep.value("source", rep.value("source_material", ""));
@@ -708,34 +883,30 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
                 continue;
             }
 
-            auto srcIt = mtlMap.find(src);
-            if (srcIt == mtlMap.end()) {
+            ReplaceSource source = FindReplaceSource(src, UniqueNodeMaterials(all), ip);
+            if (!source.mtl) {
+                entry["source_exists"] = false;
                 entry["status"] = "error";
                 entry["error"] = "source material not found";
                 results.push_back(entry);
                 continue;
             }
 
-            auto tgtIt = mtlNodes.find(tgt);
-            if (tgtIt == mtlNodes.end() || tgtIt->second.empty()) {
-                entry["replaced_count"] = 0;
-                entry["status"] = preview ? "preview" : "no_objects";
-                results.push_back(entry);
-                continue;
-            }
-
+            ReplaceOutcome outcome = RunReplacement(tgt, source.mtl, includeSubs, preview, all);
             json objects = json::array();
-            for (INode* n : tgtIt->second) {
-                objects.push_back(NodeIdentityJson(n));
-                if (!preview) {
-                    n->SetMtl(srcIt->second);
-                }
-            }
+            for (INode* n : outcome.nodes) objects.push_back(NodeIdentityJson(n));
+            const int nodeCount = (int)outcome.nodes.size();
+            const int slotCount = (int)outcome.slots.size();
 
-            entry["replaced_count"] = (int)tgtIt->second.size();
+            AddReplaceSourceInfo(entry, source);
+            entry["replaced_count"] = nodeCount;
             entry["replaced_objects"] = objects;
-            entry["status"] = preview ? "preview" : "replaced";
-            totalReplaced += (int)tgtIt->second.size();
+            entry["replaced_slot_count"] = slotCount;
+            entry["replaced_slots"] = outcome.slots;
+            entry["skipped"] = outcome.skipped;
+            entry["status"] = preview ? "preview" : (nodeCount + slotCount > 0 ? "replaced" : "no_objects");
+            totalReplaced += nodeCount;
+            totalSlots += slotCount;
             results.push_back(entry);
         }
 
@@ -746,6 +917,8 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
         json result;
         result["results"] = results;
         result["total_replaced"] = totalReplaced;
+        result["total_replaced_slots"] = totalSlots;
+        result["include_sub_materials"] = includeSubs;
         result["preview"] = preview;
         result["dry_run"] = p.value("dry_run", false);
         return result.dump();
