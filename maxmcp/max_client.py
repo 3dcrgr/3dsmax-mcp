@@ -6,9 +6,13 @@ import re
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from uuid import uuid4
+
+from .process_health import describe as describe_process
+from .process_health import diagnose_process, process_start_time, quick_hung_check
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -19,6 +23,32 @@ MCP_PIPE_ENV = "MCP_MAX_PIPE"
 
 class RequestOutcomeUnknown(Exception):
     """The request reached Max but its response was lost; never replay it."""
+
+
+class MaxHealthError(Exception):
+    """Max cannot take a request right now; carries code/retryable/details."""
+
+    code = "MAX_BUSY"
+    retryable = True
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
+
+class MaxBusyError(MaxHealthError):
+    """Max is occupied (pipe held or main thread busy); the request did not run, so it may be retried."""
+
+
+class MaxNotRespondingError(MaxHealthError):
+    """Max is hung or gone. Raised before sending unless it is also RequestOutcomeUnknown."""
+
+    code = "MAX_NOT_RESPONDING"
+    retryable = False
+
+
+class MaxNotRespondingAfterDispatch(MaxNotRespondingError, RequestOutcomeUnknown):
+    """Max stopped responding after the request was written; never replay it."""
 
 
 # Win32 constants for named pipe
@@ -73,7 +103,25 @@ _kernel32.PeekNamedPipe.argtypes = [
 ]
 _kernel32.CloseHandle.restype = wintypes.BOOL
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.GetNamedPipeServerProcessId.restype = wintypes.BOOL
+_kernel32.GetNamedPipeServerProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG)]
 _INVALID_HANDLE = wintypes.HANDLE(-1).value
+
+INSTANCE_LOCK_TIMEOUT = 10.0
+_POLL_MIN_S = 0.002
+_POLL_MAX_S = 0.05
+_REDIAGNOSE_S = 15.0
+_BLOCKED_CONFIRM_S = 20.0
+_CPU_SAMPLE_S = 1.0
+_RECHECK_SAMPLE_S = 0.25
+# Read-only probes: safe to drop at their deadline instead of waiting out a hung Max.
+_PROBE_CMD_TYPES = frozenset({"ping"})
+# Native ExecuteSync cancels work the main thread never started after 120 s.
+_QUEUE_TIMEOUT_MARKER = "main thread execution timed out"
+
+
+def _grace(timeout: float) -> float:
+    return max(10.0, 0.1 * timeout)
 
 
 class AmbiguousMaxInstanceError(ConnectionError):
@@ -112,6 +160,8 @@ class MaxClient:
         self._control_channel = False
         self._pinned_pipe_name: str | None = None
         self._bound_target: dict[str, Any] | None = None
+        self._inflight: dict[str, Any] | None = None
+        self._hung_pids: dict[int, dict[str, Any]] = {}
         env_pipe = os.environ.get(MCP_PIPE_ENV)
         env_pid = os.environ.get("MCP_MAX_PID")
         if env_pid and (not env_pid.isdecimal() or int(env_pid) <= 0):
@@ -216,7 +266,7 @@ class MaxClient:
         return target["target_pipe"]
 
     def list_max_instances(self) -> dict[str, Any]:
-        with self._pipe_lock:
+        with self._instance_lock():
             default = self._default_target()
             instances = self._live_instances()
             instances.sort(key=lambda item: item["pipe"] != default["target_pipe"])
@@ -225,7 +275,7 @@ class MaxClient:
                                   for item in instances]}
 
     def get_selected_max_instance(self) -> dict[str, Any]:
-        with self._pipe_lock:
+        with self._instance_lock():
             target = self._bound_target or (self._target(self._startup_pipe, self._startup_source) if self._startup_pipe else None)
             if target is None:
                 return {"target_pid": None, "target_pipe": None, "target_source": None, "pinned": False, "available": False}
@@ -235,7 +285,7 @@ class MaxClient:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             raise ValueError("pid must be a positive process ID")
         pipe = fr"\\.\pipe\3dsmax-mcp-pid-{pid}"
-        with self._pipe_lock:
+        with self._instance_lock():
             if not self._probe_pipe_available(pipe):
                 raise ConnectionError(f"3ds Max PID {pid} is unavailable; selection was not changed")
             self._close_pipe_handle()
@@ -244,12 +294,106 @@ class MaxClient:
             return {**self._bound_target, "available": True}
 
     def release_max_instance(self) -> dict[str, Any]:
-        with self._pipe_lock:
+        with self._instance_lock():
             self._close_pipe_handle()
             self._selected_pipe_name = None
             self._bound_target = None
             self._startup_pipe = None
             return {"target_pid": None, "target_pipe": None, "target_source": None, "pinned": False}
+
+    # ── Hang diagnosis ───────────────────────────────────────────
+    @contextmanager
+    def _instance_lock(self, timeout: float | None = None) -> Iterator[None]:
+        timeout = INSTANCE_LOCK_TIMEOUT if timeout is None else timeout
+        if not self._pipe_lock.acquire(timeout=max(0.001, timeout)):
+            raise self._busy_error(timeout)
+        try:
+            yield
+        finally:
+            self._pipe_lock.release()
+
+    def _inflight_snapshot(self) -> dict[str, Any] | None:
+        inflight = self._inflight
+        if not inflight:
+            return None
+        snapshot = {k: v for k, v in inflight.items() if k != "started"}
+        snapshot["running_s"] = round(time.perf_counter() - inflight["started"], 1)
+        return snapshot
+
+    @staticmethod
+    def _pid_for_pipe(pipe_name: str | None, handle: Any = None) -> int | None:
+        match = re.search(r"-pid-(\d+)$", pipe_name or "")
+        if match:
+            return int(match[1])
+        if handle in (None, 0, _INVALID_HANDLE):
+            return None
+        pid = wintypes.ULONG()
+        try:
+            if _kernel32.GetNamedPipeServerProcessId(handle, ctypes.byref(pid)) and pid.value:
+                return int(pid.value)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _label(pid: int | None, pipe: str | None = None) -> str:
+        return f"3ds Max (PID {pid})" if pid else f"3ds Max ({pipe or 'unknown pipe'})"
+
+    def _busy_error(self, waited: float) -> MaxHealthError:
+        """Build the error for a pipe lock that stayed held for ``waited`` seconds."""
+        inflight = self._inflight_snapshot()
+        pid = (inflight or {}).get("target_pid") or (self._bound_target or {}).get("target_pid")
+        process = diagnose_process(pid, _CPU_SAMPLE_S) if pid else None
+        state = (process or {}).get("state")
+        details = {"inflight": inflight, "process": process, "waited_s": round(waited, 1), "request_sent": False}
+        label = self._label(pid, (inflight or {}).get("target_pipe"))
+        running = (f"request '{inflight['cmd_type']}' has been running for {inflight['running_s']:.0f} s"
+                   if inflight else "another call holds the connection")
+        limit = (inflight or {}).get("timeout_s")
+        overdue = limit is not None and inflight["running_s"] >= limit + _grace(limit)
+        # One sample is not enough to call a healthy-but-stalled op hung; only an overdue request is.
+        if state == "exited" or (state == "blocked" and overdue):
+            what = ("Max has exited." if state == "exited"
+                    else "Max is blocked (deadlock or stalled I/O).")
+            return MaxNotRespondingError(
+                f"{label} is not responding: {describe_process(process)}, {running}. {what} "
+                "Nothing was sent. Do not retry yet. Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+                details,
+            )
+        evidence = f" ({describe_process(process)})" if process else ""
+        advice = ("Max may be blocked; call get_bridge_status again shortly to confirm." if state == "blocked"
+                  else "Retry later, or call get_bridge_status to check whether Max is responding.")
+        return MaxBusyError(
+            f"{label} is still busy with another request{evidence}: {running}; waited {waited:.0f} s. "
+            f"Nothing was sent. {advice}",
+            details,
+        )
+
+    def _remember_hung(self, pid: int, process: dict[str, Any], inflight: dict[str, Any] | None,
+                       source: str) -> None:
+        self._hung_pids[pid] = {"state": process.get("state"), "process": process, "inflight": inflight,
+                                "source": source, "started": process_start_time(pid)}
+
+    def _check_known_hung(self, pid: int | None, pipe_name: str) -> None:
+        """Fail fast (nothing sent) while a PID previously judged not responding is still blocked."""
+        verdict = self._hung_pids.get(pid) if pid else None
+        if verdict is None:
+            return
+        if verdict.get("started") != process_start_time(pid) or quick_hung_check(pid) is not True:
+            self._hung_pids.pop(pid, None)  # PID reused/gone, or the window pumps messages again
+            return
+        process = diagnose_process(pid, _RECHECK_SAMPLE_S)
+        if process.get("state") != "blocked":
+            self._hung_pids.pop(pid, None)
+            return
+        why = ("an earlier request was abandoned" if verdict.get("source") == "abandoned"
+               else "the bridge cancelled an earlier request its main thread never picked up")
+        raise MaxNotRespondingError(
+            f"{self._label(pid, pipe_name)} is still not responding ({describe_process(process)}; {why}). "
+            "Nothing was sent. Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+            {"inflight": None, "process": process, "previous": verdict.get("inflight"),
+             "previous_process": verdict.get("process"), "request_sent": False},
+        )
 
     def _probe_pipe_available(self, pipe_name: str | None = None) -> bool:
         """Best-effort probe that treats a busy pipe as available."""
@@ -394,15 +538,15 @@ class MaxClient:
 
         if self.transport == "pipe":
             transport_used = "namedpipe"
-            response_data = self._send_via_pipe(request, effective_timeout)
+            response_data = self._send_via_pipe(request, effective_timeout, cmd_type=cmd_type, request_id=request_id)
         elif self.transport == "tcp":
             transport_used = "tcp"
             response_data = self._send_via_tcp(request, effective_timeout)
         else:
             try:
                 transport_used = "namedpipe"
-                response_data = self._send_via_pipe(request, effective_timeout)
-            except AmbiguousMaxInstanceError:
+                response_data = self._send_via_pipe(request, effective_timeout, cmd_type=cmd_type, request_id=request_id)
+            except (AmbiguousMaxInstanceError, MaxBusyError, MaxNotRespondingError):
                 raise
             except (ConnectionError, TimeoutError) as exc:
                 if self._bound_target or self._startup_pipe or self._pinned_pipe_name:
@@ -436,20 +580,34 @@ class MaxClient:
         return response
 
     # ── Named Pipe transport ─────────────────────────────────────
-    def _send_via_pipe(self, request: str, timeout: float) -> bytes:
+    def _send_via_pipe(
+        self,
+        request: str,
+        timeout: float,
+        *,
+        cmd_type: str | None = None,
+        request_id: str | None = None,
+    ) -> bytes:
         deadline = time.perf_counter() + timeout
         data = (request + "\n").encode("utf-8")
-        with self._pipe_lock:
+        if not self._pipe_lock.acquire(timeout=max(0.001, timeout)):
+            raise self._busy_error(timeout)
+        try:
             pipe_name = self._resolve_pipe_name()
             if self._selected_pipe_name != pipe_name:
                 self._close_pipe_handle()
                 self._selected_pipe_name = pipe_name
+            self._check_known_hung(self._pid_for_pipe(pipe_name), pipe_name)
 
             for attempt in range(2):
                 handle = self._ensure_pipe_handle(deadline, pipe_name)
+                pid = self._pid_for_pipe(pipe_name, handle)
+                self._check_known_hung(pid, pipe_name)
                 if self._bound_target is None:
                     self._bound_target = getattr(self._local, "route_candidate", None) or self._target(pipe_name, "default")
                 self._local.request_target = dict(self._bound_target)
+                self._inflight = {"cmd_type": cmd_type, "request_id": request_id, "target_pipe": pipe_name,
+                                  "target_pid": pid, "timeout_s": timeout, "started": time.perf_counter()}
                 try:
                     total_written = 0
                     while total_written < len(data):
@@ -474,39 +632,12 @@ class MaxClient:
                                 "Pipe write returned 0 bytes written."
                             )
 
-                    response_data = bytearray()
-                    buf = ctypes.create_string_buffer(65536)
-                    while True:
-                        if time.perf_counter() >= deadline:
-                            self._close_pipe_handle()
-                            raise RequestOutcomeUnknown(
-                                f"Timed out waiting for named pipe response after "
-                                f"{timeout}s. The request may have committed; inspect before retrying."
-                            )
-
-                        bytes_read = wintypes.DWORD()
-                        ok = _kernel32.ReadFile(
-                            handle, buf, len(buf), ctypes.byref(bytes_read), None
-                        )
-                        if bytes_read.value > 0:
-                            response_data.extend(buf.raw[:bytes_read.value])
-                            if b"\n" in response_data:
-                                return bytes(response_data)
-
-                        if not ok:
-                            err = ctypes.get_last_error()
-                            if err == _ERROR_BROKEN_PIPE:
-                                raise BrokenPipeError(
-                                    "Pipe closed while reading response."
-                                )
-                            raise ConnectionError(
-                                f"Failed reading from pipe: Win32 error {err}"
-                            )
-
-                        if bytes_read.value == 0:
-                            raise BrokenPipeError(
-                                "Pipe closed before response terminator."
-                            )
+                    reply = self._read_pipe_response(handle, deadline, timeout, pid,
+                                                     probe=cmd_type in _PROBE_CMD_TYPES)
+                    if pid:
+                        self._hung_pids.pop(pid, None)  # Max answered, so any old verdict is stale
+                    self._check_queue_timeout(reply, pid)
+                    return reply
                 except BrokenPipeError:
                     self._close_pipe_handle()
                     if total_written:
@@ -521,6 +652,161 @@ class MaxClient:
                     if attempt == 0 and time.perf_counter() < deadline:
                         continue
                     raise
+                finally:
+                    self._inflight = None
+        finally:
+            self._pipe_lock.release()
+
+    def _read_pipe_response(self, handle: Any, deadline: float, timeout: float, pid: int | None,
+                            probe: bool = False) -> bytes:
+        """Poll for the newline-terminated reply without ever blocking in ReadFile.
+
+        Past the deadline (+ grace) the target is diagnosed: healthy long work keeps
+        waiting so its real result still arrives; an exited or confirmed-blocked Max
+        is abandoned with MaxNotRespondingAfterDispatch. A read-only probe is dropped
+        at its deadline.
+        """
+        response_data = bytearray()
+        buf = ctypes.create_string_buffer(65536)
+        delay = _POLL_MIN_S
+        next_check = deadline if probe else deadline + _grace(timeout)
+        blocked_since: float | None = None
+        while True:
+            available = wintypes.DWORD()
+            if not _kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+                err = ctypes.get_last_error()
+                if err == _ERROR_BROKEN_PIPE:
+                    raise BrokenPipeError(
+                        "Pipe closed before response terminator."
+                        if response_data else "Pipe closed while reading response."
+                    )
+                raise ConnectionError(f"Failed reading from pipe: Win32 error {err}")
+
+            if available.value:
+                bytes_read = wintypes.DWORD()
+                ok = _kernel32.ReadFile(
+                    handle, buf, min(available.value, len(buf)), ctypes.byref(bytes_read), None
+                )
+                if bytes_read.value > 0:
+                    response_data.extend(buf.raw[:bytes_read.value])
+                    if b"\n" in response_data:
+                        return bytes(response_data)
+                if not ok:
+                    err = ctypes.get_last_error()
+                    if err == _ERROR_BROKEN_PIPE:
+                        raise BrokenPipeError("Pipe closed while reading response.")
+                    raise ConnectionError(f"Failed reading from pipe: Win32 error {err}")
+                if bytes_read.value == 0:
+                    raise BrokenPipeError("Pipe closed before response terminator.")
+                delay = _POLL_MIN_S
+                continue
+
+            now = time.perf_counter()
+            if now >= next_check:
+                if probe:
+                    self._abandon_probe(pid, timeout)
+                if not pid:
+                    next_check = now + _REDIAGNOSE_S
+                    continue
+                process = diagnose_process(pid, _CPU_SAMPLE_S)
+                state = process.get("state")
+                now = time.perf_counter()
+                if state == "exited" or (state == "blocked" and blocked_since is not None
+                                         and now - blocked_since >= _BLOCKED_CONFIRM_S):
+                    self._abandon_request(pid, process, blocked_since)
+                if state == "blocked":
+                    if blocked_since is None:
+                        blocked_since = now
+                    next_check = now + _BLOCKED_CONFIRM_S
+                else:
+                    blocked_since = None
+                    next_check = now + _REDIAGNOSE_S
+                continue
+
+            time.sleep(delay)
+            delay = min(delay * 2, _POLL_MAX_S)
+
+    def _abandon_request(self, pid: int, process: dict[str, Any], blocked_since: float | None) -> None:
+        """Close the pipe and raise MaxNotRespondingAfterDispatch (never replay)."""
+        inflight = self._inflight_snapshot()
+        self._close_pipe_handle()
+        details = {"inflight": inflight, "process": process, "request_sent": True}
+        running = (f"request '{inflight['cmd_type']}' running for {inflight['running_s']:.0f} s"
+                   if inflight else "request in flight")
+        if process.get("state") == "exited":
+            raise MaxNotRespondingAfterDispatch(
+                f"{self._label(pid)} is not responding: {describe_process(process)} while {running}. "
+                "The request may have partly committed before Max exited; do not replay it blindly. "
+                "Ask the user to restart Max, then inspect the scene.",
+                details,
+            )
+        details["blocked_for_s"] = round(time.perf_counter() - blocked_since, 1) if blocked_since else None
+        self._remember_hung(pid, process, inflight, "abandoned")
+        raise MaxNotRespondingAfterDispatch(
+            f"{self._label(pid)} is not responding: {describe_process(process)}, {running}. "
+            "Max is blocked (deadlock or stalled I/O). Do not replay this request. "
+            "Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+            details,
+        )
+
+    def _abandon_probe(self, pid: int | None, timeout: float) -> None:
+        """Drop a read-only probe that missed its deadline (safe: it changes nothing)."""
+        process = diagnose_process(pid, _CPU_SAMPLE_S) if pid else None
+        inflight = self._inflight_snapshot()
+        self._close_pipe_handle()
+        state = (process or {}).get("state")
+        details = {"inflight": inflight, "process": process, "request_sent": True}
+        label = self._label(pid, (inflight or {}).get("target_pipe"))
+        probe = f"'{(inflight or {}).get('cmd_type') or 'probe'}'"
+        if state in ("blocked", "exited"):
+            what = "Max has exited." if state == "exited" else "Max is blocked (deadlock or stalled I/O)."
+            raise MaxNotRespondingError(
+                f"{label} is not responding: {describe_process(process)}; {probe} got no answer within "
+                f"{timeout:g} s. {what} The probe was dropped (it changes nothing). "
+                "Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+                details,
+            )
+        evidence = f" ({describe_process(process)})" if process else ""
+        raise MaxBusyError(
+            f"{label} did not answer {probe} within {timeout:g} s{evidence}: its main thread is busy. "
+            "The probe was dropped (it changes nothing). Retry later.",
+            details,
+        )
+
+    def _check_queue_timeout(self, reply: bytes, pid: int | None) -> None:
+        """Explain a native queue timeout: the main thread never started the request in 120 s."""
+        if not pid or _QUEUE_TIMEOUT_MARKER.encode() not in reply.lower():
+            return
+        try:
+            response = json.loads(reply.decode("utf-8-sig", errors="replace"))
+        except ValueError:
+            return
+        if (not isinstance(response, dict) or response.get("success", False)
+                or _QUEUE_TIMEOUT_MARKER not in str(response.get("error", "")).lower()):
+            return
+        process = diagnose_process(pid, _CPU_SAMPLE_S)
+        state = process.get("state")
+        if state not in ("blocked", "busy", "exited"):
+            return
+        inflight = self._inflight_snapshot()
+        details = {"inflight": inflight, "process": process, "request_sent": True, "executed": False,
+                   "bridge_error": str(response.get("error"))}
+        what = (f"Its main thread never picked up request '{(inflight or {}).get('cmd_type')}', "
+                "so the bridge cancelled it before it ran.")
+        if state == "busy":
+            raise MaxBusyError(
+                f"{self._label(pid)} is busy: {describe_process(process)}. {what} "
+                "Retry later, or call get_bridge_status to check whether Max is responding.",
+                details,
+            )
+        if state == "blocked":
+            self._remember_hung(pid, process, inflight, "queue_timeout")
+        cause = "Max has exited." if state == "exited" else "Max is blocked (deadlock or stalled I/O)."
+        raise MaxNotRespondingError(
+            f"{self._label(pid)} is not responding: {describe_process(process)}. {what} {cause} "
+            "Do not retry yet. Stalls like this have cleared on their own after 5-8 min (V-Ray/Cosmos): wait, re-check with get_bridge_status, and end the process only as a last resort (unsaved work is lost).",
+            details,
+        )
 
     # ── TCP transport (legacy) ───────────────────────────────────
     def _send_via_tcp(self, request: str, timeout: float) -> bytes:

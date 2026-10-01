@@ -406,7 +406,18 @@ def max_assistant() -> str:
 
 
 def main():
+    from .parent_watchdog import start_parent_watchdog
+
+    start_parent_watchdog()
     mcp.run(transport="stdio")
+    # Client closed stdin: exit even if non-daemon threads linger.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:
+            pass
+    os._exit(0)
 
 
 if __name__ == "__main__":

@@ -111,6 +111,7 @@ Debugging:
 - Multi/Sub: `set_sub_material`
 - Textures: `create_texture_map`, `set_texture_map_properties`
 - Dual pipeline: `create_shell_material`, `replace_material`, `batch_replace_materials`
+  - Direction: `source_material` = material to apply (already on an object), `target_material` = material being replaced; top-level node materials only. `status: "no_match"` means no object uses the target: check the direction before retrying. To apply an unassigned material use `assign_material`.
 - OSL: `write_osl_shader`
 
 ### Material notes

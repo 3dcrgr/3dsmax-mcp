@@ -30,6 +30,8 @@ class ErrorCode(str, Enum):
     BRIDGE_DOWN = "BRIDGE_DOWN"
     RENDER_BUSY = "RENDER_BUSY"
     USER_BUSY = "USER_BUSY"
+    MAX_BUSY = "MAX_BUSY"
+    MAX_NOT_RESPONDING = "MAX_NOT_RESPONDING"
     SAFE_MODE = "SAFE_MODE"
     BAD_PARAM = "BAD_PARAM"
     BAD_NODE_REF = "BAD_NODE_REF"
@@ -74,6 +76,7 @@ _ERROR_PREFIXES = (
 _ERROR_SUBSTRINGS = (" not found:",)
 _RETRYABLE_CODES = {
     ErrorCode.BRIDGE_DOWN,
+    ErrorCode.MAX_BUSY,
     ErrorCode.RENDER_BUSY,
     ErrorCode.USER_BUSY,
     ErrorCode.SCENE_CONFLICT,
@@ -284,6 +287,10 @@ def _classify_error_code(message: str, error_type: str = "") -> ErrorCode:
     lowered = f"{error_type} {message}".lower()
     if "safe mode" in lowered:
         return ErrorCode.SAFE_MODE
+    if "is not responding" in lowered:
+        return ErrorCode.MAX_NOT_RESPONDING
+    if "busy with another request" in lowered:
+        return ErrorCode.MAX_BUSY
     if (
         "named pipe" in lowered
         or "connection refused" in lowered
@@ -406,6 +413,7 @@ def _error_from_exception(exc: BaseException) -> dict[str, Any]:
         error_type=exc.__class__.__name__, message=str(exc),
         code=getattr(exc, "code", None),
         retryable=getattr(exc, "retryable", None),
+        details=getattr(exc, "details", None) or None,
     )
 
 
