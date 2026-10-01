@@ -77,8 +77,12 @@ static bool IsTabParam(ParamType2 t) {
     return (((int)t & TYPE_TAB) != 0);
 }
 
+static bool HasScriptName(const ParamDef& pd) {
+    return pd.int_name && pd.int_name[0] != 0;
+}
+
 static std::string ParamName(const ParamDef& pd, ParamID pid) {
-    return pd.int_name ? WideToUtf8(pd.int_name) : ("param_" + std::to_string(pid));
+    return HasScriptName(pd) ? WideToUtf8(pd.int_name) : ("param_" + std::to_string(pid));
 }
 
 static std::string ClassName(MtlBase* base) {
@@ -605,6 +609,16 @@ static bool CollectPB2Values(MtlBase* base, const std::string& nodeId, InspectCo
             std::string name = ParamName(pd, pid);
             int baseType = BaseParamType(pd.type);
             int count = IsTabParam(pd.type) ? std::max(0, pb->Count(pid)) : 1;
+
+            // Unnamed params are internal and hidden from MAXScript; never treat them
+            // as file sources. (Cosmos VRayBitmaps keep a package-relative copy of the
+            // texture path in one, which surfaced as a bogus FILE_MISSING row.)
+            if (!HasScriptName(pd) &&
+                (baseType == TYPE_BITMAP || baseType == TYPE_STRING || baseType == TYPE_FILENAME)) {
+                if (ctx.includeValues && !IsTabParam(pd.type) && baseType != TYPE_BITMAP)
+                    values[name] = ReadScalarValue(pb, pid, pd.type, ctx.time);
+                continue;
+            }
 
             if (baseType == TYPE_BITMAP) {
                 fileParams = true;
