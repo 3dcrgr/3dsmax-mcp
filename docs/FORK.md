@@ -22,6 +22,8 @@ The worst of these problems hung Max and lost unsaved work. Everything here is m
 | Crashed clients leave `maxmcp.server` processes connected to Max | The server exits with its client; the bridge reports connected clients | [hung-max.md](fork/hung-max.md#orphaned-servers-6-6e9188b) | Verified live (partly) |
 | `replace_material` "replaces" nothing and reports success | Direction documented, `no_match` warning, sub-material slots matched, sources found outside the scene | [replace-material.md](fork/replace-material.md) | Partly verified live |
 | Revit (Autodesk Bitmap) texture paths read as empty | Read bitmap-asset parameters; flag unreadable paths | [autodesk-bitmap-paths.md](fork/autodesk-bitmap-paths.md) | Verified live |
+| `execute_maxscript` calls an interrupted script (e.g. `quitMax`) a "parse error" | Re-compile to tell syntax errors from interruptions; new code `MAXSCRIPT_INTERRUPTED` | [smaller-fixes.md](fork/smaller-fixes.md) | Unit tested |
+| Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Unit tested |
 
 "Verified live" means the fix was exercised in a real Max 2026 session, against the scene that showed the problem, on 2026-10-01. The details pages say exactly what was and wasn't tested.
 

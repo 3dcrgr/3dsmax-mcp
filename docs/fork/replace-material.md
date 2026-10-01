@@ -1,6 +1,6 @@
 # `replace_material` that "replaced" nothing
 
-Fork issue #3. Commits `6e9188b` and `305909c`.
+Fork issue #3. Commits `6e9188b` and `9f520ba`.
 
 ## What happened
 
@@ -20,11 +20,11 @@ Three other limitations made the tool fail quietly on real scenes:
 
 **The direction is documented** (`6e9188b`). Both docstrings say: source = the material to apply, target = the material to replace. The skill guide says the same.
 
-**Nothing matched → `no_match`** (`6e9188b`, refined in `305909c`).
+**Nothing matched → `no_match`** (`6e9188b`, refined in `9f520ba`).
 - When no object *and* no sub-material slot matched, the result is `status: "no_match"` plus a warning. The warning explains the direction and where the source can come from.
 - Batch entries behave the same way.
 
-**Sub-material slots are matched** (`305909c`). The new parameter `include_sub_materials` defaults to `true`.
+**Sub-material slots are matched** (`9f520ba`). The new parameter `include_sub_materials` defaults to `true`.
 - Every Multi/Sub-Object slot, or any other material's sub-material slot, that holds a material named `target_material` gets the source.
 - A material shared by many objects is changed once.
 - A material named like the target is replaced as a whole, and isn't searched inside.
@@ -34,7 +34,7 @@ Three other limitations made the tool fail quietly on real scenes:
   - `reference_loop`, from the SDK's `TestForLoop`;
   - `set_failed`, when a plugin material ignored the change.
 
-**The source is found outside the scene** (`305909c`). The search runs in this order:
+**The source is found outside the scene** (`9f520ba`). The search runs in this order:
 1. object materials;
 2. their sub-materials;
 3. the 24 Material Editor slots;
@@ -84,7 +84,7 @@ replace_material(source_material="Plaster", target_material="Cosmos_Plaster")   
 - **The direction docs and `no_match`** (`6e9188b`) were verified live on 2026-10-01.
   - `replace_material(source="Glass", target="NoSuchMaterial_xyz", preview=True)` returned `no_match` with the direction warning.
   - The correct direction still listed the affected objects.
-- **Sub-material matching, the source search and the loop guard** (`305909c`) are unit-tested on the Python side only (`tests/test_material_replace.py`, 14 new cases). The native handler compiles cleanly, but it hasn't been run in Max yet.
+- **Sub-material matching, the source search and the loop guard** (`9f520ba`) are unit-tested on the Python side only (`tests/test_material_replace.py`, 14 new cases). The native handler compiles cleanly, but it hasn't been run in Max yet.
   - The live test plan includes Multi/Sub, nested Multi/Sub, a source that's only in the Material Editor, the loop guard, Hebrew names, batch, and plugin parents such as VRayBlendMtl and Shell_Material.
   - One check matters most: a normal Multi/Sub replacement must not be reported as `reference_loop`. If it is, the meaning of the SDK's `TestForLoop` result is inverted.
 

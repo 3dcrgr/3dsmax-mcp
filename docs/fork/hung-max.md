@@ -1,6 +1,6 @@
 # When 3ds Max hangs: a diagnosis instead of timeouts
 
-Fork issues #4 and #6, and the executor shutdown fix. Commits `25ac1ed`, `6e9188b`, `f8d4e6f`, `5409b3d` and `9685b52`.
+Fork issues #4 and #6, and the executor shutdown fix. Commits `25ac1ed`, `6e9188b`, `f8d4e6f`, `d971a56`, `91c8662`, `1dab496` and `5466a32`.
 
 ## What happened
 
@@ -34,29 +34,33 @@ Error codes:
 | `MAX_NOT_RESPONDING` | Max is hung or has exited. `request_sent` says whether the request reached Max before it was abandoned. | No. Wait, then check with `get_bridge_status`. Never replay a request that was sent. |
 | `IMPORT_SETTLING` | A native import (Cosmos) left a Max window hung. The request was not sent. | Yes, after Max settles. |
 
-### Bridge health from a pipe thread (`f8d4e6f`)
+### Bridge health from a pipe thread (`f8d4e6f`, reviewed in `d971a56`)
 
 The native bridge now answers a `health` command on the pipe thread that received it. It never posts to the main thread and never touches the scene, so it answers while Max is hung. The reply contains:
 
 | Field | Meaning |
 |---|---|
-| `mainThread.state` | `responsive`; `busy_mcp` (a bridge request is executing on the main thread); `busy_other` (the main thread stopped pumping messages and no bridge work is running, e.g. a render, a script run from the UI, a plugin, or a deadlock); `not_initialized`; `shutting_down` |
-| `mainThread.heartbeatAgeMs` | Age of the last 1 s `WM_TIMER` heartbeat on the executor's hidden window. Windows only generates `WM_TIMER` when the thread's queue is otherwise empty, so an age above about 3 s means the main thread isn't pumping. |
+| `mainThread.state` | `responsive`; `busy_mcp` (a bridge request is executing on the main thread); `busy_other` (the main thread stopped pumping messages and no bridge work is running, e.g. a render, a script run from the UI, a plugin, or a deadlock); `unknown` (no heartbeat is available; callers fall back to `ping`); `not_initialized`; `shutting_down` |
+| `mainThread.heartbeatAgeMs` | Age of the last heartbeat. Every second, a thread-pool timer posts one beat message to the executor's hidden window (at most one is outstanding), and the main thread records the time when it picks it up. Posted messages are taken in turn with the bridge's own work, so an age above about 3 s means the main thread isn't pumping. The first version used `WM_TIMER`, but Windows starves `WM_TIMER` under steady posted traffic, which made a pumping main thread look stalled. The review caught this. |
 | `mainThread.windowHung` | `IsHungAppWindow` on the executor window |
-| `executor.running` | The running request's command type and how long it has run |
-| `executor.queued`, `oldestQueuedMs`, `oldestQueuedCmd` | Work waiting for the main thread |
-| `clients.connected`, `clients.inflight[]` | Connected pipe clients (this also covers #6) and each client's request: client id, `requestId`, command type, elapsed time. The count includes the client asking. |
+| `executor.running` | The running request's command type, client id, `requestId`, and how long it has run |
+| `executor.queued`, `oldestQueuedMs`, `oldestQueuedCmd` | Work waiting for the main thread, with the oldest item's ids |
+| `clients.connected`, `clients.inflight[]` | Connected pipe clients (this also covers #6) and each client's request: client id, `requestId`, command type, elapsed time. Nested probes that the bridge dispatches itself are flagged `internal`. The count includes the client asking. |
 
 `get_bridge_status` asks for `health` first, over the control channel, so another request's pipe lock can't delay it:
 
-- **Main thread responsive:** the usual `ping` follows, and the result gains a compact `health` block.
-- **`busy_mcp` or `busy_other`:** it returns `pong: false` at once, without queueing a `ping` behind the main thread. It says who holds the main thread: this server's request (matched by `requestId`), another MCP client's request, or work outside the bridge. CPU is sampled only when the main thread isn't pumping. The result is called `not_responding` only after the main thread has been idle in a wait for 20 s or more, and then it points to `capture_hang_diagnostics`.
+- **Main thread responsive, or `unknown`:** the usual `ping` follows. The result gains a compact `health` block.
+- **`busy_mcp` for at least 2 s, or `busy_other`:** it returns `pong: false` at once, without queueing a `ping` behind the main thread.
+  - It says who holds the main thread: this server's request, another MCP client's request, or work outside the bridge. The holder is matched by `requestId` and client id, so it's never guessed from the command type. A request this server already abandoned is still recognised as its own.
+  - CPU is sampled only when the main thread isn't pumping.
+  - The result is called `not_responding` only after the main thread has been idle in a wait for 20 s or more. Then it points to `capture_hang_diagnostics`.
+- **A Cosmos import settle guard is active:** `IMPORT_SETTLING` wins over everything else.
 - **Not even the pipe threads answer:** the probe's own busy/hung verdict is returned, instead of waiting out a second timeout.
-- **Bridges older than this fork:** they answer `health` with "Unknown command type" at once, and `get_bridge_status` falls back to `ping` as before.
+- **TCP transport, or a bridge older than this fork:** `health` is skipped, or answered with "Unknown command type" at once. `get_bridge_status` then falls back to `ping` as before.
 
 ### `capture_hang_diagnostics`
 
-Commits `5409b3d` and `9685b52`.
+Commits `91c8662`, `1dab496` and `5466a32`.
 
 Timeouts tell you *that* Max is stuck, not *where*. During the Cosmos investigation ([cosmos-import.md](cosmos-import.md)), a small script that walked native thread stacks with `dbghelp` attributed both hangs within minutes, with no debugger installed. That script is now part of the package.
 
