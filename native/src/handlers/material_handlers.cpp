@@ -602,7 +602,8 @@ std::string NativeHandlers::CreateShellMaterial(const std::string& params, MCPBr
 // ── replace_material / batch_replace_materials helpers ──────────
 // Source: the first material named `source` found, in this order, in node
 // materials, their sub-material trees, the Compact Material Editor slots, the
-// scene material library and the current material library.
+// scene material library and the current material library; source_from limits
+// the search to one of those places.
 // Target: node materials named `target` (SetMtl) and, optionally, every
 // sub-material slot holding a material named `target` (SetSubMtl).
 namespace {
@@ -646,10 +647,32 @@ struct ReplaceSource {
     size_t candidates = 0;  // distinct Mtl instances carrying the name
 };
 
-ReplaceSource FindReplaceSource(const std::string& name, const std::vector<Mtl*>& roots, Interface* ip) {
+// Valid source_from values; empty means "search every place in order".
+bool IsReplaceSourcePlace(const std::string& place) {
+    return place.empty() || place == "node" || place == "sub_material" || place == "material_editor" ||
+           place == "scene_materials" || place == "material_library";
+}
+
+std::string ReadReplaceSourceFrom(const json& p, const std::string& fallback) {
+    std::string from = fallback;
+    // json::is_string() collides with the MAXScript is_string macro.
+    if (p.contains("source_from") && p["source_from"].type() == json::value_t::string)
+        from = p["source_from"].get<std::string>();
+    else if (p.contains("source_from") && !p["source_from"].is_null())
+        throw std::runtime_error("source_from must be a string");
+    if (!IsReplaceSourcePlace(from))
+        throw std::runtime_error("source_from must be one of node, sub_material, material_editor, "
+                                 "scene_materials, material_library (got '" + from + "')");
+    return from;
+}
+
+// `from` restricts the search to one place (candidates are then counted there only).
+ReplaceSource FindReplaceSource(const std::string& name, const std::vector<Mtl*>& roots, Interface* ip,
+                                const std::string& from) {
     ReplaceSource out;
     std::set<Mtl*> distinct;
     auto consider = [&](Mtl* material, const char* where) {
+        if (!from.empty() && from != where) return;
         if (!material || ReplaceMtlName(material) != name || !distinct.insert(material).second) return;
         if (!out.mtl) {
             out.mtl = material;
@@ -811,6 +834,7 @@ std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridge
         std::string targetName = p.value("target_material", "");
         bool preview = p.value("preview", false);
         bool includeSubs = p.value("include_sub_materials", true);
+        const std::string sourceFrom = ReadReplaceSourceFrom(p, "");
 
         if (sourceName.empty() || targetName.empty())
             throw std::runtime_error("source_material and target_material are required");
@@ -820,9 +844,11 @@ std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridge
         CollectNodes(ip->GetRootNode(), all);
 
         // Preview reports the target side even without a source.
-        ReplaceSource source = FindReplaceSource(sourceName, UniqueNodeMaterials(all), ip);
+        ReplaceSource source = FindReplaceSource(sourceName, UniqueNodeMaterials(all), ip, sourceFrom);
         if (!source.mtl && !preview)
-            throw std::runtime_error("Source material '" + sourceName + "' not found " + kReplaceSourceScope);
+            throw std::runtime_error("Source material '" + sourceName + "' not found " +
+                                     (sourceFrom.empty() ? std::string(kReplaceSourceScope)
+                                                         : "(searched only source_from=" + sourceFrom + ")"));
 
         ReplaceOutcome outcome = RunReplacement(targetName, source.mtl, includeSubs, preview, all);
 
@@ -833,6 +859,7 @@ std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridge
         json result;
         result["source_material"] = sourceName;
         result["target_material"] = targetName;
+        if (!sourceFrom.empty()) result["source_from"] = sourceFrom;
         AddReplaceSourceInfo(result, source);
         result["include_sub_materials"] = includeSubs;
         result[verb + "_count"] = (int)outcome.nodes.size();
@@ -844,7 +871,8 @@ std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridge
             result["preview"] = true;
         } else {
             ip->RedrawViews(ip->GetTime());
-            result["status"] = "replaced";
+            const bool blocked = outcome.nodes.empty() && outcome.slots.empty() && !outcome.skipped.empty();
+            result["status"] = blocked ? "blocked" : "replaced";
         }
         return result.dump();
     });
@@ -859,6 +887,7 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
                             ? p["replacements"] : json::array();
         bool preview = p.value("preview", false) || p.value("dry_run", false);
         bool includeSubs = p.value("include_sub_materials", true);
+        const std::string defaultFrom = ReadReplaceSourceFrom(p, "");
 
         Interface* ip = GetCOREInterface();
         std::vector<INode*> all;
@@ -883,7 +912,18 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
                 continue;
             }
 
-            ReplaceSource source = FindReplaceSource(src, UniqueNodeMaterials(all), ip);
+            std::string sourceFrom = defaultFrom;
+            try {
+                sourceFrom = ReadReplaceSourceFrom(rep, defaultFrom);
+            } catch (const std::exception& e) {
+                entry["status"] = "error";
+                entry["error"] = e.what();
+                results.push_back(entry);
+                continue;
+            }
+            if (!sourceFrom.empty()) entry["source_from"] = sourceFrom;
+
+            ReplaceSource source = FindReplaceSource(src, UniqueNodeMaterials(all), ip, sourceFrom);
             if (!source.mtl) {
                 entry["source_exists"] = false;
                 entry["status"] = "error";
@@ -904,7 +944,12 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
             entry["replaced_slot_count"] = slotCount;
             entry["replaced_slots"] = outcome.slots;
             entry["skipped"] = outcome.skipped;
-            entry["status"] = preview ? "preview" : (nodeCount + slotCount > 0 ? "replaced" : "no_objects");
+            // "blocked": the target was found but every match was skipped (loop
+            // guard / set_failed), so source and target are not reversed.
+            entry["status"] = preview ? "preview"
+                              : nodeCount + slotCount > 0 ? "replaced"
+                              : !outcome.skipped.empty()  ? "blocked"
+                                                          : "no_objects";
             totalReplaced += nodeCount;
             totalSlots += slotCount;
             results.push_back(entry);
