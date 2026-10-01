@@ -48,7 +48,10 @@ def cosmos_import(
 ) -> dict:
     """Download if needed and import one Cosmos asset into the selected Max instance.
     Returns imported nodes, materials or maps and their file checks; selection is
-    preserved. A pending download makes no scene edit. Repeating a completed model
+    preserved. New materials/maps are found by handle whatever their name (created means
+    new since the import started, not proven to come from it): primary_material (or
+    primary_map) is the main one, primary_reason says how it was picked, note says when
+    its name differs from the asset's. A pending download makes no scene edit. Repeating a completed model
     import creates another instance; if completion is unknown, inspect before retrying.
     First opens the Cosmos browser on Max's main thread (a hidden browser on another
     thread stalled/deadlocked Max); state browser_hung means nothing was imported: follow next.

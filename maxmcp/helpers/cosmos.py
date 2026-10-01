@@ -187,36 +187,79 @@ def download(client, package_id, wait_seconds, renderer):
 # across all animatables, plus texture maps) or a light poll (nodes by
 # cosmosAssetId, the 24 Material Editor slots, maps only for HDRIs) used while
 # the native importer is still working on Max's main thread.
+# __RECORD__ (pre-dispatch only) also returns the handles of every material (and,
+# for HDRIs, bitmap/HDRI map) seen as "known". Later scans get those handles back
+# (sorted, __KNOWN_*__) and also report any material/map NOT among them, whatever
+# its name: package materials are often named differently from the asset.
 _ASSET_SNAPSHOT = r"""(
  fn compactName value = (
   (dotNetClass "System.Text.RegularExpressions.Regex").Replace (toLower(value as string)) "[^a-z0-9]" ""
  )
  local key="__KEY__"
  local aid="__ASSET__"
+ local record=__RECORD__
+ local recordMaps=__RECORD_MAPS__
+ local knownMats=__KNOWN_MATS__
+ local knownMaps=__KNOWN_MAPS__
+ local diffMats=__DIFF_MATS__
+ local diffMaps=__DIFF_MAPS__
  fn matchesName value key = ((findString (compactName value) key)!=undefined)
+ fn handleOf value = ((getHandleByAnim value) as integer64)
+ fn isKnown h known = (
+  local lo=1, hi=known.count, found=false
+  while not found and lo<=hi do (
+   local mid=(lo+hi)/2
+   if known[mid]==h then found=true else if known[mid]<h then lo=mid+1 else hi=mid-1
+  )
+  found
+ )
+ fn isNew value known diff = (diff and (try(not (isKnown (handleOf value) known))catch(false)))
+ fn remember value known = (try(append known (handleOf value))catch())
+ fn slotOf value = (
+  local s=0
+  try(for i=1 to meditMaterials.count while s==0 do if meditMaterials[i]==value do s=i)catch()
+  s
+ )
  fn fileOf value = (
   local f=try(value.filename as string)catch("")
   if f=="" do f=try(value.HDRIMapName as string)catch("")
   f
  )
  fn quoteJSON value = ("\"" + (MCP_Server.escapeJsonString(value as string)) + "\"")
- fn refJSON value isNode = (
-  local h=if isNode then value.handle as string else (getHandleByAnim value) as string
-  "{\"handle\":"+(quoteJSON h)+",\"name\":"+(quoteJSON(try(value.name)catch("")))+",\"class\":"+(quoteJSON(classof value))+",\"filename\":"+(quoteJSON(fileOf value))+"}"
+ fn refJSON value isNode slot:undefined isSub:false = (
+  local h=if isNode then value.handle as string else formattedPrint (handleOf value) format:"d"
+  "{\"handle\":"+(quoteJSON h)+",\"name\":"+(quoteJSON(try(value.name)catch("")))+",\"class\":"+(quoteJSON(classof value))+",\"filename\":"+(quoteJSON(fileOf value))+(if slot==undefined then "" else ",\"slot\":"+(slot as string))+(if isSub then ",\"sub\":true" else "")+"}"
+ )
+ fn collectSubs value subs depth = (
+  if depth<12 do for i=1 to (try(getNumSubMtls value)catch(0)) do (
+   local s=try(getSubMtl value i)catch(undefined)
+   if s!=undefined and findItem subs s==0 do (append subs s; collectSubs s subs (depth+1))
+  )
  )
  fn joinJSON values = (
   local s="["
   for i=1 to values.count do (if i>1 do s+=","; s+=values[i])
   s+"]"
  )
+ fn joinHandles values = (
+  local ss=stringStream ""
+  for i=1 to values.count do (if i>1 do format "," to:ss; format "%" (formattedPrint values[i] format:"d") to:ss)
+  "["+(ss as string)+"]"
+ )
  local nodes=for n in objects where (try(n.cosmosAssetId==aid)catch(false)) collect n
  local mats=#()
  for n in nodes where n.material!=undefined do appendIfUnique mats n.material
  try(
-  for m in meditMaterials where m!=undefined and (matchesName m.name key) do appendIfUnique mats m
+  for m in meditMaterials where m!=undefined do (
+   if record do remember m knownMats
+   if (matchesName m.name key) or (isNew m knownMats diffMats) do appendIfUnique mats m
+  )
  )catch()
  for c in __MAT_CLASSES__ do try(
-  for m in (getClassInstances c processAllAnimatables:true) where (matchesName m.name key) do appendIfUnique mats m
+  for m in (getClassInstances c processAllAnimatables:true) do (
+   if record do remember m knownMats
+   if (matchesName m.name key) or (isNew m knownMats diffMats) do appendIfUnique mats m
+  )
  )catch()
  local maps=#()
  fn visitMaps value maps visited depth = (
@@ -231,10 +274,16 @@ _ASSET_SNAPSHOT = r"""(
  if __SCAN_MAPS__ do (
   for m in mats do visitMaps m maps visited 0
   for c in textureMap.classes where (matchPattern (c as string) pattern:"*bitmap*" or matchPattern (c as string) pattern:"*hdri*") do try(
-   for m in (getClassInstances c processAllAnimatables:true) where ((matchesName m.name key) or (matchesName (fileOf m) key)) do appendIfUnique maps m
+   for m in (getClassInstances c processAllAnimatables:true) do (
+    if recordMaps do remember m knownMaps
+    if (matchesName m.name key) or (matchesName (fileOf m) key) or (isNew m knownMaps diffMaps) do appendIfUnique maps m
+   )
   )catch()
  )
- "{\"nodes\":"+(joinJSON(for n in nodes collect(refJSON n true)))+",\"materials\":"+(joinJSON(for m in mats collect(refJSON m false)))+",\"maps\":"+(joinJSON(for m in maps collect(refJSON m false)))+"}"
+ local knownJSON=if record then (",\"known\":{\"materials\":"+(joinHandles knownMats)+",\"maps\":"+(if recordMaps then joinHandles knownMaps else "null")+"}") else ""
+ local subs=#()
+ for m in mats do collectSubs m subs 0
+ "{\"nodes\":"+(joinJSON(for n in nodes collect(refJSON n true)))+",\"materials\":"+(joinJSON(for m in mats collect(refJSON m false slot:(slotOf m) isSub:((findItem subs m)>0))))+",\"maps\":"+(joinJSON(for m in maps collect(refJSON m false)))+knownJSON+"}"
 )"""
 
 _RENDERER_MATERIAL_CLASSES = (
@@ -242,25 +291,56 @@ _RENDERER_MATERIAL_CLASSES = (
     'or (c as string)=="Multimaterial") collect c)')
 
 
-def _snapshot_script(asset, light=False, renderer="", scan_classes=False):
+def _handle_ints(values):
+    out = set()
+    for value in values or ():
+        try:
+            out.add(int(value))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _mxs_handles(values):
+    """Sorted MAXScript Integer64 array for isKnown's binary search (same type as handleOf)."""
+    return "#(" + ",".join("%dL" % h for h in sorted(values)) + ")"
+
+
+def _snapshot_script(asset, light=False, renderer="", scan_classes=False, known=None, record=False):
+    """known: the pre-dispatch "known" handles; materials/maps outside it are reported
+    whatever their name (a light poll diffs only the asset's own resource kind).
+    record: return those handles instead (the pre-dispatch snapshot)."""
     # Match this asset only. Do not snapshot unrelated scene/material metadata.
     key = _compact(asset["name"])
     if len(key) < 4:
         raise CosmosError("Asset has no usable identity for import verification.")
     classes, scan_maps = "material.classes", "true"
+    diff_kinds = ("materials", "maps")
     if light:
         prefix = "Corona" if _compact(renderer).startswith("corona") else "VRay"
         classes = (_RENDERER_MATERIAL_CLASSES.replace("__PREFIX__", prefix)
                    if scan_classes and asset["kind"] == "material" else "#()")
         scan_maps = "true" if asset["kind"] == "hdri" else "false"
+        diff_kinds = (_EXPECTED.get(asset["kind"]),)
+    known = {} if record else (known or {})
+    diff = {kind: kind in diff_kinds and known.get(kind) is not None for kind in ("materials", "maps")}
     return (_ASSET_SNAPSHOT.replace("__KEY__", key).replace("__ASSET__", normalize_id(asset["id"]))
-            .replace("__MAT_CLASSES__", classes).replace("__SCAN_MAPS__", scan_maps))
+            .replace("__MAT_CLASSES__", classes).replace("__SCAN_MAPS__", scan_maps)
+            .replace("__RECORD__", "true" if record else "false")
+            .replace("__RECORD_MAPS__", "true" if record and asset["kind"] == "hdri" else "false")
+            .replace("__KNOWN_MATS__", _mxs_handles(_handle_ints(known.get("materials")) if diff["materials"] else ()))
+            .replace("__KNOWN_MAPS__", _mxs_handles(_handle_ints(known.get("maps")) if diff["maps"] else ()))
+            .replace("__DIFF_MATS__", "true" if diff["materials"] else "false")
+            .replace("__DIFF_MAPS__", "true" if diff["maps"] else "false"))
 
 
-def _asset_snapshot(client, asset, light=False, renderer="", scan_classes=False, timeout=None, probe=False):
+def _asset_snapshot(client, asset, light=False, renderer="", scan_classes=False, timeout=None, probe=False,
+                    known=None):
     """Full scan by default. light=True checks nodes, Material Editor slots and
-    (for HDRIs) maps; scan_classes adds the renderer's own material classes."""
-    return _max(client, _snapshot_script(asset, light, renderer, scan_classes), timeout=timeout, probe=probe)
+    (for HDRIs) maps; scan_classes adds the renderer's own material classes.
+    known (the pre-dispatch handles) also reports new materials/maps by handle."""
+    return _max(client, _snapshot_script(asset, light, renderer, scan_classes, known), timeout=timeout,
+                probe=probe)
 
 
 # Run later only when the Material Editor is closed: restoring re-renders its
@@ -388,7 +468,7 @@ def _open_browser_script(renderer):
 
 def _prepare_script(asset, swap=True):
     return (_PREPARE.replace("__SWAP__", _MEDIT_SWAP if swap else _MEDIT_LEFTOVER)
-            .replace("__SNAPSHOT__", _snapshot_script(asset)).replace("__EDITOR_OPEN__", _EDITOR_OPEN))
+            .replace("__SNAPSHOT__", _snapshot_script(asset, record=True)).replace("__EDITOR_OPEN__", _EDITOR_OPEN))
 
 
 def _finalize_script(handles, restore_medit):
@@ -562,12 +642,13 @@ def _wait_import(client, asset, before, renderer, pid, timeout=_DETECT_TIMEOUT_S
     No poll is sent while Max's main window is hung or not answering; the loop
     waits instead. Polls are dropped at their deadline; the first dropped poll
     ends detection (error in the result) so requests never pile up on Max.
+    A material or map counts by handle (absent before dispatch), whatever its name.
     """
     expected = _EXPECTED.get(asset["kind"])
     timing = {"detected": False, "after_s": 0.0, "polls": 0, "skipped_hung": 0, "probe": None}
     if not expected:
         return timing
-    old = {item["handle"] for item in before.get(expected, [])}
+    old = _known(before, expected)
     started = time.monotonic()
     interval = 0.5
     while True:
@@ -582,7 +663,7 @@ def _wait_import(client, asset, before, renderer, pid, timeout=_DETECT_TIMEOUT_S
                 # Renderer material classes every other poll after ~4 s (Slate mode misses slots).
                 probe = _asset_snapshot(client, asset, light=True, renderer=renderer,
                                         scan_classes=elapsed >= 4 and timing["polls"] % 2 == 0,
-                                        timeout=_POLL_TIMEOUT_S, probe=True)
+                                        timeout=_POLL_TIMEOUT_S, probe=True, known=before.get("known"))
             except (MaxHealthError, RequestOutcomeUnknown) as exc:
                 timing["error"] = exc
                 timing["after_s"] = round(time.monotonic() - started, 1)
@@ -624,14 +705,25 @@ def _guard_windows(pid, settle):
     return windows
 
 
+def _known(before, kind):
+    """Handles that existed before dispatch: the reported items plus the recorded handle set."""
+    handles = {str(x["handle"]) for x in before.get(kind, [])}
+    handles.update(str(h) for h in (before.get("known") or {}).get(kind) or ())
+    return handles
+
+
 def _resources(before, after):
     resources = {}
     for kind in ("nodes", "materials", "maps"):
-        old = {x["handle"] for x in before.get(kind, [])}
+        old = _known(before, kind)
         resources[kind] = []
         for item in after.get(kind, []):
             item = dict(item)
-            item["created"] = item["handle"] not in old
+            item["created"] = str(item["handle"]) not in old
+            slot, sub = item.pop("slot", None), item.pop("sub", False)
+            if kind == "materials":
+                item["medit_slot"] = slot or None
+                item["sub_material"] = bool(sub)  # a sub-material of another listed material
             if kind == "nodes":
                 item["node_ref"] = {"handle": int(item["handle"]), "name": item["name"]}
             filename = item.get("filename")
@@ -641,6 +733,41 @@ def _resources(before, after):
                 item.pop("filename", None)
             resources[kind].append(item)
     return resources
+
+
+def _primary(response, asset, probe=None):
+    """Name the main created material/map. Preference: named like the asset, then seen by the
+    detecting poll (probe; created during the import itself, not later by hand), then not a
+    sub-material, then in a Material Editor slot, then the first. Every created one stays
+    listed; nothing is renamed."""
+    expected = _EXPECTED.get(asset["kind"])
+    if expected not in ("materials", "maps"):
+        return
+    response["asset_name"] = asset["name"]
+    created = [item for item in response.get(expected) or [] if item.get("created")]
+    if not created:
+        return
+    key, label = _compact(asset["name"]), expected[:-1]
+    early = {str(i.get("handle")) for i in (probe or {}).get(expected) or ()}
+    reasons = (("name", lambda i: key in _compact(i.get("name", ""))),
+               ("detected_during_import", lambda i: str(i.get("handle")) in early),
+               ("top_level", lambda i: not i.get("sub_material")),
+               ("medit_slot", lambda i: bool(i.get("medit_slot"))))
+    primary = min(created, key=lambda i: tuple(not test(i) for _, test in reasons))
+    reason = ("only_new" if len(created) == 1
+              else next((name for name, test in reasons if test(primary) and not all(test(i) for i in created)),
+                        "first"))
+    response["primary_" + label] = {k: primary[k] for k in ("handle", "name", "class", "medit_slot") if k in primary}
+    response["primary_reason"] = reason
+    response[label + "_name"] = primary.get("name")
+    if key not in _compact(primary.get("name", "")):
+        response["note"] = "The package %s is named '%s', not '%s' (not renamed)." % (
+            label, primary.get("name"), asset["name"])
+        top = [i for i in created if not i.get("sub_material")]
+        if len(top) > 1:  # a name match needs no guess; sub-materials do not count
+            response["note"] += (" %d new top-level %s appeared since the import started (some may be made by "
+                                 "hand meanwhile); picked by %s, all are listed in %s." % (
+                                     len(top), expected, reason, expected))
 
 
 def _health_failure(exc):
@@ -772,7 +899,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                                 "textures may still be loading." % (settle.get("cpu_cores"), settle.get("waited_s")))
             step = "confirm"
             try:
-                after = _asset_snapshot(client, asset)
+                after = _asset_snapshot(client, asset, known=before.get("known"))
                 step = "restore"
                 finished = _max(client, pending["maxscript"])
             except (MaxHealthError, RequestOutcomeUnknown) as exc:  # Max stopped responding again
@@ -797,6 +924,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
             seen = after if after is not None else detection.get("probe")
             if seen:
                 response.update(_resources(before, seen))
+                _primary(response, asset, detection.get("probe"))
             warnings.append("Selection%s not restored yet: once get_bridge_status reports Max responding, run "
                             "pending_restore.maxscript once with execute_maxscript."
                             % (" and Material Editor renderer" if restore_medit else ""))
@@ -815,6 +943,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         observed = False
         if after is not None:
             response.update(_resources(before, after))
+            _primary(response, asset, detection.get("probe"))
             observed = bool(expected) and any(item["created"] for item in response[expected])
         if finished is None:
             response["pending_restore"] = pending

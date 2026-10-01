@@ -586,6 +586,194 @@ class ReviewFixTests(_FlowCase):
         self.assertIn("left as is", result["warnings"][0])
 
 
+def slotted(handle, name, slot=0, cls="VRayMtl"):
+    return {**ref(handle, name, cls), "slot": slot}
+
+
+# Pre-dispatch snapshot with the recorded handle set (issue #9): 1-3 existed before dispatch.
+KNOWN_BEFORE = {"nodes": [], "materials": [], "maps": [], "known": {"materials": [3, 1, 2, 2], "maps": None}}
+
+
+class HandleDiffTests(_FlowCase):
+    """Issue #9: materials found by handle diff whatever their name."""
+
+    def use(self, after, before=KNOWN_BEFORE):
+        self.flow["prepare"] = {**prepared(), "before": before}
+        self.light_results = [after]
+        self.flow["full"] = after
+
+    def test_differently_named_material_detected_by_handle(self):
+        after = {"nodes": [], "materials": [slotted(77, "Steel_Polished #0", 13)], "maps": []}
+        self.use(after)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertTrue(result["import_timing"]["detected"])
+        self.assertEqual(result["asset_name"], "Plaster White")
+        self.assertEqual(result["material_name"], "Steel_Polished #0")
+        self.assertEqual(result["primary_material"], {"handle": "77", "name": "Steel_Polished #0",
+                                                      "class": "VRayMtl", "medit_slot": 13})
+        self.assertIn("named 'Steel_Polished #0', not 'Plaster White'", result["note"])
+        self.assertEqual([(m["handle"], m["created"], m["medit_slot"], m["sub_material"])
+                          for m in result["materials"]], [("77", True, 13, False)])
+        self.assertEqual(result["primary_reason"], "only_new")
+        self.assertNotIn("slot", result["materials"][0])
+        # The light polls and the confirming snapshot get the sorted recorded handles back.
+        light = [c[1] for c in self.op_client.commands if c[0] == "light"]
+        full = [c[1] for c in self.op_client.commands if c[0] == "full"]
+        for script in light + full:
+            self.assertIn("local knownMats=#(1L,2L,3L)", script)
+            self.assertIn("local diffMats=true", script)
+            self.assertIn("local record=false", script)
+        self.assertIn("local diffMaps=false", full[0])  # no map handles recorded for a material
+
+    def test_matching_name_unchanged_and_no_note(self):
+        after = {"nodes": [], "materials": [slotted(77, "Plaster_White", 2)], "maps": []}
+        self.use(after)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(result["material_name"], "Plaster_White")
+        self.assertNotIn("note", result)
+        self.assertNotIn("warnings", result)
+
+    def test_legacy_snapshot_without_known_still_name_based(self):
+        result = self.run_import()  # BEFORE has no "known": the name-only path
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(result["primary_material"]["handle"], "99")
+        self.assertIsNone(result["primary_material"]["medit_slot"])
+        self.assertNotIn("note", result)
+        full = [c[1] for c in self.op_client.commands if c[0] == "full"][0]
+        self.assertIn("local diffMats=false", full)
+        self.assertIn("local knownMats=#()", full)
+
+    def test_several_new_materials_all_listed_name_match_is_primary(self):
+        after = {"nodes": [], "materials": [slotted(80, "Wrapper", 13), slotted(81, "Plaster White"),
+                                            slotted(82, "Other", 5, "Multimaterial")], "maps": []}
+        self.use(after)
+        result = self.run_import()
+        self.assertEqual([m["handle"] for m in result["materials"] if m["created"]], ["80", "81", "82"])
+        self.assertEqual(result["primary_material"]["handle"], "81")
+        self.assertEqual(result["primary_reason"], "name")
+        self.assertNotIn("note", result)  # a name match needs no guess note
+
+    def test_matching_name_package_with_sub_materials(self):
+        # A matching-name blend whose coats are named otherwise: coats are listed (flagged), no note.
+        after = {"nodes": [], "materials": [slotted(80, "Plaster White", 13, "VRayBlendMtl"),
+                                            {**slotted(81, "Coat A"), "sub": True},
+                                            {**slotted(82, "Coat B"), "sub": True}], "maps": []}
+        self.use(after)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual([(m["handle"], m["created"], m["sub_material"]) for m in result["materials"]],
+                         [("80", True, False), ("81", True, True), ("82", True, True)])
+        self.assertNotIn("sub", result["materials"][1])
+        self.assertEqual(result["material_name"], "Plaster White")
+        self.assertNotIn("note", result)
+
+    def test_without_name_match_top_level_beats_earlier_sub_material(self):
+        # Slate mode (no slots): the first class-scan hit is a coat, the wrapper is still primary.
+        after = {"nodes": [], "materials": [{**slotted(81, "Coat"), "sub": True},
+                                            slotted(80, "Steel_Polished #0", 0, "VRayBlendMtl")], "maps": []}
+        self.use(after)
+        result = self.run_import()
+        self.assertEqual(result["primary_material"]["handle"], "80")
+        self.assertEqual(result["primary_reason"], "top_level")
+        self.assertIn("named 'Steel_Polished #0'", result["note"])
+        self.assertNotIn("top-level materials appeared", result["note"])  # only one top-level
+
+    def test_without_name_match_medit_slot_is_primary(self):
+        after = {"nodes": [], "materials": [slotted(80, "Inner"), slotted(82, "Steel_Polished #0", 13)],
+                 "maps": []}
+        self.use(after)
+        result = self.run_import()
+        self.assertEqual(result["primary_material"]["handle"], "82")
+        self.assertEqual(result["primary_reason"], "medit_slot")
+        self.assertIn("named 'Steel_Polished #0'", result["note"])
+        self.assertIn("2 new top-level materials appeared since the import started", result["note"])
+
+    def test_material_seen_during_import_beats_later_hand_made_one(self):
+        # The poll saw 82 during the import; 70 (slot 1) appeared only during settle (made by hand).
+        self.flow["prepare"] = {**prepared(), "before": KNOWN_BEFORE}
+        self.light_results = [{"nodes": [], "materials": [slotted(82, "Steel_Polished #0", 13)], "maps": []}]
+        self.flow["full"] = {"nodes": [], "materials": [slotted(70, "Material #25", 1),
+                                                        slotted(82, "Steel_Polished #0", 13)], "maps": []}
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(result["primary_material"]["handle"], "82")
+        self.assertEqual(result["primary_reason"], "detected_during_import")
+        self.assertIn("made by hand", result["note"])
+        self.assertEqual([m["handle"] for m in result["materials"] if m["created"]], ["70", "82"])
+
+    def test_snapshot_isolates_handle_check_and_flags_sub_materials(self):
+        mat = {"id": ASSET_ID, "name": "Steel Blurry", "kind": "material"}
+        script = cosmos._snapshot_script(mat, known={"materials": [5], "maps": None})
+        # A throwing handle check reads as "not new" and cannot abort the name pass.
+        self.assertIn("fn isNew value known diff = (diff and (try(not (isKnown (handleOf value) known))catch(false)))",
+                      script)
+        self.assertIn("if record do remember m knownMats", script)
+        self.assertIn("isSub:((findItem subs m)>0)", script)
+        self.assertEqual(cosmos._mxs_handles({3, 2147483648, 1}), "#(1L,3L,2147483648L)")
+        self.assertEqual(cosmos._mxs_handles(()), "#()")
+
+    def test_handles_known_before_dispatch_never_created(self):
+        # Handle 2 was recorded but not name-matched; handle 1 was reported before.
+        before = {**KNOWN_BEFORE, "materials": [ref(1, "Plaster White old")]}
+        after = {"nodes": [], "materials": [ref(1, "Plaster White old"), slotted(2, "Default", 1)], "maps": []}
+        self.use(after, before)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported_unverified")
+        self.assertFalse(any(m["created"] for m in result["materials"]))
+        self.assertNotIn("primary_material", result)
+        self.assertEqual(result["asset_name"], "Plaster White")
+        self.light_results = [after]
+        timing = cosmos._wait_import(self.op_client, cosmos._download(self.service, ASSET_ID, 0), before,
+                                     "V-Ray", PID, timeout=5)
+        self.assertFalse(timing["detected"])
+
+    def test_settling_reports_poll_candidates_by_handle(self):
+        self.use({"nodes": [], "materials": [slotted(77, "Steel_Polished #0", 13)], "maps": []})
+        self.settle = settle_result(False, hung_browser=True)
+        result = self.run_import()
+        self.assertEqual(result["state"], "settling")
+        self.assertTrue(result["detected"])
+        self.assertEqual(result["primary_material"]["name"], "Steel_Polished #0")
+        self.assertIn("note", result)
+
+    def test_prepare_records_handles_and_polls_stay_light(self):
+        mat = {"id": ASSET_ID, "name": "Steel Blurry", "kind": "material"}
+        script = cosmos._prepare_script(mat, swap=False)
+        self.assertIn("local record=true", script)
+        self.assertIn("local recordMaps=false", script)
+        self.assertIn("local diffMats=false", script)
+        self.assertNotIn("__", script.replace("__KEY__", ""))
+        known = {"materials": [9, 3000000000, "bad"], "maps": [4]}
+        light = cosmos._snapshot_script(mat, light=True, renderer="V-Ray", known=known)
+        self.assertIn("local knownMats=#(9L,3000000000L)", light)
+        self.assertIn("local knownMaps=#()", light)  # a light poll diffs only the asset's own kind
+        self.assertIn("for c in #() do", light)  # still no class scan on this poll
+        model = {"id": ASSET_ID, "name": "Oak Chair", "kind": "model"}
+        light = cosmos._snapshot_script(model, light=True, renderer="V-Ray", known=known)
+        self.assertIn("local diffMats=false", light)
+        self.assertIn("local knownMats=#()", light)
+        hdri = {"id": ASSET_ID, "name": "Sky Dome", "kind": "hdri"}
+        self.assertIn("local recordMaps=true", cosmos._snapshot_script(hdri, record=True))
+        light = cosmos._snapshot_script(hdri, light=True, renderer="V-Ray", known=known)
+        self.assertIn("local knownMaps=#(4L)", light)
+        self.assertIn("local diffMats=false", light)
+
+    def test_hdri_new_map_detected_by_handle(self):
+        before = {"nodes": [], "materials": [], "maps": [], "known": {"materials": [], "maps": [4, 5]}}
+        probe = {"nodes": [], "materials": [], "maps": [ref(5, "Old", "Bitmaptexture"), ref(6, "env_4k", "VRayHDRI")]}
+        self.light_results = [probe]
+        hdri = {**cosmos._download(self.service, ASSET_ID, 0), "kind": "hdri"}
+        timing = cosmos._wait_import(self.op_client, hdri, before, "V-Ray", PID)
+        self.assertTrue(timing["detected"])
+        response = cosmos._resources(before, probe)
+        cosmos._primary(response, hdri)
+        self.assertEqual([m["handle"] for m in response["maps"] if m["created"]], ["6"])
+        self.assertEqual(response["primary_map"]["name"], "env_4k")
+        self.assertNotIn("medit_slot", response["maps"][0])
+
+
 class BrowserEnsureTests(_FlowCase):
     """Main-thread Cosmos browser before _PREPARE: the decision table."""
 
