@@ -3,8 +3,10 @@ import math
 from typing import Optional
 
 from ..coerce import FloatList, StrList
+from ..max_client import DialogBlocked
 from ..server import mcp, client
 from ..helpers.maxscript import safe_string
+from ..helpers.precheck import PrecheckBlocked
 from ..helpers.spatial import build_clone_spatial_maxscript, enrich_spatial_payload
 
 
@@ -40,7 +42,10 @@ def clone_objects(
         if len(offset) != 3 or any(isinstance(v, bool) or not math.isfinite(float(v)) for v in offset):
             raise ValueError("offset must contain three finite numbers")
     if not clone_whole_group:
-        members, shadows = _find_group_members(names)
+        try:
+            members, shadows = _find_group_members(names)
+        except DialogBlocked as exc:  # only the read-only check is queued; nothing was cloned
+            raise PrecheckBlocked(exc, "clone_objects", "Nothing was cloned") from exc
         if members or shadows:
             return _clone_group_members(
                 names, members, shadows, mode, list(offset or [0.0, 0.0, 0.0]), count

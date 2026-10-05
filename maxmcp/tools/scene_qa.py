@@ -10,6 +10,8 @@ from typing import Optional
 
 from ..coerce import DictList, IntList, StrList
 from ..helpers.maxscript import safe_string
+from ..helpers.precheck import PrecheckBlocked
+from ..max_client import DialogBlocked, MaxHealthError, RequestOutcomeUnknown
 from ..server import client, mcp
 
 # Python-side check (#16): stacked duplicate groups left by cloning a member
@@ -663,10 +665,17 @@ def scene_qa(
 
     applying = normalized_action == "fix" and not dry_run
 
-    def duplicate_scan() -> tuple[Optional[dict], Optional[str]]:
+    def duplicate_scan(before_fix: bool = False) -> tuple[Optional[dict], Optional[str]]:
         try:
             return run_duplicate_group_check(
                 scope, group_position_tolerance, names, handles, refs), None
+        except (DialogBlocked, MaxHealthError, RequestOutcomeUnknown) as exc:
+            if not before_fix:
+                return None, str(exc)
+            # Max can't answer the read-only query: never send the fix behind it.
+            if isinstance(exc, DialogBlocked):
+                raise PrecheckBlocked(exc, "scene_qa", "Nothing was changed") from exc
+            raise
         except Exception as exc:  # report-only check must never break scene_qa
             return None, str(exc)
 
@@ -675,7 +684,7 @@ def scene_qa(
     found: Optional[dict] = None
     error: Optional[str] = None
     if run_duplicates and applying:
-        found, error = duplicate_scan()
+        found, error = duplicate_scan(before_fix=True)
 
     # A dry-run repair is read-only and deliberately uses the scan route so it
     # never opens an empty undo record or trips safe-mode mutation gating.

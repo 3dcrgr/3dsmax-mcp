@@ -259,6 +259,23 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(len(out["warnings"]), 1)
         self.assertIn("requested ancestor", out["warnings"][0])
 
+    def test_dialog_blocking_group_check_is_retryable_and_clones_nothing(self):
+        from maxmcp.helpers.precheck import PrecheckBlocked
+        from maxmcp.max_client import DialogBlocked
+        client = MagicMock()
+        client.native_available = True
+        client.send_command.side_effect = DialogBlocked("r1", "maxscript", [{"title": "Missing External Files"}])
+        with patch.object(cl, "client", client):
+            with self.assertRaises(PrecheckBlocked) as ctx:
+                cl.clone_objects(["Vase01"])
+        self.assertEqual(client.send_command.call_count, 1)  # never the clone itself
+        payload = json.loads(ctx.exception.bridge_message)
+        self.assertEqual((payload["code"], payload["retryable"]), ("BLOCKED_BY_DIALOG", True))
+        self.assertIn("Nothing was cloned", payload["message"])
+        self.assertIn("Then repeat clone_objects", payload["hint"])
+        self.assertNotIn("Do not repeat", payload["hint"])
+        self.assertFalse(payload["details"]["changed"])
+
     def test_clone_script_returns_alone_members(self):
         ms = cl.build_group_member_clone_maxscript([], [101], "copy", [0, 0, 0], 1)
         self.assertIn('\\"members\\":[', ms)

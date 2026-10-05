@@ -1650,7 +1650,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                     if restore_lost and restore_medit:
                         warnings.append("If the Material Editor renderer is still Scanline, restore it once the "
                                         "Material Editor is closed with execute_maxscript: %s" % _MEDIT_RESTORE)
-        if quiet and after is not None and not unconfirmed and not restore_lost:  # after the bridge calls, never during settle
+        if quiet and after is not None and not restore_lost:  # after the bridge calls, never during settle
             _minimize_browser(browser, pid, shown_before, minimize_browser)
             if browser.get("minimize_skipped") == "other_thread_browser":
                 warnings.append("A 'Chaos Cosmos Browser' is open on a separate (non-main) thread after the "
@@ -1658,7 +1658,8 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                                 "is gone (#1 deadlock path).")
         else:
             browser.update(minimized_after=False, minimize_skipped=(
-                "opted_out" if not minimize_browser else "not_quiet" if not quiet else "not_confirmed"))
+                "opted_out" if not minimize_browser else "not_quiet" if not quiet
+                else "restore_unknown" if restore_lost else "not_confirmed"))
         timing = {k: v for k, v in detection.items() if k != "probe"}
         response = {**base, "import_timing": {**timing, "pre_dispatch": pre, "settle": _settle_summary(settle)},
                     "medit_renderer": {k: medit.get(k) for k in ("class", "locked", "editor_open", "swapped")}

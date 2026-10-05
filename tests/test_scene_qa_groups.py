@@ -374,6 +374,31 @@ class ToolMergeTests(unittest.TestCase):
         self.assertNotIn("detected_before_fix", result["before"]["issues"][1]["details"])
         self.assertNotIn("note", result["after"]["duplicate_group_heads"])
 
+    def test_applied_fix_not_sent_when_prescan_cannot_run(self):
+        from maxmcp.helpers.precheck import PrecheckBlocked
+        from maxmcp.max_client import DialogBlocked, MaxBusyError
+        native = {"action": "fix", "dry_run": False, "fixes": ["name_collisions"],
+                  "applied": [], "applied_count": 0, "before": native_scan(), "after": native_scan([])}
+        blocked = DialogBlocked("r1", "maxscript", [{"title": "Missing External Files"}])
+        with self.assertRaises(PrecheckBlocked) as ctx:
+            self.run_tool(native, blocked, action="fix", fixes=["name_collisions"])
+        payload = json.loads(ctx.exception.bridge_message)
+        self.assertEqual((payload["code"], payload["retryable"]), ("BLOCKED_BY_DIALOG", True))
+        self.assertIn("Nothing was changed", payload["message"])
+        client = make_client(native, MaxBusyError("busy"))
+        with patch.object(sq, "client", client), self.assertRaises(MaxBusyError):
+            sq.scene_qa(action="fix", fixes=["name_collisions"])
+        self.assertEqual([c.kwargs.get("cmd_type", "maxscript") for c in client.send_command.call_args_list],
+                         ["maxscript"])
+
+    def test_scan_keeps_native_result_when_duplicate_query_is_blocked(self):
+        from maxmcp.max_client import DialogBlocked
+        blocked = DialogBlocked("r1", "maxscript", [{"title": "Missing External Files"}])
+        out, _ = self.run_tool(native_scan(), blocked)
+        result = json.loads(out)
+        self.assertEqual(result["issues"], [NATIVE_ISSUE])
+        self.assertIn("Missing External Files", json.dumps(result["duplicate_group_heads"]))
+
     def test_applied_rename_adds_note(self):
         applied = [{"fix": "name_collisions", "before": {"name": "Leg"},
                     "after": {"name": "Leg001"}}]

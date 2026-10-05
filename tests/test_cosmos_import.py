@@ -1785,6 +1785,8 @@ class SlotDialogTests(_FlowCase):
         self.assertIn(cosmos._MEDIT_RESTORE, text)  # the renderer restore is safe to run again
         self.assertNotIn("run pending_restore", text)
         self.assertEqual(self.bridge_kinds("operation").count("finalize"), 1)
+        # Imported, but the restore result is unknown: the browser is left alone.
+        self.assertEqual(result["cosmos_browser"]["minimize_skipped"], "restore_unknown")
 
     def test_lost_read_back_is_unknown(self):
         self.use(slot_prep(), slot_fin(), imported_slot=4)
