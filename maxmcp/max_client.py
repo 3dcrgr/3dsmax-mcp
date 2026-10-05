@@ -28,6 +28,21 @@ MAX_BLOCKED_CALLS = 16
 class RequestOutcomeUnknown(Exception):
     """The request reached Max but its response was lost; never replay it."""
 
+    code = "REQUEST_OUTCOME_UNKNOWN"
+    retryable = False
+
+    def __init__(self, message: str = "", details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = {"request_sent": True, **(details or {})}
+
+
+# Wording shared by every report of a request whose reply was lost after it was sent.
+OUTCOME_UNKNOWN_ADVICE = "The request may have committed; inspect before retrying."
+
+
+ALWAYS_ASK = ("Always ask the user before Save, Don't Save or any other discard, overwrite, Fetch or Reset "
+              "choice, even when working unattended.")
+
 
 class DialogBlocked(Exception):
     """A call is waiting on a modal dialog in Max and keeps running there.
@@ -49,8 +64,8 @@ class DialogBlocked(Exception):
             "type": "DialogBlocked", "code": self.code, "retryable": False, "message": message,
             "hint": ("Read the dialog. If the user has authorized you to proceed unattended, answer it with "
                      "max_dialogs(action='respond', dialog_id, expected_dialog, button) as the task intends; "
-                     "otherwise ask the user which button to press. Do not repeat the call: max_dialogs "
-                     "reports its result after the dialog closes."),
+                     "otherwise ask the user which button to press. " + ALWAYS_ASK + " Do not repeat the "
+                     "call: max_dialogs reports its result after the dialog closes."),
             "details": {"request_id": request_id, "command": command, "dialogs": dialogs},
         })
         super().__init__(message)
@@ -353,6 +368,9 @@ class MaxClient:
             dialogs = real_dialogs(meta.get("openDialogs"))
             if dialogs:
                 transport["open_dialogs"] = dialogs
+            if meta.get("quietOverride"):
+                # #12: quiet mode was off for this script, so its prompts were shown.
+                transport["quiet_override"] = meta["quietOverride"]
             return transport
         error = getattr(self._local, "last_error", None)
         if isinstance(error, dict):
@@ -1033,8 +1051,11 @@ class MaxClient:
            (MAX_BUSY / MAX_NOT_RESPONDING); anything else is diagnosed and keeps
            waiting while Max is busy or responsive, and is abandoned with
            MaxNotRespondingAfterDispatch once Max exited or stayed blocked.
-        A reply that arrives meanwhile always wins. Every wait is bounded, the
-        control channel's included.
+        A reply that arrives meanwhile always wins. Each check is bounded (dialog
+        polls and probes, the control channel's included, are dropped at their
+        deadline), but a request on a Max that stays responsive or busy waits until
+        it answers, with no upper limit: only an exited or confirmed-blocked Max
+        ends the wait.
         """
         reader = _PipeReader(handle)
         sent_at = time.perf_counter()
@@ -1158,8 +1179,12 @@ class MaxClient:
                     "waiting_s": round(now - entry["blocked_at"], 1)}
 
     def blocked_calls(self, wait: float = 0.0) -> list[dict[str, Any]]:
-        """Report calls that returned BLOCKED_BY_DIALOG; completed ones are reported once.
+        """Report calls that returned BLOCKED_BY_DIALOG; finished ones are reported once.
 
+        status: "waiting" (still in Max), "completed" (ok with its result, or the
+        bridge's error), or "lost": the connection broke or the reply was unreadable
+        after the call was sent (outcome "unknown", request_sent true), so it may
+        have committed; inspect before retrying.
         wait: seconds to wait for the blocked calls to complete. Waiting stops
         early when one of them is blocked by a dialog again.
         """
@@ -1194,7 +1219,10 @@ class MaxClient:
             except MaxBridgeError as exc:
                 item.update(status="completed", ok=False, error=exc.bridge_message)
             except Exception as exc:
-                item.update(status="completed", ok=False, error=str(exc))
+                # The connection broke (Max exited, the bridge dropped the pipe) or the reply
+                # was unreadable after the call was sent: whether it ran is unknown.
+                item.update(status="lost", ok=False, outcome="unknown", request_sent=True,
+                            error=f"{exc} {OUTCOME_UNKNOWN_ADVICE}")
             if _QUEUE_TIMEOUT_MARKER in str(item.get("error", "")).lower():
                 item["executed"] = False  # the bridge cancelled it before it started
             report.append(item)

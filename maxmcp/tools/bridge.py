@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from ..max_client import (_NOT_DIALOG_TITLE, BLOCKED_CAUSE, HANG_ADVICE, DialogBlocked, MaxBusyError,
-                          MaxNotRespondingError, _grace, real_dialogs, settling_state)
+from ..max_client import (_NOT_DIALOG_TITLE, ALWAYS_ASK, BLOCKED_CAUSE, HANG_ADVICE, DialogBlocked, MaxBusyError,
+                          MaxNotRespondingError, RequestOutcomeUnknown, _grace, real_dialogs, settling_state)
 from ..process_health import describe as describe_process, diagnose_process
 from ..server import mcp, client
 
@@ -149,7 +149,7 @@ def _blocked_by_dialog_status(dialogs: list, *, health: dict | None = None, runn
         "message": (f"{label} is waiting on {titles}: {what}, and new requests queue behind it. Max is not hung "
                     "(its main thread runs the dialog). Read it with max_dialogs(action='inspect'); answer it with "
                     "max_dialogs(action='respond') only when the user authorized unattended work, otherwise ask the "
-                    "user. Do not repeat the waiting call."),
+                    "user. " + ALWAYS_ASK + " Do not repeat the waiting call."),
         "dialogs": _dialog_summaries(dialogs),
         "main_thread": ({"state": main.get("state"), "pumping": main.get("pumping"),
                          "heartbeat_age_s": _seconds(main.get("heartbeatAgeMs")),
@@ -335,6 +335,29 @@ def _unhealthy_status(exc: MaxBusyError | MaxNotRespondingError, health: dict | 
     })
 
 
+def _lost_ping_status(exc: RequestOutcomeUnknown, health: dict | None = None) -> str:
+    """Status when the connection broke after the ping was sent (Max exiting, the bridge dropping the pipe)."""
+    pid = (health or {}).get("pid")
+    process = diagnose_process(int(pid), _CPU_SAMPLE_S) if pid else None
+    exited = (process or {}).get("state") == "exited"
+    label = f"3ds Max (PID {pid})" if pid else "3ds Max"
+    evidence = f" ({describe_process(process)})" if process else ""
+    return json.dumps({
+        "pong": False,
+        "connected": False,
+        "bridge_state": "not_responding" if exited else "connection_lost",
+        "bridge_code": getattr(exc, "code", "REQUEST_OUTCOME_UNKNOWN"),
+        "retryable": not exited,
+        "message": (f"{label} closed the connection while answering the status ping{evidence}: "
+                    + ("Max has exited. Ask the user to restart Max, then inspect the scene."
+                       if exited else "Max may be exiting, or its bridge dropped the pipe. The ping changes "
+                       "nothing; re-check with get_bridge_status.")),
+        "process": process,
+        "request_sent": True,
+        **({"health": _compact_health(health)} if health else {}),
+    })
+
+
 def _silent_bridge_status(exc: MaxBusyError | MaxNotRespondingError) -> str:
     """Status when even the bridge's pipe threads did not answer health (the probe was dropped)."""
     details = getattr(exc, "details", None) or {}
@@ -386,6 +409,8 @@ def get_bridge_status() -> str:
         return _blocked_by_dialog_status(exc.dialogs, health=health or None, request_sent=True)
     except (MaxBusyError, MaxNotRespondingError) as exc:
         return _unhealthy_status(exc, health)
+    except RequestOutcomeUnknown as exc:
+        return _lost_ping_status(exc, health or None)
     except RuntimeError as exc:
         error = str(exc)
         if "Empty command" in error or "Unknown command type" in error:
@@ -395,6 +420,8 @@ def get_bridge_status() -> str:
                 return _blocked_by_dialog_status(legacy_exc.dialogs, request_sent=True)
             except (MaxBusyError, MaxNotRespondingError) as legacy_exc:
                 return _unhealthy_status(legacy_exc)
+            except RequestOutcomeUnknown as legacy_exc:
+                return _lost_ping_status(legacy_exc)
         raise
 
     payload = json.loads(response.get("result", "{}"))

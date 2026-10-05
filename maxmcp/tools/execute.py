@@ -1,4 +1,5 @@
 import json
+import re
 
 from ..helpers.error_hints import suggest_tools_for_maxscript
 from ..helpers.python_execution import python_execution_script
@@ -7,9 +8,24 @@ from ..server import mcp, client
 
 _MAXSCRIPT_ERROR_SENTINEL = "__MCP_MS_ERR__:"
 
+# Mirrors QuietPolicy::MentionsSceneFileCommand (native/include/mcp_bridge/quiet_policy.h):
+# commands whose "save changes?" prompt quiet mode would answer by discarding work (#12).
+_SCENE_FILE_COMMANDS = ("resetmaxfile", "loadmaxfile", "fetchmaxfile", "quitmax", "checkforsave",
+                        "max reset file", "max file new", "max file open", "max fetch",
+                        # Interface spellings, e.g. through Autodesk.Max's COREInterface.
+                        "filereset", "filefetch", "loadfromfile")
+_ASCII_SPACE = re.compile(r"[ \t\n\v\f\r]+")
+
+
+def mentions_scene_file_command(script: str) -> bool:
+    """True when the script's text mentions a command that can prompt to save or discard the scene."""
+    text = _ASCII_SPACE.sub(" ", script).strip(" ").lower()
+    return any(name in text for name in _SCENE_FILE_COMMANDS)
+
 
 @mcp.tool()
-def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = None) -> str:
+def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = None,
+                      allow_discard: bool = False) -> str:
     """Execute arbitrary MAXScript in 3ds Max and return the result.
 
     Use when: no dedicated MCP tool covers the operation (custom one-offs, rare APIs).
@@ -19,10 +35,17 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     By default the script runs in Max's quiet mode: prompts such as queryBox,
     overwrite and missing-file warnings silently take their default answer.
     A script that mentions resetMaxFile, loadMaxFile, fetchMaxFile, quitMax,
-    checkForSave or "max file new/open"/"max reset file" runs with prompts shown,
+    checkForSave, "max file new/open", "max reset file", "max fetch" or the
+    Interface's FileReset/FileFetch/LoadFromFile runs with prompts shown,
     so a save-changes prompt returns BLOCKED_BY_DIALOG instead of discarding work
-    (#noPrompt still suppresses it). quiet=False always shows prompts; quiet=True
-    forces quiet mode. Answer a shown prompt with max_dialogs.
+    (#noPrompt or quiet:true arguments in the script still suppress it, and so
+    discard unsaved changes: add them only with the user's OK). quiet=False always
+    shows prompts. quiet=True forces quiet mode, except on such a script: there it
+    needs allow_discard=True as well, because quiet mode answers the save prompt by
+    discarding unsaved changes; pass both only when the user agreed to lose them.
+    The check reads only this text: for a script that runs other scripts (fileIn,
+    include, python.ExecuteFile, macros.run) that may reset, open or quit, pass
+    quiet=False. Answer a shown prompt with max_dialogs.
 
     Always pass #noPrompt to importFile, including OBJ/FBX imports:
     importFile @"C:/assets/model.fbx" #noPrompt
@@ -32,8 +55,16 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     script = code or command
     if not script:
         return "Error: provide MAXScript code in the 'code' parameter"
+    quiet_ignored = bool(quiet) and not allow_discard and mentions_scene_file_command(script)
+    if quiet_ignored:
+        quiet = False  # #12: quiet mode would answer "save changes?" by discarding the scene
     response = client.send_command(script, cmd_type="maxscript",
                                    request_fields=None if quiet is None else {"quiet": bool(quiet)})
+    if quiet_ignored and isinstance(response, dict):
+        meta = response.get("meta")
+        if not isinstance(meta, dict):
+            meta = response["meta"] = {}
+        meta["quietOverride"] = "file_command_quiet_ignored"  # reported as a warning
     result = response.get("result", "")
 
     if isinstance(result, str) and result.startswith(_MAXSCRIPT_ERROR_SENTINEL):

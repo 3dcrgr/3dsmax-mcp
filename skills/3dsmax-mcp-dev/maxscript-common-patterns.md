@@ -328,16 +328,25 @@ select (for o in objects where not o.isHiddenInVpt collect o)
 
 ## Batch File Processing
 
+`quiet:true` and `#noPrompt` suppress the "save changes?" prompt, so `loadMaxFile` and
+`resetMaxFile` with them discard the open scene's unsaved changes, and `saveMaxFile`
+overwrites every file in the folder. Run this only when the user asked for it and agreed
+to both. The guard below stops instead of discarding the user's scene.
+
 ```maxscript
 thePath = getSavePath caption:"Select Folder"
 if thePath != undefined do (
-    theFiles = getFiles (thePath + "\\*.max")
-    for f in theFiles do (
-        loadMaxFile f useFileUnits:true quiet:true
-        -- do work here
-        saveMaxFile f
+    if getSaveRequired() then
+        format "The open scene has unsaved changes: save it or ask the user first.\n"
+    else (
+        theFiles = getFiles (thePath + "\\*.max")
+        for f in theFiles do (
+            loadMaxFile f useFileUnits:true quiet:true  -- the previous file was saved below
+            -- do work here
+            saveMaxFile f  -- overwrites the original file
+        )
+        resetMaxFile #noPrompt
     )
-    resetMaxFile #noPrompt
 )
 ```
 

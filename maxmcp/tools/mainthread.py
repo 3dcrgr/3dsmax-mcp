@@ -9,14 +9,34 @@ bridge (native:main_thread).
 
 import json
 import time
+from ..max_client import MaxBridgeError
 from ..server import mcp, client
+
+
+class DialogMonitorMissing(Exception):
+    """The connected bridge predates 1.7.5's dialog monitor (native:max_dialogs)."""
+
+    code = "BRIDGE_OUTDATED"
+    retryable = False
+
+    def __init__(self, action: str) -> None:
+        super().__init__(
+            "This 3ds Max bridge has no dialog monitor: max_dialogs needs the 1.7.5-based bridge. "
+            f"Nothing was {'pressed' if action == 'respond' else 'read'}. Ask the user to answer the dialog "
+            "in Max; retrying or changing the arguments will not help.")
+        self.details = {"action": action, "executed": False}
 
 
 def _dialog_command(payload: dict) -> dict:
     # Do not probe native_available: its ping could itself wait on the blocked UI.
     # Reads are probes (dropped at the deadline); a press is not.
-    response = client.send_command(json.dumps(payload), cmd_type="native:max_dialogs", timeout=5.0,
-                                   probe=payload.get("action") != "respond")
+    try:
+        response = client.send_command(json.dumps(payload), cmd_type="native:max_dialogs", timeout=5.0,
+                                       probe=payload.get("action") != "respond")
+    except MaxBridgeError as exc:
+        if "unknown command type" in str(exc.bridge_message).lower():
+            raise DialogMonitorMissing(str(payload.get("action"))) from exc
+        raise
     return json.loads(response.get("result") or "{}")
 
 
@@ -35,13 +55,19 @@ def max_dialogs(action: str = "inspect", dialog_id: str = "", expected_dialog: s
     respond: press one button. Pass dialog_id and expected_dialog from a fresh
     inspect and button as its label or index; a changed dialog is refused.
     Then waits up to wait_seconds for interrupted calls to finish and returns
-    their results, or the next dialog holding them.
+    their results, or the next dialog holding them. A blocked call whose
+    connection broke is reported with status "lost" (outcome unknown): inspect
+    the scene before running it again.
+    Only dialogs on Max's main thread can be read and pressed. One on another
+    thread (main_thread false, e.g. a plugin's worker) is listed but never read,
+    and pressing it fails with DIALOG_NOT_ON_MAIN_THREAD: ask the user to answer it
+    in Max. A bridge without the dialog monitor (before 1.7.5) gives BRIDGE_OUTDATED.
 
     Answering is a decision. Choose yourself only when the user authorized
     unattended work and the task determines the answer. Otherwise show the
     user the dialog and ask; always ask before saving, overwriting, discarding
-    changes, Fetch, Reset or licensing choices. Pressing posts a click; check
-    what followed. Never repeat an interrupted call while it is waiting.
+    changes (Save / Don't Save), Fetch, Reset or licensing choices, even when
+    working unattended. Pressing posts a click; check what followed. Never repeat an interrupted call while it is waiting.
     Automatic: Script Controller Exception boxes are closed; recognized
     MAXScript error boxes with a sole OK are acknowledged during MCP calls,
     which then fail with MAX_DIALOG_ERROR. Requires the native bridge.

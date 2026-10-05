@@ -107,7 +107,7 @@ replace_material(source_material="Plaster", target_material="Cosmos_Plaster")   
   - The native handler was checked live at 12:30 on a Multi/Sub whose source was only in the Material Editor. The preview gave `source_found_in` "material_editor", one affected slot and an empty `skipped`. The real run replaced the slot, and `undo_last` put it back.
   - That empty `skipped` was the check that mattered most: a normal Multi/Sub slot isn't reported as `reference_loop`, so the SDK's `TestForLoop` result is read the right way round.
   - Not run in Max yet: nested Multi/Sub, the loop guard's skips, `source_from`, `blocked`, Hebrew names, batch, plugin parents such as VRayBlendMtl and Shell_Material, and the MAXScript fallback.
-- **The 1.7.5 merge** didn't change how a replacement runs, native or Python. The 2026 bridge built from it (sha256 `8b7453a6…`, from `1cf40f3`) isn't deployed or tested live yet.
+- **The 1.7.5 merge** didn't change how a replacement runs, native or Python. The 2026 bridge built from it (sha256 `8b7453a6…`, from `cbf58aa`) isn't deployed or tested live yet.
   - The rollback after an error box hasn't been tried in Max. `native/tests/dialog_watch_tests.cpp` checks, without Max, that an acknowledged error box fails the operation where it resumes (`ffccbab`).
   - The fallback batch stopping at a failed call comes from reading the code; no test covers it.
 

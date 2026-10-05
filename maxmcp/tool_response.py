@@ -44,6 +44,8 @@ class ErrorCode(str, Enum):
     DUPLICATE_NAME = "DUPLICATE_NAME"
     PATCH_APPLY_FAILED = "PATCH_APPLY_FAILED"
     MAXSCRIPT_INTERRUPTED = "MAXSCRIPT_INTERRUPTED"
+    REQUEST_OUTCOME_UNKNOWN = "REQUEST_OUTCOME_UNKNOWN"
+    BRIDGE_OUTDATED = "BRIDGE_OUTDATED"
 
 
 class ToolEnvelope(BaseModel):
@@ -524,6 +526,27 @@ def _add_dialog_warning(envelope: dict[str, Any], transport: dict[str, Any] | No
     return envelope
 
 
+_QUIET_OVERRIDE_WARNINGS = {
+    "file_command": (
+        "Quiet mode was off for this script because it mentions a scene reset/open/fetch/quit command "
+        "(#12), so its prompts were shown; a save prompt returns BLOCKED_BY_DIALOG."),
+    "file_command_quiet_ignored": (
+        "quiet=True was not applied because the script mentions a scene reset/open/fetch/quit command "
+        "(#12), so its prompts were shown. Pass allow_discard=True with quiet=True only when the user "
+        "agreed to discard unsaved changes."),
+}
+
+
+def _add_quiet_override_warning(envelope: dict[str, Any], transport: dict[str, Any] | None) -> dict[str, Any]:
+    """Tell the caller that a script ran with Max's quiet mode off (#12, meta.quietOverride)."""
+    override = (transport or {}).get("quiet_override")
+    if not override:
+        return envelope
+    envelope.setdefault("warnings", []).append(_QUIET_OVERRIDE_WARNINGS.get(
+        str(override), f"Quiet mode was off for this script ({override}), so its prompts were shown."))
+    return envelope
+
+
 def make_structured_tool(
     fn: Callable[..., Any],
     *,
@@ -564,23 +587,23 @@ def make_structured_tool(
             raw = fn(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             transport = transport_provider() if transport_provider else None
-            return _add_dialog_warning(envelope_result(
+            return _add_quiet_override_warning(_add_dialog_warning(envelope_result(
                 raw,
                 elapsed_ms=elapsed_ms,
                 transport=transport,
                 tool_name=tool_name,
                 script=script,
-            ), transport, tool_name)
+            ), transport, tool_name), transport)
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             transport = transport_provider() if transport_provider else None
-            return _add_dialog_warning(envelope_exception(
+            return _add_quiet_override_warning(_add_dialog_warning(envelope_exception(
                 exc,
                 elapsed_ms=elapsed_ms,
                 transport=transport,
                 tool_name=tool_name,
                 script=script,
-            ), transport, tool_name)
+            ), transport, tool_name), transport)
 
     wrapped.__signature__ = fn_signature  # type: ignore[attr-defined]
     wrapped.__annotations__ = resolved_annotations
