@@ -195,6 +195,8 @@ class _FlowCase(unittest.TestCase):
         self.browser_appears = MAIN_TID  # thread of the window the action creates (None: no window)
         self.hung_after_action = set()  # hwnds that stop answering once the action ran
         self.wm_null = []  # window_responsive "responds" answers, then True
+        self.iconic = set()  # minimized hwnds (IsIconic)
+        self.visible = {}  # hwnd -> visible override (default: every window but BROWSER_HWND)
         max_client._settling.clear()
         self.addCleanup(max_client._settling.clear)
         for target, attr, value in (
@@ -210,6 +212,8 @@ class _FlowCase(unittest.TestCase):
             (process_health, "window_responsive", self._window_responsive),
             (process_health, "window_thread", lambda hwnd: self.threads.get(hwnd)),
             (process_health, "_window_title", lambda hwnd: self.titles.get(hwnd, "")),
+            (process_health, "window_iconic", lambda hwnd: hwnd in self.iconic),
+            (process_health, "minimize_window", self._minimize),
             (max_client, "process_start_time", mock.Mock(return_value=1)),
         ):
             p = mock.patch.object(target, attr, value)
@@ -228,7 +232,12 @@ class _FlowCase(unittest.TestCase):
         hung = hwnd in self.hung_hwnds
         responds = (self.wm_null.pop(0) if self.wm_null else True) and not hung
         return {"hwnd": hwnd, "exists": True, "hung": hung, "responds": responds,
-                "visible": hwnd != BROWSER_HWND, "title": self.titles.get(hwnd, "")}
+                "visible": self.visible.get(hwnd, hwnd != BROWSER_HWND), "title": self.titles.get(hwnd, "")}
+
+    def _minimize(self, hwnd, pid, title):
+        self.events.append(("minimize", hwnd, pid, title))
+        self.iconic.add(hwnd)
+        return True
 
     def _open_browser(self):
         if self.browser_action.get("found") and self.browser_appears:
@@ -1201,6 +1210,157 @@ class ImportAttributionTests(_FlowCase):
         self.assertNotIn("__", prepare.replace("__KEY__", ""))
 
 
+# Pre-dispatch record of a model import (issue #13): newest 100, highest node handle 90.
+MODEL_BEFORE = {"nodes": [], "materials": [], "maps": [],
+                "known": {"materials": [3, 1, 2], "maps": None, "newest": 100, "nodes_max": 90}}
+RUG = {"id": ASSET_ID, "name": "Rug 002", "kind": "model"}
+
+
+def default_name_regex(script):
+    return re.search(r'IsMatch \(m\.name as string\) "((?:[^"\\]|\\.)*)"', script).group(1)
+
+
+class ModelImportTests(_FlowCase):
+    """Issue #13: model nodes by handle diff (VRayProxy named otherwise), slot noise ignored."""
+
+    def setUp(self):
+        super().setUp()
+        self.service.asset = lambda package_id: {"id": ASSET_ID, "name": "Rug 002", "kind": "model", "revision": 3,
+                                                 "availability": 3, "size": 1024, "preview_path": None}
+        self.flow["prepare"] = {**prepared(), "before": MODEL_BEFORE}
+
+    def rug_after(self, **extra):
+        return {"nodes": [ref(500, "Rug 002_001", "VRayProxy")],
+                "materials": [ref(150, "Rug 002 material #0")], "maps": [], **extra}
+
+    def test_vray_proxy_named_otherwise_detected_by_handle_diff(self):
+        empty = {"nodes": [], "materials": [], "maps": []}
+        self.light_results = [empty, self.rug_after()]
+        self.flow["full"] = {**self.rug_after(nodes_omitted=0, default_materials_ignored=10),
+                             "nodes": [ref(500, "Rug 002_001", "VRayProxy"), other(ref(501, "Box001", "Editable_Poly"))]}
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        timing = result["import_timing"]
+        self.assertEqual((timing["detected"], timing["polls"]), (True, 2))  # stops at the first tied node
+        self.assertEqual([(n["handle"], n["class"], n["created"]) for n in result["nodes"]],
+                         [("500", "VRayProxy", True)])
+        self.assertEqual(result["nodes"][0]["node_ref"], {"handle": 500, "name": "Rug 002_001"})
+        self.assertEqual([n["handle"] for n in result["other_new_nodes"]], ["501"])
+        self.assertNotIn("other", result["other_new_nodes"][0])
+        self.assertEqual([m["handle"] for m in result["materials"] if m["created"]], ["150"])
+        self.assertNotIn("other_new_materials", result)
+        self.assertEqual(result["default_materials_ignored"], 10)
+        self.assertNotIn("nodes_omitted", result)
+        self.assertNotIn("warnings", result)
+        # Light polls diff nodes only (no class scan), bounded; the confirm scan has the larger cap.
+        light = [c[1] for c in self.op_client.commands if c[0] == "light"]
+        full = [c[1] for c in self.op_client.commands if c[0] == "full"][0]
+        for script in light:
+            self.assertIn("local nodeDiff=true", script)
+            self.assertIn("local nodeMin=100L", script)  # max(newest 100, nodes_max 90)
+            self.assertIn("local matMin=100L", script)
+            self.assertIn("local nodeCap=%d" % cosmos._NODE_CAP_LIGHT, script)
+            self.assertIn("for c in #() do", script)
+            self.assertIn("local diffMats=false", script)
+        self.assertIn("local nodeCap=%d" % cosmos._NODE_CAP_FULL, full)
+        self.assertIn("local noiseProps=true", full)
+        prepare = next(c[1] for c in self.op_client.commands if c[0] == "prepare")
+        self.assertIn("local nodeDiff=true", prepare)
+        self.assertIn("local record=true", prepare)
+        # No bridge calls beyond the existing prepare/poll/confirm/finalize.
+        self.assertEqual(self.bridge_kinds("operation"), ["prepare", "light", "light", "full", "finalize"])
+
+    def test_only_untied_new_nodes_is_unverified_with_warning(self):
+        stray = {"nodes": [other(ref(501, "Box001", "Editable_Poly"))], "materials": [], "maps": []}
+        self.light_results = [stray]
+        self.flow["full"] = stray
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported_unverified")
+        self.assertFalse(result["import_timing"]["detected"])
+        self.assertEqual(result["nodes"], [])
+        self.assertEqual([n["handle"] for n in result["other_new_nodes"]], ["501"])
+        self.assertTrue(any("none carries cosmosAssetId" in w for w in result["warnings"]))
+
+    def test_capped_nodes_reported(self):
+        self.light_results = [self.rug_after()]
+        self.flow["full"] = self.rug_after(nodes_omitted=7)
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(result["nodes_omitted"], 7)
+        self.assertTrue(any("7 more new nodes" in w for w in result["warnings"]))
+
+    def test_node_threshold_helper(self):
+        self.assertEqual(cosmos._node_min(MODEL_BEFORE["known"]), 100)
+        self.assertEqual(cosmos._node_min({"newest": 100, "nodes_max": 250}), 250)  # lazily numbered nodes
+        self.assertEqual(cosmos._node_min({"newest": -1, "nodes_max": -1}), -1)
+        self.assertEqual(cosmos._node_min({"newest": "bad"}), -1)
+        self.assertEqual(cosmos._node_min(None), -1)
+
+    def test_node_diff_script_shape(self):
+        known = MODEL_BEFORE["known"]
+        light = cosmos._snapshot_script(RUG, light=True, renderer="V-Ray", known=known)
+        full = cosmos._snapshot_script(RUG, known=known)
+        record = cosmos._snapshot_script(RUG, record=True)
+        for script in (light, full, record):
+            self.assertEqual(script.count("("), script.count(")"))
+            self.assertNotIn("__", script)
+            # Every node above the threshold is new whatever its class; tagged nodes stay as before.
+            self.assertIn("if (try(n.cosmosAssetId==aid)catch(false)) then append nodes n", script)
+            self.assertIn("else if nodeMin>=0L and h>nodeMin do (if newNodes.count<nodeCap then append newNodes n "
+                          "else nodesOmitted+=1)", script)
+            # Tied: named like the asset, a material newer than dispatch or named like the asset; spread
+            # to new ancestors (markUp) and descendants (of tagged or tied nodes).
+            self.assertIn("(matchesName (try(n.name)catch(\"\")) key) or (m!=undefined and ((matMin>=0L and "
+                          "(try((handleOf m)>matMin)catch(false)))", script)
+            self.assertIn("for n in nodes do markUp n newNodes tied", script)
+            self.assertIn("if (j>0 and tied[j]) or (findItem nodes p)>0 do tied[i]=true", script)
+            self.assertIn("append nodeJSON (refJSON newNodes[i] true isOther:(not tied[i]))", script)
+            # Materials on tied new nodes are the import's own (core).
+            self.assertIn("for n in tiedNodes where (try(n.material!=undefined)catch(false)) do appendIfUnique mats "
+                          "n.material", script)
+        self.assertIn("if record then (if h>nodesMax do nodesMax=h)", record)
+        self.assertIn('",\\"nodes_max\\":"+(formattedPrint nodesMax format:"d")', record)
+        self.assertIn("local nodeDiff=true", record)
+        # Material/HDRI imports and records without a threshold never diff nodes.
+        mat = {**RUG, "kind": "material"}
+        self.assertIn("local nodeDiff=false", cosmos._snapshot_script(mat, known=known))
+        self.assertIn("local nodeDiff=false", cosmos._snapshot_script(mat, record=True))
+        legacy = cosmos._snapshot_script(RUG, light=True, renderer="V-Ray", known={"materials": [1]})
+        self.assertIn("local nodeDiff=false", legacy)
+        self.assertIn("local nodeMin=-1L", legacy)
+
+    def test_pristine_default_slot_materials_never_listed(self):
+        known = MODEL_BEFORE["known"]
+        mat = {**RUG, "kind": "material"}
+        full = cosmos._snapshot_script(mat, known=known)
+        light = cosmos._snapshot_script(mat, light=True, renderer="V-Ray", scan_classes=True, known=known)
+        # Same default-name rule as the #10 free-slot test ("NN - Default", "Material #N").
+        self.assertEqual(default_name_regex(full), default_name_regex(cosmos._SLOT_FNS))
+        self.assertEqual(default_name_regex(full), cosmos._DEFAULT_NAME_MXS)
+        for script in (full, light):
+            # Both material passes (slots, class scan) skip new slot noise and the fresh comparison instances.
+            self.assertEqual(script.count("(keepNew m knownMats diffMats fresh noiseProps noise)"), 2)
+            self.assertNotIn("or (isNew m knownMats diffMats) do", script)
+            self.assertIn("if (not (isNew m known diff)) or (isFresh m fresh) then false", script)
+            self.assertIn("else if (isNoise m fresh props) then (appendIfUnique noise m; false)", script)
+            self.assertIn("(getNumSubMtls m)==0 and (refs.dependentNodes m).count==0", script)
+            self.assertIn("if (getSubTexmap m j)!=undefined do ok=false", script)
+            self.assertIn('\\"default_materials_ignored\\":"+(noise.count as string)', script)
+            self.assertEqual(script.count("("), script.count(")"))
+        # Property comparison (a fresh instance per class) only on the confirming scan; polls create nothing.
+        self.assertIn("if ok and props do (", full)
+        self.assertIn("local noiseProps=true", full)
+        self.assertIn("local noiseProps=false", light)
+        # The prepare record never diffs, so it never checks (or creates) anything for noise.
+        self.assertIn("local diffMats=false", cosmos._snapshot_script(mat, record=True))
+        # Python side: only the count is surfaced, and only when non-zero.
+        response = cosmos._resources(MODEL_BEFORE, {"nodes": [], "materials": [], "maps": [],
+                                                    "default_materials_ignored": "3"})
+        self.assertEqual(response["default_materials_ignored"], 3)
+        self.assertNotIn("default_materials_ignored",
+                         cosmos._resources(MODEL_BEFORE, {"nodes": [], "materials": [], "maps": []}))
+
+
 def slot_prep(active=13, keep=True, free_slot=4, switched=True, **extra):
     return {"active": active, "material": {"handle": "2", "name": "Steel_Blurry"}, "keep": keep,
             "free_slot": free_slot, "switched": switched, "mode": "basic", "stale": False, "error": "", **extra}
@@ -1888,6 +2048,151 @@ class BrowserEnsureTests(_FlowCase):
         self.assertIn("if false then", self.op_client.commands[-1][1])
 
 
+class BrowserMinimizeTests(_FlowCase):
+    """Issue #13: a Cosmos browser the import showed is minimized (never closed) after a quiet confirm."""
+
+    def minimizes(self):
+        return [e for e in self.events if e[0] == "minimize"]
+
+    def test_browser_opened_by_import_minimized_after_quiet_confirm(self):
+        self.browsers = []  # the browser action creates a visible main-thread browser
+        result = self.run_import()
+        self.assertEqual(result["state"], "imported")
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["opened"], browser["shown_before"], browser["minimized_after"]),
+                         (True, False, True))
+        self.assertNotIn("minimize_skipped", browser)
+        self.assertEqual(self.minimizes(), [("minimize", NEW_BROWSER_HWND, PID, process_health.COSMOS_BROWSER_TITLE)])
+        at = self.index(self.minimizes()[0])
+        # Only after settle and after the confirm/finalize bridge calls; no extra bridge call.
+        self.assertGreater(at, self.index(("settle_end",)))
+        self.assertGreater(at, self.index(("bridge", "operation", "finalize")))
+        self.assertEqual(self.bridge_kinds("operation")[-2:], ["full", "finalize"])
+        self.assertFalse([e for e in self.events[at:] if e[0] == "bridge"])
+        self.assertIn(("wm_null", MAIN_HWND, cosmos._POLL_GATE_MS), self.events[:at])  # busy gate first
+
+    def test_minimized_browser_shown_by_import_is_minimized_again(self):
+        self.visible[BROWSER_HWND], self.iconic = True, {BROWSER_HWND}
+        dispatch = self.service.import_asset
+
+        def restored_by_import(asset_id, revision):
+            self.iconic.discard(BROWSER_HWND)
+            return dispatch(asset_id, revision)
+        self.service.import_asset = restored_by_import
+        result = self.run_import()
+        self.assertEqual((result["cosmos_browser"]["shown_before"], result["cosmos_browser"]["minimized_after"]),
+                         (False, True))
+        self.assertEqual([e[1] for e in self.minimizes()], [BROWSER_HWND])
+
+    def test_browser_shown_before_is_left_alone(self):
+        self.visible[BROWSER_HWND] = True
+        result = self.run_import()
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["shown_before"], browser["minimized_after"], browser["minimize_skipped"]),
+                         (True, False, "shown_before"))
+        self.assertFalse(self.minimizes())
+
+    def test_opt_out_respected(self):
+        self.browsers = []
+        result = self.run_import(minimize_browser=False)
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["minimized_after"], browser["minimize_skipped"]), (False, "opted_out"))
+        self.assertFalse(self.minimizes())
+
+    def test_not_quiet_never_minimizes(self):
+        self.browsers = []
+        self.settle = settle_result(False, hung_browser=True)
+        result = self.run_import()
+        self.assertEqual(result["state"], "settling")
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["minimized_after"], browser["minimize_skipped"]), (False, "not_quiet"))
+        self.assertFalse(self.minimizes())
+
+    def test_lost_confirm_never_minimizes(self):
+        self.browsers = []
+        self.flow["full"] = MaxNotRespondingAfterDispatch("not responding", {"process": {"state": "blocked"}})
+        result = self.run_import()
+        self.assertEqual(result["state"], "settling")
+        self.assertEqual(result["cosmos_browser"]["minimize_skipped"], "not_quiet")
+        self.assertFalse(self.minimizes())
+
+    def test_busy_max_skips_minimize(self):
+        self.browsers = []
+        finalized = ("bridge", "operation", "finalize")
+        with mock.patch.object(cosmos, "_main_window_busy", side_effect=lambda pid: finalized in self.events):
+            result = self.run_import()
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["minimized_after"], browser["minimize_skipped"]), (False, "max_busy"))
+        self.assertFalse(self.minimizes())
+
+    def test_browser_on_another_thread_never_minimized(self):
+        self.browsers = []
+        self.browser_appears = OTHER_TID  # visible, but owned by the importer's own thread
+        result = self.run_import()
+        browser = result["cosmos_browser"]
+        self.assertFalse(browser["ensured"])
+        self.assertEqual((browser["minimized_after"], browser["minimize_skipped"]), (False, "other_thread_browser"))
+        self.assertFalse(self.minimizes())
+
+    def test_any_other_thread_browser_blocks_minimizing_the_main_one(self):
+        self.browsers = []
+        dispatch = self.service.import_asset
+
+        def importer_spawns_own_browser(asset_id, revision):
+            self.browsers.append(BROWSER_HWND)  # hidden, on the importer's own thread
+            self.threads[BROWSER_HWND] = OTHER_TID
+            return dispatch(asset_id, revision)
+        self.service.import_asset = importer_spawns_own_browser
+        result = self.run_import()
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["opened"], browser["shown_before"], browser["minimized_after"],
+                          browser["minimize_skipped"]), (True, False, False, "other_thread_browser"))
+        self.assertFalse(self.minimizes())  # not even the visible main-thread one
+        self.assertTrue(any("separate (non-main) thread after the import" in w for w in result["warnings"]))
+
+    def test_opt_out_reported_when_not_quiet(self):
+        self.browsers = []
+        self.settle = settle_result(False, hung_browser=True)
+        result = self.run_import(minimize_browser=False)
+        self.assertEqual(result["state"], "settling")
+        self.assertEqual(result["cosmos_browser"]["minimize_skipped"], "opted_out")
+
+    def test_opt_out_reported_when_confirm_lost(self):
+        self.browsers = []
+        self.flow["full"] = MaxNotRespondingAfterDispatch("not responding", {"process": {"state": "blocked"}})
+        result = self.run_import(minimize_browser=False)
+        self.assertEqual(result["cosmos_browser"]["minimize_skipped"], "opted_out")
+        self.assertFalse(self.minimizes())
+
+    def test_iconic_before_false_by_default(self):
+        self.assertFalse(self.run_import()["cosmos_browser"]["iconic_before"])
+
+    def test_iconic_before_recorded(self):
+        self.visible[BROWSER_HWND], self.iconic = True, {BROWSER_HWND}  # left minimized by a previous import
+        result = self.run_import()
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["iconic_before"], browser["shown_before"]), (True, False))
+        self.assertNotIn("action", browser)  # an iconic main-thread browser counts as ready (verify live)
+
+    def test_hidden_main_thread_browser_needs_nothing(self):
+        result = self.run_import()  # default: a hidden main-thread browser before and after
+        browser = result["cosmos_browser"]
+        self.assertEqual((browser["shown_before"], browser["minimized_after"], browser["minimize_skipped"]),
+                         (False, False, "not_shown"))
+
+    def test_refused_import_never_minimizes(self):
+        self.threads[BROWSER_HWND], self.hung_hwnds = OTHER_TID, {BROWSER_HWND}
+        result = self.run_import()
+        self.assertEqual(result["state"], "browser_hung")
+        self.assertNotIn("minimized_after", result["cosmos_browser"])
+        self.assertFalse(self.minimizes())
+
+    def test_tool_exposes_the_opt_out(self):
+        source = (REPO_ROOT / "maxmcp" / "tools" / "cosmos.py").read_text(encoding="utf-8")
+        self.assertIn("minimize_browser: bool = True", source)
+        self.assertIn("swap_medit_renderer, minimize_browser)", source)
+
+
 class BrowserActionScriptTests(unittest.TestCase):
     def test_searches_by_description_without_fixed_indices(self):
         for renderer, table in (("V-Ray", '"*v-ray*"'), ("Corona", '"*corona*"')):
@@ -2295,6 +2600,21 @@ class WindowFinderTests(unittest.TestCase):
         self.assertNotEqual(process_health.window_thread(hwnd), process_health.window_thread(main))
         self.assertEqual([(w["main_thread"], w["visible"], w["hung"]) for w in state["windows"]],
                          [(False, True, False)])
+
+    def test_minimize_window_only_the_named_window_of_that_process(self):
+        title = "MCP Test Minimize Browser %d" % os.getpid()
+        child, hwnd, _ = self.spawn(title, "--mode", "pump")
+        self.assertIs(process_health.window_iconic(hwnd), False)
+        self.assertFalse(process_health.minimize_window(hwnd, os.getpid(), title))  # another process
+        self.assertFalse(process_health.minimize_window(hwnd, child.pid, "something else"))
+        self.assertIs(process_health.window_iconic(hwnd), False)
+        self.assertTrue(process_health.minimize_window(hwnd, child.pid, title))
+        deadline = time.monotonic() + 5
+        while process_health.window_iconic(hwnd) is not True and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIs(process_health.window_iconic(hwnd), True)
+        self.assertEqual(process_health.find_windows(child.pid, title), [hwnd])  # minimized, not closed
+        self.assertIsNone(process_health.window_iconic(0))
 
     def test_thread_windows_hidden_hung_browser_on_other_thread(self):
         title = "MCP Test Hung Other Browser %d" % os.getpid()

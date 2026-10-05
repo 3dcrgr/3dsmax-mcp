@@ -45,6 +45,7 @@ def cosmos_import(
     settle_seconds: int = impl.SETTLE_SECONDS_DEFAULT,
     restore_medit_renderer: bool = True,
     swap_medit_renderer: bool = False,
+    minimize_browser: bool = True,
 ) -> dict:
     """Download if needed and import one Cosmos asset into the selected Max instance.
     Returns imported nodes, materials or maps and their file checks; selection is
@@ -54,10 +55,14 @@ def cosmos_import(
     (e.g. Forest Pack regenerating its own) go to other_new_materials (if none can be tied to a
     material or model import, all stay in materials, with a warning). primary_material (or
     primary_map) is the main one, primary_reason says how it was picked, note says when
-    its name differs from the asset's. A pending download makes no scene edit. Repeating a completed model
+    its name differs from the asset's. Model nodes are found by handle whatever their class or name
+    (e.g. a VRayProxy); new nodes not tied to the import go to other_new_nodes. Unused default slot
+    materials ("Material #N") are ignored. A pending download makes no scene edit. Repeating a completed model
     import creates another instance; if completion is unknown, inspect before retrying.
     First opens the Cosmos browser on Max's main thread (a hidden browser on another
     thread stalled/deadlocked Max); state browser_hung means nothing was imported: follow next.
+    minimize_browser (default on) minimizes, never closes, that browser after a quiet import if
+    it was not shown before (cosmos_browser.minimized_after).
     swap_medit_renderer (optional; forced on if the browser cannot be opened) uses
     Scanline for the Material Editor during the import, restored later if
     restore_medit_renderer. Waits up to settle_seconds (0-300, at least 8) for Max to
@@ -68,4 +73,4 @@ def cosmos_import(
     displaced_material/medit_slot_restored if it was replaced anyway).
     """
     return impl.import_asset(client, asset_id, wait_seconds, renderer, settle_seconds, restore_medit_renderer,
-                             swap_medit_renderer)
+                             swap_medit_renderer, minimize_browser)
