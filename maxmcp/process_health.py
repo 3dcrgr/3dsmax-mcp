@@ -1,7 +1,8 @@
 """Read-only health probes for a 3ds Max process (hung window, CPU, exit).
 
 Only query rights are requested; nothing here signals or injects into the
-target, except window_responsive's no-op WM_NULL (settle checks only).
+target, except window_responsive's no-op WM_NULL (settle checks only) and
+minimize_window's posted ShowWindowAsync (cosmos_import only).
 Every public function returns a verdict instead of raising.
 """
 
@@ -66,6 +67,11 @@ if _IS_WINDOWS:
     _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     _user32.GetWindowRect.restype = wintypes.BOOL
     _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    # IsIconic reads window state; ShowWindowAsync posts and never waits for the window's thread.
+    _user32.IsIconic.restype = wintypes.BOOL
+    _user32.IsIconic.argtypes = [wintypes.HWND]
+    _user32.ShowWindowAsync.restype = wintypes.BOOL
+    _user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
 
     class _PROCESSENTRY32W(ctypes.Structure):
         _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
@@ -82,6 +88,7 @@ if _IS_WINDOWS:
     _kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
 
 _WM_NULL = 0x0000
+_SW_SHOWMINNOACTIVE = 7  # minimized; the active window stays active (no activation message)
 _SMTO_BLOCK = 0x0001
 _SMTO_ABORTIFHUNG = 0x0002
 COSMOS_BROWSER_TITLE = "Chaos Cosmos Browser"
@@ -424,6 +431,37 @@ def window_hung(hwnd: int) -> bool | None:
         return bool(_user32.IsHungAppWindow(hwnd))
     except Exception:
         return None
+
+
+def window_iconic(hwnd: int) -> bool | None:
+    """IsIconic (minimized); no message is sent. None when gone or unknown."""
+    if not _IS_WINDOWS or not hwnd:
+        return None
+    try:
+        if not _user32.IsWindow(hwnd):
+            return None
+        return bool(_user32.IsIconic(hwnd))
+    except Exception:
+        return None
+
+
+def minimize_window(hwnd: int, pid: int, title: str) -> bool:
+    """Minimize without activating (ShowWindowAsync SW_SHOWMINNOACTIVE: posted, never waits).
+
+    Only when `hwnd` still belongs to `pid` and is titled `title`. Never closes it.
+    """
+    if not _IS_WINDOWS or not hwnd or not _valid_pid(pid):
+        return False
+    try:
+        owner = wintypes.DWORD()
+        if not _user32.IsWindow(hwnd):
+            return False
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value != pid or _window_title(hwnd).casefold() != title.casefold():
+            return False
+        return bool(_user32.ShowWindowAsync(hwnd, _SW_SHOWMINNOACTIVE))
+    except Exception:
+        return False
 
 
 def window_responsive(hwnd: int, timeout_ms: int = 500) -> dict[str, Any]:

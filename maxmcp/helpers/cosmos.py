@@ -202,6 +202,17 @@ def download(client, package_id, wait_seconds, renderer):
 # meanwhile, e.g. Forest Pack regenerating its own) are flagged "other", and maps are
 # only collected from core materials, unless no core material is new (material and model
 # assets: then from all, matching the fallback in _resources).
+# Nodes (issue #13, models only): besides cosmosAssetId-tagged ones, every node whose handle
+# is above __NODE_MIN__ (the pre-dispatch "newest"/"nodes_max") is new, whatever its class or
+# name (VRayProxy, group, container). A new node is tied to the import when it is named like the
+# asset, or its material is newer than dispatch or named like the asset; ties spread to its new
+# ancestors and descendants. Untied new nodes are flagged "other". At most __NODE_CAP__ new nodes.
+# New materials that are pristine default-named slot materials ("NN - Default", "Material #N",
+# unused, no maps or sub-materials and, on full scans, every property as a fresh instance) are
+# slot noise: never listed, only counted (the fresh comparison instances are never listed).
+_DEFAULT_NAME_MXS = r"(?i)^\\s*(\\d+\\s*-\\s*default|material\\s*#\\s*\\d+)\\s*$"
+_NODE_CAP_LIGHT = 50
+_NODE_CAP_FULL = 2000
 _ASSET_SNAPSHOT = r"""(
  fn compactName value = (
   (dotNetClass "System.Text.RegularExpressions.Regex").Replace (toLower(value as string)) "[^a-z0-9]" ""
@@ -214,6 +225,11 @@ _ASSET_SNAPSHOT = r"""(
  local knownMaps=__KNOWN_MAPS__
  local diffMats=__DIFF_MATS__
  local diffMaps=__DIFF_MAPS__
+ local nodeDiff=__NODE_DIFF__
+ local nodeMin=__NODE_MIN__
+ local matMin=__MAT_MIN__
+ local nodeCap=__NODE_CAP__
+ local noiseProps=__NOISE_PROPS__
  fn matchesName value key = ((findString (compactName value) key)!=undefined)
  fn handleOf value = ((getHandleByAnim value) as integer64)
  fn isKnown h known = (
@@ -226,6 +242,41 @@ _ASSET_SNAPSHOT = r"""(
  )
  fn isNew value known diff = (diff and (try(not (isKnown (handleOf value) known))catch(false)))
  fn remember value known = (try(append known (handleOf value))catch())
+ fn isFresh m fresh = (local f=false; for e in fresh while not f do (if e[2]==m do f=true); f)
+ fn isNoise m fresh props = (
+  local ok=false
+  try(
+   if ((dotNetClass "System.Text.RegularExpressions.Regex").IsMatch (m.name as string) "__DEFAULT_NAME__") and (getNumSubMtls m)==0 and (refs.dependentNodes m).count==0 do (
+    ok=true
+    for j=1 to (getNumSubTexmaps m) while ok do if (getSubTexmap m j)!=undefined do ok=false
+    if ok and props do (
+     local c=classof m, d=undefined
+     for e in fresh while d==undefined do if e[1]==c do d=e[2]
+     if d==undefined do (d=c(); append fresh #(c, d))
+     for p in (getPropNames m) while ok do if ((try(getProperty m p)catch(#mcpErr)) as string)!=((try(getProperty d p)catch(#mcpErr)) as string) do ok=false
+    )
+   )
+  )catch(ok=false)
+  ok
+ )
+ fn keepNew m known diff fresh props noise = (
+  if (not (isNew m known diff)) or (isFresh m fresh) then false
+  else if (isNoise m fresh props) then (appendIfUnique noise m; false)
+  else true
+ )
+ fn directTie n key matMin = (
+  local m=try(n.material)catch(undefined)
+  (matchesName (try(n.name)catch("")) key) or (m!=undefined and ((matMin>=0L and (try((handleOf m)>matMin)catch(false))) or (matchesName (try(m.name)catch("")) key)))
+ )
+ fn markUp n newNodes tied = (
+  local p=try(n.parent)catch(undefined), d=0
+  while p!=undefined and d<64 do (
+   local j=findItem newNodes p
+   if j>0 do tied[j]=true
+   p=try(p.parent)catch(undefined)
+   d+=1
+  )
+ )
  fn slotOf value = (
   local s=0
   try(for i=1 to meditMaterials.count while s==0 do if meditMaterials[i]==value do s=i)catch()
@@ -258,20 +309,44 @@ _ASSET_SNAPSHOT = r"""(
   "["+(ss as string)+"]"
  )
  local newest=if record then (try(handleOf (bezier_float()))catch(-1L)) else -1L
- local nodes=for n in objects where (try(n.cosmosAssetId==aid)catch(false)) collect n
+ local nodesMax=-1L, nodesOmitted=0, newNodes=#()
+ local nodes=#()
+ for n in objects do (
+  if (try(n.cosmosAssetId==aid)catch(false)) then append nodes n
+  else if nodeDiff do (
+   local h=try(handleOf n)catch(-1L)
+   if record then (if h>nodesMax do nodesMax=h)
+   else if nodeMin>=0L and h>nodeMin do (if newNodes.count<nodeCap then append newNodes n else nodesOmitted+=1)
+  )
+ )
+ local tied=for n in newNodes collect (directTie n key matMin)
+ for n in nodes do markUp n newNodes tied
+ for i=1 to newNodes.count where tied[i] do markUp newNodes[i] newNodes tied
+ for i=1 to newNodes.count where not tied[i] do (
+  local p=try(newNodes[i].parent)catch(undefined), d=0
+  while p!=undefined and d<64 and not tied[i] do (
+   local j=findItem newNodes p
+   if (j>0 and tied[j]) or (findItem nodes p)>0 do tied[i]=true
+   p=try(p.parent)catch(undefined)
+   d+=1
+  )
+ )
+ local tiedNodes=for n in nodes collect n
+ for i=1 to newNodes.count where tied[i] do append tiedNodes newNodes[i]
+ local fresh=#(), noise=#()
  local mats=#()
- for n in nodes where n.material!=undefined do appendIfUnique mats n.material
+ for n in tiedNodes where (try(n.material!=undefined)catch(false)) do appendIfUnique mats n.material
  local nodeMats=for m in mats collect m
  try(
   for m in meditMaterials where m!=undefined do (
    if record do remember m knownMats
-   if (matchesName m.name key) or (isNew m knownMats diffMats) do appendIfUnique mats m
+   if (matchesName m.name key) or (keepNew m knownMats diffMats fresh noiseProps noise) do appendIfUnique mats m
   )
  )catch()
  for c in __MAT_CLASSES__ do try(
   for m in (getClassInstances c processAllAnimatables:true) do (
    if record do remember m knownMats
-   if (matchesName m.name key) or (isNew m knownMats diffMats) do appendIfUnique mats m
+   if (matchesName m.name key) or (keepNew m knownMats diffMats fresh noiseProps noise) do appendIfUnique mats m
   )
  )catch()
  local core=for m in mats where (findItem nodeMats m)>0 or (try(matchesName m.name key)catch(false)) or (slotOf m)>0 collect m
@@ -300,10 +375,12 @@ _ASSET_SNAPSHOT = r"""(
    )
   )catch()
  )
- local knownJSON=if record then (",\"known\":{\"materials\":"+(joinHandles knownMats)+",\"maps\":"+(if recordMaps then joinHandles knownMaps else "null")+",\"newest\":"+(formattedPrint newest format:"d")+"}") else ""
+ local knownJSON=if record then (",\"known\":{\"materials\":"+(joinHandles knownMats)+",\"maps\":"+(if recordMaps then joinHandles knownMaps else "null")+",\"newest\":"+(formattedPrint newest format:"d")+",\"nodes_max\":"+(formattedPrint nodesMax format:"d")+"}") else ""
  local subs=#()
  for m in mats do collectSubs m subs 0
- "{\"nodes\":"+(joinJSON(for n in nodes collect(refJSON n true)))+",\"materials\":"+(joinJSON(for m in mats collect(refJSON m false slot:(slotOf m) isSub:((findItem subs m)>0) isOther:((findItem core m)==0))))+",\"maps\":"+(joinJSON(for m in maps collect(refJSON m false)))+knownJSON+"}"
+ local nodeJSON=for n in nodes collect(refJSON n true)
+ for i=1 to newNodes.count do append nodeJSON (refJSON newNodes[i] true isOther:(not tied[i]))
+ "{\"nodes\":"+(joinJSON nodeJSON)+",\"materials\":"+(joinJSON(for m in mats collect(refJSON m false slot:(slotOf m) isSub:((findItem subs m)>0) isOther:((findItem core m)==0))))+",\"maps\":"+(joinJSON(for m in maps collect(refJSON m false)))+",\"nodes_omitted\":"+(nodesOmitted as string)+",\"default_materials_ignored\":"+(noise.count as string)+knownJSON+"}"
 )"""
 
 _RENDERER_MATERIAL_CLASSES = (
@@ -344,7 +421,14 @@ def _snapshot_script(asset, light=False, renderer="", scan_classes=False, known=
         diff_kinds = (_EXPECTED.get(asset["kind"]),)
     known = {} if record else (known or {})
     diff = {kind: kind in diff_kinds and known.get(kind) is not None for kind in ("materials", "maps")}
-    return (_ASSET_SNAPSHOT.replace("__KEY__", key).replace("__ASSET__", normalize_id(asset["id"]))
+    node_min = _node_min(known)
+    node_diff = asset["kind"] == "model" and (record or node_min >= 0)
+    return (_ASSET_SNAPSHOT.replace("__DEFAULT_NAME__", _DEFAULT_NAME_MXS)
+            .replace("__NODE_DIFF__", "true" if node_diff else "false").replace("__NODE_MIN__", "%dL" % node_min)
+            .replace("__MAT_MIN__", "%dL" % _newest_known({"known": known}))
+            .replace("__NODE_CAP__", str(_NODE_CAP_LIGHT if light else _NODE_CAP_FULL))
+            .replace("__NOISE_PROPS__", "false" if light else "true")
+            .replace("__KEY__", key).replace("__ASSET__", normalize_id(asset["id"]))
             .replace("__MAT_CLASSES__", classes).replace("__SCAN_MAPS__", scan_maps)
             .replace("__RECORD__", "true" if record else "false")
             .replace("__MAP_FALLBACK__", "true" if asset["kind"] in _MATERIAL_KINDS else "false")
@@ -421,7 +505,7 @@ _MEDIT_SWAP = r"""if scanline!=undefined do (
 # Never throws; any doubt means "not free".
 _SLOT_FNS = r"""local mcpFresh=#()
  fn mcpDefaultName m = (
-  (try((dotNetClass "System.Text.RegularExpressions.Regex").IsMatch (m.name as string) "(?i)^\\s*(\\d+\\s*-\\s*default|material\\s*#\\s*\\d+)\\s*$")catch(false))==true
+  (try((dotNetClass "System.Text.RegularExpressions.Regex").IsMatch (m.name as string) "__DEFAULT_NAME__")catch(false))==true
  )
  fn mcpPristine m = (
   local ok=false
@@ -459,7 +543,8 @@ _SLOT_FNS = r"""local mcpFresh=#()
  fn mcpSlotRef m = (
   if m==undefined then "null" else "{\"handle\":\""+(try(formattedPrint ((getHandleByAnim m) as integer64) format:"d")catch(""))+"\",\"name\":\""+(MCP_Server.escapeJsonString(try(m.name as string)catch("")))+"\"}"
  )
- fn mcpLooseRef m = (if m!=undefined and not (mcpDefaultName m) then mcpSlotRef m else "null")"""
+ fn mcpLooseRef m = (if m!=undefined and not (mcpDefaultName m) then mcpSlotRef m else "null")""".replace(
+    "__DEFAULT_NAME__", _DEFAULT_NAME_MXS)
 
 # In _PREPARE (BEFORE the baseline snapshot, so the fresh instances mcpPristine makes
 # are recorded as known, never reported as new): if the active slot holds a material
@@ -669,6 +754,14 @@ def _newest_known(before):
     return max(known, default=-1)
 
 
+def _node_min(known):
+    """Nodes with a handle above this are new (-1: not recorded). The record's "newest" and the
+    highest node handle it saw ("nodes_max"): both predate dispatch, and handles only grow."""
+    known = known or {}
+    values = _handle_ints([known.get("newest"), known.get("nodes_max")])
+    return max(max(values, default=-1), -1)
+
+
 def _finalize_script(handles, restore_medit, newest_known=-1):
     """newest_known: a slot occupant above this handle counts as the import's (-1: none
     does, so a displaced slot material is kept alive and reported, not swapped back)."""
@@ -792,6 +885,44 @@ def _ensure_browser(client, pid, renderer, state):
     return record, warnings, state
 
 
+def _browser_shown(state):
+    """OS-level only: is a main-thread Cosmos browser visible and not minimized (IsIconic)?"""
+    return any(w.get("main_thread") and w.get("visible") and not process_health.window_iconic(w.get("hwnd"))
+               for w in state.get("windows") or [])
+
+
+def _browser_iconic(state):
+    """OS-level only: is a main-thread Cosmos browser minimized (IsIconic)?"""
+    return any(w.get("main_thread") and process_health.window_iconic(w.get("hwnd")) is True
+               for w in state.get("windows") or [])
+
+
+def _minimize_browser(record, pid, shown_before, enabled):
+    """Issue #13: after a confirmed quiet import (never during settle), minimize a main-thread
+    Cosmos browser this import showed: OS-level, posted (ShowWindowAsync, no activation), never
+    closed, never while Max's main window does not answer, and not at all while any Cosmos
+    browser exists on another thread (minimizing the active window hands activation on; #1).
+    Sets record["minimized_after"] and, when nothing was done, record["minimize_skipped"]."""
+    why = ("opted_out" if not enabled else "shown_before" if shown_before
+           else "max_busy" if _main_window_busy(pid) else None)
+    targets = []
+    if why is None:
+        windows = _browser_state(pid).get("windows") or []
+        if any(not w.get("main_thread") for w in windows):
+            why = "other_thread_browser"
+        else:
+            targets = [w["hwnd"] for w in windows
+                       if w.get("visible") and not w.get("hung")
+                       and process_health.window_iconic(w.get("hwnd")) is False]
+            why = None if targets else "not_shown"
+    done = [h for h in targets if process_health.minimize_window(h, pid, process_health.COSMOS_BROWSER_TITLE)]
+    if targets and not done:
+        why = "minimize_failed"
+    record["minimized_after"] = bool(done)
+    if why:
+        record["minimize_skipped"] = why
+
+
 def _dispatch_gate(pid):
     """OS-level only, bounded, right before _PREPARE (earlier checks predate the
     browser action and its wait). Returns (browser state, main_busy) as soon as a
@@ -849,7 +980,8 @@ def _wait_import(client, asset, before, renderer, pid, timeout=_DETECT_TIMEOUT_S
     No poll is sent while Max's main window is hung or not answering; the loop
     waits instead. Polls are dropped at their deadline; the first dropped poll
     ends detection (error in the result) so requests never pile up on Max.
-    A material or map counts by handle (absent before dispatch), whatever its name.
+    A material or map counts by handle (absent before dispatch), whatever its name; so does a
+    model's node, once tied to the import (cosmosAssetId, a new material or the asset's name).
     A new material flagged "other" (not tied to the import, e.g. Forest Pack regenerating)
     does not count, except for a material asset when two class-scan polls in a row show the
     same non-empty set of them and nothing tied to the import (Slate mode, package named
@@ -931,6 +1063,31 @@ def _known(before, kind):
     return handles
 
 
+def _count(value):
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extra_counts(resources, after, other_nodes, warnings, asset_kind):
+    """Issue #13: untied new nodes, new nodes beyond the cap, ignored default slot materials."""
+    if other_nodes:
+        resources["other_new_nodes"] = other_nodes
+        if warnings is not None and asset_kind == "model" and not any(i["created"] for i in resources["nodes"]):
+            warnings.append("%d new node(s) appeared during the import, but none carries cosmosAssetId, a material "
+                            "newer than the import or the asset's name; they are listed in other_new_nodes (some "
+                            "may be made by hand meanwhile)." % len(other_nodes))
+    omitted = _count(after.get("nodes_omitted"))
+    if omitted:
+        resources["nodes_omitted"] = omitted
+        if warnings is not None:
+            warnings.append("%d more new nodes appeared but are not listed (the list is capped)." % omitted)
+    ignored = _count(after.get("default_materials_ignored"))
+    if ignored:
+        resources["default_materials_ignored"] = ignored  # pristine "Material #N"/"NN - Default": slot noise
+
+
 def _resources(before, after, warnings=None, asset_kind=None):
     """nodes/materials/maps with "created" flags. A map counts as created only when its
     handle is above the pre-dispatch "newest" handle (when recorded), never just because
@@ -938,8 +1095,9 @@ def _resources(before, after, warnings=None, asset_kind=None):
     Material Editor slot, not named like the asset, not on its nodes, not a sub-material
     of those) go to other_new_materials when the import produced a new material of its
     own; otherwise (assets that bring materials: material and model) they stay in
-    materials, with a warning. An HDRI brings no material: they always go apart."""
-    resources, other = {}, []
+    materials, with a warning. An HDRI brings no material: they always go apart.
+    New nodes the snapshot flags "other" (not tied to the import) always go to other_new_nodes."""
+    resources, other, other_nodes = {}, [], []
     newest = _newest_handle(before)
     for kind in ("nodes", "materials", "maps"):
         old = _known(before, kind)
@@ -949,7 +1107,8 @@ def _resources(before, after, warnings=None, asset_kind=None):
             item["created"] = str(item["handle"]) not in old
             if kind == "maps" and newest is not None and item["created"]:
                 item["created"] = max(_handle_ints([item["handle"]]), default=-1) > newest
-            if item.pop("other", False) and kind == "materials":
+            is_other = item.pop("other", False)
+            if is_other and kind == "materials":
                 other.append(item)
             slot, sub = item.pop("slot", None), item.pop("sub", False)
             if kind == "materials":
@@ -962,7 +1121,8 @@ def _resources(before, after, warnings=None, asset_kind=None):
                 item["file_exists"] = Path(filename).is_file()
             else:
                 item.pop("filename", None)
-            resources[kind].append(item)
+            (other_nodes if is_other and kind == "nodes" else resources[kind]).append(item)
+    _extra_counts(resources, after, other_nodes, warnings, asset_kind)
     other_new = [item for item in other if item["created"]]
     if not other_new:
         return resources
@@ -1162,7 +1322,7 @@ def _prepare_failed(base, pid, exc, restore_medit_renderer, swap=True, step="pre
 
 
 def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETTLE_SECONDS_DEFAULT,
-                 restore_medit_renderer=True, swap_medit_renderer=False):
+                 restore_medit_renderer=True, swap_medit_renderer=False, minimize_browser=True):
     if (not isinstance(settle_seconds, int) or isinstance(settle_seconds, bool)
             or not 0 <= settle_seconds <= SETTLE_SECONDS_MAX):
         raise ValueError("settle_seconds must be an integer from 0 to %d" % SETTLE_SECONDS_MAX)
@@ -1179,6 +1339,8 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         pid = importer["pid"]
         _snapshot_script(asset)  # validate the asset identity before touching Max
         browser_state = _browser_state(pid)
+        shown_before = _browser_shown(browser_state)  # before the browser step (#13)
+        iconic_before = _browser_iconic(browser_state)  # e.g. minimized by the previous import
         pre = _pre_dispatch_state(pid, browser_state)
         if pre["main_hung"]:
             raise CosmosError("Max (PID %s) is not responding: its main window hung. Nothing was sent and nothing "
@@ -1203,6 +1365,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                 raise  # nothing was sent, so nothing changed
             return {**_prepare_failed(base, pid, exc, restore_medit_renderer, step="browser"),
                     "cosmos_browser": _browser_record(browser_state, False, warning="browser action call lost")}
+        browser.update(shown_before=shown_before, iconic_before=iconic_before)
         if browser.get("refused"):
             return _busy_refusal(base, pid, ensured_state, pre, browser)
         gate, main_busy = _dispatch_gate(pid)  # the checks above predate the action and its wait
@@ -1265,6 +1428,15 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
                 health, failure, lost, quiet = _health_failure(exc), str(exc), step, False
             except Exception as exc:
                 warnings.append("Could not confirm the import or restore the selection: %s" % exc)
+        if quiet and after is not None:  # after the bridge calls, never during settle
+            _minimize_browser(browser, pid, shown_before, minimize_browser)
+            if browser.get("minimize_skipped") == "other_thread_browser":
+                warnings.append("A 'Chaos Cosmos Browser' is open on a separate (non-main) thread after the "
+                                "import, so the browser was not minimized; do not open/close windows until it "
+                                "is gone (#1 deadlock path).")
+        else:
+            browser.update(minimized_after=False, minimize_skipped=(
+                "opted_out" if not minimize_browser else "not_quiet" if not quiet else "not_confirmed"))
         timing = {k: v for k, v in detection.items() if k != "probe"}
         response = {**base, "import_timing": {**timing, "pre_dispatch": pre, "settle": _settle_summary(settle)},
                     "medit_renderer": {k: medit.get(k) for k in ("class", "locked", "editor_open", "swapped")}
