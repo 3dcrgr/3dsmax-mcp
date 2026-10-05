@@ -363,7 +363,8 @@ inline std::string MaxScriptFailureMessage(const std::wstring& wcmd, std::string
             return withSdk("MAXScript did not complete: 3ds Max is shutting down (e.g. after quitMax), "
                            "so the syntax check was skipped. If the script ended the Max session that is expected.");
         }
-        if (MainThreadExecutor::IsDirectMode()) return withSdk(kUnclassified);
+        // The compile check uses MAXScript's thread state: main thread only.
+        if (!MainThreadExecutor::IsMainThread()) return withSdk(kUnclassified);
 
         ScopedMaxScriptEvaluationContext context;
         MAXScript_TLS* _tls = context.Get_TLS();
@@ -442,11 +443,12 @@ inline std::string RunMAXScript(const std::string& script) {
     // one process-wide flag that TempQuietMode saves and restores, so only
     // Max's main thread changes it: a direct-mode read on a pipe thread
     // overlapping a main-thread save/restore could leave Max quiet for good.
-    // Never quiet for a script that could prompt to save or discard the
-    // scene (#12): its prompt must reach the agent, not take a default.
+    // A script that could prompt to save or discard the scene (#12) runs with
+    // quiet mode forced off, even if something else left Max quiet: its
+    // prompt must reach the agent, not take a default.
     std::optional<TempQuietMode> quiet;
-    if (!MainThreadExecutor::IsDirectMode() && !QuietPolicy::MentionsSceneFileCommand(script))
-        quiet.emplace(TRUE);
+    if (MainThreadExecutor::IsMainThread())
+        quiet.emplace(QuietPolicy::MentionsSceneFileCommand(script) ? FALSE : TRUE);
     std::wstring wcmd = WrapForErrorCapture(Utf8ToWide(script));
     FPValue fpv;
     BOOL ok = FALSE;

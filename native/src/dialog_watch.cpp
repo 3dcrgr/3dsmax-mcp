@@ -84,8 +84,12 @@ std::atomic<unsigned> controller_closed{0};
 
 std::mutex text_mutex;
 // A timed-out in-process WM_GETTEXT may still execute later. Keep its buffer
-// alive rather than letting a late window procedure write into freed memory.
-std::vector<std::unique_ptr<wchar_t[]>> pending_text;
+// alive rather than letting a late window procedure write into freed memory,
+// until its window is destroyed: a message to a destroyed window is never
+// delivered. Capped per window, so one hung field cannot disable the others.
+struct PendingText { HWND hwnd; std::unique_ptr<wchar_t[]> buffer; };
+std::vector<PendingText> pending_text;
+constexpr size_t kPendingPerWindow = 4, kPendingTotal = 256;
 
 // Structured errors keep their code through the dispatcher.
 [[noreturn]] void Fail(const char* code, const std::string& message, bool retryable = false) {
@@ -208,12 +212,17 @@ std::string Token(const std::string& id, const json& snapshot) {
 // cross-thread message read has a timeout.
 bool MessageText(HWND hwnd, std::string& text) {
     std::lock_guard<std::mutex> lock(text_mutex);
-    if (GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId() || pending_text.size() >= 64) return false;
+    if (GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId()) return false;
+    pending_text.erase(std::remove_if(pending_text.begin(), pending_text.end(),
+        [](const PendingText& entry) { return !IsWindow(entry.hwnd); }), pending_text.end());
+    const auto for_window = std::count_if(pending_text.begin(), pending_text.end(),
+        [hwnd](const PendingText& entry) { return entry.hwnd == hwnd; });
+    if (static_cast<size_t>(for_window) >= kPendingPerWindow || pending_text.size() >= kPendingTotal) return false;
     auto buffer = std::make_unique<wchar_t[]>(4096);
     DWORD_PTR count = 0;
     if (!SendMessageTimeoutW(hwnd, WM_GETTEXT, 4096, reinterpret_cast<LPARAM>(buffer.get()),
             SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT, 40, &count)) {
-        pending_text.push_back(std::move(buffer));
+        pending_text.push_back({hwnd, std::move(buffer)});
         return false;
     }
     text = Utf8(buffer.get());
@@ -268,6 +277,9 @@ json RunOnMain(std::function<json()> work, DWORD timeout_ms) {
     if (GetCurrentThreadId() == main_thread) return work();
     // A main thread that stops retrieving posted messages is not in a dialog's
     // loop; a sent message would only run inside whatever call blocks it.
+    // The heartbeat notices that only after a few periods (up to ~3 s), so in
+    // that window a read can still run inside such a call. Reads only read,
+    // and presses are posted (PostOnMain), so neither ever acts there.
     if (!MainThreadPumping()) Fail("MAIN_THREAD_BUSY", kNotPumping, true);
     auto task = std::make_shared<LaneTask>();
     task->work = std::move(work);
@@ -462,16 +474,31 @@ Pressed PressButton(HWND hwnd, const std::string& id, const std::string& cls, co
         }, 1500);
         return {out["snapshot"], out["button"]};
     }
+    // Like the Qt path: never queue a click into a main thread that is not
+    // pumping (it would fire whenever Max recovers, maybe minutes later).
+    if (!MainThreadPumping()) Fail("MAIN_THREAD_BUSY", kNotPumping, true);
     std::vector<HWND> controls;
     json snapshot = Win32Snapshot(hwnd, &controls);
     if (Token(id, snapshot) != expected) Fail("STALE_DIALOG", "the dialog changed or closed; inspect again");
     const int index = SelectButton(snapshot, spec);
     const json& button = snapshot["buttons"][index];
     const int control_id = button.value("id", 0);
-    const bool posted = button.value("kind", "") == "push" && control_id > 0
-        ? PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(control_id, BN_CLICKED), reinterpret_cast<LPARAM>(controls[index]))
-        : PostMessageW(controls[index], BM_CLICK, 0, 0);
-    if (!posted) Fail("DIALOG_PRESS_FAILED", "the click could not be posted");
+    const HWND control = controls[index];
+    const bool command = button.value("kind", "") == "push" && control_id > 0;
+    const ULONG_PTR identity = reinterpret_cast<ULONG_PTR>(GetPropW(hwnd, kTokenProperty));
+    // Posted through the lane and checked again when the main thread takes it:
+    // the same dialog instance, the button still enabled inside it.
+    PostOnMain([hwnd, control, control_id, command, identity] {
+        if (!IsWindow(hwnd) || reinterpret_cast<ULONG_PTR>(GetPropW(hwnd, kTokenProperty)) != identity ||
+            !IsWindow(control) || !IsChild(hwnd, control) || !IsWindowEnabled(control)) return;
+        // A button's WM_COMMAND goes to its own parent, which is a nested pane
+        // (e.g. a file dialog's template) rather than the dialog itself.
+        const HWND parent = GetParent(control);
+        if (command && parent)
+            PostMessageW(parent, WM_COMMAND, MAKEWPARAM(control_id, BN_CLICKED), reinterpret_cast<LPARAM>(control));
+        else
+            PostMessageW(control, BM_CLICK, 0, 0);
+    });
     return {snapshot, button};
 }
 
@@ -631,6 +658,10 @@ void AutoAcknowledge() {
                 event["request_id"] = session->request;
                 event["command"] = session->command;
             }
+        } catch (const std::exception& e) {
+            // A press refused because the main thread stopped pumping is retried
+            // on a later tick, like a refused Qt read.
+            retry = Message(e) == kNotPumping;
         } catch (...) { /* Recovery must never terminate Max; inspection remains available. */ }
         {
             // Publish before the operation can finish, so a fast return cannot

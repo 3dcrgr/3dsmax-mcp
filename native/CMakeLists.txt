@@ -153,7 +153,9 @@ add_dependencies(mcp_bridge qt_import_libs)
 target_sources(mcp_bridge PRIVATE src/qt_dialogs.cpp)
 set_source_files_properties(src/qt_dialogs.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${MCP_QT_DIR}/include"
-    COMPILE_DEFINITIONS "QT_NO_VERSION_TAGGING"
+    # QT_NO_DEBUG compiles out Q_ASSERT in inline Qt code: NDEBUG does not,
+    # and a failing assert would call qFatal and abort 3ds Max.
+    COMPILE_DEFINITIONS "QT_NO_VERSION_TAGGING;QT_NO_DEBUG"
     COMPILE_OPTIONS "/Zc:__cplusplus;/permissive-")
 target_link_libraries(mcp_bridge PRIVATE ${MCP_QT_IMPORT_LIBS})
 
@@ -209,24 +211,8 @@ if(MSVC)
         "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
-# ── Deploy ───────────────────────────────────────────────────────
-option(MCP_BUILD_TRANSACTION_POLICY_TESTS "Build SDK-independent dispatcher transaction policy tests" OFF)
-if(MCP_BUILD_TRANSACTION_POLICY_TESTS)
-    enable_testing()
-    add_executable(transaction_policy_tests tests/transaction_policy_tests.cpp)
-    target_include_directories(transaction_policy_tests PRIVATE include third_party)
-    add_test(NAME transaction_policy COMMAND transaction_policy_tests)
-    add_executable(capture_region_tests tests/capture_region_tests.cpp)
-    target_include_directories(capture_region_tests PRIVATE include third_party)
-    add_test(NAME capture_region COMMAND capture_region_tests)
-    add_executable(color_value_tests tests/color_value_tests.cpp)
-    target_include_directories(color_value_tests PRIVATE include)
-    add_test(NAME color_value COMMAND color_value_tests)
-    add_executable(dialog_sweeper_tests tests/dialog_sweeper_tests.cpp src/dialog_watch.cpp)
-    target_include_directories(dialog_sweeper_tests PRIVATE include third_party)
-    target_compile_definitions(dialog_sweeper_tests PRIVATE NOMINMAX _UNICODE UNICODE)
-    add_test(NAME dialog_sweeper COMMAND dialog_sweeper_tests)
-endif()
+# ── Tests ────────────────────────────────────────────────────────
+# SDK-independent tests are a separate project: native/tests/CMakeLists.txt.
 
 option(MCP_BUILD_AGENT_VIEWPORT_PROBE "Build optional live agent viewport SDK test harness" OFF)
 if(MCP_BUILD_AGENT_VIEWPORT_PROBE)
@@ -239,6 +225,7 @@ if(MCP_BUILD_AGENT_VIEWPORT_PROBE)
     target_sources(agent_viewport_probe PRIVATE src/window_capture.cpp)
 endif()
 
+# ── Deploy ───────────────────────────────────────────────────────
 set(MAX_PLUGINS_DIR "C:/Program Files/Autodesk/3ds Max ${MAX_VERSION}/plugins"
     CACHE PATH "3ds Max plugins directory")
 

@@ -22,6 +22,12 @@ void detects_file_commands_anywhere() {
     require(MentionsSceneFileCommand("max reset file"), "max reset file");
     require(MentionsSceneFileCommand("max   file\topen"), "whitespace-tolerant max file open");
     require(MentionsSceneFileCommand("MAX FILE NEW"), "max file new");
+    require(MentionsSceneFileCommand("max fetch"), "max fetch (Edit > Fetch) discards changes since Hold");
+    require(MentionsSceneFileCommand("max\n  Fetch"), "whitespace-tolerant max fetch");
+    require(MentionsSceneFileCommand("(dotNetClass \"Autodesk.Max.GlobalInterface\").Instance.COREInterface.FileReset false"),
+            "Interface FileReset");
+    require(MentionsSceneFileCommand("core.FileFetch()"), "Interface FileFetch");
+    require(MentionsSceneFileCommand("core.LoadFromFile @\"C:/a.max\" 0 true"), "Interface LoadFromFile");
 }
 
 void leaves_other_scripts_alone() {
@@ -32,6 +38,7 @@ void leaves_other_scripts_alone() {
     require(!MentionsSceneFileCommand("holdMaxFile()"), "hold does not prompt");
     require(!MentionsSceneFileCommand("saveMaxFile fp"), "save does not discard");
     require(!MentionsSceneFileCommand("max file save"), "max file save");
+    require(!MentionsSceneFileCommand("max hold"), "max hold only saves the hold buffer");
 }
 
 void resolves_quiet() {

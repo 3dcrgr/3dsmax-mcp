@@ -108,12 +108,20 @@ std::string NativeHandlers::ManageScene(const std::string& params, MCPBridgeGUP*
             return "Hold saved successfully";
         }
         if (action == "fetch") {
+            // Fetch replaces the scene with the Hold buffer after a
+            // confirmation; keep it visible even if something left Max quiet.
+            TempQuietMode prompts(FALSE);
             ip->FileFetch();
             NativeHandlers::ResetSceneDeltaSessions();
             return "Fetched (restored) held state";
         }
         if (action == "reset") {
-            ip->FileReset(FALSE); // FALSE = no prompt
+            // noPrompt=FALSE: Max asks to confirm (and to save unsaved changes)
+            // unless it is in quiet mode, which is forced off here, so unsaved
+            // work is never discarded silently; the prompt reaches the agent
+            // as BLOCKED_BY_DIALOG.
+            TempQuietMode prompts(FALSE);
+            ip->FileReset(FALSE);
             NativeHandlers::ResetSceneDeltaSessions();
             return "Scene reset to empty";
         }

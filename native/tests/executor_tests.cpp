@@ -232,6 +232,37 @@ void initialize_reopens_after_shutdown() {
     executor.Shutdown();
 }
 
+// Quiet mode and the MAXScript compile check key on IsMainThread(), not on
+// direct mode: true for queued work and for direct mode switched on on the
+// main thread (a nested Dispatch), false on a pipe thread in either mode.
+void is_main_thread_ignores_direct_mode() {
+    MainThreadExecutor executor;
+    executor.Initialize();
+    require(MainThreadExecutor::IsMainThread(), "the initializing thread is not the main thread");
+    MainThreadExecutor::EnableDirectMode();
+    require(MainThreadExecutor::IsMainThread(), "direct mode on the main thread hid the main thread");
+    MainThreadExecutor::DisableDirectMode();
+
+    std::atomic<bool> done{false};
+    bool worker_plain = true, worker_direct = true, queued_on_main = false, direct_inline = true;
+    std::thread worker([&] {
+        worker_plain = MainThreadExecutor::IsMainThread();
+        executor.ExecuteSync([&] { queued_on_main = MainThreadExecutor::IsMainThread(); return std::string(); }, 20000);
+        MainThreadExecutor::EnableDirectMode();
+        worker_direct = MainThreadExecutor::IsMainThread();
+        executor.ExecuteSync([&] { direct_inline = MainThreadExecutor::IsMainThread(); return std::string(); }, 50);
+        MainThreadExecutor::DisableDirectMode();
+        done = true;
+    });
+    pump_until(done, 5000);
+    worker.join();
+    require(done, "worker did not finish");
+    require(!worker_plain && !worker_direct, "a pipe thread reported itself as the main thread");
+    require(queued_on_main, "queued work did not run on the main thread");
+    require(!direct_inline, "direct-mode work on a pipe thread reported the main thread");
+    executor.Shutdown();
+}
+
 // Healthy path still works: queued work runs and returns its result.
 void queued_work_runs() {
     MainThreadExecutor executor;
@@ -264,9 +295,11 @@ int main() {
         begin_shutdown_inside_running_item();
         initialize_reopens_after_shutdown();
         direct_mode_passes_through_dialog_guard();
+        is_main_thread_ignores_direct_mode();
         std::cout << "PASS: queued work runs; expired work skipped; running work outlives the caller's "
                      "timeout; shutdown wakes queued waiter; execute-after-shutdown fails fast; initialize "
-                     "reopens the gate; shutdown inside a running item; direct mode passes the dialog guard\n";
+                     "reopens the gate; shutdown inside a running item; direct mode passes the dialog guard; "
+                     "IsMainThread ignores direct mode\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

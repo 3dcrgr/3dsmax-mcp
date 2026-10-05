@@ -7,6 +7,7 @@
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/transaction_policy.h"
 #include "mcp_bridge/dialog_watch.h"
+#include "mcp_bridge/native_error_code.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
@@ -195,45 +196,18 @@ static bool ResultLooksLikeError(const std::string& result) {
     return status == "error" || status == "failed";
 }
 
-static std::string NativeErrorCodeForMessage(const std::string& message) {
-    std::string lower = message;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower.find("user_busy") != std::string::npos) return "USER_BUSY";
-    if (lower.find("stale_view") != std::string::npos) return "STALE_VIEW";
-    if (lower.find("safe mode") != std::string::npos) return "SAFE_MODE";
-    if (lower.find("main thread execution timed out") != std::string::npos ||
-        lower.find("named pipe") != std::string::npos ||
-        (lower.find("bridge") != std::string::npos && lower.find("not found") != std::string::npos))
-        return "BRIDGE_DOWN";
-    if (lower.find("render busy") != std::string::npos ||
-        lower.find("already rendering") != std::string::npos)
-        return "RENDER_BUSY";
-    if (lower.find("ambiguous") != std::string::npos) return "AMBIGUOUS";
-    if (lower.find("unknown object class") != std::string::npos ||
-        lower.find("unknown modifier class") != std::string::npos ||
-        lower.find("unknown material class") != std::string::npos ||
-        lower.find("unknown class") != std::string::npos ||
-        (lower.find("plugin") != std::string::npos && lower.find("missing") != std::string::npos))
-        return "PLUGIN_MISSING";
-    if (lower.find("not found") != std::string::npos ||
-        lower.find("no material assigned") != std::string::npos ||
-        lower.find("no modifiers on") != std::string::npos)
-        return "NOT_FOUND";
-    return "BAD_PARAM";
-}
-
 static std::string NormalizeNativeError(const std::string& message) {
     json structured = json::parse(message, nullptr, false);
     if (!structured.is_discarded() && structured.is_object() &&
         (structured.contains("code") || structured.contains("message"))) {
         return structured.dump();
     }
-    const std::string code = NativeErrorCodeForMessage(message);
+    const std::string code = NativeErrors::CodeForMessage(message);
     json payload;
     payload["type"] = "NativeError";
     payload["message"] = message;
     payload["code"] = code;
-    payload["retryable"] = (code == "BRIDGE_DOWN" || code == "RENDER_BUSY" || code == "USER_BUSY");
+    payload["retryable"] = NativeErrors::IsRetryable(code);
     return payload.dump();
 }
 
@@ -280,14 +254,18 @@ private:
     MSTR label_;
 };
 
-// RAII guard — enables direct mode on construction, disables on destruction
+// RAII guard — enables direct mode on construction and restores the previous
+// mode on destruction, so a nested Dispatch never clears its caller's mode.
 struct DirectModeGuard {
     bool active;
-    DirectModeGuard(bool enable) : active(enable) {
+    bool previous;
+    DirectModeGuard(bool enable) : active(enable), previous(MainThreadExecutor::IsDirectMode()) {
         if (active) MainThreadExecutor::EnableDirectMode();
     }
     ~DirectModeGuard() {
-        if (active) MainThreadExecutor::DisableDirectMode();
+        if (!active) return;
+        if (previous) MainThreadExecutor::EnableDirectMode();
+        else MainThreadExecutor::DisableDirectMode();
     }
 };
 
@@ -385,10 +363,12 @@ static std::string HandleMaxScript(
 
     return gup->GetExecutor().ExecuteSync([&command, quiet]() -> std::string {
         // Quiet mode lets prompts take their defaults, as batch scripts expect.
-        // quiet=false leaves Max's mode alone so prompts reach the agent as
-        // blocking dialogs. quietErrors keeps errors textual either way.
+        // quiet=false forces quiet mode off for the script (restored after),
+        // even if a plugin or script left Max quiet, so prompts reach the
+        // agent as blocking dialogs (#12). Only the main thread changes the
+        // process-wide flag. quietErrors keeps errors textual either way.
         std::optional<TempQuietMode> quiet_mode;
-        if (quiet) quiet_mode.emplace(TRUE);
+        if (MainThreadExecutor::IsMainThread()) quiet_mode.emplace(quiet ? TRUE : FALSE);
         std::wstring wcmd = HandlerHelpers::WrapForErrorCapture(
             HandlerHelpers::Utf8ToWide(command));
 
@@ -589,7 +569,10 @@ std::string CommandDispatcher::Dispatch(
     // Route to handler — read-only handlers run directly on pipe thread
     // _forceMainThread flag allows benchmarking the same handler both ways
     bool forceMain = req.value("_forceMainThread", false);
-    bool direct = !forceMain && IsDirectHandler(cmd_type);
+    // A Dispatch nested on the main thread (invoke_tool, run_tool_smoke) is
+    // already where main-thread work runs: direct mode would only make it look
+    // like a pipe thread (no quiet mode, no compile check, threadMode "direct").
+    bool direct = !forceMain && IsDirectHandler(cmd_type) && !MainThreadExecutor::IsMainThread();
     DirectModeGuard dmg(direct);
 
     try {

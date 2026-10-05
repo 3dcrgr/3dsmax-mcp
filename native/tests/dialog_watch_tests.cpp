@@ -4,7 +4,10 @@
 // Qt reads never send into a main thread that stopped pumping; a Qt press that
 // timed out never clicks later; an acknowledged error is published before the
 // operation can commit; a Qt error box refused while the main thread did not
-// pump is acknowledged once it pumps again.
+// pump is acknowledged once it pumps again; a Win32 press goes to the button's
+// own parent, is refused while the main thread does not pump and is dropped if
+// the button changed before delivery; timed-out field reads of closed dialogs
+// never disable later reads.
 //
 //   cmake -S native/tests -B native/build-tests -G "Visual Studio 17 2022" -A x64
 //   cmake --build native/build-tests --config Release
@@ -374,6 +377,79 @@ int run() {
                 "the late acknowledgment did not fail the operation");
     }
 
+    // 9. A Win32 press reaches the button's own parent (a nested pane here,
+    //    like a file dialog's template), is refused while the main thread does
+    //    not pump, and is checked again when the main thread takes it.
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    HWND nested = top(L"DWTestWindow", L"Nested Pane Dialog", owner);
+    HWND pane = CreateWindowExW(0, L"DWTestWindow", L"", WS_CHILD | WS_VISIBLE, 0, 0, 180, 80, nested, nullptr,
+                                instance, nullptr);
+    HWND apply = CreateWindowExW(0, L"Button", L"Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 60, 20, pane,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(1234)), instance, nullptr);
+    require(pane && apply, "nested pane not created");
+    {
+        inspect = control({{"action", "inspect"}});
+        const json nested_read = find_dialog(inspect, "Nested Pane Dialog");
+        require(!nested_read.is_null() && nested_read["buttons"].size() == 1, "nested pane button not listed");
+        const json respond = {{"action", "respond"}, {"dialog_id", nested_read["dialog_id"]},
+                              {"expected_dialog", nested_read["expected_dialog"]}, {"button", "Apply"}};
+        control(respond);
+        require(pump_until([&] { return intrusive_count(pane) == 1; }, 3000),
+                "the press did not reach the button's own parent pane");
+        require(intrusive_count(nested) == 0, "the press went to the top-level dialog, which does not own the button");
+
+        // Not pumping: refused (retryable), and nothing is queued for later.
+        g_pumping = false;
+        error.clear();
+        control(respond, &error);
+        g_pumping = true;
+        const json busy = error_payload(error);
+        require(busy.value("code", "") == "MAIN_THREAD_BUSY" && busy.value("retryable", false),
+                ("Win32 press while the main thread does not pump not refused: " + error).c_str());
+        pump_until([] { return false; }, 300);
+        require(intrusive_count(pane) == 1, "a refused Win32 press clicked anyway");
+
+        // Posted, but the button is disabled before the main thread takes it:
+        // the press is dropped on delivery.
+        std::string posted_error;
+        std::thread worker([&] {
+            try { DialogWatch::Control(respond.dump()); }
+            catch (const std::exception& e) { posted_error = e.what(); }
+        });
+        worker.join();  // the main thread does not pump meanwhile
+        require(posted_error.empty(), ("press not posted: " + posted_error).c_str());
+        EnableWindow(apply, FALSE);
+        pump_until([] { return false; }, 300);
+        require(intrusive_count(pane) == 1, "a press delivered after its button was disabled still clicked");
+    }
+
+    // 10. Timed-out field reads keep their buffers only while their window
+    //     exists: 70 dialogs whose edits could not be read (main thread not
+    //     pumping) do not stop a later dialog's fields from being read.
+    {
+        g_pumping = false;  // Qt reads fail fast instead of waiting 1.5 s each
+        for (int i = 0; i < 70; ++i) {
+            HWND busy = top(L"DWTestWindow", L"Busy Fields", owner);
+            edit_child(busy);
+            std::thread worker([] {
+                try { DialogWatch::Control(json{{"action", "inspect"}}.dump()); } catch (...) {}
+            });
+            worker.join();  // not pumping: the edit's WM_GETTEXT times out
+            DestroyWindow(busy);
+        }
+        g_pumping = true;
+        pump();
+        HWND fresh = top(L"DWTestWindow", L"Fresh Fields", owner);
+        edit_child(fresh);
+        inspect = control({{"action", "inspect"}});
+        const json fresh_read = find_dialog(inspect, "Fresh Fields");
+        require(!fresh_read.is_null() && fresh_read["fields"].size() == 1 &&
+                    fresh_read["fields"][0].value("value", "") == "value",
+                "field reads stayed disabled after many timed-out reads of closed dialogs");
+        DestroyWindow(fresh);
+    }
+    DestroyWindow(nested);
+
     stop = true;
     other_thread.join();
     for (const auto& [title, hwnd] : tools) DestroyWindow(hwnd);
@@ -383,7 +459,9 @@ int run() {
     DialogWatch::Stop();
     std::cout << "PASS: tool windows are never dialogs; other-thread dialogs are listed, never read or pressed; "
                  "Qt reads need a pumping main thread; timed-out presses never click; acknowledgments publish "
-                 "before the operation resumes; refused Qt error reads are retried\n";
+                 "before the operation resumes; refused Qt error reads are retried; Win32 presses reach the "
+                 "button's parent, need a pumping main thread and are re-checked on delivery; field reads "
+                 "recover after timeouts\n";
     return 0;
 }
 

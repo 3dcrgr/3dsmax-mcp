@@ -11,6 +11,7 @@ constexpr char kShutdownError[] = "MainThreadExecutor is shutting down";
 thread_local bool MainThreadExecutor::tl_direct_mode_ = false;
 thread_local MainThreadExecutor::WorkLabel MainThreadExecutor::tl_label_;
 WPARAM MainThreadExecutor::s_execute_cookie_ = 0;
+std::atomic<DWORD> MainThreadExecutor::s_main_thread_id_{0};
 bool MainThreadExecutor::s_executing_ = false;
 std::deque<std::shared_ptr<MainThreadExecutor::WorkItem>> MainThreadExecutor::s_deferred_;
 std::atomic<bool> MainThreadExecutor::s_shutting_down_{false};
@@ -40,6 +41,7 @@ void MainThreadExecutor::Initialize() {
     // the thread that owns hwnd_ and pumps WM_MCP_EXECUTE. ExecuteSync uses it
     // to detect re-entrant calls already on the main thread.
     main_thread_id_ = GetCurrentThreadId();
+    s_main_thread_id_.store(main_thread_id_, std::memory_order_release);
 
     // Generate a per-process cookie before the window exists. std::random_device
     // on MSVC is non-deterministic. Reject 0 so we have a single sentinel value

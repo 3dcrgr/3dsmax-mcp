@@ -52,6 +52,15 @@ public:
     static void DisableDirectMode() { tl_direct_mode_ = false; }
     static bool IsDirectMode()      { return tl_direct_mode_; }
 
+    // True on the thread that called Initialize() (Max's main thread). Unlike
+    // !IsDirectMode() this also holds inside a nested Dispatch that runs on
+    // the main thread (invoke_tool, run_tool_smoke), and it is false on every
+    // other thread whatever its mode. Lock-free; any thread.
+    static bool IsMainThread() {
+        const DWORD id = s_main_thread_id_.load(std::memory_order_acquire);
+        return id != 0 && GetCurrentThreadId() == id;
+    }
+
     // Names the work items this thread submits (the dispatcher uses the
     // request's cmd type, client id and request id) so health snapshots can
     // say whose request is queued or running.
@@ -147,6 +156,8 @@ private:
     ATOM wndclass_atom_ = 0;
     // Set once in Initialize() (called on the Max main thread). Read-only after.
     DWORD main_thread_id_ = 0;
+    // Process-wide copy for IsMainThread().
+    static std::atomic<DWORD> s_main_thread_id_;
     PTP_TIMER heartbeat_timer_ = nullptr;
 
     static thread_local bool tl_direct_mode_;

@@ -12,6 +12,9 @@
 // included, whatever the arguments. A false positive only leaves a prompt
 // visible (and #noPrompt / quiet:true arguments still suppress it); a false
 // negative could discard a scene. Merging is not listed: it never asks to save.
+// A text check cannot see a command reached indirectly (fileIn of a .ms file,
+// macros.run, actionMan.executeAction, a name built at run time, a callback):
+// such scripts need an explicit quiet=false.
 namespace QuietPolicy {
 
 inline std::string Normalized(const std::string& script) {
@@ -35,7 +38,9 @@ inline std::string Normalized(const std::string& script) {
 inline bool MentionsSceneFileCommand(const std::string& script) {
     static const char* const kNames[] = {
         "resetmaxfile", "loadmaxfile", "fetchmaxfile", "quitmax", "checkforsave",
-        "max reset file", "max file new", "max file open",
+        "max reset file", "max file new", "max file open", "max fetch",
+        // Interface spellings, e.g. through Autodesk.Max's COREInterface.
+        "filereset", "filefetch", "loadfromfile",
     };
     const std::string text = Normalized(script);
     for (const char* name : kNames) {
