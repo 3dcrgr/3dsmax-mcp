@@ -67,12 +67,13 @@ def read_ports() -> dict[str, Any]:
     """The command and Live Link v2 ports from Vantage's preferences, else the defaults."""
     ports: dict[str, Any] = {"command": DEFAULT_COMMAND_PORT, "link": DEFAULT_LINK_PORT, "source": "default"}
     path = vantage_ini_path()
+    # Qt writes this file: "key=value" lines only; keys can hold ":".
+    parser = configparser.ConfigParser(strict=False, interpolation=None, delimiters=("=",), allow_no_value=True)
     try:
-        text = path.read_text(encoding="utf-8", errors="replace") if path else ""
-        # Qt writes this file: "key=value" lines only; keys can hold ":".
-        parser = configparser.ConfigParser(strict=False, interpolation=None, delimiters=("=",),
-                                           allow_no_value=True)
+        text = path.read_text(encoding="utf-8-sig", errors="replace") if path else ""
         parser.read_string(text)
+    except configparser.ParsingError:
+        pass  # raised after the whole file is read: every good section is kept
     except (OSError, configparser.Error):
         return ports
     if not parser.has_section("Preferences"):
@@ -89,12 +90,21 @@ def read_ports() -> dict[str, Any]:
     return ports
 
 
+class NotListening(OSError):
+    """Nothing accepted the connection: Vantage isn't listening (yet) on that port."""
+
+
 def _request(method: str, path: str, port: int, body: Optional[dict] = None,
              timeout: float = COMMAND_TIMEOUT) -> tuple[int, bytes]:
     # http.client never applies system proxies. "localhost" tries ::1 first,
-    # where Vantage listens, then 127.0.0.1.
+    # where Vantage listens, then 127.0.0.1. On Windows a refused loopback
+    # connect takes about 2 s per address, so it usually ends as a timeout.
     conn = http.client.HTTPConnection("localhost", port, timeout=timeout)
     try:
+        try:
+            conn.connect()
+        except OSError as exc:
+            raise NotListening("%s: %s" % (type(exc).__name__, exc)) from exc
         data = None
         headers: dict[str, str] = {}
         if body is not None:
@@ -108,14 +118,14 @@ def _request(method: str, path: str, port: int, body: Optional[dict] = None,
 
 
 def ping(port: int, timeout: float = PING_TIMEOUT) -> dict[str, Any]:
-    """{listening, status} for GET /ping; never raises."""
+    """{listening, responsive, status} for GET /ping; never raises."""
     try:
         status, _ = _request("GET", "/ping", port, timeout=timeout)
-    except ConnectionRefusedError:
-        return {"listening": False}
-    except (OSError, http.client.HTTPException) as exc:
-        return {"listening": False, "error": "%s: %s" % (type(exc).__name__, exc)}
-    return {"listening": True, "status": status}
+    except NotListening as exc:
+        return {"listening": False, "responsive": False, "error": str(exc)}
+    except (OSError, http.client.HTTPException) as exc:  # connected, but no usable reply
+        return {"listening": True, "responsive": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    return {"listening": True, "responsive": True, "status": status}
 
 
 def get_status(port: int, timeout: float = COMMAND_TIMEOUT) -> dict[str, Any]:
@@ -139,8 +149,11 @@ def get_status(port: int, timeout: float = COMMAND_TIMEOUT) -> dict[str, Any]:
     return data
 
 
-def read_status() -> dict[str, Any]:
-    """Whether Vantage runs and is ready, and its getStatus fields. Never raises."""
+def read_status(timeout: Optional[float] = None) -> dict[str, Any]:
+    """Whether Vantage runs and is ready, and its getStatus fields. Never raises.
+
+    timeout caps each HTTP request (ping and getStatus), for callers with a deadline.
+    """
     ports = read_ports()
     pids = [p["pid"] for p in list_processes(("vantage.exe",))]
     out: dict[str, Any] = {
@@ -160,12 +173,15 @@ def read_status() -> dict[str, Any]:
         # No HTTP: a refused localhost connection takes about 2 s per address on Windows.
         out.update(phase="not_running", ready=False)
         return _with_warnings(out, warnings)
-    probe = ping(ports["command"])
+    probe = ping(ports["command"], PING_TIMEOUT if timeout is None else min(PING_TIMEOUT, timeout))
     out["listening"] = probe["listening"]
+    if probe.get("error"):
+        out["ping_error"] = probe["error"]
     if not probe["listening"]:
-        if probe.get("error"):
-            out["ping_error"] = probe["error"]
         out.update(phase="starting", ready=False)  # the command server opens about 5 s after launch
+        return _with_warnings(out, warnings)
+    if not probe["responsive"]:
+        out.update(phase="unresponsive", ready=False)  # accepts connections but doesn't answer
         return _with_warnings(out, warnings)
     if probe["status"] == 503:
         out.update(phase="initializing", ready=False)
@@ -175,9 +191,9 @@ def read_status() -> dict[str, Any]:
         return _with_warnings(out, warnings)
     out.update(phase="ready", ready=True)
     try:
-        status = get_status(ports["command"])
+        status = get_status(ports["command"], COMMAND_TIMEOUT if timeout is None else min(COMMAND_TIMEOUT, timeout))
     except VantageError as exc:
-        out.update(status_error=str(exc), status_code=exc.code)
+        out.update(status_error=str(exc), status_code=exc.code, status_retryable=exc.retryable)
         return _with_warnings(out, warnings)
     for source, name in _STATUS_FIELDS:
         if source in status:

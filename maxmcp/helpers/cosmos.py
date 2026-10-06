@@ -10,9 +10,10 @@ from pathlib import Path
 
 from .. import process_health
 from ..max_client import (HANG_ADVICE, DialogBlocked, MaxBridgeError, MaxClient, MaxHealthError,
-                          RequestOutcomeUnknown, mark_settling, real_dialogs, release_settling)
+                          RequestOutcomeUnknown, mark_settling, release_settling)
 
 from .cosmos_client import Cosmos, CosmosError, asset_id as normalize_id
+from .dialogs import open_main_dialogs as _open_main_dialogs
 
 _KIND_TAGS = {"all": (), "model": (1,), "material": (38,), "hdri": (427,)}
 _STATES = {1: "unavailable", 2: "not_downloaded", 3: "ready",
@@ -1408,21 +1409,6 @@ def _health_failure(exc):
     if isinstance(exc, DialogBlocked):  # still running in Max, waiting on the dialog
         failure.update(request_sent=True, request_id=exc.request_id, dialogs=exc.dialogs)
     return failure
-
-
-def _open_main_dialogs(client):
-    """Dialogs holding Max's main thread, from the bridge's dialog monitor (window-manager
-    state only, over the control channel; nothing reaches Max's main thread). [] when the
-    bridge has no monitor, or reports that Max's main thread stopped pumping (busy or hung
-    whatever dialog is open; the OS-level checks cover that). Cosmos browser, Material
-    Editor and viewport windows never count."""
-    try:
-        status = client._dialog_control("status")
-        if status.get("main_thread_pumping") is False:
-            return []
-        return real_dialogs([d for d in status.get("dialogs", []) if isinstance(d, dict) and d.get("main_thread")])
-    except Exception:
-        return []
 
 
 def _dialog_refusal(base, pre, dialogs, browser=None):

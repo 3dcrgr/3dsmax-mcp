@@ -1,72 +1,121 @@
 # Chaos Vantage: status and Live Link
 
-Added on the `merge-1.7.5` branch (2026-10-06). Chaos is working on an official MCP server for Vantage but hasn't shipped one: Vantage 3.4.0 has none. These two tools cover what can be done safely without it.
+Added on the `merge-1.7.5` branch (2026-10-06). Chaos is working on an official MCP server for Vantage but hasn't shipped one: Vantage 3.4.0 has none. These tools cover what can be done safely without it.
 
 ## What they use
 
 - **Vantage's local command server.** Vantage 3.4 runs an undocumented HTTP server on localhost, on the IPv6 loopback only. The port is 20702 unless Vantage's preferences (`%APPDATA%\Chaos\Vantage\vantage.ini`, `commandPort`) say otherwise. `GET /ping` answers 200 when Vantage is ready and 503 while it initialises. `POST /command` takes `{"command": ...}`. Chaos's own 3ds Max scripts (`dcc_scripts\3dsMax\Vantage-UtilityFunctions.ms` in the Vantage install) use it the same way. It isn't a public interface, so a Vantage update can change it.
-- **V-Ray's MAXScript Live Link functions** (V-Ray 6 and later, distributed-rendering protocol 2): `vrayGPUSetLiveLinkServers #("localhost:20703")`, `vrayGPUStartIPR liveLinkMode:true` and `vrayGPUStopIPR()`. That's the minimal path in Chaos's `Vantage-LiveLink.ms`, without its renderer switch, message boxes, sleeps and timers. The link port is Vantage's `liveLink2Port`, 20703 by default.
+- **V-Ray's MAXScript Live Link functions,** on V-Ray builds with distributed-rendering protocol 2 (DR2), V-Ray 7.3 and later. This machine runs V-Ray GPU 7.40.04 DR2.
+  - The calls are `vrayGPUSetLiveLinkServers #("localhost:20703")`, `vrayGPUStartIPR liveLinkMode:true` and `vrayGPUStopIPR()`.
+  - That's the minimal path in Chaos's `Vantage-LiveLink.ms`, without its renderer switch, message boxes, sleeps and timers.
+  - The link port is Vantage's `liveLink2Port`, 20703 by default.
 
 ## `vantage_status`
 
 Reads Vantage's state without sending anything to 3ds Max:
 - `running` and `pids`, from the process list. With no `vantage.exe` running, nothing is sent over HTTP: a refused localhost connection takes about 2 s per address on Windows.
-- `phase`: `not_running`, `starting` (the process runs but the port isn't open yet, for about 5 s after launch), `initializing` (ping 503) or `ready`.
-- From `getStatus`: `state` (for example `RenderingInteractive`, `LoadingScene` or `RenderingOffline`), `live_link`, `offline_task` with the offline frames, `last_task_id` and `version`. Fields Vantage adds later are reported in `other_fields`.
-  - `live_link` is `Online` while waiting for a DCC, `Connected` while linked, and `Offline` when the Live Link server is off.
-  - `linked` is true while a link is connected. It doesn't say which 3ds Max is linked.
+- `phase`:
+  - `not_running`.
+  - `starting`: the process runs but nothing accepts a connection on the port yet (about 5 s after launch); see `ping_error`.
+  - `initializing`: ping 503.
+  - `unresponsive`: it accepts the connection but doesn't answer within 2 s.
+  - `unexpected`: another ping status, in `ping_status`.
+  - `ready`. With `ready`, a failed getStatus is reported in `status_error`, `status_code` and `status_retryable`.
+- **From `getStatus`:**
+  - `state`, for example `RenderingInteractive`, `LoadingScene` or `RenderingOffline`.
+  - `live_link`: `Connected` while linked, as seen live. `Online` (waiting for a DCC) and `Offline` (Live Link server off) are inferred from Chaos's wait loop and haven't been observed.
+  - `offline_task` with the offline frames, `last_task_id` and `version`.
+  - Fields Vantage adds later go in `other_fields`.
+  - `linked` is true while a link is connected. It doesn't say which 3ds Max or DCC is linked.
 - A warning when more than one `vantage.exe` runs. A second instance can't open the Live Link port, but may still answer on the command port.
 
 ## `vantage_live_link`
 
+Only on request. `action` is required.
+
 **`action="start"`.** Each check below refuses without changing anything:
-- Vantage must be running and ready: `VANTAGE_NOT_RUNNING`, `VANTAGE_STARTING` or `VANTAGE_UNAVAILABLE`. The tool doesn't launch Vantage.
-- If Vantage already reports a connected link, the result is `already_linked` and nothing is sent to Max.
-- If Vantage's Live Link server is off, the result is `VANTAGE_LINK_OFFLINE`. During an offline render it's `VANTAGE_BUSY`.
-- If the agent viewport holds a render preview, the result is `RENDER_BUSY`. A Live Link would otherwise render the agent's locked view with its preview settings.
+- **Vantage must be ready.** Otherwise it refuses with:
+  - `VANTAGE_NOT_RUNNING`: the tool doesn't launch Vantage.
+  - `VANTAGE_STARTING`, also while Vantage reports `Startup`.
+  - `VANTAGE_UNRESPONSIVE`.
+  - `VANTAGE_UNAVAILABLE`, also while Vantage reports `Shutdown`.
+  - `VANTAGE_BAD_REPLY`.
+- **Already linked:** if Vantage reports a connected link, the result is `already_linked` and nothing is sent to Max.
+- **Live Link server off:** `VANTAGE_LINK_OFFLINE`.
+- **Vantage busy:** loading a scene or rendering offline gives `VANTAGE_BUSY`.
+- **A dialog open in Max** (read from the bridge's dialog monitor, not Max's main thread) gives `BLOCKED_BY_DIALOG`, and nothing is sent. Otherwise the start would run inside the dialog's loop.
+- **Agent viewport:** if it holds a render preview, or its window is hidden or offscreen (it may still hold one), the result is `RENDER_BUSY`. A Live Link would otherwise render the agent's locked view with its preview settings. When a V-Ray IPR is already running, this check is skipped, because reading the agent viewport's state briefly activates its view.
 - **In one MAXScript call,** so nothing can start an IPR in between:
   - The V-Ray functions must exist, or the result is `UNSUPPORTED`.
   - No undo operation may be open (`USER_BUSY`).
   - The production renderer must be V-Ray GPU, checked by class ID (`UNSUPPORTED`). The tool never switches renderers.
-  - V-Ray must report protocol 2 (`UNSUPPORTED` otherwise). Protocol 1 needs Chaos's script, which rewrites `vrayrt_dr.cfg` and render settings.
-  - No V-Ray IPR may be running (`vrayIsRenderingIPR()`), and no V-Ray viewport IPR checked in the active viewport (`RENDER_BUSY`).
-  - Then the call sets the link server, starts the Live Link IPR and marks it in the Max global `mcp_vantageLiveLink`.
-- **Then it polls Vantage, never Max,** every 0.5 s for up to `wait_seconds` (default 20, at most 60).
-  - The result is `linked` on `Connected`, or `link_failed` if Vantage reports `Offline`.
-  - On timeout it's `starting`, with a warning. The IPR keeps running, because large scenes take longer to translate.
+  - V-Ray must report protocol 2 (`UNSUPPORTED` otherwise). On protocol 1, Chaos's script links over Live Link v1 (port 20701) and turns off Cryptomatte and Enhancer VFB output with message boxes.
+  - No V-Ray IPR may be running, and no V-Ray viewport IPR checked in the active viewport (`RENDER_BUSY`). The exception is the link this MCP server started, which is still connecting: that gives `changed: false`, and the tool waits for it.
+  - Then the call sets the link server, starts the Live Link IPR and stores a new token in the Max global `mcp_vantageLiveLink`.
+- **Not detected:** a production render in progress.
+- **Then it polls Vantage, never Max,** every 0.5 s for up to `wait_seconds` (default 20, at most 60). The result is one of:
+  - `linked`, on `Connected`.
+  - `link_failed`, if Vantage reports `Offline`.
+  - `starting`, on timeout. The IPR keeps running, because large scenes take longer to translate.
+  - `start_failed`, if no V-Ray IPR runs in Max afterwards.
+  - `requested`, with `wait_seconds=0`.
 - **Afterwards,** one read-only probe reports `vrayIsRenderingIPR()` as `vray_ipr`, and any dialog open in Max is listed under `dialogs`.
+- **If the start request's reply is lost** (`REQUEST_OUTCOME_UNKNOWN`), the link may have started. Check `vantage_status` before doing anything else.
+
+**Ownership.** No V-Ray query identifies an IPR session, so "the link this tool started" means all of these:
+- this MCP server process started it and still holds its token;
+- the Max global still holds that token;
+- Chaos's toolbar log (`VRayToVantageLog.log` in Max's user scripts folder, recreated on every toolbar Live Link action) is unchanged since.
+
+Any call that sees no IPR running clears the global. After an MCP server restart, or once the toolbar has been used, the tool no longer counts the link as its own.
 
 **`action="stop"`:**
-- If Vantage doesn't report a connected link, the result is `not_linked`, and nothing is sent to Max.
-- In one MAXScript call:
-  - If no V-Ray IPR runs in this Max, the result is `not_linked`; the link may belong to another Max.
-  - A link without the `mcp_vantageLiveLink` mark gives `LIVE_LINK_NOT_OWNED`, unless `force=true`, which is for when the user asked.
-  - Otherwise it calls `vrayGPUStopIPR()`, never `vrayStopIPR()`, and clears the mark.
-- Then it polls Vantage for up to 15 s until the link is no longer `Connected`.
+- **With a connected link:**
+  - The tool's own link is stopped.
+  - Any other link gives `LIVE_LINK_NOT_OWNED`.
+  - With `force=true`, whatever V-Ray GPU IPR runs in this Max is stopped, since Vantage doesn't say which DCC is linked. Use it only when the user asked.
+- **Without a connected link:** only the tool's own link that never reached `Connected` is stopped, for example after `starting` or `link_failed`. A link that connected and then dropped may have been replaced by the user's own IPR, so it's left alone, and `force` changes nothing. Otherwise the result is `not_linked`, and nothing is sent to Max.
+- **In one MAXScript call:**
+  - No IPR running gives `not_linked`.
+  - A production renderer other than V-Ray GPU gives `UNSUPPORTED`.
+  - Otherwise it calls `vrayGPUStopIPR()`, never `vrayStopIPR()`, clears the global, and reports `vray_ipr_after`.
+- **Then,** if a link was connected, it polls Vantage for up to 15 s until the link is no longer `Connected`.
 
-Nothing else is changed. In particular, `rt_system_vrayLog_show` isn't touched: Chaos's scripts force it to 0 on start and to 2 on stop. The link server list is left set, as Chaos's stop leaves it.
+**Nothing else is changed.**
+- `rt_system_vrayLog_show` isn't touched. Chaos's scripts set it to 0 on start, then to 2 once Vantage answers the ping, on timeout and on stop, without restoring the user's value.
+- The link server list is left set, as Chaos's stop leaves it.
+- Chaos's Vantage toolbar button in Max doesn't show a link started by this tool, and clicking it stops that link.
 
 ## Not included
 
-- **Launching Vantage.** A process started by the MCP server might be ended with it, and Chaos's own launch check can start a second instance while the first is still initialising.
-- **Setting the camera or scene state on a running Vantage.** No command exists for either. Under Live Link the camera follows Max, so set it there.
-- **Loading scenes, and offline or command-line renders.** These need a `.vrscene` export, which must not be done on production scenes: it crashed Max.
-- **`startLiveLinkSequence` renders, `startSnapshot`, `getImage` and `loadConfig`.** They're untested, and Chaos's own sequence render hands control to a Vantage dialog. `loadConfig` has an open bug that can detach Vantage's view from the Max camera.
+- **Launching Vantage.** A process started by the MCP server might be ended with it. Chaos's own launch check can also start a second instance while the first is still initialising.
+- **Moving Vantage's view.** No command moves or rebinds it. Under Live Link it follows Max's viewport, so set it there.
+- **Loading scene files, and command-line or offline renders of a scene file.** These need a `.vrscene` export, which must not be done on production scenes: it crashed Max.
+- **Untested commands:**
+  - Live Link sequence renders (`startLiveLinkSequence` and the like). Chaos's own sequence render hands control to a Vantage dialog.
+  - `startSnapshot`.
+  - `loadConfig`. It changes scene and camera settings, and has an open bug that can detach Vantage's view from the Max camera.
 
 ## While linked
 
-Live Link streams every scene, camera and light change from Max to Vantage, so:
-- Agent viewport render modes refuse with `RENDER_BUSY`; shaded captures still work.
-- `capture_multi_view` without the agent viewport, and `isolate_and_capture_selected`, change the view or hide nodes, and those changes reach Vantage.
-- Whether `render_scene` stops, fails or runs alongside a Live Link IPR is untested.
+- **What reaches Vantage:** scene changes (hiding, isolating, edits), and view changes in the viewport the Live Link IPR renders. So prefer agent viewport captures, and avoid `capture_multi_view` without it and `isolate_and_capture_selected`.
+- **Agent viewport render modes** are expected to refuse while linked, with the message `RENDER_BUSY: V-Ray IPR is running outside AGENT VIEWPORT`, currently under code `BAD_PARAM`. Shaded captures don't start an IPR. This isn't tested live.
+- **`render_scene`:** whether it stops, fails or runs alongside a Live Link IPR is untested.
 
 ## How it was verified
 
-- **Unit tests:** 33 in `tests/test_vantage.py`. The HTTP client runs against a real local server on `::1`. The tool's checks, refusals, polling and MAXScript text are tested against a mocked bridge. The scripts never mention a file command (#12) or any call Chaos's toolbar makes beyond the minimal ones.
-- **Live, read-only, on 2026-10-06:** `vantage_status` against Vantage 3.4.0 with Max linked returned `ready`, `RenderingInteractive`, `Connected` and version 3.4.0, in 20 ms.
+- **Unit tests** in `tests/test_vantage.py`:
+  - The HTTP client runs against a real local server on `::1`, and against a socket that accepts but never answers.
+  - The tool's checks, refusals, ownership rules, polling and MAXScript text are tested against a mocked bridge.
+  - Every script is checked against the side-effecting calls Chaos's toolbar makes: renderer assignment, `VRayVantage_*`, `ShellLaunch`, `queryBox`, `messageBox`, `sleep`, `vrayExportVRScene`, `openFile`, `vrayStopIPR`, .NET, `rt_system_vrayLog_show`, `distributed_rendering` and callbacks. None mentions a file command (#12). Besides the three Live Link calls, they only read state.
+- **An adversarial review** (four lenses, each finding checked by a skeptic) found two majors. Both are fixed:
+  - Ownership could go stale.
+  - A link that never connected couldn't be stopped.
+- **Live, read-only, on 2026-10-06:** `read_status()`, all that `vantage_status` does, run from this checkout against Vantage 3.4.0 with Max linked. It returned `ready`, `RenderingInteractive`, `Connected` and version 3.4.0, in 20 ms.
 - **Not tested live yet:** starting and stopping the link. Test it on a small throwaway scene first, then check:
   - which `vrayIsRenderingIPR()` value a Live Link IPR reports;
   - how long Vantage takes to report `Connected`;
-  - whether V-Ray shows a dialog;
+  - what `liveLinkState` reports when idle, after a stop, and with the Live Link server off;
+  - whether V-Ray shows a dialog, the VFB or the V-Ray Messages window;
   - how the agent viewport behaves while linked.
-- The tools are on `merge-1.7.5` only and aren't deployed.
+- The tools are on `merge-1.7.5` only and aren't deployed. They need the 1.7.5 bridge, for quiet mode and the dialog monitor, so don't backport them to the 1.7.3-based line as they are.
