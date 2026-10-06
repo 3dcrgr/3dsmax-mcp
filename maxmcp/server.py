@@ -38,6 +38,7 @@ _READ_ONLY_TOOLS = {
     "inspect_mesh",
     "geometry_qa",
     "contact_check",
+    "resting_check",
     "pick_component",
     "inspect_curve",
     "get_hierarchy",
@@ -80,6 +81,7 @@ _READ_ONLY_TOOLS = {
 
 _DESTRUCTIVE_TOOLS = {
     "mesh_edit",
+    "drop_to_surface",
     "scene_patch",
     "scene_qa",
     "delete_objects",
@@ -111,6 +113,7 @@ _IDEMPOTENT_TOOLS = {
     "get_object_properties",
     "analyze_node_orientation",
     "contact_check",
+    "resting_check",
     "get_hierarchy",
     "get_instances",
     "get_dependencies",
@@ -235,6 +238,7 @@ CORE_TOOL_MODULES = (
     "mesh_ops",
     "geometry_qa",
     "contact_check",
+    "resting",
     "component_pick",
     "loft",
     "curve_model",

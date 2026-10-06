@@ -516,6 +516,8 @@ _SCRIPT_TEMPLATE = r'''(
     -- the node, or undefined (appended to skipped) when it is not mesh-convertible
     fn ccResolve nm skipped = (
         local m = getNodeByName nm exact:true all:true
+        -- getNodeByName can miss linked children (seen live): scan the scene before giving up
+        if m.count == 0 do m = for o in objects where o.name == nm collect o
         if m.count != 1 do throw ("Node name must resolve uniquely: " + nm)
         if ccIsMesh m[1] then m[1] else (append skipped m[1]; undefined)
     )

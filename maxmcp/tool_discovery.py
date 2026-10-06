@@ -67,7 +67,7 @@ TOOLSET_SPECS = (
     ToolsetSpec(
         "modeling",
         "Modifier stacks, booleans, splines, custom polygon meshes, and visual vertex/edge/face editing.",
-        ("modifiers", "booleans", "splines", "poly_edit", "mesh_ops", "geometry_qa", "contact_check", "component_pick", "loft", "curve_model", "curve_edit"),
+        ("modifiers", "booleans", "splines", "poly_edit", "mesh_ops", "geometry_qa", "contact_check", "resting", "component_pick", "loft", "curve_model", "curve_edit"),
     ),
     ToolsetSpec(
         "materials",

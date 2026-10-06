@@ -36,6 +36,8 @@ SKIP_DEFAULT = {
     "vantage_get_image",
     "vantage_live_link",
     "script_controller",
+    "resting_check",
+    "drop_to_surface",
     "cosmos_search",
     "cosmos_download",
     "cosmos_import",
@@ -200,6 +202,7 @@ CUSTOM: dict[str, dict] = {
 
 MUTATE_TOOLS = {
     "script_controller",
+    "drop_to_surface",
     "create_lights",
     "edit_lights",
     "plugin_patch",
