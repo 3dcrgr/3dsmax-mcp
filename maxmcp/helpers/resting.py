@@ -7,34 +7,39 @@ and the drop plan live here so they are deterministic and testable without Max.
 Method (fork issue #17):
 
 * Each item's underside comes from its own evaluated mesh: the lowest vertex
-  in each cell of an XY grid over its footprint. Never from rays cast up into
-  the item, which miss back faces of single-sided cloth and sparse needles.
+  in each cell of an XY grid over its footprint (plus points on its faces when
+  the mesh is too coarse to fill the grid). Never from rays cast up into the
+  item, which miss back faces of single-sided cloth and sparse needles.
 * Below each underside point, one double-sided segment is cast straight down
-  against every support, from ``max_sink`` above the point (to see items
-  sunk into a surface) to ``max_drop`` below it. Each support gets one
-  ``RayMeshGridIntersect``, built once, sized by its face count and freed on
-  every path. A segment's nearest hit gives the signed gap: positive above
-  the surface, negative below it.
-* Supports are, unless given: visible, renderable mesh nodes that start
-  strictly lower than the item, overlap its footprint and reach within
-  ``max_drop`` of its underside. Starting strictly lower keeps stacks acyclic.
-  Scatter objects (Mesher, Forest Pack, RailClone, tyFlow, particles, fur) are
-  left out. Coincident duplicates and reference twins of an item are never
-  its supports; twins sharing its base object move with it.
+  against every support, from ``max_sink`` above the point to ``max_drop``
+  below it. Each support gets one ``RayMeshGridIntersect``, built once, sized by
+  its face count and freed on every path. When a support surface lies above
+  the point, a parity test (distinct crossings straight up) tells a sunk point
+  (inside, or under an open sheet) from an overhang; a point deeper than
+  ``max_sink`` inside a closed support also reads as sunk, never as floating.
+* Supports are, unless given: visible, renderable mesh nodes that start below
+  the item's median underside height, overlap its footprint and reach within
+  ``max_drop`` of its lowest point; never its own descendants. Scatter objects
+  (Mesher, Forest Pack, RailClone, tyFlow, particles, fur) and excluded nodes
+  are left out, and an item over one of them is never dropped. Coincident
+  duplicates (same transform and geometry) are ignored; reference twins (same
+  base object and transform) move with their item. Explicit ``supports`` add
+  the other items, so stacks still work.
 
 Lengths are always given in millimetres and converted with
 ``units.decodeValue "1mm"``; results come back in scene units and are
 reported in millimetres too. The time budget counts from when Python built the
 request (``sent_ms``), like contact_check, so queue wait uses it up.
 
-Drops (``drop_to_surface``) move only along world Z, bottom-up, in one undo
-step. The apply script re-measures every moved item inside the hold and
-cancels it when any ends up floating or sunk beyond tolerance.
+Drops (``drop_to_surface``) move only along world Z, in support order, in one
+undo step. The apply script re-measures every moved item inside the hold and
+cancels it when any ends up off its planned gap.
 """
 from __future__ import annotations
 
 import base64
 import math
+import re
 import time
 from typing import Any
 
@@ -43,6 +48,7 @@ from .maxscript import safe_string
 
 STATUSES = ("penetrating", "floating", "no_support", "resting", "unchecked")
 GROUP_MODES = ("members", "rigid")
+STOP_REASONS = ("none", "deadline", "deadline_search")
 
 DEFAULT_TOLERANCE_MM = 0.5
 DEFAULT_CLEARANCE_MM = 0.2
@@ -53,6 +59,7 @@ DEFAULT_MAX_ITEM_VERTS = 100_000
 DEFAULT_MAX_SUPPORT_FACES = 1_000_000
 DEFAULT_TIME_BUDGET_S = 20.0
 MAX_UNITS = 500
+DENSE_FACTOR = 20  # items above max_item_verts * DENSE_FACTOR vertices are not read at all
 MIN_APPLY_MS = 3000  # an apply needs at least this much budget left after measuring
 
 SKIP_REASONS = {
@@ -60,21 +67,26 @@ SKIP_REASONS = {
     "empty_group": "group with no mesh members",
     "already_included": "already included through another item",
 }
+UNCHECKED_REASONS = ("deadline", "too_dense")
 SUPPORT_SKIP_REASONS = {
     "not_mesh": "not mesh-convertible geometry",
     "empty_mesh": "no faces",
     "face_limit": "face count above max_support_faces",
     "coincident": "coincident duplicate of an item",
 }
+BLOCK_REASONS = ("scatter", "excluded", "not_mesh", "face_limit", "empty_mesh")
 NOT_MOVABLE_REASONS = ("frozen", "locked_z", "linked", "xref", "constrained", "animated", "check_failed",
-                       "companion_not_movable")
+                       "companion_not_movable", "unmeasured_support", "cyclic_support", "dependent_not_movable",
+                       "unchecked")
 APPLY_REFUSALS = {
-    "__BUSY__": ("USER_BUSY", "An undo operation is open in 3ds Max."),
+    "__BUSY__": ("USER_BUSY", "An undo operation is open (or suspended) in 3ds Max."),
     "__AUTOKEY__": ("AUTO_KEY_ON", "Auto Key is on in 3ds Max, so a move would set keys."),
     "__DEADLINE__": ("DEADLINE_BEFORE_APPLY", "Too little of the time budget was left to apply and verify."),
 }
+APPLY_STATUSES = ("applied", "rolled_back", "rolled_back_deadline", "rollback_failed")
 
 _BIG = 1e29
+_PLACEHOLDER = re.compile(r"@@([A-Z_]+)@@")
 
 
 def _mm(value: Any, label: str, low: float, high: float) -> float:
@@ -108,7 +120,7 @@ def _names(value: Any, label: str) -> list[str]:
 
 def validate(names: Any, supports: Any, exclude_supports: Any, group_mode: Any, tolerance_mm: Any,
              max_drop_mm: Any, max_sink_mm: Any, samples: Any, max_item_verts: Any, max_support_faces: Any,
-             time_budget_s: Any, request_timeout_s: Any = None) -> dict[str, Any]:
+             time_budget_s: Any, request_timeout_s: Any = None, *, tool: str = "resting_check") -> dict[str, Any]:
     """The validated measurement settings."""
     if group_mode not in GROUP_MODES:
         raise ValueError("group_mode must be members or rigid")
@@ -117,7 +129,10 @@ def validate(names: Any, supports: Any, exclude_supports: Any, group_mode: Any, 
     exclude_l = _names(exclude_supports, "exclude_supports")
     if supports_l and exclude_l:
         raise ValueError("Pass supports or exclude_supports, not both")
-    _, budget_s = validate_budgets(1, time_budget_s, request_timeout_s)
+    try:
+        _, budget_s = validate_budgets(1, time_budget_s, request_timeout_s)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("contact_check", tool)) from exc
     return {
         "names": names_l,
         "supports": supports_l,
@@ -143,12 +158,11 @@ def _ms_float(value: float) -> str:
 
 
 def _fill(template: str, values: dict[str, Any]) -> str:
-    out = template
-    for key, value in values.items():
-        out = out.replace("@@" + key + "@@", str(value))
-    if "@@" in out:
-        raise ValueError("unfilled placeholder in resting script")
-    return out
+    """Substitute @@KEY@@ in one pass, so inserted values (names) are never rescanned."""
+    missing = sorted(set(_PLACEHOLDER.findall(template)) - set(values))
+    if missing:
+        raise ValueError(f"unfilled placeholders in resting script: {missing}")
+    return _PLACEHOLDER.sub(lambda m: str(values[m.group(1)]), template)
 
 
 def _deadline_values(time_budget_s: float, sent_ms: int | None) -> dict[str, Any]:
@@ -170,6 +184,7 @@ def build_measure_script(settings: dict[str, Any], *, sent_ms: int | None = None
         "SINK_MM": _ms_float(settings["max_sink_mm"]),
         "SAMPLES": int(settings["samples"]),
         "MAX_VERTS": int(settings["max_item_verts"]),
+        "DENSE_VERTS": int(settings["max_item_verts"]) * DENSE_FACTOR,
         "MAX_SUP_FACES": int(settings["max_support_faces"]),
         "MAX_UNITS": MAX_UNITS,
     })
@@ -185,6 +200,9 @@ def build_apply_script(settings: dict[str, Any], moves: list[dict[str, Any]], ve
     """
     if not moves:
         raise ValueError("build_apply_script needs at least one move")
+    handles = [int(m["handle"]) for m in moves]
+    if len(set(handles)) != len(handles):
+        raise ValueError("build_apply_script got two moves for one node")
     mv = "#(" + ", ".join("#(%d, %s, %s, %s)" % (int(m["handle"]), _ms_float(m["dz"]), _ms_float(m["z_before"]),
                                                  _ms_float(m["z_after"])) for m in moves) + ")"
     vf = "#(" + ", ".join(
@@ -197,6 +215,7 @@ def build_apply_script(settings: dict[str, Any], moves: list[dict[str, Any]], ve
         "VERIFY": vf,
         "EPS": _ms_float(eps),
         "LABEL": safe_string(label),
+        "TOL_MM": _ms_float(settings["tolerance_mm"]),
         "DROP_MM": _ms_float(settings["max_drop_mm"]),
         "SINK_MM": _ms_float(settings["max_sink_mm"]),
         "SAMPLES": int(settings["samples"]),
@@ -266,68 +285,100 @@ def parse_measure(raw: str) -> dict[str, Any]:
             "tolerance": _float(head[1]), "lift": _float(head[2]), "max_drop": _float(head[3]),
             "units_name": head[4], "upm": _float(head[5]), "unit_count": int(head[6]), "measured": int(head[7]),
             "elapsed_ms": int(head[8]), "time_budget_ms": int(head[9]), "queue_wait_ms": int(head[10]),
-            "stop": head[11], "frame": head[12], "auto_key": head[13] == "true", "pool": int(head[14]),
+            "stop": head[11], "frame": int(head[12]), "auto_key": head[13] == "true", "pool": int(head[14]),
             "scatter_excluded": int(head[15]),
         }
         if report["upm"] <= 0 or report["tolerance"] <= 0:
             raise ValueError("bad units")
+        if report["stop"] not in STOP_REASONS:
+            raise ValueError("bad stop reason")
         units: dict[int, dict[str, Any]] = {}
-        gaps: list[dict[str, Any]] = []
-        skipped, supports_skipped, unchecked, dependents, companions = [], [], [], [], []
-        mesh_unit: dict[int, int] = {}
         declared: dict[int, dict[str, Any]] = {}
+        gaps: list[dict[str, Any]] = []
+        skipped, supports_used, supports_skipped, unchecked, dependents, companions, blockers, groups = \
+            [], [], [], [], [], [], [], []
         for line in lines[1:-1]:
             f = line.split("|")
             kind = f[0]
-            if kind == "I" and len(f) == 22:
+            if kind == "D" and len(f) == 5:
                 idx = int(f[1])
+                if idx in declared or not 1 <= idx <= report["unit_count"]:
+                    raise ValueError("duplicate or out-of-range unit")
+                declared[idx] = {"handle": _handle(f[2]), "name": _name(f[3]), "meshes": _handles(f[4])}
+            elif kind == "I" and len(f) == 22:
+                idx = int(f[1])
+                if idx in units:
+                    raise ValueError("duplicate unit result")
                 units[idx] = {
                     "index": idx, "handle": _handle(f[2]), "name": _name(f[3]), "kind": f[4],
                     "group": ({"handle": _handle(f[5]), "name": _name(f[6])} if f[5] != "0" else None),
                     "min_z": _float(f[7]), "verts": int(f[8]), "stride": int(f[9]), "samples": int(f[10]),
                     "hits": int(f[11]), "min_gap": _opt(f[12]), "p10": _opt(f[13]), "p50": _opt(f[14]),
                     "contact": int(f[15]), "min_gap_point": _point(f[16]), "not_movable": f[17],
-                    "node_z": _float(f[18]), "ancestors": _handles(f[19]), "classes": f[20].split(",") if f[20] else [],
-                    "meshes": _handles(f[21]),
+                    "node_z": _float(f[18]), "ancestors": _handles(f[19]),
+                    "classes": f[20].split(",") if f[20] else [], "meshes": _handles(f[21]),
                 }
             elif kind == "G" and len(f) == 7:
                 gaps.append({"unit": int(f[1]), "support": _handle(f[2]), "support_name": _name(f[3]),
                              "gap": _float(f[4]), "hits": int(f[5]), "point": _point(f[6])})
             elif kind == "P" and len(f) == 5:
-                supports_skipped.append({"handle": _handle(f[1]), "name": _name(f[2]), "info": f[3],
-                                         "faces": int(f[4]), "used": True})
+                supports_used.append({"handle": _handle(f[1]), "name": _name(f[2]), "info": f[3], "faces": int(f[4])})
             elif kind == "Q" and len(f) == 5:
                 if f[3] not in SUPPORT_SKIP_REASONS:
                     raise ValueError("unknown support skip reason")
-                supports_skipped.append({"handle": _handle(f[1]), "name": _name(f[2]), "reason": f[3],
-                                         "detail": f[4], "used": False})
+                supports_skipped.append({"handle": _handle(f[1]), "name": _name(f[2]), "reason": f[3], "detail": f[4]})
             elif kind == "K" and len(f) == 4:
                 if f[3] not in SKIP_REASONS:
                     raise ValueError("unknown skip reason")
                 skipped.append({"handle": _handle(f[1]), "name": _name(f[2]), "reason": f[3]})
             elif kind == "X" and len(f) == 3:
+                if f[2] not in UNCHECKED_REASONS:
+                    raise ValueError("unknown unchecked reason")
                 unchecked.append({"unit": int(f[1]), "reason": f[2]})
             elif kind == "R" and len(f) == 4:
                 dependents.append({"unit": int(f[1]), "handle": _handle(f[2]), "name": _name(f[3])})
             elif kind == "C" and len(f) == 7:
                 companions.append({"unit": int(f[1]), "handle": _handle(f[2]), "name": _name(f[3]),
                                    "not_movable": f[4], "node_z": _float(f[5]), "ancestors": _handles(f[6])})
-            elif kind == "D" and len(f) == 5:
-                # unit declared (before measuring): index, head handle, name, mesh handles
-                declared[int(f[1])] = {"handle": _handle(f[2]), "name": _name(f[3]), "meshes": _handles(f[4])}
-                mesh_unit.update({h: int(f[1]) for h in declared[int(f[1])]["meshes"]})
+            elif kind == "B" and len(f) == 5:
+                if f[4] not in BLOCK_REASONS:
+                    raise ValueError("unknown block reason")
+                blockers.append({"unit": int(f[1]), "handle": _handle(f[2]), "name": _name(f[3]), "reason": f[4]})
+            elif kind == "H" and len(f) == 3:
+                groups.append({"handle": _handle(f[1]), "name": _name(f[2])})
             else:
                 raise ValueError("unknown record")
+        if len(declared) != report["unit_count"]:
+            raise ValueError("units declared don't match the header")
+        results = set(units) | {x["unit"] for x in unchecked}
+        if results != set(declared) or len(units) + len(unchecked) != len(declared):
+            raise ValueError("each unit needs exactly one result or unchecked record")
+        if len(units) != report["measured"]:
+            raise ValueError("measured count doesn't match")
+        for rec in gaps + companions + dependents + blockers:
+            if rec["unit"] not in declared:
+                raise ValueError("record for an undeclared unit")
     except (ValueError, IndexError, TypeError) as exc:
         raise RuntimeError(f"Resting check report is malformed: {exc}") from exc
-    for u in units.values():
-        for h in u["meshes"]:
-            mesh_unit[h] = u["index"]
-    report.update(units=units, gaps=gaps, skipped=skipped, unchecked=unchecked, dependents=dependents,
-                  companions=companions, mesh_unit=mesh_unit, declared=declared,
-                  supports_used=[s for s in supports_skipped if s.get("used")],
-                  supports_skipped=[s for s in supports_skipped if not s.get("used")])
+    mesh_unit: dict[int, int] = {}
+    for idx, d in declared.items():
+        mesh_unit.update({h: idx for h in d["meshes"]})
+    for c in companions:  # a twin moves with its unit, so as a support it moves too
+        mesh_unit.setdefault(c["handle"], c["unit"])
+    report.update(units=units, declared=declared, gaps=gaps, skipped=skipped, unchecked=unchecked,
+                  dependents=dependents, companions=companions, blockers=blockers, group_heads=groups,
+                  mesh_unit=mesh_unit, supports_used=_dedupe(supports_used), supports_skipped=_dedupe(supports_skipped))
     return report
+
+
+def _dedupe(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen, out = set(), []
+    for r in records:
+        key = (r["handle"], r.get("reason"))
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
 
 
 def classify(unit: dict[str, Any], tolerance: float) -> str:
@@ -344,24 +395,74 @@ def classify(unit: dict[str, Any], tolerance: float) -> str:
 
 # ── drop plan ─────────────────────────────────────────────────────────────────
 
+def _order(report: dict[str, Any]) -> tuple[list[int], set[int]]:
+    """Units with their supports and moved ancestors first (Kahn, ties by lowest point); and units in cycles."""
+    units = report["units"]
+    head_unit = {u["handle"]: i for i, u in units.items()}
+    deps: dict[int, set[int]] = {i: set() for i in units}
+    for g in report["gaps"]:
+        s = report["mesh_unit"].get(g["support"])
+        if s is not None and s != g["unit"] and s in units and g["unit"] in units:
+            deps[g["unit"]].add(s)
+    for i, u in units.items():
+        for anc in u["ancestors"]:
+            if anc in head_unit and head_unit[anc] != i:
+                deps[i].add(head_unit[anc])
+                break
+    order: list[int] = []
+    remaining = dict(deps)
+    while remaining:
+        ready = sorted((i for i, d in remaining.items() if not (d & set(remaining))), key=lambda i: (units[i]["min_z"], i))
+        if not ready:
+            break
+        for i in ready:
+            order.append(i)
+            del remaining[i]
+    cyclic = set(remaining)
+    order += sorted(cyclic, key=lambda i: (units[i]["min_z"], i))
+    return order, cyclic
+
+
 def plan_drops(report: dict[str, Any], *, clearance: float, lift_penetrating: bool = False) -> dict[int, dict[str, Any]]:
-    """Per unit: {own, total, gap_now, reason}: Z offsets in scene units, bottom-up.
+    """Per unit: {own, total, inherited, gap0, gap_now, target, reason}: Z offsets in scene units.
 
     A pure Z move shifts every vertical gap exactly: gap' = gap0 + dz_item - dz_support.
-    Units are processed by their lowest point, so every item support is planned
-    before the items on it (supports start strictly lower). A unit linked under a
-    moved unit inherits that move; ``own`` is what it moves by itself.
+    Floating items (and sunk ones, on request) go to ``clearance``; the rest keep the
+    gap they had, following any support that moves. An item that can't move but
+    would lose its support pins that support (and, through it, its own supports).
     """
+    order, cyclic = _order(report)
+    pinned: set[int] = set()
+    for _ in range(len(order) + 1):
+        plan = _plan_once(report, order, cyclic, pinned, clearance, lift_penetrating)
+        tol = report["tolerance"]
+        new_pins: set[int] = set()
+        for i, p in plan.items():
+            if p["own"] or p["reason"] not in NOT_MOVABLE_REASONS or p["gap_now"] is None or p["gap0"] is None:
+                continue
+            if abs(p["gap_now"] - p["gap0"]) > tol:  # held in place while its support moves
+                for g in report["gaps"]:
+                    s = report["mesh_unit"].get(g["support"])
+                    if g["unit"] == i and s is not None and s in plan and plan[s]["total"] and s not in pinned:
+                        new_pins.add(s)
+        if not new_pins:
+            return plan
+        pinned |= new_pins
+    return plan
+
+
+def _plan_once(report, order, cyclic, pinned, clearance, lift_penetrating):
     tol = report["tolerance"]
     units = report["units"]
     unchecked = {u["unit"] for u in report["unchecked"]}
+    blocked = {b["unit"] for b in report["blockers"]}
+    twin_held = {c["unit"] for c in report["companions"] if c["not_movable"]}
     by_unit: dict[int, list[dict[str, Any]]] = {}
     for g in report["gaps"]:
         by_unit.setdefault(g["unit"], []).append(g)
     head_unit = {u["handle"]: idx for idx, u in units.items()}
-    blocked = {c["unit"] for c in report["companions"] if c["not_movable"]}
     plan: dict[int, dict[str, Any]] = {}
-    for idx in sorted(units, key=lambda i: (units[i]["min_z"], i)):
+    for idx in order:
         u = units[idx]
         inherited = 0.0
         for anc in u["ancestors"]:  # nearest first
@@ -371,58 +472,83 @@ def plan_drops(report: dict[str, Any], *, clearance: float, lift_penetrating: bo
         gap0 = gap_now = None
         for g in by_unit.get(idx, []):
             sup_unit = report["mesh_unit"].get(g["support"])
-            moved = plan[sup_unit]["total"] if sup_unit is not None and sup_unit in plan else 0.0
+            moved = plan[sup_unit]["total"] if sup_unit is not None and sup_unit in plan and sup_unit != idx else 0.0
             gap0 = g["gap"] if gap0 is None else min(gap0, g["gap"])
             value = g["gap"] - moved
             gap_now = value if gap_now is None else min(gap_now, value)
         if gap_now is not None:
             gap_now += inherited
         own, reason = 0.0, ""
+        fix = gap0 is not None and (gap0 > tol or (lift_penetrating and gap0 < -tol))
+        target = (clearance if fix else gap0) if gap0 is not None else None
         if idx in unchecked:
             reason = "unchecked"
         elif gap_now is None:
             reason = "no_support"
         elif u["not_movable"]:
             reason = u["not_movable"]
-        elif idx in blocked:
+        elif idx in twin_held:
             reason = "companion_not_movable"
+        elif idx in blocked:
+            reason = "unmeasured_support"
+        elif idx in cyclic:
+            reason = "cyclic_support"
+        elif idx in pinned:
+            reason = "dependent_not_movable"
         else:
-            # Floating items (and sunk ones, on request) go to clearance; the rest
-            # keep the contact they had, following any support that moved.
-            fix = gap0 > tol or (lift_penetrating and gap0 < -tol)
-            target = clearance if fix else gap0
             if abs(target - gap_now) > tol * 1e-3:
                 own = target - gap_now
             if not fix:
                 reason = ("follows_support" if own else "resting") if gap0 >= -tol else "penetrating_not_lifted"
-        plan[idx] = {"own": own, "total": inherited + own, "inherited": inherited, "gap_now": gap_now,
-                     "gap0": gap0, "reason": reason}
+        plan[idx] = {"own": own, "total": inherited + own, "inherited": inherited, "gap0": gap0,
+                     "gap_now": gap_now, "target": target, "reason": reason}
     return plan
 
 
 def moves_and_checks(report: dict[str, Any], plan: dict[int, dict[str, Any]], *, clearance: float
                      ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """(moves, verify, companions_moved) for build_apply_script."""
+    """(moves, verify, companions_moved) for build_apply_script; one move per node.
+
+    Raises ValueError on two different moves for one node (a plan conflict).
+    """
     tol = report["tolerance"]
     units = report["units"]
-    moved_heads = {units[i]["handle"] for i, p in plan.items() if p["own"]}
-    moves, verify, companions_moved = [], [], []
+    head_unit = {u["handle"]: i for i, u in units.items()}
+    moves: dict[int, dict[str, Any]] = {}
+    verify, companions_moved = [], []
     supports_of: dict[int, list[int]] = {}
     for g in report["gaps"]:
         supports_of.setdefault(g["unit"], []).append(g["support"])
+
+    def add(handle: int, dz: float, z_before: float, z_after: float) -> None:
+        if handle in moves:
+            if abs(moves[handle]["dz"] - dz) > tol * 1e-3:
+                raise ValueError(f"plan conflict: node {handle} would move twice")
+            return
+        moves[handle] = {"handle": handle, "dz": dz, "z_before": z_before, "z_after": z_after}
+
     for idx, p in plan.items():
-        if not p["own"]:
-            continue
         u = units[idx]
-        moves.append({"handle": u["handle"], "dz": p["own"], "z_before": u["node_z"], "z_after": u["node_z"] + p["total"]})
-        verify.append({"unit": idx, "meshes": u["meshes"], "supports": supports_of.get(idx, []),
-                       "low": -tol, "high": clearance + tol})
-        for c in report["companions"]:
-            if c["unit"] != idx or any(a in moved_heads for a in c["ancestors"]):
-                continue  # a twin under a moved node moves with it
-            moves.append({"handle": c["handle"], "dz": p["own"], "z_before": c["node_z"], "z_after": c["node_z"] + p["own"]})
-            companions_moved.append({"of": u["name"], "name": c["name"], "handle": c["handle"]})
-    return moves, verify, companions_moved
+        if p["own"]:
+            add(u["handle"], p["own"], u["node_z"], u["node_z"] + p["total"])
+        if p["total"]:
+            final = p["gap_now"] + p["own"] if p["gap_now"] is not None else None
+            if final is not None:
+                verify.append({"unit": idx, "meshes": u["meshes"], "supports": supports_of.get(idx, []),
+                               "low": final - tol, "high": final + tol})
+            for c in report["companions"]:
+                if c["unit"] != idx or c["handle"] in head_unit:
+                    continue
+                carried = 0.0  # what the twin already gets from a moved ancestor
+                for anc in c["ancestors"]:
+                    if anc in head_unit and head_unit[anc] in plan:
+                        carried = plan[head_unit[anc]]["total"]
+                        break
+                dz = p["total"] - carried
+                if abs(dz) > tol * 1e-3:
+                    add(c["handle"], dz, c["node_z"], c["node_z"] + p["total"])
+                    companions_moved.append({"of": u["name"], "name": c["name"], "handle": c["handle"]})
+    return list(moves.values()), verify, companions_moved
 
 
 def parse_apply(raw: str) -> dict[str, Any]:
@@ -432,14 +558,17 @@ def parse_apply(raw: str) -> dict[str, Any]:
     for marker in APPLY_REFUSALS:
         if raw.startswith(marker):
             return {"status": "refused", "code": APPLY_REFUSALS[marker][0], "detail": APPLY_REFUSALS[marker][1]}
-    for marker, code in (("__STALE__|", "SCENE_CHANGED"), ("__GONE__|", "NODE_GONE"), ("__READBACK__|", "READBACK_FAILED")):
+    for marker, code, what in (("__STALE__|", "SCENE_CHANGED", "%s moved since it was measured."),
+                               ("__GONE__|", "NODE_GONE", "Node %s no longer exists.")):
         if raw.startswith(marker):
-            return {"status": "refused" if code != "READBACK_FAILED" else "rolled_back", "code": code,
-                    "detail": raw.split("|", 1)[1].strip()}
+            return {"status": "refused", "code": code, "detail": what % raw.split("|", 1)[1].strip()}
+    if raw.startswith("__READBACK__|"):
+        return {"status": "rolled_back", "code": "READBACK_FAILED",
+                "detail": "%s didn't end where planned (position check)." % raw.split("|", 1)[1].strip()}
     lines = _check_raw(raw, "W|", "Drop")
     try:
         head = lines[0].split("|")
-        if len(head) != 4 or head[1] not in ("applied", "rolled_back", "rolled_back_deadline"):
+        if len(head) != 5 or head[1] not in APPLY_STATUSES:
             raise ValueError("bad header")
         verify = []
         for line in lines[1:-1]:
@@ -447,13 +576,14 @@ def parse_apply(raw: str) -> dict[str, Any]:
             if f[0] != "V" or len(f) != 5:
                 raise ValueError("unknown record")
             verify.append({"unit": int(f[1]), "gap": _opt(f[2]), "hits": int(f[3]), "ok": f[4] == "1"})
-        return {"status": head[1], "elapsed_ms": int(head[2]), "time_budget_ms": int(head[3]), "verify": verify}
+        return {"status": head[1], "elapsed_ms": int(head[2]), "time_budget_ms": int(head[3]),
+                "restore": head[4], "verify": verify}
     except (ValueError, IndexError) as exc:
         raise RuntimeError(f"Drop report is malformed: {exc}") from exc
 
 
 # ── MAXScript ─────────────────────────────────────────────────────────────────
-# Placeholders are @@NAME@@ (no % formatting, so MAXScript's own % stays literal).
+# Placeholders are @@NAME@@, substituted in one pass (MAXScript's own % stays literal).
 
 _LIBRARY = r'''(
     fn rcElapsed t0 = (
@@ -462,6 +592,7 @@ _LIBRARY = r'''(
         d
     )
     fn rcG v = formattedPrint v format:".7g"
+    fn rcG9 v = formattedPrint v format:".9g"
     fn rcP p = if p == undefined then "" else (rcG p.x) + "," + (rcG p.y) + "," + (rcG p.z)
     fn rcH n = formattedPrint ((getHandleByAnim n) as integer64) format:"d"
     fn rcB64 s = (dotNetClass "System.Convert").ToBase64String ((dotNetClass "System.Text.Encoding").UTF8.GetBytes s)
@@ -504,7 +635,7 @@ _LIBRARY = r'''(
         s
     )
     fn rcScatter n = (
-        local c = toLower ((classOf n) as string)
+        local c = toLower (((classOf n) as string) + " " + ((classOf n.baseObject) as string))
         local hit = false
         for k in #("mesher", "forest", "railclone", "tyflow", "fur", "particle", "pf_source", "scatter", "pcloud", "blizzard", "spray", "snow") while not hit do (
             if (findString c k) != undefined do hit = true
@@ -516,10 +647,16 @@ _LIBRARY = r'''(
         (distance ta.row1 tb.row1) < 1e-4 and (distance ta.row2 tb.row2) < 1e-4 and \
         (distance ta.row3 tb.row3) < 1e-4 and (distance ta.row4 tb.row4) < posEps
     )
+    -- reference twin: same base object and transform (e.g. *_ENMESH), moves with its item
+    fn rcTwin a b posEps = a.baseObject == b.baseObject and (rcSameTM a b posEps)
+    -- coincident duplicate: same transform and the same geometry
+    fn rcCoincident a b posEps = (rcSameTM a b posEps) and ((a.baseObject == b.baseObject) or \
+        (((try ((getPolygonCount a)[1]) catch (-1)) == (try ((getPolygonCount b)[1]) catch (-2))) and \
+         (distance a.min b.min) < posEps and (distance a.max b.max) < posEps))
     -- "" when the node may be moved along world Z, else the reason
     fn rcNotMovable n = (
         try (
-            if n.isFrozen then "frozen"
+            if n.isFrozen or (n.layer != undefined and n.layer.isFrozen) then "frozen"
             else if (getTransformLockFlags n)[3] then "locked_z"
             else if matchPattern ((classOf n.baseObject) as string) pattern:"Link*" then "linked"
             else if (classOf n.baseObject) == XRefObject then "xref"
@@ -529,6 +666,11 @@ _LIBRARY = r'''(
             else ""
         ) catch ("check_failed")
     )
+    fn rcNotMovableAll nodes = (
+        local why = ""
+        for n in nodes while why == "" do why = rcNotMovable n
+        why
+    )
     fn rcGrid s = (
         local nf = try ((getPolygonCount s)[1]) catch (0)
         local rm = RayMeshGridIntersect()
@@ -537,8 +679,22 @@ _LIBRARY = r'''(
         rm.buildGrid()
         rm
     )
-    -- lowest vertex per XY cell over the footprint; #(points, verts, stride, cellW, cellH),
-    -- or undefined when the deadline passes
+    fn rcKeep lowZ lowX lowY bmin cw ch nx ny p = (
+        local ix = ((p.x - bmin.x) / cw) as integer + 1
+        local iy = ((p.y - bmin.y) / ch) as integer + 1
+        if ix < 1 do ix = 1
+        if ix > nx do ix = nx
+        if iy < 1 do iy = 1
+        if iy > ny do iy = ny
+        local k = (iy - 1) * nx + ix
+        if p.z < lowZ[k] do (
+            lowZ[k] = p.z
+            lowX[k] = p.x
+            lowY[k] = p.y
+        )
+    )
+    -- lowest point per XY cell over the footprint: vertices, plus points on the faces of a
+    -- coarse mesh; #(points, verts, stride, cellW, cellH), or undefined at the deadline
     fn rcSamples meshNodes bmin bmax cells maxVerts t0 limitMs = (
         local ex = bmax.x - bmin.x, ey = bmax.y - bmin.y
         if ex < 1e-6 do ex = 1e-6
@@ -568,20 +724,23 @@ _LIBRARY = r'''(
                         tick = 0
                         if (rcElapsed t0) > limitMs do expired = true
                     )
-                    local p = getVert m i
-                    local ix = ((p.x - bmin.x) / cw) as integer + 1
-                    local iy = ((p.y - bmin.y) / ch) as integer + 1
-                    if ix < 1 do ix = 1
-                    if ix > nx do ix = nx
-                    if iy < 1 do iy = 1
-                    if iy > ny do iy = ny
-                    local k = (iy - 1) * nx + ix
-                    if p.z < lowZ[k] do (
-                        lowZ[k] = p.z
-                        lowX[k] = p.x
-                        lowY[k] = p.y
-                    )
+                    rcKeep lowZ lowX lowY bmin cw ch nx ny (getVert m i)
                     i += st
+                )
+                -- a coarse mesh (a box, a 1x1 plane) leaves cells empty: sample its faces too
+                local nf = getNumFaces m
+                if not expired and nv < cells * 4 and nf > 0 and nf <= 5000 do (
+                    local kk = (ceil (sqrt (4.0 * cells / nf))) as integer
+                    if kk < 1 do kk = 1
+                    if kk > 16 do kk = 16
+                    for fi = 1 to nf while not expired do (
+                        local f = getFace m fi
+                        local a = getVert m (f.x as integer), b = getVert m (f.y as integer), c = getVert m (f.z as integer)
+                        for i2 = 0 to kk do for j2 = 0 to (kk - i2) do (
+                            local u2 = (i2 as float) / kk, v2 = (j2 as float) / kk
+                            rcKeep lowZ lowX lowY bmin cw ch nx ny (a + (b - a) * u2 + (c - a) * v2)
+                        )
+                    )
                 )
                 try (delete m) catch ()
             )
@@ -591,11 +750,34 @@ _LIBRARY = r'''(
             #(pts, verts, stride, cw, ch)
         )
     )
-    -- signed gap below p: nearest hit distance from p + lift, minus lift; undefined without a hit
-    fn rcGap rm p lift maxDrop jit = (
+    -- odd number of distinct crossings straight up from q to above topZ: q is inside
+    -- the support (or under an open sheet of it)
+    fn rcInside rm q topZ eps = (
+        local n = rm.intersectSegment q [q.x, q.y, topZ + 10.0 * eps + 0.001] true
+        local ds = for i = 1 to n collect (rm.getHitDist i)
+        ds = for d in ds where d > eps collect d
+        sort ds
+        local cnt = 0, last = -1e30
+        for d in ds do (if (d - last) > eps do (cnt += 1; last = d))
+        (mod cnt 2) == 1
+    )
+    -- signed gap at p: positive = clearance to the surface below, negative = depth
+    -- under the surface above; undefined without a hit. Sunk deeper than lift reads -lift.
+    fn rcGap rm p lift maxDrop jit topZ eps = (
         local q = p + jit
         local cnt = rm.intersectSegment (q + [0, 0, lift]) (q - [0, 0, maxDrop]) true
-        if cnt > 0 then (rm.getHitDist (rm.getClosestHit())) - lift else undefined
+        if cnt == 0 then undefined else (
+            local above = 1e30, below = 1e30
+            for i = 1 to cnt do (
+                local d = (rm.getHitDist i) - lift
+                if d < -eps then (if (-d) < above do above = -d) else (
+                    if d < 0.0 do d = 0.0
+                    if d < below do below = d
+                )
+            )
+            if rcInside rm q topZ eps then (if above < 1e29 then -above else -lift)
+            else if below < 1e29 then below else undefined
+        )
     )
 '''
 
@@ -613,16 +795,18 @@ _DEADLINE = r'''
         local upm = units.decodeValue "1mm"
         local lift = (@@SINK_MM@@ as float) * upm
         local maxDrop = (@@DROP_MM@@ as float) * upm
+        local tol = (@@TOL_MM@@ as float) * upm
+        if not (tol > 0) do throw "Invalid tolerance after unit conversion"
+        local eps = tol * 0.01
+        local posEps = upm * 0.001
 '''
 
 _MEASURE_BODY = r'''
     local rms = #(), result = undefined
     try (''' + _DEADLINE + r'''
-        local tol = (@@TOL_MM@@ as float) * upm
-        if not (tol > 0) do throw "Invalid tolerance after unit conversion"
-        local eps = tol * 0.01
         local cells = @@SAMPLES@@
         local maxVerts = @@MAX_VERTS@@
+        local denseVerts = @@DENSE_VERTS@@
         local maxSupFaces = @@MAX_SUP_FACES@@
         local rigid = @@RIGID@@
         local namesIn = @@NAMES@@
@@ -635,27 +819,44 @@ _MEASURE_BODY = r'''
         local roots = if named then (for nm in namesIn collect rcResolve nm) else (for n in selection collect n)
         if roots.count == 0 do throw "Pass names, or select the items to check"
         roots = (for r in roots where isGroupHead r collect r) + (for r in roots where not (isGroupHead r) collect r)
-        local unitHead = #(), unitMeshes = #(), claimed = #()
+        local unitHead = #(), unitMeshes = #(), unitTwins = #(), claimed = #()
         for r in roots do (
             if isGroupHead r then (
+                format "H|%|%\n" (rcH r) (rcB64 r.name) to:ss
                 local ms = for m in (rcMeshDesc r #()) where (findItem claimed m) == 0 collect m
                 if ms.count == 0 then (
                     if named do format "K|%|%|%\n" (rcH r) (rcB64 r.name) (if (rcMeshDesc r #()).count == 0 then "empty_group" else "already_included") to:ss
                 ) else if rigid then (
                     append unitHead r
                     append unitMeshes ms
+                    append unitTwins #()
                     join claimed ms
                 ) else (
                     for m in ms do (
-                        append unitHead m
-                        append unitMeshes #(m)
+                        -- a reference twin of an item already listed moves with it
+                        local owner = 0
+                        for k = 1 to unitHead.count while owner == 0 do (
+                            if unitMeshes[k].count == 1 and (rcTwin unitHead[k] m posEps) do owner = k
+                        )
+                        if owner > 0 then (append unitTwins[owner] m) else (
+                            append unitHead m
+                            append unitMeshes #(m)
+                            append unitTwins #()
+                        )
                         append claimed m
                     )
                 )
             ) else if rcIsMesh r then (
                 if (findItem claimed r) == 0 then (
-                    append unitHead r
-                    append unitMeshes #(r)
+                    local owner = 0
+                    for k = 1 to unitHead.count while owner == 0 do (
+                        if unitMeshes[k].count == 1 and (rcTwin unitHead[k] r posEps) do owner = k
+                    )
+                    if owner > 0 then (append unitTwins[owner] r) else (
+                        append unitHead r
+                        append unitMeshes #(r)
+                        append unitTwins #()
+                    )
                     append claimed r
                 ) else if named do format "K|%|%|already_included\n" (rcH r) (rcB64 r.name) to:ss
             ) else if named do format "K|%|%|not_mesh\n" (rcH r) (rcB64 r.name) to:ss
@@ -664,23 +865,23 @@ _MEASURE_BODY = r'''
         if nU == 0 do throw "No mesh items to check (non-mesh nodes and empty groups are skipped)"
         if nU > @@MAX_UNITS@@ do throw ("Too many items (" + nU as string + "); narrow names to at most @@MAX_UNITS@@")
         local uMin = #(), uMax = #()
-        local gMin = [1e30, 1e30, 1e30], gMax = [-1e30, -1e30, -1e30]
+        local gx0 = 1e30, gy0 = 1e30, gz0 = 1e30, gx1 = -1e30, gy1 = -1e30, gz1 = -1e30
         for u = 1 to nU do (
-            local bmin = [1e30, 1e30, 1e30], bmax = [-1e30, -1e30, -1e30]
+            local x0 = 1e30, y0 = 1e30, z0 = 1e30, x1 = -1e30, y1 = -1e30, z1 = -1e30
             for m in unitMeshes[u] do (
                 local a = m.min, b = m.max
-                bmin.x = amin bmin.x a.x; bmin.y = amin bmin.y a.y; bmin.z = amin bmin.z a.z
-                bmax.x = amax bmax.x b.x; bmax.y = amax bmax.y b.y; bmax.z = amax bmax.z b.z
+                x0 = amin x0 a.x; y0 = amin y0 a.y; z0 = amin z0 a.z
+                x1 = amax x1 b.x; y1 = amax y1 b.y; z1 = amax z1 b.z
             )
-            uMin[u] = bmin
-            uMax[u] = bmax
-            gMin.x = amin gMin.x bmin.x; gMin.y = amin gMin.y bmin.y; gMin.z = amin gMin.z bmin.z
-            gMax.x = amax gMax.x bmax.x; gMax.y = amax gMax.y bmax.y; gMax.z = amax gMax.z bmax.z
+            uMin[u] = [x0, y0, z0]
+            uMax[u] = [x1, y1, z1]
+            gx0 = amin gx0 x0; gy0 = amin gy0 y0; gz0 = amin gz0 z0
+            gx1 = amax gx1 x1; gy1 = amax gy1 y1; gz1 = amax gz1 z1
             local hs = ""
             for m in unitMeshes[u] do hs += (if hs == "" then "" else ",") + (rcH m)
             format "D|%|%|%|%\n" u (rcH unitHead[u]) (rcB64 unitHead[u].name) hs to:ss
         )
-        -- support pool
+        -- support pool, plus nodes left out that could hide a surface (blockers)
         local exclAll = #()
         for nm in exclIn do (
             local e = rcResolve nm
@@ -688,7 +889,7 @@ _MEASURE_BODY = r'''
             join exclAll (rcMeshDesc e #())
         )
         local explicit = supIn.count > 0
-        local pool = #(), nScatter = 0
+        local pool = #(), skipN = #(), skipWhy = #(), nScatter = 0
         if explicit then (
             for nm in supIn do (
                 local s = rcResolve nm
@@ -698,87 +899,118 @@ _MEASURE_BODY = r'''
                     else if (findItem pool c) == 0 do append pool c
                 )
             )
+            -- items always support each other, so stacks work with explicit supports
+            for c in claimed where (findItem pool c) == 0 do append pool c
         ) else (
-            for n in geometry where rcIsMesh n and not n.isHiddenInVpt and n.renderable do (
-                local a = n.min, b = n.max
-                if b.z >= gMin.z - maxDrop - lift and a.z <= gMax.z + tol and a.x <= gMax.x and b.x >= gMin.x and a.y <= gMax.y and b.y >= gMin.y do (
-                    if (findItem claimed n) == 0 and (rcScatter n) then (nScatter += 1) else append pool n
+            local tick = 0
+            for n in geometry while not expired do (
+                tick += 1
+                if tick >= 256 do (
+                    tick = 0
+                    if (rcElapsed t0) > limitMs do (expired = true; stop = "deadline_search")
+                )
+                if not expired and not n.isHiddenInVpt and n.renderable do (
+                    local a = n.min, b = n.max
+                    if b.z >= gz0 - maxDrop - lift and a.z <= gz1 + tol and a.x <= gx1 and b.x >= gx0 and a.y <= gy1 and b.y >= gy0 do (
+                        if (findItem claimed n) > 0 then append pool n
+                        else if (findItem exclAll n) > 0 then (append skipN n; append skipWhy "excluded")
+                        else if not (rcIsMesh n) then (append skipN n; append skipWhy "not_mesh")
+                        else if rcScatter n then (append skipN n; append skipWhy "scatter"; nScatter += 1)
+                        else append pool n
+                    )
                 )
             )
         )
-        pool = for p in pool where (findItem exclAll p) == 0 collect p
         local poolMin = for p in pool collect p.min
         local poolMax = for p in pool collect p.max
-        local gridOf = #()
-        if pool.count > 0 do gridOf[pool.count] = undefined
+        local skipMin = for p in skipN collect p.min
+        local skipMax = for p in skipN collect p.max
+        local gridOf = #(), gridWhy = #()
+        if pool.count > 0 do (gridOf[pool.count] = undefined; gridWhy[pool.count] = undefined)
         local measured = 0
-        local posEps = upm * 0.001
         for u = 1 to nU do (
             local head = unitHead[u]
             if not expired and (rcElapsed t0) > limitMs do (expired = true; stop = "deadline")
-            if expired then (format "X|%|deadline\n" u to:ss) else (
-                -- reference twins (same base object, same transform) move with the item
-                local twins = #()
-                for m in unitMeshes[u] do (
-                    for d in (refs.dependentNodes m.baseObject) where isValidNode d and d != m and (findItem unitMeshes[u] d) == 0 and (findItem twins d) == 0 and (rcSameTM d m posEps) do (
-                        append twins d
-                        format "C|%|%|%|%|%|%\n" u (rcH d) (rcB64 d.name) (rcNotMovable d) (rcG d.transform.row4.z) (rcAncestors d) to:ss
-                    )
-                )
-                -- supports: start strictly lower, overlap the footprint, reach within max_drop
-                local sup = #()
-                for k = 1 to pool.count do (
-                    local s = pool[k]
-                    if (findItem unitMeshes[u] s) == 0 and (findItem twins s) == 0 and poolMin[k].x <= uMax[u].x and poolMax[k].x >= uMin[u].x and poolMin[k].y <= uMax[u].y and poolMax[k].y >= uMin[u].y do (
-                        local dup = false
-                        for m in unitMeshes[u] while not dup do (
-                            if (rcSameTM s m posEps) do dup = true
-                        )
-                        if dup then (format "Q|%|%|coincident|%\n" (rcH s) (rcB64 s.name) u to:ss) else (
-                            if poolMin[k].z < uMin[u].z - eps and poolMax[k].z >= uMin[u].z - maxDrop - eps do (
-                                local related = false
-                                for m in unitMeshes[u] while not related do (
-                                    if (rcIsAncestor s m) or (rcIsAncestor m s) do related = true
-                                )
-                                if not related do append sup k
-                            )
-                        )
-                    )
-                )
-                local supOk = #()
-                for k in sup while not expired do (
-                    if gridOf[k] == undefined do (
-                        local nf = try ((getPolygonCount pool[k])[1]) catch (0)
-                        if nf == 0 then (
-                            gridOf[k] = false
-                            format "Q|%|%|empty_mesh|0\n" (rcH pool[k]) (rcB64 pool[k].name) to:ss
-                        ) else if (not explicit) and nf > maxSupFaces then (
-                            gridOf[k] = false
-                            format "Q|%|%|face_limit|%\n" (rcH pool[k]) (rcB64 pool[k].name) nf to:ss
-                        ) else if (rcElapsed t0) > limitMs then (expired = true; stop = "deadline") else (
-                            local rm = rcGrid pool[k]
-                            append rms rm
-                            gridOf[k] = rm
-                            format "P|%|%|%|%\n" (rcH pool[k]) (rcB64 pool[k].name) ((classOf pool[k].baseObject) as string) nf to:ss
-                        )
-                    )
-                    if gridOf[k] != undefined and gridOf[k] != false do append supOk k
-                )
-                local smp = if expired then undefined else (rcSamples unitMeshes[u] uMin[u] uMax[u] cells maxVerts t0 limitMs)
+            local nVerts = 0
+            for m in unitMeshes[u] do nVerts += try ((getPolygonCount m)[2]) catch (0)
+            if expired then (format "X|%|deadline\n" u to:ss)
+            else if nVerts > denseVerts then (format "X|%|too_dense\n" u to:ss)
+            else (
+                local smp = rcSamples unitMeshes[u] uMin[u] uMax[u] cells maxVerts t0 limitMs
                 if smp == undefined then (
                     expired = true
                     stop = "deadline"
                     format "X|%|deadline\n" u to:ss
                 ) else (
                     local pts = smp[1]
+                    local zs = for p in pts collect p.z
+                    sort zs
+                    local lowZ = if zs.count > 0 then zs[1] else uMin[u].z
+                    local medZ = if zs.count > 0 then zs[amax 1 ((ceil (zs.count * 0.5)) as integer)] else uMin[u].z
+                    -- reference twins: listed items folded in, plus twins outside the set
+                    local twins = for t in unitTwins[u] collect t
+                    for m in unitMeshes[u] do (
+                        for d in (refs.dependentNodes m.baseObject) where isValidNode d and d != m and (findItem claimed d) == 0 and (findItem twins d) == 0 and (rcSameTM d m posEps) do append twins d
+                    )
+                    for d in twins do format "C|%|%|%|%|%|%\n" u (rcH d) (rcB64 d.name) (rcNotMovable d) (rcG9 d.transform.row4.z) (rcAncestors d) to:ss
+                    -- supports: start below the item's median underside, overlap its footprint,
+                    -- reach within max_drop of its lowest point; never its own descendants
+                    local sup = #()
+                    for k = 1 to pool.count do (
+                        local s = pool[k]
+                        if (findItem unitMeshes[u] s) == 0 and (findItem twins s) == 0 and poolMin[k].x <= uMax[u].x and poolMax[k].x >= uMin[u].x and poolMin[k].y <= uMax[u].y and poolMax[k].y >= uMin[u].y do (
+                            local dup = false
+                            for m in unitMeshes[u] while not dup do (
+                                if (rcCoincident s m posEps) do dup = true
+                            )
+                            if dup then (format "Q|%|%|coincident|%\n" (rcH s) (rcB64 s.name) u to:ss) else (
+                                if poolMin[k].z < medZ - eps and poolMax[k].z >= lowZ - maxDrop - eps do (
+                                    local below = false
+                                    for m in unitMeshes[u] while not below do (
+                                        if (rcIsAncestor m s) do below = true
+                                    )
+                                    if not below do append sup k
+                                )
+                            )
+                        )
+                    )
+                    -- anything left out that could be the real surface blocks a drop
+                    for j = 1 to skipN.count do (
+                        if skipMin[j].x <= uMax[u].x and skipMax[j].x >= uMin[u].x and skipMin[j].y <= uMax[u].y and skipMax[j].y >= uMin[u].y and skipMin[j].z < medZ - eps and skipMax[j].z >= lowZ - maxDrop - eps and (findItem twins skipN[j]) == 0 do (
+                            format "B|%|%|%|%\n" u (rcH skipN[j]) (rcB64 skipN[j].name) skipWhy[j] to:ss
+                        )
+                    )
+                    local supOk = #()
+                    for k in sup while not expired do (
+                        if gridOf[k] == undefined do (
+                            local nf = try ((getPolygonCount pool[k])[1]) catch (0)
+                            if nf == 0 then (
+                                gridOf[k] = false
+                                gridWhy[k] = "empty_mesh"
+                                format "Q|%|%|empty_mesh|0\n" (rcH pool[k]) (rcB64 pool[k].name) to:ss
+                            ) else if (not explicit) and nf > maxSupFaces then (
+                                gridOf[k] = false
+                                gridWhy[k] = "face_limit"
+                                format "Q|%|%|face_limit|%\n" (rcH pool[k]) (rcB64 pool[k].name) nf to:ss
+                            ) else if (rcElapsed t0) > limitMs then (expired = true; stop = "deadline") else (
+                                local rm = rcGrid pool[k]
+                                append rms rm
+                                gridOf[k] = rm
+                                format "P|%|%|%|%\n" (rcH pool[k]) (rcB64 pool[k].name) ((classOf pool[k].baseObject) as string) nf to:ss
+                            )
+                        )
+                        if gridOf[k] == false and gridWhy[k] != undefined do format "B|%|%|%|%\n" u (rcH pool[k]) (rcB64 pool[k].name) gridWhy[k] to:ss
+                        if gridOf[k] != undefined and gridOf[k] != false do append supOk k
+                    )
                     local jit = [smp[4] * 0.0011, smp[5] * 0.0013, 0.0]
                     local best = for p in pts collect 1e30
                     local gLines = #()
                     for k in supOk while not expired do (
                         local sMin = 1e30, sHits = 0, sPt = undefined
+                        local topZ = poolMax[k].z
                         for i = 1 to pts.count while not expired do (
-                            if (mod i 64) == 0 and (rcElapsed t0) > limitMs do expired = true
-                            local g = rcGap gridOf[k] pts[i] lift maxDrop jit
+                            if (mod i 32) == 0 and (rcElapsed t0) > limitMs do expired = true
+                            local g = rcGap gridOf[k] pts[i] lift maxDrop jit topZ eps
                             if g != undefined do (
                                 sHits += 1
                                 if g < sMin do (sMin = g; sPt = pts[i])
@@ -788,7 +1020,7 @@ _MEASURE_BODY = r'''
                         if sHits > 0 do append gLines ("G|" + u as string + "|" + (rcH pool[k]) + "|" + (rcB64 pool[k].name) + "|" + (rcG sMin) + "|" + sHits as string + "|" + (rcP sPt))
                     )
                     if expired then (
-                        stop = "deadline"
+                        if stop == "none" do stop = "deadline"
                         format "X|%|deadline\n" u to:ss
                     ) else (
                         for gl in gLines do format "%\n" gl to:ss
@@ -809,20 +1041,21 @@ _MEASURE_BODY = r'''
                         )
                         local hs = ""
                         for m in unitMeshes[u] do hs += (if hs == "" then "" else ",") + (rcH m)
+                        local why = if rigid and (isGroupHead head) then (rcNotMovableAll (#(head) + unitMeshes[u])) else (rcNotMovable head)
                         format "I|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%\n" u (rcH head) (rcB64 head.name) \
                             (if isGroupHead head then "group" else "node") \
                             (if grp == undefined then "0" else rcH grp) (if grp == undefined then "" else rcB64 grp.name) \
-                            (rcG uMin[u].z) smp[2] smp[3] pts.count gaps.count (rcG minGap) (rcG p10) (rcG p50) nContact (rcP minPt) \
-                            (rcNotMovable head) (rcG head.transform.row4.z) (rcAncestors head) classes hs to:ss
+                            (rcG9 lowZ) smp[2] smp[3] pts.count gaps.count (rcG minGap) (rcG p10) (rcG p50) nContact (rcP minPt) \
+                            why (rcG9 head.transform.row4.z) (rcAncestors head) classes hs to:ss
                         measured += 1
                     )
-                )
-                -- nodes outside the set that sit on this item
-                if not explicit do (
-                    for k = 1 to pool.count do (
-                        local s = pool[k]
-                        if (findItem claimed s) == 0 and (findItem twins s) == 0 and poolMin[k].z >= uMin[u].z + eps and poolMin[k].z <= uMax[u].z + tol and poolMin[k].x <= uMax[u].x and poolMax[k].x >= uMin[u].x and poolMin[k].y <= uMax[u].y and poolMax[k].y >= uMin[u].y do (
-                            format "R|%|%|%\n" u (rcH s) (rcB64 s.name) to:ss
+                    -- nodes outside the set that sit on this item
+                    if not explicit do (
+                        for k = 1 to pool.count do (
+                            local s = pool[k]
+                            if (findItem claimed s) == 0 and (findItem twins s) == 0 and poolMin[k].z >= uMin[u].z + eps and poolMin[k].z <= uMax[u].z + tol and poolMin[k].x <= uMax[u].x and poolMax[k].x >= uMin[u].x and poolMin[k].y <= uMax[u].y and poolMax[k].y >= uMin[u].y do (
+                                format "R|%|%|%\n" u (rcH s) (rcB64 s.name) to:ss
+                            )
                         )
                     )
                 )
@@ -837,15 +1070,15 @@ _MEASURE_BODY = r'''
 )'''
 
 _APPLY_BODY = r'''
-    local rms = #(), result = undefined, ownsHold = false
+    local rms = #(), result = undefined, ownsHold = false, suspended = false
     try (''' + _DEADLINE + r'''
-        local eps = @@EPS@@ as float
+        local zEps = @@EPS@@ as float
         local cells = @@SAMPLES@@
         local maxVerts = @@MAX_VERTS@@
         local moves = @@MOVES@@
         local checks = @@VERIFY@@
         if (limitMs - (rcElapsed t0)) < @@MIN_APPLY_MS@@ then (result = "__DEADLINE__") \
-        else if theHold.Holding() then (result = "__BUSY__") \
+        else if theHold.Holding() or theHold.IsSuspended() or theHold.SuperLevel() != 0 then (result = "__BUSY__") \
         else if animButtonState then (result = "__AUTOKEY__") \
         else (
             local nodesM = #(), gone = undefined, stale = undefined
@@ -853,7 +1086,7 @@ _APPLY_BODY = r'''
                 local n = getAnimByHandle mv[1]
                 if not (isValidNode n) then (if gone == undefined do gone = mv[1] as string) else (
                     append nodesM n
-                    if stale == undefined and (abs (n.transform.row4.z - mv[3])) > eps do stale = n.name
+                    if stale == undefined and (abs (n.transform.row4.z - mv[3])) > zEps do stale = n.name
                 )
             )
             if gone != undefined then (result = "__GONE__|" + gone) \
@@ -861,41 +1094,54 @@ _APPLY_BODY = r'''
             else (
                 theHold.Begin()
                 ownsHold = true
-                for k = 1 to moves.count do (in coordsys world move nodesM[k] [0, 0, moves[k][2]])
+                with animate off (
+                    for k = 1 to moves.count do (in coordsys world move nodesM[k] [0, 0, moves[k][2]])
+                )
                 local bad = undefined
                 for k = 1 to moves.count while bad == undefined do (
-                    if (abs (nodesM[k].transform.row4.z - moves[k][4])) > eps do bad = nodesM[k].name
+                    if (abs (nodesM[k].transform.row4.z - moves[k][4])) > zEps do bad = nodesM[k].name
                 )
-                if bad != undefined then (
-                    theHold.Cancel()
-                    ownsHold = false
-                    result = "__READBACK__|" + bad
-                ) else (
-                    -- re-measure every moved item against fresh grids of its supports
-                    local ss = stringStream ""
+                local ss = stringStream ""
+                local status = "applied"
+                if bad != undefined then (status = "readback") else (
+                    -- re-measure every moved item against one fresh grid per support, without
+                    -- recording the grids in the undo step
+                    theHold.Suspend()
+                    suspended = true
+                    local gH = #(), gR = #(), gTop = #()
                     local allOk = true, expired = false
                     for c in checks while not expired do (
                         local ms = for h in c[2] collect (getAnimByHandle h)
                         ms = for m in ms where isValidNode m collect m
-                        local bmin = [1e30, 1e30, 1e30], bmax = [-1e30, -1e30, -1e30]
+                        local x0 = 1e30, y0 = 1e30, z0 = 1e30, x1 = -1e30, y1 = -1e30, z1 = -1e30
                         for m in ms do (
                             local a = m.min, b = m.max
-                            bmin.x = amin bmin.x a.x; bmin.y = amin bmin.y a.y; bmin.z = amin bmin.z a.z
-                            bmax.x = amax bmax.x b.x; bmax.y = amax bmax.y b.y; bmax.z = amax bmax.z b.z
+                            x0 = amin x0 a.x; y0 = amin y0 a.y; z0 = amin z0 a.z
+                            x1 = amax x1 b.x; y1 = amax y1 b.y; z1 = amax z1 b.z
                         )
-                        local smp = if ms.count == 0 then undefined else (rcSamples ms bmin bmax cells maxVerts t0 limitMs)
+                        local smp = if ms.count == 0 then undefined else (rcSamples ms [x0, y0, z0] [x1, y1, z1] cells maxVerts t0 limitMs)
                         if smp == undefined then (expired = true) else (
                             local pts = smp[1]
                             local jit = [smp[4] * 0.0011, smp[5] * 0.0013, 0.0]
                             local best = 1e30, hits = 0
                             for h in c[3] while not expired do (
-                                local s = getAnimByHandle h
-                                if isValidNode s do (
-                                    local rm = rcGrid s
-                                    append rms rm
+                                local gi = findItem gH h
+                                if gi == 0 do (
+                                    local s = getAnimByHandle h
+                                    if isValidNode s and (rcElapsed t0) <= limitMs then (
+                                        local rm = rcGrid s
+                                        append rms rm
+                                        append gH h; append gR rm; append gTop s.max.z
+                                        gi = gH.count
+                                    ) else if not (isValidNode s) then (
+                                        append gH h; append gR undefined; append gTop 0.0
+                                        gi = gH.count
+                                    ) else (expired = true)
+                                )
+                                if gi > 0 and gR[gi] != undefined do (
                                     for i = 1 to pts.count while not expired do (
-                                        if (mod i 64) == 0 and (rcElapsed t0) > limitMs do expired = true
-                                        local g = rcGap rm pts[i] lift maxDrop jit
+                                        if (mod i 32) == 0 and (rcElapsed t0) > limitMs do expired = true
+                                        local g = rcGap gR[gi] pts[i] lift maxDrop jit gTop[gi] eps
                                         if g != undefined do (
                                             hits += 1
                                             if g < best do best = g
@@ -903,27 +1149,45 @@ _APPLY_BODY = r'''
                                     )
                                 )
                             )
-                            local ok = hits > 0 and best >= c[4] and best <= c[5]
-                            if not ok do allOk = false
-                            format "V|%|%|%|%\n" c[1] (rcG best) hits (if ok then 1 else 0) to:ss
+                            if not expired do (
+                                local ok = hits > 0 and best >= c[4] and best <= c[5]
+                                if not ok do allOk = false
+                                format "V|%|%|%|%\n" c[1] (rcG best) hits (if ok then 1 else 0) to:ss
+                            )
                         )
                     )
-                    local status = "applied"
-                    if expired then (
-                        theHold.Cancel()
-                        status = "rolled_back_deadline"
-                    ) else if not allOk then (
-                        theHold.Cancel()
-                        status = "rolled_back"
-                    ) else (
-                        theHold.Accept "@@LABEL@@"
+                    theHold.Resume()
+                    suspended = false
+                    if expired then (status = "rolled_back_deadline") else if not allOk do (status = "rolled_back")
+                )
+                local restore = "none"
+                if status == "applied" then (
+                    theHold.Accept "@@LABEL@@"
+                ) else (
+                    theHold.Cancel()
+                    -- the cancel must have put every node back; put any straggler back by hand
+                    restore = "ok"
+                    with animate off (
+                        for k = 1 to moves.count do (
+                            local n = nodesM[k]
+                            if isValidNode n and (abs (n.transform.row4.z - moves[k][3])) > zEps do (
+                                in coordsys world move n [0, 0, moves[k][3] - n.transform.row4.z]
+                                restore = "manual"
+                                if (abs (n.transform.row4.z - moves[k][3])) > zEps do restore = "failed"
+                            )
+                        )
                     )
-                    ownsHold = false
-                    result = "W|" + status + "|" + (rcElapsed t0) as string + "|" + budgetMs as string + "\n" + (ss as string) + "END\n"
+                    if restore == "failed" do status = "rollback_failed"
+                )
+                ownsHold = false
+                global mcpLastDrop = #(@@SENT_MS@@L, status, for mv in moves collect #(mv[1], mv[2], mv[3], mv[4]))
+                if status == "readback" then (result = "__READBACK__|" + bad) else (
+                    result = "W|" + status + "|" + (rcElapsed t0) as string + "|" + budgetMs as string + "|" + restore + "\n" + (ss as string) + "END\n"
                 )
             )
         )
     ) catch (
+        if suspended do try (theHold.Resume()) catch ()
         if ownsHold and theHold.Holding() do theHold.Cancel()
         result = "__ERROR__|" + (getCurrentException() as string)
     )
