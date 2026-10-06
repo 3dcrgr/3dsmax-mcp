@@ -20,36 +20,67 @@ Two new tools share one helper (`maxmcp/helpers/resting.py`). Each sends one bou
   - `min_gap_mm`, `gap_p10_mm`, `gap_p50_mm` and `contact_fraction`;
   - the support it rests on, the three closest supports, and the world point of the smallest gap.
 - **`drop_to_surface`** plans the same measurement into world-Z moves. `dry_run` is true by default.
-  - It moves only items that float, until their lowest point sits `clearance_mm` (default 0.2) above the support.
+  - Floating items drop until their lowest point sits `clearance_mm` (default 0.2) above their support.
   - Items already resting follow any support that moves, so a plate on a dropped placemat goes down with it.
   - Sunk items are lifted only with `lift_penetrating=true`.
+  - An applied drop needs `names` (never the live selection) and at least 5 s of `time_budget_s`. When `names` include a group it also needs `group_mode`:
+    - `members` drops each prop of a table-setting group;
+    - `rigid` moves furniture or assemblies as one piece.
 
-**Method:**
-- **Undersides:** each item's lowest vertex per cell of an XY grid over its footprint (`samples`, default 64), from its evaluated mesh. They come from vertices, never from rays into the item, so cloth and needles measure correctly. Dense meshes are read at every n-th vertex above `max_item_verts`, and flagged `sampled`.
-- **Rays:** one double-sided segment per cell, cast straight down against each support. It runs from `max_sink_mm` above the point (to see sinking) to `max_drop_mm` below it. Each support gets one `RayMeshGridIntersect`, built once and freed on every path.
+**Measuring:**
+- **Undersides:** the lowest point per cell of an XY grid over the item's footprint (`samples`, default 64), from its evaluated mesh. Points come from vertices, plus points on the faces of a coarse mesh (a box, a 1×1 plane), never from rays into the item, so cloth and needles measure correctly. Dense meshes are read at every n-th vertex above `max_item_verts` (flagged `sampled`). Items above 20 × `max_item_verts` vertices are skipped (`too_dense`).
+- **Gaps:** one double-sided segment per cell, cast straight down against each support, from `max_sink_mm` above the point to `max_drop_mm` below it. Each support gets one `RayMeshGridIntersect`, built once and freed on every path.
+  - When a support surface lies above the point, a parity test (distinct crossings straight up) tells a sunk point (inside the support, or under an open sheet of it) from an overhang such as a plate rim over a fork.
+  - A point deeper than `max_sink_mm` inside a closed support reads as sunk, never as floating.
 - **Supports**, unless `supports` lists them:
-  - visible, renderable meshes that start strictly lower than the item, lie under its footprint and reach within `max_drop_mm` of it. Starting lower keeps stacks acyclic, and a cloth draped over an item is never its support.
-  - Scatter objects (Mesher, Forest Pack, RailClone, tyFlow, particles, fur) are left out.
-  - Coincident duplicates of an item, such as the stacked copies from #16, are ignored and reported.
-  - `exclude_supports` removes others.
-- **Groups:** a group head in `names` expands to its mesh members (`group_mode="members"`). `group_mode="rigid"` treats the whole group as one item and moves its head.
-- **Twins:** reference twins (same base object and transform, such as `*_ENMESH` copies) move with their item.
+  - visible, renderable meshes that start below the item's median underside, lie under its footprint and reach within `max_drop_mm` of its lowest point;
+  - never the item's own descendants. Its parent counts: a cup linked to the tray it stands on rests on the tray.
+  - The other items always count too, even with explicit `supports`, so stacks work.
+  - Scatter objects (Mesher, Forest Pack, RailClone, tyFlow, particles, fur) are left out, and `exclude_supports` removes others.
+  - Coincident duplicates of an item (same transform *and* geometry, such as the stacked copies from #16) are ignored and reported.
+- **Twins:** reference twins (same base object and transform, such as `*_ENMESH` copies) move with their item. When both are named, they become one item.
 - **Budget:** the time budget counts from the send, like `contact_check`, at most 45 s. Items it didn't reach are `unchecked`, with `complete: false`.
 
+**Planning:**
+- **Order:** items are planned in support order and ancestry order; items that support each other in a loop are held.
+- **Pinning:** an item that can't move but would lose its support pins that support, and through it the supports below.
+- **Blocked:** an item over something left out of the measurement (scatter, excluded, not a mesh, above the face limit) is never moved. Its gap may be to a surface further down.
+
 **Applying** (`dry_run=false`):
-- **Refuses, moving nothing,** while Auto Key is on, an undo operation is open, the measurement was incomplete, or less than 3 s of budget is left.
-- **Never moves** frozen, Z-locked, linked (Revit), xref, constrained or animated nodes, or an item whose twin is one of those. Items on them are planned against them where they are.
-- **One undo step,** "MCP drop to surface". Before moving, it checks that every node is still where it was measured. Inside the step it re-measures every moved item against fresh grids of its supports. If any ends up floating or sunk beyond `tolerance_mm`, it cancels the step, so nothing moves.
-- **Result:** `move_log` lists each node with `dz_mm`, `z_before` and `z_after`.
+- **Refuses, moving nothing,** while:
+  - Auto Key is on;
+  - an undo operation is open or suspended;
+  - the measurement was incomplete;
+  - too little budget is left.
+- **Never moves:**
+  - frozen (including by layer), Z-locked, linked (Revit), xref, constrained or animated nodes;
+  - in rigid mode, a group with any such member;
+  - an item whose twin can't move.
+- **One undo step,** "MCP drop to surface":
+  - It checks every node is still where it was measured, then moves with animation off.
+  - Inside the step it re-measures every moved and carried item against one fresh grid per support, with the hold suspended so the grids aren't recorded.
+  - If any item ends more than `tolerance_mm` off its planned gap, it cancels the step.
+  - After a cancel it checks every node is back, and puts stragglers back by hand (`rollback_failed` if that fails).
+- **Result:** `move_log` lists each node with `dz_mm` and `z_before`/`z_after` (world Z in scene units). The Max global `mcpLastDrop` keeps the last outcome, in case a reply is lost.
 - **Left behind:** nodes outside `names` that sit on a moved item stay where they are, and the result names them.
 
 ## Limits
 
-- **Gaps run straight down from the lowest vertex per cell.** A tilted item moves only in Z: rotating it to lie flat is the user's call. A knife on a plate rim needs more `samples`.
-- **Proxies (VRayProxy and similar)** are measured from their viewport preview mesh, not the render mesh.
-- **Supports are evaluated at the current frame,** and so are the moves.
+- **Moves are along world Z only.** A tilted item isn't rotated to lie flat; that's the user's call.
+- **Proxies (VRayProxy and similar)** are measured from their viewport preview mesh.
+- **Measurements are at the current frame.**
+- **Members mode on furniture groups** drops their attached parts. Use `group_mode="rigid"` for furniture.
 
 ## Status
 
-- Unit tested in `tests/test_resting_check.py`: validation, report parsing, classification, the stack plan (following, inheritance, frozen supports, twins, lifting) and the apply paths.
-- **Not tested live yet:** test on scratch objects first, never on production props.
+- **Unit tests** in `tests/test_resting_check.py`: validation, report parsing, classification, and the plan: following, inheritance, child-below-parent order, pinning, cycles, blockers, twins as supports, twins of carried items, sunk followers, lifting. Plus the apply paths and the script contents.
+- **Reviews:** an adversarial review in four lenses, and a live run in a scratch 3ds Max 2026 (V-Ray 7, cm).
+- **Live run results:**
+  - The first version found correct statuses and stacked drops: runner −1.8 mm, placemat −4.6, plate −8.4, the glass following. One undo reverted it, and the refusals and deadlines worked.
+  - It also exposed five wrong-result cases, which the review fixes cover:
+    - a cup linked to its tray;
+    - a twin as a support;
+    - an origin-pivot slab;
+    - both twins named;
+    - a twin carried by its parent.
+- **Production:** not tested live yet. Test on scratch objects first.
