@@ -113,6 +113,11 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("123L", script)
         self.assertIn("rm.intersectSegment (q + [0, 0, lift]) (q - [0, 0, maxDrop]) true", script)
         self.assertIn("rcInsideDepth rm q topZ botZ lift eps", script)  # parity test for sunk vs overhang
+        self.assertIn("(mod dn[1] 2) == 1 and up[3] < 0.0 and dn[3] > 0.0", script)  # deep only inside a closed solid
+        apply = self.apply_script()
+        self.assertIn("rcGap gR[gi] pts[i] lift maxDrop jit gTop[gi] gBot[gi] eps", apply)
+        self.assertIn("ROLLBACK FAILED, check:", apply)
+        self.assertEqual(apply.count("("), apply.count(")"))
         self.assertIn("snapshotAsMesh nd renderMesh:false", script)
         self.assertIn("if (rcIsAncestor m s) do below = true", script)  # descendants only; ancestors may support
         self.assertIn("for c in claimed where (findItem pool c) == 0 do append pool c", script)  # stacks with explicit supports
@@ -120,7 +125,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("rcCoincident s m posEps", script)
         self.assertIn('format:".9g"', script)
         self.assertIn("for o in objects where o.name == nm collect o", script)  # getNodeByName fallback
-        self.assertIn("poolMin[k].z < medZ + tol", script)  # a zero-thickness mat still supports
+        self.assertIn("(poolMin[k].z < medZ - eps or poolMax[k].z <= medZ + tol)", script)  # a zero-thickness mat supports
         self.assertIn('append skipWhy "hidden"', script)
         self.assertIn("rcGap gridOf[k] pts[i] lift maxDrop jit topZ poolMin[k].z eps", script)
         self.assertEqual(script.count("("), script.count(")"))
@@ -251,6 +256,9 @@ class PlanTests(unittest.TestCase):
         lifted = rs.plan_drops(r, clearance=0.0, lift_penetrating=True)
         self.assertAlmostEqual(lifted[1]["own"], 0.3)
         self.assertAlmostEqual(lifted[2]["own"], 0.3)  # the plate follows its support up
+        deep = stack_report(placemat_gap=-3.0, plate_gap=0.0, glass_gap=0.0)  # 30 mm, max_sink 20 mm
+        plan = rs.plan_drops(deep, clearance=0.0, lift_penetrating=True)
+        self.assertEqual((plan[1]["own"], plan[1]["reason"]), (0.0, "too_deep_to_lift"))
 
     def test_sunk_follower_is_verified_at_its_own_gap(self):
         r = stack_report(placemat_gap=0.5, plate_gap=-0.1, glass_gap=0.0)

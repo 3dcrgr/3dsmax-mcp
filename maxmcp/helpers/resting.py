@@ -480,7 +480,8 @@ def _plan_once(report, order, cyclic, pinned, clearance, lift_penetrating):
         if gap_now is not None:
             gap_now += inherited
         own, reason = 0.0, ""
-        fix = gap0 is not None and (gap0 > tol or (lift_penetrating and gap0 < -tol))
+        too_deep = gap0 is not None and gap0 < -(report["lift"] + tol)  # never lift by more than max_sink
+        fix = gap0 is not None and (gap0 > tol or (lift_penetrating and gap0 < -tol and not too_deep))
         target = (clearance if fix else gap0) if gap0 is not None else None
         if idx in unchecked:
             reason = "unchecked"
@@ -500,7 +501,8 @@ def _plan_once(report, order, cyclic, pinned, clearance, lift_penetrating):
             if abs(target - gap_now) > tol * 1e-3:
                 own = target - gap_now
             if not fix:
-                reason = ("follows_support" if own else "resting") if gap0 >= -tol else "penetrating_not_lifted"
+                reason = (("follows_support" if own else "resting") if gap0 >= -tol
+                          else "too_deep_to_lift" if too_deep and lift_penetrating else "penetrating_not_lifted")
             if not own and inherited and reason in ("", "resting"):
                 reason = "follows_parent"
         plan[idx] = {"own": own, "total": inherited + own, "inherited": inherited, "gap0": gap0,
@@ -774,25 +776,29 @@ _LIBRARY = r'''(
             #(pts, verts, stride, cw, ch)
         )
     )
-    -- #(distinct crossings from a to b, distance to the first)
+    -- #(distinct crossings from a to b, distance to the nearest, z of its grid normal).
+    -- getHitNormal is the reverse of the Max face normal (live: a plane facing up reads [0,0,-1])
     fn rcCrossings rm a b eps = (
         local n = rm.intersectSegment a b true
-        local ds = for i = 1 to n collect (rm.getHitDist i)
-        ds = for d in ds where d > eps collect d
-        sort ds
-        local cnt = 0, last = -1e30, first = 0.0
-        for d in ds do (
-            if (d - last) > eps do (
-                cnt += 1
-                last = d
-                if cnt == 1 do first = d
+        local ds = #(), first = 0.0, firstNz = 0.0, best = 1e30
+        for i = 1 to n do (
+            local d = rm.getHitDist i
+            if d > eps do (
+                append ds d
+                if d < best do (best = d; firstNz = (rm.getHitNormal i).z)
             )
         )
-        #(cnt, first)
+        if ds.count > 0 do first = best
+        sort ds
+        local cnt = 0, last = -1e30
+        for d in ds do (if (d - last) > eps do (cnt += 1; last = d))
+        #(cnt, first, firstNz)
     )
     -- depth of q inside the support, from the parity of the crossings straight up; 0 when
-    -- outside. Within lift, under an open sheet counts too (a sunk item under a 1-plane floor);
-    -- deeper, only a closed support does (odd crossings down as well), not a tabletop overhead
+    -- outside. Within lift, under an open sheet counts too (a sunk item under a 1-plane floor),
+    -- whatever the normals. Deeper, only a closed solid counts: odd crossings down as well, the
+    -- surface above facing up and the one below facing down (both away from q). So a ceiling
+    -- or tabletop overhead, or a room's floor plane, doesn't
     fn rcInsideDepth rm q topZ botZ lift eps = (
         if q.z > topZ + eps then 0.0 else (
             local up = rcCrossings rm q [q.x, q.y, topZ + 10.0 * eps + 0.001] eps
@@ -800,7 +806,7 @@ _LIBRARY = r'''(
             else if up[2] <= lift then up[2]
             else (
                 local dn = rcCrossings rm q [q.x, q.y, botZ - 10.0 * eps - 0.001] eps
-                if (mod dn[1] 2) == 1 then up[2] else 0.0
+                if (mod dn[1] 2) == 1 and up[3] < 0.0 and dn[3] > 0.0 then up[2] else 0.0
             )
         )
     )
@@ -1004,7 +1010,8 @@ _MEASURE_BODY = r'''
                         for d in (refs.dependentNodes m.baseObject) where isValidNode d and d != m and (findItem claimed d) == 0 and (findItem twins d) == 0 and (rcSameTM d m posEps) do append twins d
                     )
                     for d in twins do format "C|%|%|%|%|%|%\n" u (rcH d) (rcB64 d.name) (rcNotMovable d) (rcG9 d.transform.row4.z) (rcAncestors d) to:ss
-                    -- supports: start below the item's median underside, overlap its footprint,
+                    -- supports: start below the item's median underside (or lie wholly at or below it, a
+                    -- zero-thickness mat; never the cup standing on that mat), overlap its footprint,
                     -- reach within max_drop of its lowest point; never its own descendants
                     local sup = #()
                     for k = 1 to pool.count do (
@@ -1015,7 +1022,7 @@ _MEASURE_BODY = r'''
                                 if (rcCoincident s m posEps) do dup = true
                             )
                             if dup then (format "Q|%|%|coincident|%\n" (rcH s) (rcB64 s.name) u to:ss) else (
-                                if poolMin[k].z < medZ + tol and poolMax[k].z >= lowZ - maxDrop - eps do (
+                                if (poolMin[k].z < medZ - eps or poolMax[k].z <= medZ + tol) and poolMax[k].z >= lowZ - maxDrop - eps do (
                                     local below = false
                                     for m in unitMeshes[u] while not below do (
                                         if (rcIsAncestor m s) do below = true
@@ -1027,7 +1034,7 @@ _MEASURE_BODY = r'''
                     )
                     -- anything left out that could be the real surface blocks a drop
                     for j = 1 to skipN.count do (
-                        if skipMin[j].x <= uMax[u].x and skipMax[j].x >= uMin[u].x and skipMin[j].y <= uMax[u].y and skipMax[j].y >= uMin[u].y and skipMin[j].z < medZ + tol and skipMax[j].z >= lowZ - maxDrop - eps and (findItem twins skipN[j]) == 0 do (
+                        if skipMin[j].x <= uMax[u].x and skipMax[j].x >= uMin[u].x and skipMin[j].y <= uMax[u].y and skipMax[j].y >= uMin[u].y and (skipMin[j].z < medZ - eps or skipMax[j].z <= medZ + tol) and skipMax[j].z >= lowZ - maxDrop - eps and (findItem twins skipN[j]) == 0 do (
                             format "B|%|%|%|%\n" u (rcH skipN[j]) (rcB64 skipN[j].name) skipWhy[j] to:ss
                         )
                     )
@@ -1121,12 +1128,12 @@ _MEASURE_BODY = r'''
 )'''
 
 _APPLY_BODY = r'''
-    local rms = #(), result = undefined, ownsHold = false, suspended = false
+    local rms = #(), result = undefined, ownsHold = false, suspended = false, moves = #(), zEps = 0.001
     try (''' + _DEADLINE + r'''
-        local zEps = @@EPS@@ as float
+        zEps = @@EPS@@ as float
         local cells = @@SAMPLES@@
         local maxVerts = @@MAX_VERTS@@
-        local moves = @@MOVES@@
+        moves = @@MOVES@@
         local checks = @@VERIFY@@
         if (limitMs - (rcElapsed t0)) < @@MIN_APPLY_MS@@ then (result = "__DEADLINE__") \
         else if theHold.Holding() or theHold.IsSuspended() or theHold.SuperLevel() != 0 then (result = "__BUSY__") \
@@ -1159,7 +1166,7 @@ _APPLY_BODY = r'''
                     -- recording the grids in the undo step
                     theHold.Suspend()
                     suspended = true
-                    local gH = #(), gR = #(), gTop = #()
+                    local gH = #(), gR = #(), gTop = #(), gBot = #()
                     local allOk = true, expired = false
                     for c in checks while not expired do (
                         local ms = for h in c[2] collect (getAnimByHandle h)
@@ -1182,17 +1189,17 @@ _APPLY_BODY = r'''
                                     if isValidNode s and (rcElapsed t0) <= limitMs then (
                                         local rm = rcGrid s
                                         append rms rm
-                                        append gH h; append gR rm; append gTop s.max.z
+                                        append gH h; append gR rm; append gTop s.max.z; append gBot s.min.z
                                         gi = gH.count
                                     ) else if not (isValidNode s) then (
-                                        append gH h; append gR undefined; append gTop 0.0
+                                        append gH h; append gR undefined; append gTop 0.0; append gBot 0.0
                                         gi = gH.count
                                     ) else (expired = true)
                                 )
                                 if gi > 0 and gR[gi] != undefined do (
                                     for i = 1 to pts.count while not expired do (
                                         if (mod i 32) == 0 and (rcElapsed t0) > limitMs do expired = true
-                                        local g = rcGap gR[gi] pts[i] lift maxDrop jit gTop[gi] eps
+                                        local g = rcGap gR[gi] pts[i] lift maxDrop jit gTop[gi] gBot[gi] eps
                                         if g != undefined do (
                                             hits += 1
                                             if g < best do best = g
@@ -1238,9 +1245,27 @@ _APPLY_BODY = r'''
             )
         )
     ) catch (
+        local err = getCurrentException() as string
         if suspended do try (theHold.Resume()) catch ()
-        if ownsHold and theHold.Holding() do theHold.Cancel()
-        result = "__ERROR__|" + (getCurrentException() as string)
+        if ownsHold and theHold.Holding() do (
+            theHold.Cancel()
+            -- as on a normal cancel, put any straggler back by hand
+            local left = ""
+            try (
+                with animate off (
+                    for mv in moves do (
+                        local n = getAnimByHandle mv[1]
+                        if isValidNode n and (abs (n.transform.row4.z - mv[3])) > zEps do (
+                            in coordsys world move n [0, 0, mv[3] - n.transform.row4.z]
+                            if (abs (n.transform.row4.z - mv[3])) > zEps do left += " " + n.name
+                        )
+                    )
+                )
+            ) catch (left += " (restore failed)")
+            err += if left == "" then " [The drop's undo step was cancelled and every node is back where it was.]" \
+                else (" [ROLLBACK FAILED, check:" + left + "]")
+        )
+        result = "__ERROR__|" + err
     )
     for r in rms where r != undefined do try (r.free()) catch ()
     result

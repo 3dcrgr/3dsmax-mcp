@@ -301,6 +301,9 @@ def drop_to_surface(
         warnings.append(f"These items support each other in a loop, so they aren't moved: {_short(by_reason['cyclic_support'])}.")
     if by_reason.get("penetrating_not_lifted"):
         warnings.append(f"Sunk items weren't lifted (lift_penetrating=false): {_short(by_reason['penetrating_not_lifted'])}.")
+    if by_reason.get("too_deep_to_lift"):
+        warnings.append("Sunk deeper than max_sink_mm, so not lifted (check them by hand): "
+                        f"{_short(by_reason['too_deep_to_lift'])}.")
     if report["group_heads"] and group_mode is None:
         msg = ("names include groups (" + _short([g["name"] for g in report["group_heads"]]) + "): pass group_mode "
                "\"members\" to drop each prop, or \"rigid\" to move furniture or assemblies as one piece.")

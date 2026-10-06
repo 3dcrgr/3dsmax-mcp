@@ -31,9 +31,10 @@ Two new tools share one helper (`maxmcp/helpers/resting.py`). Each sends one bou
 - **Undersides:** the lowest point per cell of an XY grid over the item's footprint (`samples`, default 64), from its evaluated mesh. Points come from vertices, plus points on every face larger than a cell (a box, a 1×1 plane), for meshes up to 20,000 faces; never from rays into the item, so cloth and needles measure correctly. Dense meshes are read at every n-th vertex above `max_item_verts` (flagged `sampled`). Items above 20 × `max_item_verts` vertices are skipped (`too_dense`).
 - **Gaps:** one double-sided segment per cell, cast straight down against each support, from `max_sink_mm` above the point to `max_drop_mm` below it. Each support gets one `RayMeshGridIntersect`, built once and freed on every path.
   - A parity test (distinct crossings straight up) runs first. It tells a sunk point from an overhang such as a plate rim over a fork, and gives the exact depth.
-  - Within `max_sink_mm`, a point under an open sheet (a 1-plane floor) counts as sunk. Deeper, only a closed support counts (odd crossings downwards too), so an item under a single-plane tabletop isn't read as 70 cm deep.
+  - Within `max_sink_mm`, a point under an open sheet (a 1-plane floor) counts as sunk. Deeper, only a closed solid counts: odd crossings downwards too, with the surface above facing up and the one below facing down (both away from the point). So an item under a ceiling or a single-plane tabletop isn't read as 70 cm deep.
+  - `lift_penetrating` never lifts an item sunk deeper than `max_sink_mm`; it reports `too_deep_to_lift` instead.
 - **Supports**, unless `supports` lists them:
-  - visible, renderable meshes that start below the item's median underside (or within `tolerance_mm` of it, such as a zero-thickness mat), lie under its footprint and reach within `max_drop_mm` of its lowest point;
+  - visible, renderable meshes that start below the item's median underside (or lie wholly at or below it, such as a zero-thickness mat under a cup, but never the cup on that mat), lie under its footprint and reach within `max_drop_mm` of its lowest point;
   - never the item's own descendants. Its parent counts: a cup linked to the tray it stands on rests on the tray.
   - The other items always count too, even with explicit `supports`, so stacks work.
   - Scatter objects (Mesher, Forest Pack, RailClone, tyFlow, particles, fur) are left out, and `exclude_supports` removes others.
