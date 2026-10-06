@@ -36,6 +36,8 @@ What the status words mean:
 
 The details pages say exactly what was and wasn't tested.
 
+**Added:** `resting_check` and `drop_to_surface` find props floating above or sunk into the surface below them and drop floating ones onto it (fork issue #17). See [resting-check.md](fork/resting-check.md). Unit tested; not tested live yet.
+
 ## Installing
 
 Install from source, the same way as upstream, but from this fork. Its default branch is `fix/fork-fixes`, so a plain clone already has the fixes:

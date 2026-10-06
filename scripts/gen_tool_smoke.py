@@ -31,6 +31,8 @@ FLAG_EXPECT_ERROR = 2
 
 # Skipped unless run_tool_smoke(include_skipped=True) / native includeSkipped
 SKIP_DEFAULT = {
+    "resting_check",
+    "drop_to_surface",
     "cosmos_search",
     "cosmos_download",
     "cosmos_import",
@@ -194,6 +196,7 @@ CUSTOM: dict[str, dict] = {
 }
 
 MUTATE_TOOLS = {
+    "drop_to_surface",
     "create_lights",
     "edit_lights",
     "plugin_patch",
