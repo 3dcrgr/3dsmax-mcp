@@ -247,7 +247,7 @@ python scripts/hot_core.py path        # built DLL plus the mcp_core.path line a
 python scripts/hot_core.py status --gup-dir "<folder of the installed .gup>"
 ```
 
-`--max-version` picks another Max (default 2027) and `--build-dir` another tree. A full `cmake --build native\build-hot-2027 --config Release` also builds the hot shell (`Release\mcp_bridge.gup`). The developer installs that shell in place of the static GUP and restarts Max once; from then on, core rebuilds reload in place. A core loads only into a shell built with the same compiler, Max SDK, configuration and boundary versions, so build both from the same tree.
+`--max-version` picks another Max (default 2027) and `--build-dir` another tree. A full `cmake --build native\build-hot-2027 --config Release` also builds the hot shell (`Release\mcp_bridge.gup`). Install that shell in place of the static GUP and restart Max once; from then on, core rebuilds reload in place. A core loads only into a shell built with the same compiler, Max SDK, configuration and boundary versions, so build both from the same tree.
 
 ### How the shell finds the core
 
@@ -308,4 +308,5 @@ python scripts/run_live_tool_smoke.py --tier read
 | `skills/3dsmax-mcp-dev/` | Agent skill source |
 | `scripts/build_skill.py` | Skill archive builder and installer |
 | `scripts/hot_core.py` | Hot-reloadable native core build helper (development) |
+| `scripts/mcpcall.py` | Runs one tool from current source in a fresh process, optionally pinned to a Max `--pid` (development) |
 | `scripts/gen_tool_registry.py` | Native diagnostic tool registry |
