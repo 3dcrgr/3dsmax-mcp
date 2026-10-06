@@ -339,7 +339,8 @@ def coerce_param_value(raw: dict[str, Any], value: Any, upm: float | None, label
         if match.group(2):
             if not upm:
                 raise ValueError(f"{label}: scene unit scale unknown; pass scene units")
-            number = number * _UNIT_MM[match.group(2)] * upm
+            # 7 significant digits: upm comes from a float32 ("20cm" gave 20.0000002 cm live)
+            number = float(f"{number * _UNIT_MM[match.group(2)] * upm:.7g}")
     else:
         number = _number(value)
         if number is None:
@@ -590,7 +591,24 @@ def match_items(items: list[dict[str, Any]], query: str = "", category: str = ""
             if not all(t in hay for t in terms):
                 continue
         out.append(item)
-    return sorted(out, key=lambda it: it["route"].lower())
+    phrase = " ".join(terms)
+
+    def rank(item: dict[str, Any]) -> tuple[int, str]:
+        # exact name, then the whole phrase in the name, then every word in the name, then elsewhere
+        names = [str(item.get("name") or "").lower()] + [str(n).lower() for n in item.get("names") or []]
+        if not terms:
+            level = 0
+        elif phrase in names:
+            level = 0
+        elif any(phrase in n for n in names):
+            level = 1
+        elif any(all(t in n for t in terms) for n in names):
+            level = 2
+        else:
+            level = 3
+        return level, item["route"].lower()
+
+    return sorted(out, key=rank)
 
 
 def public_item(item: dict[str, Any], *, check_files: bool = True) -> dict[str, Any]:

@@ -173,7 +173,7 @@ Read [railclone.md](railclone.md) for XML authoring, single-footprint models, so
 
 - `railclone_inspect` — start here: bases and their splines, exposed parameters (typed value, limits, selector options, graph inputs), segments, output counts. Read only.
 - `railclone_set_param` — exposed parameters by exact name or id (`{"Pickets Distance": "20cm"}`); limits are checked because RailClone doesn't clamp; one undo step; returns item counts before/after.
-- `railclone_library` / `railclone_from_library` — search the library browser roots, then create an item by route or exact name with `splines=[...]`. Never call `loadLibraryItemByPath` yourself: a wrong route opens a modal dialog.
+- `railclone_library` / `railclone_from_library` — search the library browser roots, then create an item by route or exact name with `splines=[...]`. Never call `loadLibraryItemByPath` yourself: a wrong route opens a modal dialog. Loading a `.max` item clears Max's undo history (RailClone's browser does too), so it needs `allow_undo_flush=true`: ask the user first in a production scene. `.rail` items keep the history.
 - `get_railclone_style` — complete XML and `style_token`; target by unique name or handle.
 - `set_railclone_style` — replace XML, passing the token as `expected_style`. One undo step adopts a staged RailClone base; node identity and modifiers remain. Instanced bases and linked master/slave styles are refused.
 - `get_railclone_output` — rebuilds first, then paged generated items with source segments, transform/bounds strings (object space; `bounds_world` for world) and tags, placeholders flagged; `include_xml=true` also returns the complete output XML.

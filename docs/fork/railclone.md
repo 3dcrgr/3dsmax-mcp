@@ -22,13 +22,13 @@ Two live test sessions on 2026-10-06 (3ds Max 2026.3, RailClone Pro 7.1.1, V-Ray
 
 ## New tools
 
-- **`railclone_inspect(name, handle, include_graph=true)`**, read only, one call:
+- **`railclone_inspect(name, handle, include_graph=true)`**, read only (it rebuilds with undo off before reading the output), one call:
   - **node:** style route, style description, saved version, plugin version, material (name, class, ids), raw settings (`disabled`, `seed`, `gscale`, `vmesh` display mode, `rmesh` render mode, ...), `maxseg`/`maxfaces`/`maxtime`, units, instancing.
   - **bases:** id, name, spline or surface, assigned node, start and length.
   - **params:** each exposed parameter with the value from the array its type uses, its limits, selector options, and with `include_graph` the graph inputs that use it.
   - **segments:** id, name, source node (none = embedded mesh), source class, `sobjmtl`, instance/slice/bend/renderable, and the item count.
   - **graph:** node counts by type and the exposed connectors (`_exp_*`) mapped to parameter ids.
-  - **output:** counts by source segment and placeholders. It is not rebuilt; use `get_railclone_output` for positions.
+  - **output:** counts by source segment and placeholders, after a rebuild. Use `get_railclone_output` for positions.
 - **`railclone_set_param(params, name, handle)`**:
   - Keys are an exact parameter name or its id. An ambiguous or unknown name is refused, and so are separators.
   - The value goes to the array its type uses (table below). A selector accepts an option label or value, and writes the value to `pafloatval` and the 0-based option index to `paintval`. A distance accepts scene units or a string such as `"60cm"`.
@@ -39,9 +39,11 @@ Two live test sessions on 2026-10-06 (3ds Max 2026.3, RailClone Pro 7.1.1, V-Ray
   - Each item: `route` (`\<root>\<category path>\<item name>`), category, name, `.max`/`.rail` file, object, material, matlib, uuid, thumbnail, and `load_method`.
   - Matlib macros are expanded where possible: `$(LIBROOTPATH)` is the root folder, `$(LIBFULLPATH)` the category folder, and a relative path is relative to the category folder. `$(RENDERER)` and `$(SELECTEDRENDERER)` stay, listed in `matlib_macros`.
   - A root that doesn't answer within 3 s (an offline share) is skipped with `ROOT_UNREACHABLE`. The scan stops after 20 s or 5000 `index.xml` files (`complete: false`).
-- **`railclone_from_library(item, splines, name, method="auto", fix_maps=true)`**:
+- **`railclone_from_library(item, splines, name, method="auto", fix_maps=true, allow_undo_flush=false)`**:
+  - **Undo history:** loading a `.max` library item clears 3ds Max's undo history, whether by merge or by route (RailClone's own browser does the same; verified live). Such items are refused unless `allow_undo_flush=true`, and the result says `undo_history_cleared`. `.rail` items keep the history. Either way, one undo removes the new RailClone.
   - `item` is a route or an exact item name (or uuid). It's validated in Python before anything reaches Max: the root name must match the registry exactly (case included), every category folder must exist with that exact spelling, and the category's `index.xml` must have exactly one item with that name. The item file must exist.
   - **merge** (auto for `.max` items with a `.mat` matlib): `mergeMAXFile <file> #(<object>) #autoRenameDups #useMergedMtlDups #neverReparent quiet:true`, the new RailClone found by comparing node handles, then the material: `$(RENDERER)`/`$(SELECTEDRENDERER)` become `RC_getRenderer()`, the `.mat` file must exist, `loadTempMaterialLibrary`, and the material is picked by name. `.style` stays empty after a merge.
+    - `mergeMAXFile` is never recorded in undo, and `loadTempMaterialLibrary` inside an undo step wipes that step. So both run first; the result is a `copy` made inside the undo step, and the merged original is deleted without undo afterwards. Nodes a merge brings along besides the RailClone stay after an undo (`EXTRA_NODES_NOT_UNDOABLE`).
   - **route** (auto for `.rail` items, `.pmat` matlibs, or items without an object): `RailClone_Pro()`, the name set afterwards, the selection saved, only the new object selected, `loadLibraryItemByPath <route>` (0 = loaded), the selection restored. The browser assigns the renderer's material. If the new object isn't the only selected node after `select` (for example on a hidden or frozen current layer), it stops with `SELECT_FAILED` before the load, since a failed load opens the modal dialog.
   - The splines go to the spline bases (`batype` 0) in order; more splines than spline bases is refused. The node is moved to the first spline's pivot; that is cosmetic, because the output follows the spline after a rebuild.
   - With `fix_maps`, bitmaps (`BitmapTexture`, `VRayBitmap`) whose file doesn't exist and isn't found through the map paths are pointed at `<category>\maps\<file>` when that file exists. Route-loaded `.rail` items need this: 29 of 29 bitmaps of Baseboard 002 were missing before.
@@ -63,11 +65,15 @@ Two live test sessions on 2026-10-06 (3ds Max 2026.3, RailClone Pro 7.1.1, V-Ray
 | A failed route load shows a modal "Library Browser" dialog; a disk path or other non-route string fails in about 1 ms without one | user had to dismiss it |
 | A successful route load sets `.style` to the route and assigns the renderer-specific Multimaterial; library `<maxscript>` hooks aren't run | `t2_load_route2` |
 | `loadTempMaterialLibrary` on a `.mat` returns the library without changing the current one; on a `.pmat` it blocked for over 120 s | `q7_matlib`, `x7_pmat` |
+| `loadTempMaterialLibrary` clears the whole undo history; inside a `theHold` step it also wipes that step | `rc4_matlib_undo*` (third session) |
+| Merging a RailClone library `.max` item clears the undo history, and so does a route load of a `.max` item; a route load of a `.rail` item, a plain box merge and `RailClone_Pro()` don't | `rc4_flush4`, `rc4_route_flush*` |
+| `mergeMAXFile` isn't recorded in undo, even inside `theHold` | `rc4_mergeundo` |
+| `getStyleDesc()` empties the output export (`getXMLOutput` returns `<RailClone version="1"/>` until the next rebuild) | `rc4_ox5` |
+| A `for ... collect` written straight into a function call's arguments that reads the caller's locals fails ("Bad free thunk local member index") or reads the wrong variable (a loop index became the stringStream) | `rc4_repro*` |
 | Library segments are embedded meshes (`sobjnode` undefined); their face IDs index the node's Multimaterial; writing `sobjmtl` has no effect | `x7_t7_*`, `q7_mtl` |
 
 ## Limits
 
-- **Not tested live yet.** Everything above was written from the two live reports and unit tests with a mocked Max. The MAXScript itself hasn't run.
 - `railclone_from_library` doesn't guard against the modal dialog beyond validating the route; a route that passes validation but still fails (for example a library whose folder names differ from its browser names) would show it. The DialogMonitor idea from the reports is untested and not implemented.
 - Routes are built from folder names and the item's english `<name>` (or its first one). That matched the stock library; a library whose category names differ from its folders isn't handled.
 - `.pmat` material libraries are only loaded through a route load.
@@ -79,7 +85,15 @@ Two live test sessions on 2026-10-06 (3ds Max 2026.3, RailClone Pro 7.1.1, V-Ray
 ## Status
 
 - Unit tests: `tests/test_railclone_tools.py` (duplicate-attribute XML in get/set, placeholders and world bounds, the inspect report, parameter planning and refusals, the library index, route validation and the generated MAXScript for both load methods, registration).
-- Not tested live yet. Checks to run in a scratch Max with RailClone:
+- **Tested live** on 2026-10-06 in a scratch 3ds Max 2026 (RailClone Pro 7.1.1, V-Ray 7), third session. It found and fixed: the two MAXScript closure failures, `handle` returned as `IntegerPtr` text, inspect reporting 0 items (`getStyleDesc` emptied the export), merges that one undo didn't remove, the undo history clearing (now refused without consent), float noise in converted distances (`"20cm"` gave 20.0000002) and search ranking (exact names first). Results after the fixes:
+  1. `get_railclone_style` on Metal Fence 1: 12 nodes, 12 duplicate attributes removed; `set_railclone_style` round trip `Ok`, `base_replaced`; the old token then gives `STALE_STYLE`.
+  2. After moving the node 300 units: `rebuild=false` returns the shifted cache (with a `NOT_REBUILT` warning), the default rebuild puts `bounds_world` back on the spline.
+  3. `railclone_inspect` on Glass Railing 03: 9 params with selector options and `used_by`, 20 segments, 109 items (23 placeholders, 86 placed).
+  4. `railclone_set_param({"Pickets Distance": "20cm"})`: pickets 48 → 24; one undo restores 10 cm and 106 items. `-5` and an unknown name are refused before anything is sent. The selector `Spandrel Type` set by label (`"Glass"`, `"Solid"` for RailClone's `"Solid "`) swaps the wood and glass segments and writes both arrays.
+  5. `railclone_library`: the CRGR roots on `\\crgr-server` were reachable; `"Metal Fence 1"` ranks the exact item first.
+  6. `railclone_from_library`: Metal Fence 1 (merge, with consent): 106 items, `_RC_fencing`, selection unchanged, one undo removes it, nothing left over. Baseboard 002 (`.rail`, route): 5 items, the browser's material, 29 maps fixed, selection restored, undo history kept, one undo removes it. Glass Railing 03 (`.rail`): 86 placed, 9 maps fixed. A wrong-case root is refused in Python, with no dialog.
+
+  The original checklist, for reference:
   1. `get_railclone_style` on a merged Metal Fence 1 returns 12+ nodes with `duplicate_attributes_removed` > 0; a `set_railclone_style` round trip with its token returns `Ok`.
   2. Move a RailClone 300 units; `get_railclone_output` returns `bounds_world` on the spline, `rebuild=false` returns the shifted cache; placeholders are flagged.
   3. `railclone_inspect` on Glass Railing 03: 9 params with types, selector options and `used_by`; 20 segments; the output counts.

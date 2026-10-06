@@ -289,6 +289,10 @@ class InspectTests(unittest.TestCase):
             self.assertIn(needle, self.script)
         for forbidden in ("theHold.Begin", "segmentsUpdate 1", "setXMLStyle"):
             self.assertNotIn(forbidden, self.script.replace(rc._FUNCTIONS, ""))
+        body = self.script.replace(rc._FUNCTIONS, "")
+        # rebuilt (undo off) before reading, and getStyleDesc last: it empties the output export (live)
+        self.assertLess(body.index("rcRebuild base"), body.index("api.getXMLOutput()"))
+        self.assertLess(body.index("api.getXMLOutput()"), body.index("getStyleDesc"))
 
     def test_node(self):
         node = self.out["node"]
@@ -340,7 +344,7 @@ class InspectTests(unittest.TestCase):
         self.assertEqual({(e["connector"], e["param_index"]) for e in graph["exposed"]},
                          {("_exp_10_0", 2), ("_exp_distance_0", 1)})
         self.assertEqual(self.out["output"], {"total": 3, "placed": 2, "placeholders": 1,
-                                              "by_segment": {"post": 1, "rail": 1}, "rebuilt": False})
+                                              "by_segment": {"post": 1, "rail": 1}, "rebuilt": True})
         codes = {w.split(":")[0] for w in self.out["warnings"]}
         self.assertIn("SHARED_BASE", codes)
         self.assertIn("PARAM_OUT_OF_LIMITS", codes)
@@ -551,6 +555,14 @@ class LibraryFixture(unittest.TestCase):
 
 
 class LibraryTests(LibraryFixture):
+    def test_exact_name_ranks_first(self):
+        from maxmcp.helpers import railclone_lib as rclib
+        items = [{"name": n, "route": "\L\\" + n, "category": "Fences\Metal", "names": [n]}
+                 for n in ("2 Red Brick Wall Fence 1 1m", "Metal Fence 10", "Metal Fence 1", "Old Metal Fence 1x")]
+        ranked = [it["name"] for it in rclib.match_items(items, "metal fence 1")]
+        self.assertEqual(ranked[:3], ["Metal Fence 1", "Metal Fence 10", "Old Metal Fence 1x"])
+        self.assertEqual(ranked[-1], "2 Red Brick Wall Fence 1 1m")
+
     def test_search_and_routes(self):
         out = rc.railclone_library(query="metal fence")
         self.assertEqual(out["total"], 2)
@@ -613,9 +625,22 @@ class FromLibraryTests(LibraryFixture):
     ROUTE_RAIL = "\\Railclone Library\\Architecture\\Interior\\Baseboards\\Baseboard 002"
 
     def call(self, raw, **kw):
+        kw.setdefault("allow_undo_flush", True)
         with patch.object(rc, "client", client_with(raw)) as client:
             out = rc.railclone_from_library(**kw)
         return out, scripts(client)[0]
+
+    def test_max_item_needs_undo_flush_consent(self):
+        exc = self.refused(ValueError, item="Metal Fence 1", splines=["Path600"])
+        self.assertIn("clears 3ds Max's undo history", str(exc))
+        self.assertIn("allow_undo_flush=true", str(exc))
+        out, script = self.call(lib_raw(), item="Metal Fence 1", splines=["Path600"])
+        self.assertTrue(out["undo_history_cleared"])
+        # the material library is loaded before the undo step (inside, it wipes the step)
+        self.assertLess(script.index("loadTempMaterialLibrary matPath"), script.index("theHold.Begin()"))
+        self.assertLess(script.index("mergeMAXFile maxFile"), script.index("theHold.Begin()"))
+        self.assertIn("o = copy mergedRc", script)
+        self.assertIn("if mergedRc != undefined do with undo off (delete mergedRc)", script)
 
     def refused(self, exc_type, **kw):
         with patch.object(rc, "client", client_with()) as client:
@@ -651,8 +676,9 @@ class FromLibraryTests(LibraryFixture):
     def test_route_for_rail_item(self):
         raw = lib_raw(extra=["M|" + b64("RC_wood_001.jpg"), "W|" + b64("NO_MATERIAL: test")])
         raw = raw.replace("K|style|" + V(""), "K|style|" + V(self.ROUTE_RAIL))
-        out, script = self.call(raw, item=self.ROUTE_RAIL, splines=["Path600"])
+        out, script = self.call(raw, item=self.ROUTE_RAIL, splines=["Path600"], allow_undo_flush=False)
         self.assertIn('local methodName = "route"', script)
+        self.assertFalse(out["undo_history_cleared"])  # .rail items keep the undo history
         strings = decoded_strings(script)
         self.assertIn(self.ROUTE_RAIL, strings)
         self.assertIn(os.path.join(self.boards, "maps") + "\\", strings)
@@ -660,7 +686,7 @@ class FromLibraryTests(LibraryFixture):
         self.assertNotIn(".pmat", " ".join(strings))
         sel = script.index("select o")
         load = script.index("api.loadLibraryItemByPath routeArg")
-        restore = script.index("if prevSel.count == 0 then clearSelection()")
+        restore = script.index("rcRestoreSel prevSel", load)
         guard = script.index("if not (selection.count == 1 and selection[1] == o) do throw \"SELECT_FAILED")
         self.assertLess(sel, guard)
         self.assertLess(guard, load)
