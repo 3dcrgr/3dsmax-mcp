@@ -17,10 +17,7 @@ from ..max_client import CORE_MAX_WAIT_MS, MaxBridgeError, RequestOutcomeUnknown
 from ..server import client, mcp
 from ..tool_response import parse_error_payload
 
-_RESTART_STEP = (
-    "A native change then needs the developer to install the rebuilt GUP and restart 3ds Max; "
-    "do not do either yourself."
-)
+_RESTART_STEP = "To apply a native change, install the rebuilt GUP and restart 3ds Max."
 
 
 class CoreControlError(Exception):
@@ -154,8 +151,8 @@ def reload_native_core(action: str = "status", wait_ms: int = 5000, path: str | 
     drain_ms. next_step says what to do next; on failure it is in
     error.details.next_step and the hint.
 
-    Errors: CORE_STATIC: static layout, reload unsupported; do not retry, the
-    developer must install the rebuilt GUP and restart Max. CORE_BUSY
+    Errors: CORE_STATIC: static layout, reload unsupported; do not retry; a
+    native change applies after the rebuilt GUP is installed and Max restarts. CORE_BUSY
     (retryable): native calls were still running; retry later or with a larger
     wait_ms. CORE_LOAD_FAILED and CORE_VERSION_MISMATCH: the old core keeps
     running unchanged; fix and rebuild the core, then reload again.

@@ -2,8 +2,8 @@
 
 Configures and builds a separate native/build-hot-<ver> tree, prints where the
 built core DLL is and how the shell finds it, and shows which core a shell
-would load. It never installs, copies into Program Files or ProgramData, stops
-3ds Max or runs dev.bat: installing the hot shell .gup stays with the developer.
+would load. It never installs, copies into Program Files or ProgramData, or
+stops 3ds Max; deploying the hot shell .gup is a separate step.
 
     python scripts/hot_core.py configure            # native/build-hot-2027
     python scripts/hot_core.py build                # mcp_core target only, Release
@@ -115,7 +115,7 @@ def path(args) -> None:
     require_hot(target)
     dll, gup = target / CORE_DLL, target / SHELL_GUP
     print(f"Core DLL:  {dll}\n           {describe(dll)}")
-    print(f"Hot shell: {gup}\n           {describe(gup)}; the developer installs it, this script never does")
+    print(f"Hot shell: {gup}\n           {describe(gup)}; deploy it separately, this script never installs it")
     print("\nPoint the installed hot shell at this core with one of (first set wins):")
     print("  1. reload_native_core(action=\"reload\", path=...) with the path above, for one reload")
     print(f"  2. MCP_CORE_DLL in 3ds Max's environment, set before Max starts:\n       $env:MCP_CORE_DLL = \"{dll}\"")
