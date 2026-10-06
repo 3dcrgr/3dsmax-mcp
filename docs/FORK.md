@@ -39,22 +39,27 @@ Everything in the table below is fork-only, including the fixes to 1.7.5's own d
 | Curve tools reject Line objects | Line counts as an editable spline | [smaller-fixes.md](fork/smaller-fixes.md#curve-tools-rejected-line-objects) | Verified live |
 | A Cosmos material whose package name differs from the asset name isn't found | Detect what the import created by handle, whatever its name; report both names | [cosmos-import.md](fork/cosmos-import.md#finding-what-the-import-created-9-2853b1c) | Verified live; the follow-up that keeps other plugins' new items apart is deployed, retest pending |
 | A Cosmos import silently replaces the material in the user's active Material Editor slot | Point the importer at a free slot, then put any displaced material back once Max is quiet | [cosmos-import.md](fork/cosmos-import.md#keeping-the-users-material-editor-slot-10-c1e09a7) | Partly verified live (the material was kept, but V-Ray's default slots weren't seen as free); the follow-up is deployed, retest pending |
-| After a restart and Hold/Fetch, the agent viewport can't be reclaimed | Tag the agent's floating viewport in the scene and reclaim exactly that restored window | [smaller-fixes.md](fork/smaller-fixes.md#the-agent-viewport-couldnt-be-reclaimed-after-a-restart) | Deployed (`1cf0f9d8…`); the first live test was inconclusive, because the fetched Hold predated the tag. Also in the 2026 bridge built from the 1.7.5 merge (`8b7453a6…`) |
-| Upstream 1.7.5's dialog monitor can report the Cosmos browser, the Material Editor or the agent viewport as a blocking dialog, and reads or presses dialogs of any thread | These windows are never dialogs; dialogs of other threads (e.g. the Cosmos importer's) are listed but never read or pressed; Qt dialogs are only read while Max's main thread pumps | [cosmos-import.md](fork/cosmos-import.md#windows-that-are-never-dialogs-6e03f99) | Unit tested; in the 2026 bridge (sha256 `8b7453a6…`); not tested live yet |
-| Upstream 1.7.5's dialog handling calls a hung Max "blocked by a dialog", can commit a call before its acknowledged error is recorded, can click after reporting a failed press, and can leave Max in quiet mode | A main thread that stopped pumping is a hang; errors publish before the call resumes; timed-out presses are withdrawn or reported `DIALOG_OUTCOME_UNKNOWN`; quiet mode only changes on the main thread; `cosmos_import` handles `MAX_DIALOG_ERROR` and dialogs before dispatch | [hung-max.md](fork/hung-max.md#upstream-175s-dialog-handling-fixed-on-the-merge) | Unit tested; in the 2026 bridge (sha256 `8b7453a6…`); not tested live yet |
+| After a restart and Hold/Fetch, the agent viewport can't be reclaimed | Tag the agent's floating viewport in the scene and reclaim exactly that restored window | [smaller-fixes.md](fork/smaller-fixes.md#the-agent-viewport-couldnt-be-reclaimed-after-a-restart) | Deployed (`1cf0f9d8…`); the first live test was inconclusive, because the fetched Hold predated the tag. Also in the 2026 bridge built from the 1.7.5 merge (`d5cd6ba5…`) |
+| Upstream 1.7.5's dialog monitor can report the Cosmos browser, the Material Editor or the agent viewport as a blocking dialog, and reads or presses dialogs of any thread | These windows are never dialogs; dialogs of other threads (e.g. the Cosmos importer's) are listed but never read or pressed; Qt dialogs are only read while Max's main thread pumps | [cosmos-import.md](fork/cosmos-import.md#windows-that-are-never-dialogs-6e03f99) | Unit tested; in the 2026 bridge (sha256 `d5cd6ba5…`); not tested live yet |
+| Upstream 1.7.5's dialog handling calls a hung Max "blocked by a dialog", can commit a call before its acknowledged error is recorded, can click after reporting a failed press, and can leave Max in quiet mode | A main thread that stopped pumping is a hang; errors publish before the call resumes; timed-out presses are withdrawn or reported `DIALOG_OUTCOME_UNKNOWN`; quiet mode only changes on the main thread; `cosmos_import` handles `MAX_DIALOG_ERROR` and dialogs before dispatch | [hung-max.md](fork/hung-max.md#upstream-175s-dialog-handling-fixed-on-the-merge) | Unit tested; in the 2026 bridge (sha256 `d5cd6ba5…`); not tested live yet |
+| A Cosmos model import reports no nodes, lists untouched "Material #N" slot materials as new, and leaves the Cosmos browser on top of other windows | New nodes found by handle, whatever their class or name (VRayProxy, container, group); untouched default slot materials ignored; the browser the import showed is minimized after a quiet, confirmed import | [cosmos-import.md](fork/cosmos-import.md#model-nodes-slot-noise-and-the-browser-13-3b3210d) | Unit tested and deployed (1.7.3-based) on 2026-10-05; not tested live yet |
+| `contact_check` rejects an explicit `tolerance` or `near_gap`, and one non-mesh node aborts the call | Thresholds are millimetres, converted to scene units; non-mesh nodes are skipped with a warning | [smaller-fixes.md](fork/smaller-fixes.md#contact_check-thresholds-non-mesh-nodes-and-dense-meshes-14-15) | Unit tested and deployed (1.7.3-based) on 2026-10-05; not tested live yet |
+| `contact_check` on dense meshes keeps Max's main thread busy for minutes after the client gave up | Work estimate, cheapest pairs first, a `time_budget_s` deadline (at most 45 s, queue time included); partial results with `complete: false` | [smaller-fixes.md](fork/smaller-fixes.md#contact_check-thresholds-non-mesh-nodes-and-dense-meshes-14-15) | Unit tested and deployed (1.7.3-based) on 2026-10-05; not tested live yet |
+| Cloning a member of a closed group clones the whole group, stacked invisibly on the original | `clone_objects` clones the member alone and detaches the copy, in one undo step with rollback; `scene_qa` reports stacked duplicate groups (`duplicate_group_heads`) | [smaller-fixes.md](fork/smaller-fixes.md#cloning-a-closed-group-member-cloned-the-whole-group-16) | Unit tested and deployed (1.7.3-based) on 2026-10-05; not tested live yet |
+| On the 1.7.5 merge, a dialog holding the read-only check that `clone_objects` or `scene_qa` fix mode runs first says "do not repeat", though nothing was changed | A retryable `BLOCKED_BY_DIALOG` that says nothing was cloned or changed; `scene_qa` never sends its fix behind that check | [smaller-fixes.md](fork/smaller-fixes.md#cloning-a-closed-group-member-cloned-the-whole-group-16) | Unit tested; 1.7.5 merge only |
 
 What the status words mean:
 - **Verified live:** the fix was exercised in a real Max 2026 session on the production machine, on 2026-10-01, with the 1.7.3-based fork. Some checks used a stand-in for the original failure, such as a 20 s `sleep` instead of a real hang.
 - **Reviewed:** an adversarial code review was run before deployment.
 - **Deployed:** the fix runs on the production machine, which runs the 1.7.3-based fork. The 2026 bridge there is sha256 `1cf0f9d8…`.
 
-Nothing from the 1.7.5 merge has run in Max yet, Python or native. That includes the 2026 bridge now in `native/bin/` (sha256 `8b7453a6…`).
+Nothing from the 1.7.5 merge has run in Max yet, Python or native. That includes the 2026 bridge now in `native/bin/` (sha256 `d5cd6ba5…`).
 
 The details pages say exactly what was and wasn't tested.
 
 ## Installing
 
-Install from source, the same way as upstream, but from this fork. Its default branch is `fix/fork-fixes`, so a plain clone already has the fixes:
+Install from source, the same way as upstream, but from this fork. Its default branch is `fix/fork-fixes`, the 1.7.3-based line that runs in production, so a plain clone has the fixes. For this branch, upstream 1.7.5 plus the fixes, clone with `-b merge-1.7.5`:
 
 ```powershell
 git clone https://github.com/3dcrgr/3dsmax-mcp.git
@@ -68,7 +73,7 @@ Close 3ds Max and your AI clients first, as upstream's README says.
 After updating, start a new client session. MCP clients cache the tool list, so new tools such as `capture_hang_diagnostics` don't appear in sessions that were already open, even after the server restarts.
 
 **The native bridge:** `install.py` copies the prebuilt bridges from `native/bin/`.
-- In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available. It's built from `cbf58aa` on this branch (the #12 docs commit; `de4231f` after it adds only tests), upstream 1.7.5 plus the fork, #12 included (sha256 `8b7453a690bac6eb…`). The production machine runs a 1.7.3-based fork build (sha256 `1cf0f9d80486d913…`).
+- In this fork only `mcp_bridge_2026.gup` is rebuilt with the fixes, because only the Max 2026 SDK was available. It's built from `ec903a5` on this branch: upstream 1.7.5 plus the fork, #12 and the second merge review's native fixes included (sha256 `d5cd6ba5f7f35b83…`). Later commits change only Python and docs, and generate the same tool registry. The production machine runs a 1.7.3-based fork build (sha256 `1cf0f9d80486d913…`).
 - The 2023, 2024, 2025 and 2027 bridges are still upstream's builds (1.7.5). With those, the Python-side fixes work, but the native ones are missing: `health`, the executor shutdown drain, Autodesk Bitmap paths and the duplicate VRayBitmap row fix, `MAXSCRIPT_INTERRUPTED`, `replace_material`'s sub-material matching and source search, the agent viewport reclaim (#11), the dialog monitor's rules for Cosmos, Material Editor and other-thread windows, and the native half of the 1.7.5 dialog fixes (publishing errors before the call resumes, withdrawn presses, quiet mode on the main thread only, `main_thread_pumping`, the Qt error-box retry, the agent viewport's render cleanup after an error box).
 - To get them for another Max version, build the bridge yourself (below).
 
@@ -130,10 +135,11 @@ ctest --test-dir native/build-tests -C Release --output-on-failure
 | Branch | Contents |
 |---|---|
 | `master` | Upstream's `master`, unchanged |
-| `fix/fork-fixes` | Upstream 1.7.5 plus the reviewed fixes. The merge and the fixes to 1.7.5's dialog handling aren't deployed or tested live yet; the Status column above says what is. |
-| `fork/integration` | `fix/fork-fixes` plus the newest fixes and these docs while they're under review. It's fast-forwarded into `fix/fork-fixes` after review. |
+| `fix/fork-fixes` | The production line: upstream 1.7.3 plus the fork's fixes, #1 to #16 (#12 applies only to 1.7.5). The fork's default branch. |
+| `merge-1.7.5` | This branch: upstream 1.7.5 (`29aed53`) plus every fork fix and the fixes to 1.7.5's own dialog handling. Unit tested and reviewed, but not deployed or tested live yet; the Status column above says what is. It replaces `fix/fork-fixes` once the live checks pass. |
+| `fork/integration` | Staging for fixes under review, fast-forwarded into `fix/fork-fixes` after review. |
 
-The production machine still runs the 1.7.3-based fork: commit `928c940`, the last `fix/fork-fixes` before the merge, with a 2026 bridge built from `8330c2c` (sha256 `1cf0f9d8…`).
+The production machine runs the 1.7.3-based fork: Python from `a83f57c`, the tip of `fix/fork-fixes`, with a 2026 bridge built from `8330c2c` (sha256 `1cf0f9d8…`).
 
 Pull requests to upstream will be cut from upstream's `master`, one per fix, so each can be reviewed on its own.
 

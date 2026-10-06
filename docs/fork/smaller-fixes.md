@@ -26,7 +26,7 @@ Tests: `tests/test_execute_failures.py`. They cover how the Python server classi
 
 **Status.** The check is in the native bridge, and only the 2026 bridge in `native/bin/` has it. With upstream's 1.7.5 bridges (2023, 2024, 2025 and 2027), an interrupted script gets the same reply as a syntax error: "MAXScript execution failed: <Max's error text>", with a code picked from keywords in that text, usually `BAD_PARAM`.
 - **Verified live** on 2026-10-01 with the fork's 1.7.3-based 2026 bridge: `(1 +` returned `BAD_PARAM` with the compiler's message. Quitting with `try (quitMax #noPrompt quiet:true) catch ()` was also run live: the bridge connection dropped and Max exited cleanly.
-- **Not tested live yet:** the 2026 bridge built from the 1.7.5 merge (sha256 `8b7453a6…`), and a bare `quitMax #noPrompt`, which should give `MAXSCRIPT_INTERRUPTED`. Run that check with the merged bridge, on a throwaway Max.
+- **Not tested live yet:** the 2026 bridge built from the 1.7.5 merge (sha256 `d5cd6ba5…`), and a bare `quitMax #noPrompt`, which should give `MAXSCRIPT_INTERRUPTED`. Run that check with the merged bridge, on a throwaway Max.
 - Since the merge, `execute_maxscript` runs in Max's quiet mode by default, except for scripts that mention a scene file command (see [#12](#quiet-mode-could-discard-unsaved-work) below).
 
 ## Failed agent scripts printed errors in the user's Listener
@@ -39,7 +39,7 @@ Fork issue #8. Commit `6552786`.
 
 **What changed.** `execute_maxscript`, and the native tools that run MAXScript internally, now run scripts with quiet errors. Compile errors and aborts go to Max's log, not the Listener, and the compile-only check behind the parse-error detail prints nothing either. The caller gets the same results as before: `BAD_PARAM` "MAXScript execution failed (parse error): <detail>", `MAXSCRIPT_INTERRUPTED`, and runtime errors with their message. A script's own output, such as `print`, still reaches the Listener.
 
-**Status.** This is in the native bridge. All of upstream's 1.7.5 bridges have the same change, and so does the 2026 bridge built from the merge. Verified live with the fork's 1.7.3-based 2026 bridge (sha256 `c621db10…`) on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message and left the Listener unchanged, and `print "hello"; 42` returned `42` with only `"hello"` added to the Listener. Not checked live yet with the merged bridge (sha256 `8b7453a6…`).
+**Status.** This is in the native bridge. All of upstream's 1.7.5 bridges have the same change, and so does the 2026 bridge built from the merge. Verified live with the fork's 1.7.3-based 2026 bridge (sha256 `c621db10…`) on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message and left the Listener unchanged, and `print "hello"; 42` returned `42` with only `"hello"` added to the Listener. Not checked live yet with the merged bridge (sha256 `d5cd6ba5…`).
 
 Upstream's quiet mode makes prompts take their default answer; `execute_maxscript(quiet=False)` doesn't set it. The fork changes quiet mode only on Max's main thread (`8a8b26c`, see [hung-max.md](hung-max.md#upstream-175s-dialog-handling-fixed-on-the-merge)).
 
@@ -68,7 +68,7 @@ Fork issue #11. Commit `8330c2c`.
 - `release` restores the panel's previous name, and clears the tag only if this process held the window.
 - `status` reports `reclaimable`, the window and `next_action: "open"`, and errors name the stale window.
 
-**Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32. It's in the 2026 bridge in `native/bin/`, built from the 1.7.5 merge (sha256 `8b7453a6…`). An earlier build with it (sha256 `1cf0f9d8…`) was deployed on 2026-10-01. Unit tested in `tests/test_agent_viewport_reclaim.py`.
+**Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32. It's in the 2026 bridge in `native/bin/`, built from the 1.7.5 merge (sha256 `d5cd6ba5…`). An earlier build with it (sha256 `1cf0f9d8…`) was deployed on 2026-10-01. Unit tested in `tests/test_agent_viewport_reclaim.py`.
 - **The first live test was inconclusive.** After the restart, `open` worked, but it couldn't reclaim the restored panel, because that Hold was written by the old bridge, which never tagged it. Closing the stale panel let agent captures work again.
 - A Hold taken with the new bridge is waiting for the next restart.
 
@@ -87,5 +87,36 @@ Fork issue #12. Commit `aa3d91d`.
 - Native tools that run MAXScript internally follow the same rule. The `manage_scene` fallbacks (`resetMaxFile #noPrompt`, `fetchMaxFile quiet:true`) still run without a prompt.
 - **Limits:** the check reads only the submitted text. It doesn't see a command name built from pieces at runtime (`execute ("reset" + "MaxFile()")`), a file action run through `actionMan`, or commands inside scripts run with `fileIn`, `include`, `python.ExecuteFile` or `macros.run` (or startup and pipeline scripts called by name). Those run inside the quiet call, so their save prompts take the default answer. Agents should pass `quiet=False` when a script runs other scripts that may reset, open or quit. `#noPrompt` and `quiet:true` arguments in the script suppress the prompt whatever the bridge does, so the skill tells agents to add them only with the user's OK.
 
-**Status.** Unit tested (`native/tests/quiet_policy_tests.cpp`, `tests/test_execute_failures.py`, `tests/test_merge_review_safety.py`). It's in the 2026 bridge built from the 1.7.5 merge; not tested live yet. The second merge review added `max fetch` and the Interface spellings to the list, and the client-side `allow_discard` rule. The client side works with any bridge; the longer native list needs a 2026 bridge rebuilt after it (`8b7453a6…` predates it). The live check: on a throwaway scene with unsaved changes, `resetMaxFile()` should return `BLOCKED_BY_DIALOG` with the save prompt, not reset.
+**Status.** Unit tested (`native/tests/quiet_policy_tests.cpp`, `tests/test_execute_failures.py`, `tests/test_merge_review_safety.py`). It's in the 2026 bridge built from the 1.7.5 merge; not tested live yet. The second merge review added `max fetch` and the Interface spellings to the list, and the client-side `allow_discard` rule. The client side works with any bridge; the longer native list is in the 2026 bridge in `native/bin/` (`d5cd6ba5…`). The live check: on a throwaway scene with unsaved changes, `resetMaxFile()` should return `BLOCKED_BY_DIALOG` with the save prompt, not reset.
 
+## `contact_check` thresholds, non-mesh nodes and dense meshes (#14, #15)
+
+Fork issues #14 and #15. Commit `02cb984`.
+
+**What happened.**
+- An explicit `near_gap` or `tolerance` failed with "invalid thresholds", and one node in `against` that isn't a mesh aborted the whole call (#14).
+- Two 148k-vertex garlands kept Max's main thread busy for more than 5 minutes, long after the client had timed out (#15).
+
+**What changed.**
+- Explicit `tolerance` and `near_gap` are always millimetres (0 means the defaults, 0.1 mm and 10 mm), converted to scene units like the defaults. Results stay in scene units. Values are checked before anything is sent.
+- Nodes in `names` or `against` that can't become a mesh are skipped with a warning and listed in `skipped`. If none of the `names` nodes is a mesh, the call fails with a clear error.
+- After the bounding-box pass, the script estimates the work (vertices per candidate pair) and checks the cheapest pairs first, within a work budget. It checks a deadline, `time_budget_s`, between pairs and inside long vertex loops. The deadline is at most 45 s, below the client timeout, and counts from when the request was built, so time spent queued counts too.
+- On the budget or the deadline it stops and returns partial results: `complete: false`, `pairs_total`, `pairs_checked`, `work_estimate`, the heaviest nodes, the stop reason and `queue_wait_ms`. Check dense meshes (garlands, foliage, Mesher objects) separately.
+- The report header changed, so the parser and the script ship together. The skill explains units, skipping and the budget.
+
+**Status.** Unit tested in `tests/test_contact_check.py`. Deployed (Python) on the 1.7.3-based fork on 2026-10-05; not tested live yet. On the 1.7.5 merge, the 45 s cap stays below the client's reply deadline, and a request that waited too long in the queue is cancelled and never runs.
+
+## Cloning a closed-group member cloned the whole group (#16)
+
+Fork issue #16. Commit `a83f57c`.
+
+**What happened.** `maxOps.cloneNodes` (and the SDK's `CloneNodes`, which `clone_objects` used) clones the *whole* group when given a member of a closed group. The copies sit exactly on the original, so nothing looks wrong. Cloning 16 props in a production scene left 1,646 duplicate objects.
+
+**What changed.**
+- `clone_objects` first runs one read-only check for requested names that are group members: `isGroupMember`, or a closed group head among the ancestors, nested and open groups included. Names match case-exactly; an ambiguous exact name is refused.
+- Members are copied node by node (copy, instance or reference, as `mode` says), with their own children and links rebuilt. The top copy is detached (`.parent = undefined; setGroupMember c false`) and checked. It all happens in one undo step, with the same `offset`, `count` and naming as the normal path. If the scene gains more nodes than the script tracked, everything is rolled back.
+- Non-members and group heads take the existing paths, so naming a group head still clones the group. `clone_whole_group=True` restores Max's behaviour. The result adds `group_members` (`name`, `group`, `open_group`), `detached_from_group` and warnings.
+- `scene_qa` has a new read-only check, `duplicate_group_heads`. It finds group heads with the same position, rotation and scale whose child lists match once names are normalised (case, trailing digits, the `_mcp` suffix, class). Near matches are reported as `name_match: "partial"`. It never deletes anything, in fix mode either.
+- **On the 1.7.5 merge** (`cb4d0ff`): if a dialog holds the read-only check that `clone_objects`, or `scene_qa` in fix mode, runs first, the call returns `BLOCKED_BY_DIALOG` with `retryable: true` and "Nothing was cloned" or "Nothing was changed". Repeat it once the dialog is answered. The queued check runs then too, harmlessly. `scene_qa` never sends its fix behind a check that couldn't run.
+
+**Status.** Unit tested in `tests/test_clone_groups.py` and `tests/test_scene_qa_groups.py`. Deployed (Python) on the 1.7.3-based fork on 2026-10-05; not tested live yet.

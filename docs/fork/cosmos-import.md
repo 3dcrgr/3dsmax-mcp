@@ -109,6 +109,22 @@ New result fields:
 - **The first live test (`c1e09a7`) was a partial pass.** The displaced material was kept alive, and the restore hint was right. But slots 16–24 held untouched V-Ray materials named "Material #16" to "Material #24", so no slot counted as free, and the import still landed in the user's active slot.
 - `c88975e` fixes that and was deployed the same day; it hasn't been retested live yet.
 
+### Model nodes, slot noise and the browser (#13, `3b3210d`)
+
+**What happened.** Importing the Cosmos model "Rug 002" created a VRayProxy, "Rug 002_001", but the tool polled for 31 s and returned `imported_unverified` with no nodes. `other_new_materials` listed 10 untouched "Material #N" materials from Material Editor slots. The Cosmos browser the import had opened stayed on top of other windows, Vantage included.
+
+**What changed.**
+- **Model nodes by handle.** The prepare call also records the newest node handle. A new node above it, of any class or name (VRayProxy, container, group, helper), is tied to the import when it's named like the asset, carries a material newer than the dispatch or named like the asset, or is related to a tied node or one tagged with the Cosmos ID.
+  - Tied nodes are reported in `nodes`; a VRayProxy also reports its file. Other new nodes go to `other_new_nodes`.
+  - Detection stops at the first light poll that shows a tied node. The polls stay light, and the node lists are capped (`nodes_omitted`).
+- **Slot noise.** Untouched default-named slot materials (no maps or sub-materials, unused, pristine when confirmed) are ignored, and only counted in `default_materials_ignored`.
+- **The browser.** If the import showed the Cosmos browser, it's minimized after a quiet, confirmed import and its finalize, with `ShowWindowAsync(SW_SHOWMINNOACTIVE)`. The call is posted, never activates or closes a window, and only touches main-thread browser windows of this Max. It's skipped if any browser runs on another thread, or Max is busy.
+  - `minimize_browser=False` opts out. The result reports `cosmos_browser.shown_before`, `iconic_before`, `minimized_after` and `minimize_skipped`.
+  - On the 1.7.5 merge it's also skipped when a dialog interrupted the confirming snapshot (`not_confirmed`) or the restore call's result is unknown (`restore_unknown`).
+- No new bridge calls. The #1, #9 and #10 behaviour is unchanged.
+
+**Status.** Unit tested in `tests/test_cosmos_import.py`. Deployed (Python) on the 1.7.3-based fork on 2026-10-05; not tested live yet.
+
 ### Dialogs during an import (upstream 1.7.5)
 
 Upstream 1.7.5 (`5c44e76`) added blocking-dialog handling: a call held by a modal dialog returns `BLOCKED_BY_DIALOG`, `max_dialogs` reads and answers the dialog, and a recognised MAXScript error box during a call is acknowledged and fails that call with `MAX_DIALOG_ERROR`. A modal dialog keeps Max's windows answering, so the OS checks above can't see it. Since the merge (`a07ef93`, `f70b0cc`, `34a7ce5`), `cosmos_import` handles it:
@@ -140,7 +156,7 @@ The fork's monitor:
 
 With upstream's bridges, the client applies the same titles: replies don't list these windows, the automatic inspect doesn't run while one is open, and `cosmos_import`'s dialog checks ignore them. Only titles are matched, so a real message box titled exactly like one of these windows wouldn't be reported.
 
-**Status.** Unit tested in `native/tests/dialog_watch_tests.cpp`, which counts every message the monitor sends these windows, and on the client side in `tests/test_hang_diagnosis.py` and `tests/test_cosmos_import.py`. It's in the 2026 bridge built from the merge (`8b7453a6…`), which isn't deployed or tested live yet.
+**Status.** Unit tested in `native/tests/dialog_watch_tests.cpp`, which counts every message the monitor sends these windows, and on the client side in `tests/test_hang_diagnosis.py` and `tests/test_cosmos_import.py`. It's in the 2026 bridge built from the merge (`d5cd6ba5…`), which isn't deployed or tested live yet.
 
 ## How it was verified
 
