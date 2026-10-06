@@ -245,6 +245,9 @@ def drop_to_surface(
         raise ValueError("clearance_mm must not exceed tolerance_mm, or a dropped item would still read as floating")
     if not dry_run and not settings["names"]:
         raise ValueError("drop_to_surface with dry_run=false needs names: it never acts on the live selection")
+    if not dry_run and settings["time_budget_s"] < 5:
+        raise ValueError("drop_to_surface with dry_run=false needs time_budget_s of at least 5 s to measure, "
+                         "apply and verify")
     report = _measure(settings)
     upm = report["upm"]
     plan = rs.plan_drops(report, clearance=clearance_mm * upm, lift_penetrating=lift_penetrating)
@@ -272,7 +275,8 @@ def drop_to_surface(
         result["companions"] = companions
         warnings.append(f"Reference twins move with their items: {_short([c['name'] for c in companions])}.")
     moved_units = {i for i, p in plan.items() if p["total"]}
-    outside = [d["name"] for d in report["dependents"] if d["unit"] in moved_units]
+    moving_twins = {m["handle"] for m in moves}
+    outside = [d["name"] for d in report["dependents"] if d["unit"] in moved_units and d["handle"] not in moving_twins]
     if outside:
         warnings.append(f"These nodes sit on moved items but aren't in names, so they'd be left behind: {_short(outside)}.")
     by_reason: dict[str, list[str]] = {}

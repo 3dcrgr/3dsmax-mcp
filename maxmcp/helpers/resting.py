@@ -599,7 +599,8 @@ _LIBRARY = r'''(
     fn rcIsMesh n = isValidNode n and (isKindOf n GeometryClass) and not (isKindOf n TargetObject) and (canConvertTo n TriMeshGeometry)
     fn rcResolve nm = (
         local m = getNodeByName nm exact:true all:true
-        if m.count != 1 do throw ("Node name must resolve uniquely: " + nm)
+        if m.count == 0 do throw ("Node not found: " + nm)
+        if m.count > 1 do throw ("Node name matches " + m.count as string + " nodes, pass a unique name: " + nm)
         m[1]
     )
     -- mesh nodes below n, any depth (nested group members included)
@@ -711,7 +712,8 @@ _LIBRARY = r'''(
         for k = 1 to nCells do (lowZ[k] = 1e30; lowX[k] = 0.0; lowY[k] = 0.0)
         local verts = 0, stride = 1, expired = false, tick = 0
         for nd in meshNodes while not expired do (
-            local m = try (snapshotAsMesh nd renderMesh:false) catch (try (snapshotAsMesh nd) catch (undefined))
+            if (rcElapsed t0) > limitMs do expired = true
+            local m = if expired then undefined else (try (snapshotAsMesh nd renderMesh:false) catch (try (snapshotAsMesh nd) catch (undefined)))
             if m != undefined do (
                 local nv = getNumVerts m
                 verts += nv
@@ -911,7 +913,7 @@ _MEASURE_BODY = r'''
                 )
                 if not expired and not n.isHiddenInVpt and n.renderable do (
                     local a = n.min, b = n.max
-                    if b.z >= gz0 - maxDrop - lift and a.z <= gz1 + tol and a.x <= gx1 and b.x >= gx0 and a.y <= gy1 and b.y >= gy0 do (
+                    if b.z >= gz0 - maxDrop - lift and a.z <= gz1 + maxDrop and a.x <= gx1 and b.x >= gx0 and a.y <= gy1 and b.y >= gy0 do (
                         if (findItem claimed n) > 0 then append pool n
                         else if (findItem exclAll n) > 0 then (append skipN n; append skipWhy "excluded")
                         else if not (rcIsMesh n) then (append skipN n; append skipWhy "not_mesh")
@@ -1053,7 +1055,7 @@ _MEASURE_BODY = r'''
                     if not explicit do (
                         for k = 1 to pool.count do (
                             local s = pool[k]
-                            if (findItem claimed s) == 0 and (findItem twins s) == 0 and poolMin[k].z >= uMin[u].z + eps and poolMin[k].z <= uMax[u].z + tol and poolMin[k].x <= uMax[u].x and poolMax[k].x >= uMin[u].x and poolMin[k].y <= uMax[u].y and poolMax[k].y >= uMin[u].y do (
+                            if (findItem claimed s) == 0 and (findItem twins s) == 0 and poolMin[k].z >= uMin[u].z + eps and poolMin[k].z <= uMax[u].z + maxDrop and poolMin[k].x <= uMax[u].x and poolMax[k].x >= uMin[u].x and poolMin[k].y <= uMax[u].y and poolMax[k].y >= uMin[u].y do (
                                 format "R|%|%|%\n" u (rcH s) (rcB64 s.name) to:ss
                             )
                         )
