@@ -1,4 +1,4 @@
-"""Chaos Vantage: read its state, and start or stop V-Ray GPU Live Link from 3ds Max."""
+"""Chaos Vantage: read its state, save its current frame, and start or stop V-Ray GPU Live Link from 3ds Max."""
 
 from __future__ import annotations
 
@@ -36,8 +36,9 @@ CHAOS_LOG = "VRayToVantageLog.log"  # Chaos's toolbar recreates it on every Live
 _OWN: Optional[dict[str, Any]] = None  # {token, log, connected_seen} of the link this process started
 _USER_SCRIPTS: Optional[str] = None
 
-_NOT_RUNNING_HINT = ("Ask the user to start Chaos Vantage (it needs about 7 s to initialise), then call "
-                     "vantage_live_link again. This tool doesn't launch Vantage.")
+_NOT_RUNNING_HINT = ("Ask the user to start Chaos Vantage (it needs about 7 s to initialise), then retry. "
+                     "No tool here launches Vantage.")
+SAMPLES_TIMEOUT_LIMIT = 15  # Vantage busy-waits and holds its command queue while it counts samples
 IMAGE_DIR = os.path.join(tempfile.gettempdir(), "3dsmax-mcp")
 _STOP_BY_HAND = ("ask the user to stop it with the V-Ray Frame Buffer's IPR button or Chaos's Vantage toolbar")
 
@@ -70,11 +71,13 @@ def vantage_get_image(
     (with its exposure and colour corrections), from the scene Vantage has open:
     with Live Link, Max's linked view. Downscaled by a whole factor to at most
     max_width pixels wide (0 = full size). minimum_samples (1-16384) waits until
-    Vantage has rendered that many samples, at most timeout_seconds (1-60); 0 takes
-    the next frame. While it waits, Vantage spins one CPU core and holds its other
-    commands, so keep waits short. Each call also leaks a few process handles
-    inside Vantage (a Vantage 3.4 bug): call it when an image is needed, never in
-    a polling loop. Uses Vantage's undocumented getImage command.
+    Vantage has rendered that many samples, at most timeout_seconds (1-15 then;
+    1-60 with 0, which takes the next frame). While it waits, Vantage spins one CPU
+    core and holds its other commands; a target it never reaches costs the whole
+    timeout. Each call also leaks a process handle inside Vantage for every
+    process it scans before finding 3ds Max, often dozens (a Vantage 3.4 bug):
+    call it when an image is needed, never in a polling loop. Uses Vantage's
+    undocumented getImage command.
     """
     if isinstance(max_width, bool) or not isinstance(max_width, int) or not 0 <= max_width <= 16384:
         raise ValueError("max_width must be an integer from 0 to 16384")
@@ -82,11 +85,18 @@ def vantage_get_image(
         raise ValueError("minimum_samples must be an integer from 0 to 16384")
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 60:
         raise ValueError("timeout_seconds must be an integer from 1 to 60")
+    if minimum_samples and timeout_seconds > SAMPLES_TIMEOUT_LIMIT:
+        raise ValueError("with minimum_samples, timeout_seconds must be at most %d: Vantage busy-waits and holds "
+                         "its other commands meanwhile" % SAMPLES_TIMEOUT_LIMIT)
     status = _require_ready()
     if status.get("state") in vc.OFFLINE_STATES + ("LoadingScene",) or status.get("offline_task") in vc.OFFLINE_TASKS:
         raise VantageError("Chaos Vantage is busy (%s, offline task %s), so it has no interactive frame to give."
                            % (status.get("state"), status.get("offline_task")), "VANTAGE_BUSY", True,
                            "Wait for Vantage to finish, or ask the user.", {"vantage": _summary(status)})
+    if minimum_samples and status.get("state") == "RenderingInteractivePaused":
+        raise VantageError("Chaos Vantage is paused, so it won't reach %d samples." % minimum_samples,
+                           "VANTAGE_PAUSED", False, "Use minimum_samples=0 for the current frame, or ask the user "
+                                                    "to resume Vantage.", {"vantage": _summary(status)})
     started = _clock()
     doc = vc.get_image(int(status["command_port"]), timeout_seconds, minimum_samples)
     try:

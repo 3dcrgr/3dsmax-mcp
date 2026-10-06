@@ -35,23 +35,27 @@ Saves the frame Vantage is showing as a PNG under `%TEMP%\3dsmax-mcp\` and retur
 
 - **What it shows:** Vantage's current interactive frame, with its exposure and colour corrections, from the scene Vantage has open. With Live Link that's Max's linked view; without a link a warning says so.
 - **Size:** Vantage returns the frame at its own resolution. The tool keeps every n-th pixel and row, with n a whole number, so the result is at most `max_width` pixels wide (default 1600; 0 = full size). Pixels are never resampled.
-- **Waiting:** `minimum_samples` (1-16384) waits until Vantage has rendered that many samples, at most `timeout_seconds` (1-60, default 5). With 0 it takes the next frame. While it waits, Vantage spins one CPU core and holds its other commands, so keep waits short.
+- **Waiting:** `minimum_samples` (1-16384) waits until Vantage has rendered that many samples, at most `timeout_seconds` (1-15 then; 1-60 with 0, default 5). With 0 it takes the next frame. While it waits, Vantage spins one CPU core and holds its other commands, and a target it never reaches costs the whole timeout. While Vantage is paused, `minimum_samples` is refused (`VANTAGE_PAUSED`).
 - **Refusals:**
   - Vantage not ready, as for `vantage_live_link`.
   - `VANTAGE_BUSY` while it loads a scene or renders offline.
   - `VANTAGE_NO_FRAME` when Vantage had no frame.
-  - `VANTAGE_TIMEOUT` when the samples weren't reached in time.
+  - `VANTAGE_TIMEOUT`: the samples weren't reached in time (not retryable), or, without `minimum_samples`, Vantage's command queue didn't advance (it may be paused, or another getImage is waiting; retry at most once).
+  - `VANTAGE_FRAME_TOO_LARGE` for a reply over 512 MB (frames above roughly 13K × 7.5K).
   - `VANTAGE_NO_HOST` when Vantage found no supported DCC process. It also happens when 3ds Max runs as administrator and Vantage doesn't.
-- **Don't poll.** Each `getImage` call leaks a few process handles inside Vantage 3.4: it opens every running process to look for a DCC and doesn't close them. Call it when an image is needed, never in a loop.
+- **Don't poll.** Each `getImage` call leaks handles inside Vantage 3.4: it opens running processes one by one to look for a DCC and never closes them. That's one handle for every process it scans before finding 3ds Max, often dozens, and all of them when it finds none. Call it when an image is needed, never in a loop.
 
 **The protocol**, worked out from `vantage.exe` 3.4.0 because Chaos doesn't document it:
 - **Request:** `POST /command {"command": "getImage", "timeoutSeconds": n, "minimumSamples": m}`. The values must be JSON numbers; strings are ignored. The timeout defaults to 5 and is clamped to 1-120.
 - **Reply:** `{"bitmap": <base64>, "headerSize": 56}`.
   - The base64 text ends with one NUL character.
-  - It decodes to a complete 32-bit BI_RGB BMP, top-down (negative height), with pixels B,G,R,X. The fourth byte isn't a usable alpha.
+  - It decodes to a complete 32-bit BI_RGB BMP, top-down (negative height), with pixels B,G,R,X. The fourth byte isn't a usable alpha. The tool accepts only uncompressed BI_RGB, and refuses when `headerSize` disagrees with the BMP's own pixel offset, so a format change fails instead of giving wrong colours.
   - `{"bitmap": null, "headerSize": 0}` means no frame.
 - **Errors:** 403, 408 and 503 have empty bodies. 400 carries `{"errorText": ...}`.
-- **Converting:** the embedded Python has no Pillow or NumPy, so the tool decodes the BMP and writes the PNG with the standard library. A 1080p frame takes about 0.04 s.
+- **Converting:** the embedded Python has no Pillow or NumPy, so the tool decodes the BMP and writes the PNG with the standard library. Measured end to end against a local server:
+  - 1080p takes about 0.1 s.
+  - 4K takes about 0.25 s and roughly 150 MB of memory at the default width.
+  - 8K takes about 1 s and roughly 600 MB.
 
 ## `vantage_live_link`
 

@@ -4,8 +4,10 @@ Vantage 3.4 runs an undocumented HTTP server on localhost (IPv6 loopback only;
 port 20702 unless Vantage's own preferences say otherwise). Chaos's 3ds Max
 scripts (dcc_scripts/3dsMax/Vantage-UtilityFunctions.ms) use it:
 GET /ping answers 200 when Vantage is ready and 503 while it initialises, and
-POST /command takes {"command": ...}. Only getStatus is sent from here. The
-interface isn't public and may change between Vantage versions.
+POST /command takes {"command": ...}. Only getStatus and getImage are sent from
+here. getImage is costly (Vantage busy-waits on one core, holds its other
+commands, and leaks process handles), so only vantage_get_image calls it, once
+per request. The interface isn't public and may change between Vantage versions.
 """
 
 from __future__ import annotations
@@ -95,6 +97,10 @@ class NotListening(OSError):
     """Nothing accepted the connection: Vantage isn't listening (yet) on that port."""
 
 
+class ReplyTooLarge(http.client.HTTPException):
+    """The reply is larger than the caller allows."""
+
+
 def _request(method: str, path: str, port: int, body: Optional[dict] = None,
              timeout: float = COMMAND_TIMEOUT, max_body: int = _MAX_BODY) -> tuple[int, bytes]:
     # http.client never applies system proxies. "localhost" tries ::1 first,
@@ -113,7 +119,12 @@ def _request(method: str, path: str, port: int, body: Optional[dict] = None,
             headers["Content-Type"] = "application/json"
         conn.request(method, path, body=data, headers=headers)
         response = conn.getresponse()
-        return response.status, response.read(max_body)
+        if response.length is not None and response.length > max_body:
+            raise ReplyTooLarge("reply of %d bytes exceeds %d" % (response.length, max_body))
+        body = response.read(max_body + 1)
+        if len(body) > max_body:
+            raise ReplyTooLarge("reply exceeds %d bytes" % max_body)
+        return response.status, body
     finally:
         conn.close()
 
@@ -162,31 +173,40 @@ def get_image(port: int, timeout_seconds: int = 5, minimum_samples: int = 0) -> 
     try:
         status, raw = _request("POST", "/command", port, body=request, timeout=timeout_seconds + 15,
                                max_body=IMAGE_MAX_BODY)
+    except ReplyTooLarge as exc:
+        raise VantageError("Chaos Vantage's frame is too large to fetch (%s)." % exc, "VANTAGE_FRAME_TOO_LARGE",
+                           False, "Lower Vantage's viewport resolution.") from exc
     except (OSError, http.client.HTTPException) as exc:
         raise VantageError("Chaos Vantage didn't answer getImage on localhost:%d (%s: %s)."
                            % (port, type(exc).__name__, exc), "VANTAGE_UNAVAILABLE", True) from exc
-    text = raw.decode("utf-8", "replace")
     if status == 403:
         raise VantageError("Chaos Vantage refused getImage: it found no running 3ds Max or other supported DCC "
                            "it can read (it also can't when 3ds Max runs as administrator and Vantage doesn't).",
                            "VANTAGE_NO_HOST", False)
     if status == 408:
-        raise VantageError("Chaos Vantage didn't reach %d samples within %d s." % (minimum_samples, timeout_seconds),
-                           "VANTAGE_TIMEOUT", True)
+        if minimum_samples:
+            raise VantageError("Chaos Vantage didn't reach %d samples within %d s."
+                               % (minimum_samples, timeout_seconds), "VANTAGE_TIMEOUT", False,
+                               "Use a lower minimum_samples, or 0 for the current frame. Don't retry in a loop.")
+        raise VantageError("Chaos Vantage didn't hand over a frame within %d s: its command queue didn't advance "
+                           "(it may be paused, or another getImage request is still waiting)." % timeout_seconds,
+                           "VANTAGE_TIMEOUT", True, "Check vantage_status; retry at most once, never in a loop.")
     if status != 200:
-        detail = text[:300]
+        detail = raw[:300].decode("utf-8", "replace")
         try:
-            detail = json.loads(text).get("errorText") or detail
+            detail = json.loads(raw).get("errorText") or detail
         except (ValueError, AttributeError):
             pass
         raise VantageError("Chaos Vantage answered getImage with HTTP %d: %s" % (status, detail),
                            "VANTAGE_UNAVAILABLE", status >= 500)
+    head = raw[:300].decode("utf-8", "replace")
     try:
-        data = json.loads(text)
+        data = json.loads(raw)  # bytes, so the reply isn't held twice
     except ValueError:
         data = None
+    del raw
     if not isinstance(data, dict) or "bitmap" not in data:
-        raise VantageError("Chaos Vantage's getImage reply isn't the expected JSON: %s" % text[:300],
+        raise VantageError("Chaos Vantage's getImage reply isn't the expected JSON: %s" % head,
                            "VANTAGE_BAD_REPLY", False)
     return data
 

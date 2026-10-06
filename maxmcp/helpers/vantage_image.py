@@ -20,8 +20,11 @@ class VantageImageError(ValueError):
 
 
 def decode_bitmap(doc: dict) -> Optional[bytes]:
-    """The BMP file bytes from a getImage reply, or None when Vantage had no frame."""
-    b64 = doc.get("bitmap")
+    """The BMP file bytes from a getImage reply, or None when Vantage had no frame.
+
+    Takes the base64 text out of doc, so a large frame isn't held twice.
+    """
+    b64 = doc.pop("bitmap", None)
     if b64 is None:
         return None
     if not isinstance(b64, str):
@@ -33,17 +36,24 @@ def decode_bitmap(doc: dict) -> Optional[bytes]:
 
 
 def bmp_info(bmp: bytes, header_size: int = 0) -> dict:
-    """Width, height, row order, bytes per pixel and pixel offset of a BI_RGB 24/32-bit BMP."""
+    """Width, height, row order, bytes per pixel and pixel offset of a BI_RGB 24/32-bit BMP.
+
+    Only uncompressed BI_RGB is accepted: anything else (bit fields, palettes)
+    would decode to wrong colours rather than fail.
+    """
     if len(bmp) < 54 or bmp[:2] != b"BM":
         raise VantageImageError("getImage didn't return a BMP")
     off_bits = struct.unpack_from("<I", bmp, 10)[0]
     bi_size, width, height, planes, bpp, compression = struct.unpack_from("<IiiHHI", bmp, 14)
-    if bi_size < 40 or planes != 1 or bpp not in (24, 32) or compression not in (0, 3) or width <= 0 or height == 0:
+    if bi_size < 40 or planes != 1 or bpp not in (24, 32) or compression != 0 or width <= 0 or height == 0:
         raise VantageImageError("unsupported BMP (header %d, %dx%d, %d bpp, compression %d)"
                                 % (bi_size, width, height, bpp, compression))
+    if header_size and header_size != off_bits:
+        raise VantageImageError("getImage headerSize %d disagrees with the BMP's pixel offset %d"
+                                % (header_size, off_bits))
     pixel_bytes = bpp // 8
     stride = (width * pixel_bytes + 3) & ~3
-    offset = header_size or off_bits
+    offset = off_bits
     rows = abs(height)
     if offset < 14 + bi_size or len(bmp) < offset + stride * rows:
         raise VantageImageError("BMP pixel data is truncated (%d bytes for %dx%d)" % (len(bmp), width, rows))
@@ -82,11 +92,11 @@ def bmp_to_png(bmp: bytes, header_size: int = 0, max_width: int = 0) -> tuple[by
         raw += b"\x00"  # PNG filter type 0 (none) per row
         raw += out_row
     out_h = len(rows)
-    png = _png_rgb(out_w, out_h, bytes(raw))
+    png = _png_rgb(out_w, out_h, raw)
     return png, {"width": out_w, "height": out_h, "source_width": w, "source_height": h, "factor": factor}
 
 
-def _png_rgb(width: int, height: int, raw: bytes) -> bytes:
+def _png_rgb(width: int, height: int, raw) -> bytes:
     def chunk(kind: bytes, data: bytes) -> bytes:
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
 

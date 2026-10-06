@@ -46,6 +46,24 @@ def bmp32(w, h, top_down=True, pixel=lambda x, y: (x * 10 % 256, y * 20 % 256, 2
     return bytes(hdr) + bytes(px)
 
 
+def bmp24(w, h, top_down=False, pixel=lambda x, y: (x * 10 % 256, y * 20 % 256, 200)):
+    """A padded 24-bit BMP (rows rounded up to 4 bytes), bottom-up by default."""
+    stride = (w * 3 + 3) & ~3
+    hdr = bytearray(54)
+    struct.pack_into("<2sI", hdr, 0, b"BM", stride * h + 54)
+    struct.pack_into("<I", hdr, 10, 54)
+    struct.pack_into("<IiiHH", hdr, 14, 40, w, -h if top_down else h, 1, 24)
+    px = bytearray()
+    for row in range(h):
+        y = row if top_down else h - 1 - row
+        line = bytearray()
+        for x in range(w):
+            r, g, b = pixel(x, y)
+            line += bytes([b, g, r])
+        px += line + bytes(stride - len(line))
+    return bytes(hdr) + bytes(px)
+
+
 def image_reply(bmp):
     return json.dumps({"bitmap": base64.b64encode(bmp).decode() + "\x00", "headerSize": 56}, indent=4)
 
@@ -59,8 +77,8 @@ def png_pixels(png):
         data = png[pos + 8:pos + 8 + length]
         assert zlib.crc32(kind + data) & 0xFFFFFFFF == struct.unpack_from(">I", png, pos + 8 + length)[0]
         if kind == b"IHDR":
-            w, h, depth, color = struct.unpack_from(">IIBB", data)
-            assert (depth, color) == (8, 2)
+            w, h, *fields = struct.unpack_from(">IIBBBBB", data)
+            assert tuple(fields) == (8, 2, 0, 0, 0)
         elif kind == b"IDAT":
             idat += data
         pos += 12 + length
@@ -218,6 +236,36 @@ class GetImageHttpTests(_ServerTestCase):
         self.assertEqual(json.loads(_Handler.requests[-1][3]),
                          {"command": "getImage", "timeoutSeconds": 2, "minimumSamples": 64})
 
+    def test_reply_over_one_megabyte(self):
+        bmp = bmp32(600, 600)
+        _Handler.behaviour = {"image": (200, image_reply(bmp))}
+        doc = vc.get_image(self.port, 2)
+        self.assertEqual(vimg.decode_bitmap(doc), bmp)
+
+    def test_request_timeout_and_body_cap(self):
+        with patch.object(vc, "_request", return_value=(200, image_reply(bmp32(2, 2)).encode())) as request:
+            vc.get_image(20702, 7)
+        self.assertEqual(request.call_args.kwargs["timeout"], 22)
+        self.assertEqual(request.call_args.kwargs["max_body"], vc.IMAGE_MAX_BODY)
+
+    def test_too_large_reply(self):
+        with patch.object(vc, "IMAGE_MAX_BODY", 1000):
+            _Handler.behaviour = {"image": (200, image_reply(bmp32(40, 40)))}
+            with self.assertRaises(VantageError) as ctx:
+                vc.get_image(self.port, 1)
+        self.assertEqual((ctx.exception.code, ctx.exception.retryable), ("VANTAGE_FRAME_TOO_LARGE", False))
+
+    def test_timeout_wording(self):
+        _Handler.behaviour = {"image": (408, None)}
+        with self.assertRaises(VantageError) as ctx:
+            vc.get_image(self.port, 3)
+        self.assertIn("didn't hand over a frame", str(ctx.exception))
+        self.assertTrue(ctx.exception.retryable)
+        with self.assertRaises(VantageError) as ctx:
+            vc.get_image(self.port, 3, 500)
+        self.assertIn("didn't reach 500 samples", str(ctx.exception))
+        self.assertFalse(ctx.exception.retryable)
+
     def test_error_statuses(self):
         cases = [((403, None), "VANTAGE_NO_HOST", False), ((408, None), "VANTAGE_TIMEOUT", True),
                  ((503, None), "VANTAGE_UNAVAILABLE", True),
@@ -257,11 +305,19 @@ class VantageImageTests(unittest.TestCase):
         self.assertEqual([p[0] for p in rows[1]], [0, 30, 60])
         self.assertEqual([r[0][1] for r in rows], [0, 60])
 
+    def test_24_bit_padded_rows(self):
+        png, _ = vimg.bmp_to_png(bmp24(5, 3), 0, 0)
+        w, h, rows = png_pixels(png)
+        self.assertEqual((w, h, rows[0][0], rows[2][4]), (5, 3, (0, 0, 200), (40, 40, 200)))
+
     def test_rejects_bad_bitmaps(self):
         good = bmp32(4, 4)
-        for bad in (b"XX" + good[2:], good[:-5], good[:28] + struct.pack("<H", 16) + good[30:]):
+        bitfields = good[:30] + struct.pack("<I", 3) + good[34:]
+        for bad in (b"XX" + good[2:], good[:-5], good[:28] + struct.pack("<H", 16) + good[30:], bitfields):
             with self.assertRaises(vimg.VantageImageError):
                 vimg.bmp_to_png(bad, 56, 0)
+        with self.assertRaises(vimg.VantageImageError):
+            vimg.bmp_to_png(good, 66, 0)  # headerSize disagrees with the BMP's pixel offset
 
 
 class UnresponsiveServerTests(unittest.TestCase):
@@ -430,7 +486,7 @@ class StartTests(LiveLinkTestCase):
     def test_vantage_not_ready(self):
         e = self.assertRefused("VANTAGE_NOT_RUNNING", [{"running": False, "phase": "not_running", "ready": False}],
                                max_client())
-        self.assertIn("doesn't launch", json.loads(e.bridge_message)["hint"])
+        self.assertIn("No tool here launches Vantage", json.loads(e.bridge_message)["hint"])
         self.assertRefused("VANTAGE_STARTING", [{"running": True, "phase": "initializing", "ready": False}],
                            max_client())
         self.assertRefused("VANTAGE_STARTING", [status(state="Startup")], max_client())
@@ -667,9 +723,22 @@ class GetImageToolTests(unittest.TestCase):
             self.grab(status(), {"bitmap": base64.b64encode(b"nope").decode(), "headerSize": 56})
         self.assertEqual(ctx.exception.code, "VANTAGE_BAD_REPLY")
 
+    def test_hints_never_point_to_live_link(self):
+        for st in ({"running": False, "phase": "not_running", "ready": False}, status(state="Shutdown")):
+            with self.assertRaises(VantageError) as ctx:
+                self.grab(st)
+            self.assertNotIn("vantage_live_link", ctx.exception.bridge_message)
+
+    def test_paused_vantage_refuses_sample_waits(self):
+        with self.assertRaises(VantageError) as ctx:
+            self.grab(status(state="RenderingInteractivePaused"), minimum_samples=64)
+        self.assertEqual(ctx.exception.code, "VANTAGE_PAUSED")
+        out, _ = self.grab(status(state="RenderingInteractivePaused"))
+        self.assertEqual(out["type"], "image_file")
+
     def test_bad_params(self):
         for kwargs in ({"max_width": -1}, {"minimum_samples": 16385}, {"timeout_seconds": 0},
-                       {"timeout_seconds": 61}, {"max_width": True}):
+                       {"timeout_seconds": 61}, {"max_width": True}, {"minimum_samples": 8, "timeout_seconds": 16}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.grab(status(), **kwargs)
 
