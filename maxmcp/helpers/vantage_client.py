@@ -25,6 +25,7 @@ PING_TIMEOUT = 2.0
 # Chaos's scripts allow 5 s: "There are cases in which Vantage replies very slow".
 COMMAND_TIMEOUT = 5.0
 _MAX_BODY = 1 << 20
+IMAGE_MAX_BODY = 512 << 20  # base64 of an 8K frame is about 180 MB
 
 # getStatus fields, as Vantage names them, and the names reported here.
 _STATUS_FIELDS = (
@@ -95,7 +96,7 @@ class NotListening(OSError):
 
 
 def _request(method: str, path: str, port: int, body: Optional[dict] = None,
-             timeout: float = COMMAND_TIMEOUT) -> tuple[int, bytes]:
+             timeout: float = COMMAND_TIMEOUT, max_body: int = _MAX_BODY) -> tuple[int, bytes]:
     # http.client never applies system proxies. "localhost" tries ::1 first,
     # where Vantage listens, then 127.0.0.1. On Windows a refused loopback
     # connect takes about 2 s per address, so it usually ends as a timeout.
@@ -112,7 +113,7 @@ def _request(method: str, path: str, port: int, body: Optional[dict] = None,
             headers["Content-Type"] = "application/json"
         conn.request(method, path, body=data, headers=headers)
         response = conn.getresponse()
-        return response.status, response.read(_MAX_BODY)
+        return response.status, response.read(max_body)
     finally:
         conn.close()
 
@@ -145,6 +146,47 @@ def get_status(port: int, timeout: float = COMMAND_TIMEOUT) -> dict[str, Any]:
         data = None
     if not isinstance(data, dict):
         raise VantageError("Chaos Vantage's getStatus reply isn't a JSON object: %s" % text[:300],
+                           "VANTAGE_BAD_REPLY", False)
+    return data
+
+
+def get_image(port: int, timeout_seconds: int = 5, minimum_samples: int = 0) -> dict[str, Any]:
+    """Vantage's getImage reply: {"bitmap": base64 BMP or None, "headerSize": n}. Raises VantageError.
+
+    Vantage waits (busy, on one core, holding its other commands) until minimum_samples
+    are rendered or timeout_seconds pass; without minimum_samples it returns the next frame.
+    """
+    request: dict[str, Any] = {"command": "getImage", "timeoutSeconds": int(timeout_seconds)}
+    if minimum_samples:
+        request["minimumSamples"] = int(minimum_samples)  # numbers only: Vantage ignores strings
+    try:
+        status, raw = _request("POST", "/command", port, body=request, timeout=timeout_seconds + 15,
+                               max_body=IMAGE_MAX_BODY)
+    except (OSError, http.client.HTTPException) as exc:
+        raise VantageError("Chaos Vantage didn't answer getImage on localhost:%d (%s: %s)."
+                           % (port, type(exc).__name__, exc), "VANTAGE_UNAVAILABLE", True) from exc
+    text = raw.decode("utf-8", "replace")
+    if status == 403:
+        raise VantageError("Chaos Vantage refused getImage: it found no running 3ds Max or other supported DCC "
+                           "it can read (it also can't when 3ds Max runs as administrator and Vantage doesn't).",
+                           "VANTAGE_NO_HOST", False)
+    if status == 408:
+        raise VantageError("Chaos Vantage didn't reach %d samples within %d s." % (minimum_samples, timeout_seconds),
+                           "VANTAGE_TIMEOUT", True)
+    if status != 200:
+        detail = text[:300]
+        try:
+            detail = json.loads(text).get("errorText") or detail
+        except (ValueError, AttributeError):
+            pass
+        raise VantageError("Chaos Vantage answered getImage with HTTP %d: %s" % (status, detail),
+                           "VANTAGE_UNAVAILABLE", status >= 500)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or "bitmap" not in data:
+        raise VantageError("Chaos Vantage's getImage reply isn't the expected JSON: %s" % text[:300],
                            "VANTAGE_BAD_REPLY", False)
     return data
 

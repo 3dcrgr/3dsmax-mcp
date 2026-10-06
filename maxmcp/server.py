@@ -26,6 +26,7 @@ if __name__ == "__main__" and __spec__ is not None:
 _READ_ONLY_TOOLS = {
     "cosmos_search",
     "vantage_status",
+    "vantage_get_image",
     "material_roles",
     "get_bridge_status",
     "get_plugin_capabilities",

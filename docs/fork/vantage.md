@@ -1,4 +1,4 @@
-# Chaos Vantage: status and Live Link
+# Chaos Vantage: status, image and Live Link
 
 Added on the `merge-1.7.5` branch (2026-10-06). Chaos is working on an official MCP server for Vantage but hasn't shipped one: Vantage 3.4.0 has none. These tools cover what can be done safely without it.
 
@@ -28,6 +28,30 @@ Reads Vantage's state without sending anything to 3ds Max:
   - Fields Vantage adds later go in `other_fields`.
   - `linked` is true while a link is connected. It doesn't say which 3ds Max or DCC is linked.
 - A warning when more than one `vantage.exe` runs. A second instance can't open the Live Link port, but may still answer on the command port.
+
+## `vantage_get_image`
+
+Saves the frame Vantage is showing as a PNG under `%TEMP%\3dsmax-mcp\` and returns its `file`, `width`, `height`, `source_width`, `source_height` and `factor`. It never sends anything to 3ds Max.
+
+- **What it shows:** Vantage's current interactive frame, with its exposure and colour corrections, from the scene Vantage has open. With Live Link that's Max's linked view; without a link a warning says so.
+- **Size:** Vantage returns the frame at its own resolution. The tool keeps every n-th pixel and row, with n a whole number, so the result is at most `max_width` pixels wide (default 1600; 0 = full size). Pixels are never resampled.
+- **Waiting:** `minimum_samples` (1-16384) waits until Vantage has rendered that many samples, at most `timeout_seconds` (1-60, default 5). With 0 it takes the next frame. While it waits, Vantage spins one CPU core and holds its other commands, so keep waits short.
+- **Refusals:**
+  - Vantage not ready, as for `vantage_live_link`.
+  - `VANTAGE_BUSY` while it loads a scene or renders offline.
+  - `VANTAGE_NO_FRAME` when Vantage had no frame.
+  - `VANTAGE_TIMEOUT` when the samples weren't reached in time.
+  - `VANTAGE_NO_HOST` when Vantage found no supported DCC process. It also happens when 3ds Max runs as administrator and Vantage doesn't.
+- **Don't poll.** Each `getImage` call leaks a few process handles inside Vantage 3.4: it opens every running process to look for a DCC and doesn't close them. Call it when an image is needed, never in a loop.
+
+**The protocol**, worked out from `vantage.exe` 3.4.0 because Chaos doesn't document it:
+- **Request:** `POST /command {"command": "getImage", "timeoutSeconds": n, "minimumSamples": m}`. The values must be JSON numbers; strings are ignored. The timeout defaults to 5 and is clamped to 1-120.
+- **Reply:** `{"bitmap": <base64>, "headerSize": 56}`.
+  - The base64 text ends with one NUL character.
+  - It decodes to a complete 32-bit BI_RGB BMP, top-down (negative height), with pixels B,G,R,X. The fourth byte isn't a usable alpha.
+  - `{"bitmap": null, "headerSize": 0}` means no frame.
+- **Errors:** 403, 408 and 503 have empty bodies. 400 carries `{"errorText": ...}`.
+- **Converting:** the embedded Python has no Pillow or NumPy, so the tool decodes the BMP and writes the PNG with the standard library. A 1080p frame takes about 0.04 s.
 
 ## `vantage_live_link`
 
@@ -118,4 +142,5 @@ Any call that sees no IPR running clears the global. After an MCP server restart
   - what `liveLinkState` reports when idle, after a stop, and with the Live Link server off;
   - whether V-Ray shows a dialog, the VFB or the V-Ray Messages window;
   - how the agent viewport behaves while linked.
+- **`vantage_get_image`:** the decoder and every error path are tested against a local stub server that serves the protocol above. It hasn't been run against a real Vantage yet; Vantage wasn't running when it was built. Check the colours and orientation against Vantage's window on the first live use.
 - The tools are on `merge-1.7.5` only and aren't deployed. They need the 1.7.5 bridge, for quiet mode and the dialog monitor, so don't backport them to the 1.7.3-based line as they are.

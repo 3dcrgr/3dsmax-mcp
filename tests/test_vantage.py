@@ -1,5 +1,6 @@
 """Tests for the Chaos Vantage tools: vantage_status and vantage_live_link."""
 
+import base64
 import importlib
 import json
 import os
@@ -7,7 +8,9 @@ import socket
 import sys
 import tempfile
 import threading
+import struct
 import unittest
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -16,6 +19,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from maxmcp.helpers import vantage_client as vc  # noqa: E402
+from maxmcp.helpers import vantage_image as vimg  # noqa: E402
 from maxmcp.helpers.vantage_client import VantageError  # noqa: E402
 from maxmcp.max_client import MaxNotRespondingAfterDispatch  # noqa: E402
 
@@ -25,6 +29,48 @@ READY = {"running": True, "pids": [28660], "command_port": 20702, "link_port": 2
          "listening": True, "phase": "ready", "ready": True, "state": "RenderingInteractive",
          "live_link": "Online", "offline_task": "None", "linked": False, "version": "3.4.0"}
 LOG = (True, 111, 10)
+
+
+def bmp32(w, h, top_down=True, pixel=lambda x, y: (x * 10 % 256, y * 20 % 256, 200)):
+    """A Vantage-shaped 32-bit BMP: 56-byte header, B,G,R,X pixels (pixel() gives R,G,B)."""
+    hdr = bytearray(56)
+    struct.pack_into("<2sI", hdr, 0, b"BM", w * h * 4 + 56)
+    struct.pack_into("<I", hdr, 10, 56)
+    struct.pack_into("<IiiHH", hdr, 14, 40, w, -h if top_down else h, 1, 32)
+    px = bytearray()
+    for row in range(h):
+        y = row if top_down else h - 1 - row
+        for x in range(w):
+            r, g, b = pixel(x, y)
+            px += bytes([b, g, r, 0x7F])
+    return bytes(hdr) + bytes(px)
+
+
+def image_reply(bmp):
+    return json.dumps({"bitmap": base64.b64encode(bmp).decode() + "\x00", "headerSize": 56}, indent=4)
+
+
+def png_pixels(png):
+    """(width, height, rows of RGB tuples) from an 8-bit RGB, unfiltered PNG."""
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, idat, w, h = 8, b"", None, None
+    while pos < len(png):
+        length, kind = struct.unpack_from(">I4s", png, pos)
+        data = png[pos + 8:pos + 8 + length]
+        assert zlib.crc32(kind + data) & 0xFFFFFFFF == struct.unpack_from(">I", png, pos + 8 + length)[0]
+        if kind == b"IHDR":
+            w, h, depth, color = struct.unpack_from(">IIBB", data)
+            assert (depth, color) == (8, 2)
+        elif kind == b"IDAT":
+            idat += data
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    rows = []
+    for y in range(h):
+        line = raw[y * (1 + 3 * w):(y + 1) * (1 + 3 * w)]
+        assert line[0] == 0
+        rows.append([tuple(line[1 + 3 * x:4 + 3 * x]) for x in range(w)])
+    return w, h, rows
 
 
 def status(**changes):
@@ -66,6 +112,14 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8")
         self.requests.append(("POST", self.path, self.headers.get("Content-Type"), body))
+        if json.loads(body).get("command") == "getImage":
+            code, reply = self.behaviour.get("image", (200, image_reply(bmp32(3, 2))))
+            if reply is None:
+                self.send_response(code)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            return self._send(code, reply)
         code, reply = self.behaviour.get("command", (200, json.dumps({
             "state": "RenderingInteractive", "liveLinkState": "Connected", "offlineTaskState": "None",
             "offlineStartFrame": 0, "offlineCurrentFrame": 0, "lastProcessedTaskID": 3,
@@ -77,7 +131,7 @@ class _V6Server(ThreadingHTTPServer):
     address_family = socket.AF_INET6  # Vantage listens on ::1 only
 
 
-class HttpClientTests(unittest.TestCase):
+class _ServerTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.server = _V6Server(("::1", 0), _Handler)
@@ -94,6 +148,8 @@ class HttpClientTests(unittest.TestCase):
         _Handler.behaviour = {}
         _Handler.requests = []
 
+
+class HttpClientTests(_ServerTestCase):
     def test_ping_ready_and_initializing(self):
         self.assertEqual(vc.ping(self.port), {"listening": True, "responsive": True, "status": 200})
         _Handler.behaviour = {"ping": 503}
@@ -150,6 +206,62 @@ class HttpClientTests(unittest.TestCase):
         self.assertEqual((out["phase"], out["status_code"], out["status_retryable"]),
                          ("ready", "VANTAGE_BAD_REPLY", False))
         self.assertNotIn("live_link", out)
+
+
+class GetImageHttpTests(_ServerTestCase):
+    def test_request_and_reply(self):
+        doc = vc.get_image(self.port, 3)
+        self.assertEqual(json.loads(_Handler.requests[-1][3]), {"command": "getImage", "timeoutSeconds": 3})
+        self.assertEqual(doc["headerSize"], 56)
+        self.assertTrue(doc["bitmap"].endswith("\x00"))
+        vc.get_image(self.port, 2, 64)
+        self.assertEqual(json.loads(_Handler.requests[-1][3]),
+                         {"command": "getImage", "timeoutSeconds": 2, "minimumSamples": 64})
+
+    def test_error_statuses(self):
+        cases = [((403, None), "VANTAGE_NO_HOST", False), ((408, None), "VANTAGE_TIMEOUT", True),
+                 ((503, None), "VANTAGE_UNAVAILABLE", True),
+                 ((400, json.dumps({"errorText": "unknown command 'getImage'"})), "VANTAGE_UNAVAILABLE", False),
+                 ((200, json.dumps({"state": "x"})), "VANTAGE_BAD_REPLY", False)]
+        for behaviour, code, retryable in cases:
+            with self.subTest(code=code, status=behaviour[0]):
+                _Handler.behaviour = {"image": behaviour}
+                with self.assertRaises(VantageError) as ctx:
+                    vc.get_image(self.port, 1)
+                self.assertEqual((ctx.exception.code, ctx.exception.retryable), (code, retryable))
+                if behaviour[0] == 400:
+                    self.assertIn("unknown command", str(ctx.exception))
+
+
+class VantageImageTests(unittest.TestCase):
+    def test_decode_strips_nul_and_handles_null(self):
+        bmp = bmp32(2, 2)
+        self.assertEqual(vimg.decode_bitmap(json.loads(image_reply(bmp))), bmp)
+        self.assertIsNone(vimg.decode_bitmap({"bitmap": None, "headerSize": 0}))
+        with self.assertRaises(vimg.VantageImageError):
+            vimg.decode_bitmap({"bitmap": "not base64!!"})
+
+    def test_png_colours_and_row_order(self):
+        for top_down in (True, False):
+            with self.subTest(top_down=top_down):
+                png, info = vimg.bmp_to_png(bmp32(5, 3, top_down), 56, 0)
+                w, h, rows = png_pixels(png)
+                self.assertEqual((w, h, info["factor"]), (5, 3, 1))
+                self.assertEqual(rows[0][0], (0, 0, 200))
+                self.assertEqual(rows[2][4], (40, 40, 200))  # R from x, G from y: top row first
+
+    def test_downscale_keeps_every_nth_pixel(self):
+        png, info = vimg.bmp_to_png(bmp32(7, 5), 56, 3)
+        w, h, rows = png_pixels(png)
+        self.assertEqual((w, h, info["source_width"], info["factor"]), (3, 2, 7, 3))
+        self.assertEqual([p[0] for p in rows[1]], [0, 30, 60])
+        self.assertEqual([r[0][1] for r in rows], [0, 60])
+
+    def test_rejects_bad_bitmaps(self):
+        good = bmp32(4, 4)
+        for bad in (b"XX" + good[2:], good[:-5], good[:28] + struct.pack("<H", 16) + good[30:]):
+            with self.assertRaises(vimg.VantageImageError):
+                vimg.bmp_to_png(bad, 56, 0)
 
 
 class UnresponsiveServerTests(unittest.TestCase):
@@ -509,6 +621,59 @@ class StopTests(LiveLinkTestCase):
         self.assertIn("still reports a connected", out["warnings"][0])
 
 
+class GetImageToolTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for name, value in (("IMAGE_DIR", tmp.name), ("client", MagicMock())):
+            patcher = patch.object(vt, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def grab(self, st, doc=None, **kwargs):
+        doc = doc if doc is not None else json.loads(image_reply(bmp32(40, 20)))
+        with patch.object(vt.vc, "read_status", return_value=st), \
+                patch.object(vt.vc, "get_image", return_value=doc) as get_image:
+            return vt.vantage_get_image(**kwargs), get_image
+
+    def test_saves_png_and_never_touches_max(self):
+        out, get_image = self.grab(status(live_link="Connected"), max_width=16)
+        self.assertEqual((out["type"], out["width"], out["height"], out["source_width"], out["factor"]),
+                         ("image_file", 14, 7, 40, 3))
+        with open(out["file"], "rb") as f:
+            self.assertEqual(png_pixels(f.read())[:2], (14, 7))
+        self.assertEqual(out["size_bytes"], os.path.getsize(out["file"]))
+        get_image.assert_called_once_with(20702, 5, 0)
+        self.assertNotIn("warnings", out)
+        vt.client.send_command.assert_not_called()
+
+    def test_unlinked_vantage_warns(self):
+        out, _ = self.grab(status(live_link="Online"), max_width=0, minimum_samples=32, timeout_seconds=4)
+        self.assertEqual((out["width"], out["minimum_samples"]), (40, 32))
+        self.assertIn("isn't linked", out["warnings"][0])
+
+    def test_refusals(self):
+        with self.assertRaises(VantageError) as ctx:
+            self.grab({"running": False, "phase": "not_running", "ready": False})
+        self.assertEqual(ctx.exception.code, "VANTAGE_NOT_RUNNING")
+        for st in (status(state="RenderingOffline"), status(state="LoadingScene")):
+            with self.assertRaises(VantageError) as ctx:
+                self.grab(st)
+            self.assertEqual(ctx.exception.code, "VANTAGE_BUSY")
+        with self.assertRaises(VantageError) as ctx:
+            self.grab(status(), {"bitmap": None, "headerSize": 0})
+        self.assertEqual((ctx.exception.code, ctx.exception.retryable), ("VANTAGE_NO_FRAME", True))
+        with self.assertRaises(VantageError) as ctx:
+            self.grab(status(), {"bitmap": base64.b64encode(b"nope").decode(), "headerSize": 56})
+        self.assertEqual(ctx.exception.code, "VANTAGE_BAD_REPLY")
+
+    def test_bad_params(self):
+        for kwargs in ({"max_width": -1}, {"minimum_samples": 16385}, {"timeout_seconds": 0},
+                       {"timeout_seconds": 61}, {"max_width": True}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.grab(status(), **kwargs)
+
+
 class ScriptSafetyTests(unittest.TestCase):
     SCRIPTS = staticmethod(lambda: (vt._start_script(20703, "1-a", ""), vt._start_script(20703, "1-b", "1-a"),
                                     vt._stop_script("", False), vt._stop_script("1-a", True)))
@@ -542,6 +707,7 @@ class RegistrationTests(unittest.TestCase):
         names = {t["name"] for t in extract_tools(Path(vt.__file__))}
         self.assertNotIn("vantage_status", names)
         self.assertNotIn("vantage_live_link", names)
+        self.assertNotIn("vantage_get_image", names)
 
     def test_registered_and_skipped_by_smoke(self):
         from maxmcp import server
@@ -550,7 +716,8 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("vantage", server.SPECIALTY_TOOL_MODULES)
         self.assertIn("vantage_status", server._READ_ONLY_TOOLS)
         self.assertEqual(sum("vantage" in spec.modules for spec in TOOLSET_SPECS), 1)
-        self.assertTrue({"vantage_status", "vantage_live_link"} <= SKIP_DEFAULT)
+        self.assertTrue({"vantage_status", "vantage_live_link", "vantage_get_image"} <= SKIP_DEFAULT)
+        self.assertIn("vantage_get_image", server._READ_ONLY_TOOLS)
 
     def test_progressive_profile_indexes_the_tools(self):
         from maxmcp import server
@@ -558,7 +725,8 @@ class RegistrationTests(unittest.TestCase):
         catalog = ProgressiveToolCatalog(  # raises if a module isn't in exactly one toolset
             package="maxmcp", tools_dir=Path(vt.__file__).resolve().parent, hidden_mcp=MagicMock(),
             allowed_modules=server.CORE_TOOL_MODULES + server.SPECIALTY_TOOL_MODULES)
-        self.assertTrue({"vantage_status", "vantage_live_link"} <= set(catalog.module_tools.get("vantage", ())))
+        self.assertEqual(set(catalog.module_tools.get("vantage", ())),
+                         {"vantage_status", "vantage_live_link", "vantage_get_image"})
 
     def test_error_envelope_keeps_code_hint_and_details(self):
         from maxmcp.tool_response import envelope_exception

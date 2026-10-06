@@ -33,6 +33,7 @@ FLAG_EXPECT_ERROR = 2
 SKIP_DEFAULT = {
     "max_dialogs",
     "vantage_status",
+    "vantage_get_image",
     "vantage_live_link",
     "script_controller",
     "cosmos_search",

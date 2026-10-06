@@ -61,7 +61,7 @@ The details pages say exactly what was and wasn't tested.
 
 | Feature | What it does | Details | Status |
 |---|---|---|---|
-| Chaos Vantage status and Live Link | `vantage_status` reads Vantage's state over its local command port, without touching Max. `vantage_live_link` starts or stops V-Ray GPU Live Link from Max, refusing rather than switching renderers or launching Vantage, and stopping only the link this MCP server started unless `force=true` | [vantage.md](fork/vantage.md) | Unit tested and reviewed. `vantage_status` read live (read-only) against Vantage 3.4.0 on 2026-10-06; starting and stopping the link aren't tested live yet. `merge-1.7.5` only |
+| Chaos Vantage status, image and Live Link | `vantage_status` reads Vantage's state over its local command port, without touching Max. `vantage_get_image` saves the frame Vantage shows as a PNG. `vantage_live_link` starts or stops V-Ray GPU Live Link from Max, refusing rather than switching renderers or launching Vantage, and stopping only the link this MCP server started unless `force=true` | [vantage.md](fork/vantage.md) | Unit tested and reviewed. `vantage_status` read live (read-only) against Vantage 3.4.0 on 2026-10-06; `vantage_get_image`, starting and stopping the link aren't tested live yet. `merge-1.7.5` only |
 
 ## Installing
 

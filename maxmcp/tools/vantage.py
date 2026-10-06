@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import uuid
 from typing import Any, Literal, Optional
 
 from ..helpers import vantage_client as vc
+from ..helpers import vantage_image as vimg
 from ..helpers.dialogs import open_main_dialogs
 from ..helpers.maxscript import safe_string
 from ..helpers.native_compat import is_missing_native_route_error
@@ -36,6 +38,7 @@ _USER_SCRIPTS: Optional[str] = None
 
 _NOT_RUNNING_HINT = ("Ask the user to start Chaos Vantage (it needs about 7 s to initialise), then call "
                      "vantage_live_link again. This tool doesn't launch Vantage.")
+IMAGE_DIR = os.path.join(tempfile.gettempdir(), "3dsmax-mcp")
 _STOP_BY_HAND = ("ask the user to stop it with the V-Ray Frame Buffer's IPR button or Chaos's Vantage toolbar")
 
 
@@ -53,6 +56,59 @@ def vantage_status() -> dict[str, Any]:
     default), as Chaos's own 3ds Max scripts do. It can change between versions.
     """
     return vc.read_status()
+
+
+@mcp.tool()
+def vantage_get_image(
+    max_width: int = 1600,
+    minimum_samples: int = 0,
+    timeout_seconds: int = 5,
+) -> dict[str, Any]:
+    """Save the frame Chaos Vantage is showing as a PNG, without touching 3ds Max.
+
+    Read the returned `file` to view it. It's Vantage's current interactive frame
+    (with its exposure and colour corrections), from the scene Vantage has open:
+    with Live Link, Max's linked view. Downscaled by a whole factor to at most
+    max_width pixels wide (0 = full size). minimum_samples (1-16384) waits until
+    Vantage has rendered that many samples, at most timeout_seconds (1-60); 0 takes
+    the next frame. While it waits, Vantage spins one CPU core and holds its other
+    commands, so keep waits short. Each call also leaks a few process handles
+    inside Vantage (a Vantage 3.4 bug): call it when an image is needed, never in
+    a polling loop. Uses Vantage's undocumented getImage command.
+    """
+    if isinstance(max_width, bool) or not isinstance(max_width, int) or not 0 <= max_width <= 16384:
+        raise ValueError("max_width must be an integer from 0 to 16384")
+    if isinstance(minimum_samples, bool) or not isinstance(minimum_samples, int) or not 0 <= minimum_samples <= 16384:
+        raise ValueError("minimum_samples must be an integer from 0 to 16384")
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 60:
+        raise ValueError("timeout_seconds must be an integer from 1 to 60")
+    status = _require_ready()
+    if status.get("state") in vc.OFFLINE_STATES + ("LoadingScene",) or status.get("offline_task") in vc.OFFLINE_TASKS:
+        raise VantageError("Chaos Vantage is busy (%s, offline task %s), so it has no interactive frame to give."
+                           % (status.get("state"), status.get("offline_task")), "VANTAGE_BUSY", True,
+                           "Wait for Vantage to finish, or ask the user.", {"vantage": _summary(status)})
+    started = _clock()
+    doc = vc.get_image(int(status["command_port"]), timeout_seconds, minimum_samples)
+    try:
+        bmp = vimg.decode_bitmap(doc)
+        if bmp is None:
+            raise VantageError("Chaos Vantage had no frame to return.", "VANTAGE_NO_FRAME", True,
+                               "Check vantage_status; Vantage may be paused or still preparing the scene.")
+        png, info = vimg.bmp_to_png(bmp, int(doc.get("headerSize") or 0), max_width)
+    except vimg.VantageImageError as exc:
+        raise VantageError("Chaos Vantage's image couldn't be read: %s" % exc, "VANTAGE_BAD_REPLY", False) from exc
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    path = os.path.join(IMAGE_DIR, "vantage_%s.png" % uuid.uuid4().hex)
+    with open(path, "wb") as f:
+        f.write(png)
+    result: dict[str, Any] = {"type": "image_file", "file": path, "mime_type": "image/png", "size_bytes": len(png),
+                              **info, "seconds": round(_clock() - started, 2), "vantage": _summary(status)}
+    if minimum_samples:
+        result["minimum_samples"] = minimum_samples
+    if status.get("live_link") != "Connected":
+        result["warnings"] = ["Vantage isn't linked to 3ds Max (live_link %s): the image shows whatever scene "
+                              "Vantage has open." % status.get("live_link")]
+    return result
 
 
 @mcp.tool()
