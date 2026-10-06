@@ -59,7 +59,7 @@ The details pages say exactly what was and wasn't tested.
 
 ## Installing
 
-Install from source, the same way as upstream, but from this fork. Its default branch is `fix/fork-fixes`, the 1.7.3-based line that runs in production, so a plain clone has the fixes. For this branch, upstream 1.7.5 plus the fixes, clone with `-b merge-1.7.5`:
+Install from source, the same way as upstream, but from this fork. Its default branch is `fix/fork-fixes`, the 1.7.3-based line that runs in production, so a plain clone has the fixes' source and Python side. Its prebuilt 2026 bridge is an older build (`c621db10…`, from before #11); production runs `1cf0f9d8…`, built from `8330c2c`. For this branch, upstream 1.7.5 plus the fixes, clone with `-b merge-1.7.5`:
 
 ```powershell
 git clone https://github.com/3dcrgr/3dsmax-mcp.git

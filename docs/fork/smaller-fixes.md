@@ -99,7 +99,7 @@ Fork issues #14 and #15. Commit `02cb984`.
 
 **What changed.**
 - Explicit `tolerance` and `near_gap` are always millimetres (0 means the defaults, 0.1 mm and 10 mm), converted to scene units like the defaults. Results stay in scene units. Values are checked before anything is sent.
-- Nodes in `names` or `against` that can't become a mesh are skipped with a warning and listed in `skipped`. If none of the `names` nodes is a mesh, the call fails with a clear error.
+- Nodes in `names` or `against` that can't become a mesh are skipped with a warning and listed in `skipped_nodes`. If none of the `names` nodes is a mesh, the call fails with a clear error.
 - After the bounding-box pass, the script estimates the work (vertices per candidate pair) and checks the cheapest pairs first, within a work budget. It checks a deadline, `time_budget_s`, between pairs and inside long vertex loops. The deadline is at most 45 s, below the client timeout, and counts from when the request was built, so time spent queued counts too.
 - On the budget or the deadline it stops and returns partial results: `complete: false`, `pairs_total`, `pairs_checked`, `work_estimate`, the heaviest nodes, the stop reason and `queue_wait_ms`. Check dense meshes (garlands, foliage, Mesher objects) separately.
 - The report header changed, so the parser and the script ship together. The skill explains units, skipping and the budget.
@@ -115,8 +115,8 @@ Fork issue #16. Commit `a83f57c`.
 **What changed.**
 - `clone_objects` first runs one read-only check for requested names that are group members: `isGroupMember`, or a closed group head among the ancestors, nested and open groups included. Names match case-exactly; an ambiguous exact name is refused.
 - Members are copied node by node (copy, instance or reference, as `mode` says), with their own children and links rebuilt. The top copy is detached (`.parent = undefined; setGroupMember c false`) and checked. It all happens in one undo step, with the same `offset`, `count` and naming as the normal path. If the scene gains more nodes than the script tracked, everything is rolled back.
-- Non-members and group heads take the existing paths, so naming a group head still clones the group. `clone_whole_group=True` restores Max's behaviour. The result adds `group_members` (`name`, `group`, `open_group`), `detached_from_group` and warnings.
-- `scene_qa` has a new read-only check, `duplicate_group_heads`. It finds group heads with the same position, rotation and scale whose child lists match once names are normalised (case, trailing digits, the `_mcp` suffix, class). Near matches are reported as `name_match: "partial"`. It never deletes anything, in fix mode either.
+- Calls that name no group member take the existing paths. In a mixed call, non-members and group heads are cloned with `maxOps.cloneNodes` in the same undo step, so naming a group head still clones the group. `clone_whole_group=True` restores Max's behaviour. The result adds `group_members` (`name`, `group`, `open_group`), `detached_from_group` and warnings.
+- `scene_qa` has a new read-only check, `duplicate_group_heads`. It finds group heads with the same position, rotation and scale whose child lists match by class and name, ignoring case, trailing digits and the `_mcp` suffix. Near matches are reported as `name_match: "partial"`. It never deletes anything, in fix mode either.
 - **On the 1.7.5 merge** (`cb4d0ff`): if a dialog holds the read-only check that `clone_objects`, or `scene_qa` in fix mode, runs first, the call returns `BLOCKED_BY_DIALOG` with `retryable: true` and "Nothing was cloned" or "Nothing was changed". Repeat it once the dialog is answered. The queued check runs then too, harmlessly. `scene_qa` never sends its fix behind a check that couldn't run.
 
 **Status.** Unit tested in `tests/test_clone_groups.py` and `tests/test_scene_qa_groups.py`. Deployed (Python) on the 1.7.3-based fork on 2026-10-05; not tested live yet.
