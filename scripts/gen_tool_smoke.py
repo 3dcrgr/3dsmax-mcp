@@ -63,6 +63,10 @@ SKIP_DEFAULT = {
     "get_railclone_style",
     "set_railclone_style",
     "get_railclone_output",
+    "railclone_inspect",
+    "railclone_set_param",
+    "railclone_library",
+    "railclone_from_library",
     "load_dc_preset",
     "add_dc_script_operator",
     "set_data_channel_operator",
@@ -223,6 +227,8 @@ MUTATE_TOOLS = {
     "write_osl_shader",
     "set_modifier_property",
     "batch_rename_objects",
+    "railclone_set_param",
+    "railclone_from_library",
 }
 
 TIER_FIXTURE_NAMES = {

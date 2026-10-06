@@ -75,6 +75,8 @@ _READ_ONLY_TOOLS = {
     "mcg_list_graphs",
     "mcg_inspect_graph",
     "mcg_search_operators",
+    "railclone_inspect",
+    "railclone_library",
 }
 
 _DESTRUCTIVE_TOOLS = {
@@ -97,6 +99,7 @@ _DESTRUCTIVE_TOOLS = {
     "undo_last",
     "mcg_cleanup_workspace",
     "mcg_reload_operators",
+    "railclone_set_param",
 }
 
 _IDEMPOTENT_TOOLS = {
@@ -130,6 +133,8 @@ _IDEMPOTENT_TOOLS = {
     "mcg_list_graphs",
     "mcg_inspect_graph",
     "mcg_search_operators",
+    "railclone_inspect",
+    "railclone_library",
 }
 
 
@@ -393,7 +398,7 @@ def max_assistant() -> str:
         "Plugin resources are available under resource://3dsmax-mcp/plugins/{plugin_name}/manifest, /guide, /recipes, and /gotchas.\n"
         "For tyFlow maintenance, inspect with get_tyflow_info first; enable include_flow_properties/include_event_properties/include_operator_properties for deep readback before edits.\n"
         "For tyFlow creation/mutation, use create_tyflow, modify_tyflow_operator, set_tyflow_shape, set_tyflow_physx, and get_tyflow_particles.\n"
-        "For RailClone 7.3.5+, read get_railclone_style, replace XML with set_railclone_style using expected_style, then verify get_railclone_output.\n"
+        "For RailClone, read railclone_inspect first; change exposed parameters with railclone_set_param; edit the graph with get_railclone_style then set_railclone_style(expected_style=style_token); verify with get_railclone_output. Find library items with railclone_library and create them with railclone_from_library.\n"
         "For Max Creation Graph work, use mcg_search_operators for typed ports, mcg_create_graph for a temp template fork, and mcg_apply_patch for the normal checkpoint-patch-compile-verify-rollback loop.\n"
         "MCG mutations use opaque graph_id values and expected hashes; never ask the user to copy, compile, run, or install a generated graph manually. Keep retries bounded to eight iterations and do not call mcg_reload_operators in the normal per-graph loop.\n"
         "Prefer dedicated tools over raw MAXScript when available.\n"
