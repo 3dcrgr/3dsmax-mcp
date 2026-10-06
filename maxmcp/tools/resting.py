@@ -105,9 +105,14 @@ def _warnings(report: dict[str, Any], statuses: dict[int, str]) -> list[str]:
         out.append(f"{report['scatter_excluded']} scatter objects (Mesher, Forest Pack, RailClone, tyFlow, particles, "
                    "fur) weren't used as supports.")
     blocked: dict[str, set[str]] = {}
+    hidden: dict[str, set[str]] = {}
     for b in report["blockers"]:
         if b["unit"] in units:
-            blocked.setdefault(units[b["unit"]]["name"], set()).add(b["name"])
+            (hidden if b["reason"] in rs.WARN_ONLY_BLOCKS else blocked).setdefault(units[b["unit"]]["name"], set()).add(b["name"])
+    if hidden:
+        out.append("Hidden or non-renderable meshes lie under: "
+                   + _short([f"{k} ({', '.join(sorted(v))})" for k, v in hidden.items()])
+                   + ". They aren't used as supports; unhide them first if the items rest on them.")
     if blocked:
         out.append("A surface left out of the measurement (scatter, excluded, too dense or not a mesh) lies under: "
                    + _short([f"{k} ({', '.join(sorted(v))})" for k, v in blocked.items()])
@@ -282,9 +287,11 @@ def drop_to_surface(
     by_reason: dict[str, list[str]] = {}
     for i, p in plan.items():
         by_reason.setdefault(p["reason"], []).append(units[i]["name"])
-    held = [n for r in ("frozen", "locked_z", "linked", "xref", "constrained", "animated", "check_failed",
-                        "companion_not_movable") for n in by_reason.get(r, [])
-            if statuses.get(next(i for i in units if units[i]["name"] == n)) in ("floating", "penetrating")]
+    held_twins = {c["unit"]: c["name"] for c in report["companions"] if c["not_movable"]}
+    held = [n + (f" (twin {held_twins[i]})" if i in held_twins else "")
+            for i, p in plan.items() for n in [units[i]["name"]]
+            if p["reason"] in ("frozen", "locked_z", "linked", "xref", "constrained", "animated", "check_failed",
+                               "companion_not_movable") and statuses.get(i) in ("floating", "penetrating")]
     if held:
         warnings.append(f"Not moved (frozen, locked, linked, constrained or animated): {_short(held)}.")
     if by_reason.get("dependent_not_movable"):

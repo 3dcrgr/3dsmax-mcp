@@ -28,21 +28,23 @@ Two new tools share one helper (`maxmcp/helpers/resting.py`). Each sends one bou
     - `rigid` moves furniture or assemblies as one piece.
 
 **Measuring:**
-- **Undersides:** the lowest point per cell of an XY grid over the item's footprint (`samples`, default 64), from its evaluated mesh. Points come from vertices, plus points on the faces of a coarse mesh (a box, a 1×1 plane), never from rays into the item, so cloth and needles measure correctly. Dense meshes are read at every n-th vertex above `max_item_verts` (flagged `sampled`). Items above 20 × `max_item_verts` vertices are skipped (`too_dense`).
+- **Undersides:** the lowest point per cell of an XY grid over the item's footprint (`samples`, default 64), from its evaluated mesh. Points come from vertices, plus points on every face larger than a cell (a box, a 1×1 plane), for meshes up to 20,000 faces; never from rays into the item, so cloth and needles measure correctly. Dense meshes are read at every n-th vertex above `max_item_verts` (flagged `sampled`). Items above 20 × `max_item_verts` vertices are skipped (`too_dense`).
 - **Gaps:** one double-sided segment per cell, cast straight down against each support, from `max_sink_mm` above the point to `max_drop_mm` below it. Each support gets one `RayMeshGridIntersect`, built once and freed on every path.
-  - When a support surface lies above the point, a parity test (distinct crossings straight up) tells a sunk point (inside the support, or under an open sheet of it) from an overhang such as a plate rim over a fork.
-  - A point deeper than `max_sink_mm` inside a closed support reads as sunk, never as floating.
+  - A parity test (distinct crossings straight up) runs first. It tells a sunk point from an overhang such as a plate rim over a fork, and gives the exact depth.
+  - Within `max_sink_mm`, a point under an open sheet (a 1-plane floor) counts as sunk. Deeper, only a closed support counts (odd crossings downwards too), so an item under a single-plane tabletop isn't read as 70 cm deep.
 - **Supports**, unless `supports` lists them:
-  - visible, renderable meshes that start below the item's median underside, lie under its footprint and reach within `max_drop_mm` of its lowest point;
+  - visible, renderable meshes that start below the item's median underside (or within `tolerance_mm` of it, such as a zero-thickness mat), lie under its footprint and reach within `max_drop_mm` of its lowest point;
   - never the item's own descendants. Its parent counts: a cup linked to the tray it stands on rests on the tray.
   - The other items always count too, even with explicit `supports`, so stacks work.
   - Scatter objects (Mesher, Forest Pack, RailClone, tyFlow, particles, fur) are left out, and `exclude_supports` removes others.
   - Coincident duplicates of an item (same transform *and* geometry, such as the stacked copies from #16) are ignored and reported.
-- **Twins:** reference twins (same base object and transform, such as `*_ENMESH` copies) move with their item. When both are named, they become one item.
+  - Hidden and non-renderable meshes under an item are never supports. The result names them in a warning, but they don't hold the item.
+- **Twins:** reference twins (same base object and transform, such as `*_ENMESH` copies) move with their item. When both are named, they become one item. A twin that can't move holds its item, and the warning names the twin.
+- **Names:** a name `getNodeByName` misses (seen live on linked children) is found by a scene scan; `contact_check` does the same.
 - **Budget:** the time budget counts from the send, like `contact_check`, at most 45 s. Items it didn't reach are `unchecked`, with `complete: false`.
 
 **Planning:**
-- **Order:** items are planned in support order and ancestry order; items that support each other in a loop are held.
+- **Order:** items are planned in support order and ancestry order; items that support each other in a loop are held. An item that only moves because its parent moves has the reason `follows_parent`.
 - **Pinning:** an item that can't move but would lose its support pins that support, and through it the supports below.
 - **Blocked:** an item over something left out of the measurement (scatter, excluded, not a mesh, above the face limit) is never moved. Its gap may be to a surface further down.
 

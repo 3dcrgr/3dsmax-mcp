@@ -74,7 +74,8 @@ SUPPORT_SKIP_REASONS = {
     "face_limit": "face count above max_support_faces",
     "coincident": "coincident duplicate of an item",
 }
-BLOCK_REASONS = ("scatter", "excluded", "not_mesh", "face_limit", "empty_mesh")
+BLOCK_REASONS = ("scatter", "excluded", "not_mesh", "face_limit", "empty_mesh", "hidden")
+WARN_ONLY_BLOCKS = ("hidden",)  # reported, but the item may still move
 NOT_MOVABLE_REASONS = ("frozen", "locked_z", "linked", "xref", "constrained", "animated", "check_failed",
                        "companion_not_movable", "unmeasured_support", "cyclic_support", "dependent_not_movable",
                        "unchecked")
@@ -455,7 +456,7 @@ def _plan_once(report, order, cyclic, pinned, clearance, lift_penetrating):
     tol = report["tolerance"]
     units = report["units"]
     unchecked = {u["unit"] for u in report["unchecked"]}
-    blocked = {b["unit"] for b in report["blockers"]}
+    blocked = {b["unit"] for b in report["blockers"] if b["reason"] not in WARN_ONLY_BLOCKS}
     twin_held = {c["unit"] for c in report["companions"] if c["not_movable"]}
     by_unit: dict[int, list[dict[str, Any]]] = {}
     for g in report["gaps"]:
@@ -500,6 +501,8 @@ def _plan_once(report, order, cyclic, pinned, clearance, lift_penetrating):
                 own = target - gap_now
             if not fix:
                 reason = ("follows_support" if own else "resting") if gap0 >= -tol else "penetrating_not_lifted"
+            if not own and inherited and reason in ("", "resting"):
+                reason = "follows_parent"
         plan[idx] = {"own": own, "total": inherited + own, "inherited": inherited, "gap0": gap0,
                      "gap_now": gap_now, "target": target, "reason": reason}
     return plan
@@ -599,6 +602,8 @@ _LIBRARY = r'''(
     fn rcIsMesh n = isValidNode n and (isKindOf n GeometryClass) and not (isKindOf n TargetObject) and (canConvertTo n TriMeshGeometry)
     fn rcResolve nm = (
         local m = getNodeByName nm exact:true all:true
+        -- getNodeByName can miss linked children (seen live): scan the scene before giving up
+        if m.count == 0 do m = for o in objects where o.name == nm collect o
         if m.count == 0 do throw ("Node not found: " + nm)
         if m.count > 1 do throw ("Node name matches " + m.count as string + " nodes, pass a unique name: " + nm)
         m[1]
@@ -637,6 +642,14 @@ _LIBRARY = r'''(
     )
     fn rcScatter n = (
         local c = toLower (((classOf n) as string) + " " + ((classOf n.baseObject) as string))
+        local hit = false
+        for k in #("mesher", "forest", "railclone", "tyflow", "fur", "particle", "pf_source", "scatter", "pcloud", "blizzard", "spray", "snow") while not hit do (
+            if (findString c k) != undefined do hit = true
+        )
+        hit
+    )
+    fn rcScatterBase n = (
+        local c = toLower ((classOf n.baseObject) as string)
         local hit = false
         for k in #("mesher", "forest", "railclone", "tyflow", "fur", "particle", "pf_source", "scatter", "pcloud", "blizzard", "spray", "snow") while not hit do (
             if (findString c k) != undefined do hit = true
@@ -729,18 +742,27 @@ _LIBRARY = r'''(
                     rcKeep lowZ lowX lowY bmin cw ch nx ny (getVert m i)
                     i += st
                 )
-                -- a coarse mesh (a box, a 1x1 plane) leaves cells empty: sample its faces too
+                -- faces larger than a cell (a box, a 1x1 plane) span cells no vertex reaches:
+                -- sample points on them, as densely as the cells need
                 local nf = getNumFaces m
-                if not expired and nv < cells * 4 and nf > 0 and nf <= 5000 do (
-                    local kk = (ceil (sqrt (4.0 * cells / nf))) as integer
-                    if kk < 1 do kk = 1
-                    if kk > 16 do kk = 16
+                local minCell = amin cw ch
+                if not expired and nf > 0 and nf <= 20000 do (
                     for fi = 1 to nf while not expired do (
+                        tick += 1
+                        if tick >= 512 do (
+                            tick = 0
+                            if (rcElapsed t0) > limitMs do expired = true
+                        )
                         local f = getFace m fi
                         local a = getVert m (f.x as integer), b = getVert m (f.y as integer), c = getVert m (f.z as integer)
-                        for i2 = 0 to kk do for j2 = 0 to (kk - i2) do (
-                            local u2 = (i2 as float) / kk, v2 = (j2 as float) / kk
-                            rcKeep lowZ lowX lowY bmin cw ch nx ny (a + (b - a) * u2 + (c - a) * v2)
+                        local edge = amax (distance a b) (amax (distance b c) (distance a c))
+                        if edge > minCell * 0.75 do (
+                            local kk = (ceil (1.5 * edge / minCell)) as integer
+                            if kk > 48 do kk = 48
+                            for i2 = 0 to kk do for j2 = 0 to (kk - i2) do (
+                                local u2 = (i2 as float) / kk, v2 = (j2 as float) / kk
+                                rcKeep lowZ lowX lowY bmin cw ch nx ny (a + (b - a) * u2 + (c - a) * v2)
+                            )
                         )
                     )
                 )
@@ -752,33 +774,52 @@ _LIBRARY = r'''(
             #(pts, verts, stride, cw, ch)
         )
     )
-    -- odd number of distinct crossings straight up from q to above topZ: q is inside
-    -- the support (or under an open sheet of it)
-    fn rcInside rm q topZ eps = (
-        local n = rm.intersectSegment q [q.x, q.y, topZ + 10.0 * eps + 0.001] true
+    -- #(distinct crossings from a to b, distance to the first)
+    fn rcCrossings rm a b eps = (
+        local n = rm.intersectSegment a b true
         local ds = for i = 1 to n collect (rm.getHitDist i)
         ds = for d in ds where d > eps collect d
         sort ds
-        local cnt = 0, last = -1e30
-        for d in ds do (if (d - last) > eps do (cnt += 1; last = d))
-        (mod cnt 2) == 1
+        local cnt = 0, last = -1e30, first = 0.0
+        for d in ds do (
+            if (d - last) > eps do (
+                cnt += 1
+                last = d
+                if cnt == 1 do first = d
+            )
+        )
+        #(cnt, first)
     )
-    -- signed gap at p: positive = clearance to the surface below, negative = depth
-    -- under the surface above; undefined without a hit. Sunk deeper than lift reads -lift.
-    fn rcGap rm p lift maxDrop jit topZ eps = (
+    -- depth of q inside the support, from the parity of the crossings straight up; 0 when
+    -- outside. Within lift, under an open sheet counts too (a sunk item under a 1-plane floor);
+    -- deeper, only a closed support does (odd crossings down as well), not a tabletop overhead
+    fn rcInsideDepth rm q topZ botZ lift eps = (
+        if q.z > topZ + eps then 0.0 else (
+            local up = rcCrossings rm q [q.x, q.y, topZ + 10.0 * eps + 0.001] eps
+            if (mod up[1] 2) != 1 then 0.0
+            else if up[2] <= lift then up[2]
+            else (
+                local dn = rcCrossings rm q [q.x, q.y, botZ - 10.0 * eps - 0.001] eps
+                if (mod dn[1] 2) == 1 then up[2] else 0.0
+            )
+        )
+    )
+    -- signed gap at p: positive = clearance to the surface below, negative = depth under the
+    -- surface above (exact, however deep); undefined when there is nothing below
+    fn rcGap rm p lift maxDrop jit topZ botZ eps = (
         local q = p + jit
-        local cnt = rm.intersectSegment (q + [0, 0, lift]) (q - [0, 0, maxDrop]) true
-        if cnt == 0 then undefined else (
-            local above = 1e30, below = 1e30
+        local depth = rcInsideDepth rm q topZ botZ lift eps
+        if depth > 0.0 then (-depth) else (
+            local cnt = rm.intersectSegment (q + [0, 0, lift]) (q - [0, 0, maxDrop]) true
+            local below = 1e30
             for i = 1 to cnt do (
                 local d = (rm.getHitDist i) - lift
-                if d < -eps then (if (-d) < above do above = -d) else (
+                if d >= -eps do (
                     if d < 0.0 do d = 0.0
                     if d < below do below = d
                 )
             )
-            if rcInside rm q topZ eps then (if above < 1e29 then -above else -lift)
-            else if below < 1e29 then below else undefined
+            if below < 1e29 then below else undefined
         )
     )
 '''
@@ -911,7 +952,15 @@ _MEASURE_BODY = r'''
                     tick = 0
                     if (rcElapsed t0) > limitMs do (expired = true; stop = "deadline_search")
                 )
-                if not expired and not n.isHiddenInVpt and n.renderable do (
+                local hid = not expired and (n.isHiddenInVpt or not n.renderable)
+                if hid and (findItem claimed n) == 0 and not (rcScatterBase n) do (
+                    local a = n.min, b = n.max
+                    if b.z >= gz0 - maxDrop - lift and a.z <= gz1 and a.x <= gx1 and b.x >= gx0 and a.y <= gy1 and b.y >= gy0 and rcIsMesh n do (
+                        append skipN n
+                        append skipWhy "hidden"
+                    )
+                )
+                if not expired and not hid do (
                     local a = n.min, b = n.max
                     if b.z >= gz0 - maxDrop - lift and a.z <= gz1 + maxDrop and a.x <= gx1 and b.x >= gx0 and a.y <= gy1 and b.y >= gy0 do (
                         if (findItem claimed n) > 0 then append pool n
@@ -966,7 +1015,7 @@ _MEASURE_BODY = r'''
                                 if (rcCoincident s m posEps) do dup = true
                             )
                             if dup then (format "Q|%|%|coincident|%\n" (rcH s) (rcB64 s.name) u to:ss) else (
-                                if poolMin[k].z < medZ - eps and poolMax[k].z >= lowZ - maxDrop - eps do (
+                                if poolMin[k].z < medZ + tol and poolMax[k].z >= lowZ - maxDrop - eps do (
                                     local below = false
                                     for m in unitMeshes[u] while not below do (
                                         if (rcIsAncestor m s) do below = true
@@ -978,7 +1027,7 @@ _MEASURE_BODY = r'''
                     )
                     -- anything left out that could be the real surface blocks a drop
                     for j = 1 to skipN.count do (
-                        if skipMin[j].x <= uMax[u].x and skipMax[j].x >= uMin[u].x and skipMin[j].y <= uMax[u].y and skipMax[j].y >= uMin[u].y and skipMin[j].z < medZ - eps and skipMax[j].z >= lowZ - maxDrop - eps and (findItem twins skipN[j]) == 0 do (
+                        if skipMin[j].x <= uMax[u].x and skipMax[j].x >= uMin[u].x and skipMin[j].y <= uMax[u].y and skipMax[j].y >= uMin[u].y and skipMin[j].z < medZ + tol and skipMax[j].z >= lowZ - maxDrop - eps and (findItem twins skipN[j]) == 0 do (
                             format "B|%|%|%|%\n" u (rcH skipN[j]) (rcB64 skipN[j].name) skipWhy[j] to:ss
                         )
                     )
@@ -1012,7 +1061,7 @@ _MEASURE_BODY = r'''
                         local topZ = poolMax[k].z
                         for i = 1 to pts.count while not expired do (
                             if (mod i 32) == 0 and (rcElapsed t0) > limitMs do expired = true
-                            local g = rcGap gridOf[k] pts[i] lift maxDrop jit topZ eps
+                            local g = rcGap gridOf[k] pts[i] lift maxDrop jit topZ poolMin[k].z eps
                             if g != undefined do (
                                 sHits += 1
                                 if g < sMin do (sMin = g; sPt = pts[i])

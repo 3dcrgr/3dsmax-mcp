@@ -112,13 +112,17 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("local rigid = true", script)
         self.assertIn("123L", script)
         self.assertIn("rm.intersectSegment (q + [0, 0, lift]) (q - [0, 0, maxDrop]) true", script)
-        self.assertIn("rcInside rm q topZ eps", script)  # parity test for sunk vs overhang
+        self.assertIn("rcInsideDepth rm q topZ botZ lift eps", script)  # parity test for sunk vs overhang
         self.assertIn("snapshotAsMesh nd renderMesh:false", script)
         self.assertIn("if (rcIsAncestor m s) do below = true", script)  # descendants only; ancestors may support
         self.assertIn("for c in claimed where (findItem pool c) == 0 do append pool c", script)  # stacks with explicit supports
         self.assertIn("(classOf n.baseObject) as string", script)  # scatter by base class too
         self.assertIn("rcCoincident s m posEps", script)
         self.assertIn('format:".9g"', script)
+        self.assertIn("for o in objects where o.name == nm collect o", script)  # getNodeByName fallback
+        self.assertIn("poolMin[k].z < medZ + tol", script)  # a zero-thickness mat still supports
+        self.assertIn('append skipWhy "hidden"', script)
+        self.assertIn("rcGap gridOf[k] pts[i] lift maxDrop jit topZ poolMin[k].z eps", script)
         self.assertEqual(script.count("("), script.count(")"))
 
     def test_names_with_placeholders_are_literal(self):
@@ -267,6 +271,7 @@ class PlanTests(unittest.TestCase):
         plan = rs.plan_drops(r, clearance=0.0)
         self.assertAlmostEqual(plan[2]["inherited"], -0.6)
         self.assertAlmostEqual(plan[2]["own"], 0.0)  # moves with the tray, nothing of its own
+        self.assertEqual(plan[2]["reason"], "follows_parent")
         moves, verify, _ = rs.moves_and_checks(r, plan, clearance=0.0)
         self.assertEqual([m["handle"] for m in moves], [11])
         self.assertEqual(sorted(v["unit"] for v in verify), [1, 2])  # the carried cup is verified too
@@ -293,6 +298,11 @@ class PlanTests(unittest.TestCase):
         r = stack_report(extra=["B|1|60|%s|scatter" % b64("Garland")])
         plan = rs.plan_drops(r, clearance=0.0)
         self.assertEqual((plan[1]["own"], plan[1]["reason"]), (0.0, "unmeasured_support"))
+
+    def test_hidden_mesh_only_warns(self):
+        r = stack_report(extra=["B|1|61|%s|hidden" % b64("Old_Table")])
+        plan = rs.plan_drops(r, clearance=0.0)
+        self.assertAlmostEqual(plan[1]["own"], -0.5)  # still drops onto the visible table
 
     def test_unchecked_and_no_support(self):
         r = rs.parse_measure(report(unit_line(1, 11, "Spoon", 0.9, gap=None), declare(2, 12, "Knife"),
@@ -401,6 +411,15 @@ class ToolTests(unittest.TestCase):
                          ("#centimeters", 0.5, True, False))
         out, _ = self.run_check(raw, include_resting=True, limit=2)
         self.assertEqual((len(out["nodes"]), out["nodes_truncated"]), (2, True))
+
+    def test_hidden_and_held_twin_warnings(self):
+        raw = report(gap_line(1, 90, "Table", 0.3), unit_line(1, 11, "Placemat", 0.75, gap=0.3),
+                     "B|1|61|%s|hidden" % b64("Old_Table"), "C|1|21|%s|frozen|0.75|" % b64("Placemat_ENMESH"))
+        out, _ = self.drop(raw)
+        text = " ".join(out["warnings"])
+        self.assertIn("Hidden or non-renderable meshes lie under: Placemat (Old_Table)", text)
+        self.assertIn("Placemat (twin Placemat_ENMESH)", text)
+        self.assertNotIn("left out of the measurement", text)
 
     def test_partial_results(self):
         raw = report(unit_line(1, 11, "Placemat", 0.75, gap=0.0), declare(2, 12, "Garland"), "X|2|deadline",
