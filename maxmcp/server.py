@@ -25,6 +25,7 @@ if __name__ == "__main__" and __spec__ is not None:
 
 _READ_ONLY_TOOLS = {
     "cosmos_search",
+    "vantage_status",
     "material_roles",
     "get_bridge_status",
     "get_plugin_capabilities",
@@ -99,6 +100,7 @@ _DESTRUCTIVE_TOOLS = {
 
 _IDEMPOTENT_TOOLS = {
     "cosmos_search",
+    "vantage_status",
     "material_roles",
     "cosmos_download",
     "get_bridge_status",
@@ -266,6 +268,7 @@ SPECIALTY_TOOL_MODULES = (
     "railclone",
     "render",
     "render_automations",
+    "vantage",
     "scattering",
     "state_sets",
     "tyflow",

@@ -57,6 +57,12 @@ Nothing from the 1.7.5 merge has run in Max yet, Python or native. That includes
 
 The details pages say exactly what was and wasn't tested.
 
+## What's added
+
+| Feature | What it does | Details | Status |
+|---|---|---|---|
+| Chaos Vantage status and Live Link | `vantage_status` reads Vantage's state over its local command port, without touching Max. `vantage_live_link` starts or stops V-Ray GPU Live Link from Max, refusing rather than switching renderers, launching Vantage or stopping an IPR it didn't start | [vantage.md](fork/vantage.md) | Unit tested. `vantage_status` read live (read-only) against Vantage 3.4.0 on 2026-10-06; starting and stopping the link aren't tested live yet. `merge-1.7.5` only |
+
 ## Installing
 
 Install from source, the same way as upstream, but from this fork. Its default branch is `fix/fork-fixes`, the 1.7.3-based line that runs in production, so a plain clone has the fixes' source and Python side. Its prebuilt 2026 bridge is an older build (`c621db10…`, from before #11); production runs `1cf0f9d8…`, built from `8330c2c`. For this branch, upstream 1.7.5 plus the fixes, clone with `-b merge-1.7.5`:

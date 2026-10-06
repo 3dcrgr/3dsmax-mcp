@@ -32,6 +32,8 @@ FLAG_EXPECT_ERROR = 2
 # Skipped unless run_tool_smoke(include_skipped=True) / native includeSkipped
 SKIP_DEFAULT = {
     "max_dialogs",
+    "vantage_status",
+    "vantage_live_link",
     "script_controller",
     "cosmos_search",
     "cosmos_download",

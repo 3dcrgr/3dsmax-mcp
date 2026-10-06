@@ -144,8 +144,8 @@ TOOLSET_SPECS = (
     ),
     ToolsetSpec(
         "rendering",
-        "Render configuration and render automation drivers.",
-        ("render", "render_automations"),
+        "Render configuration, render automation drivers and Chaos Vantage Live Link.",
+        ("render", "render_automations", "vantage"),
     ),
 )
 

@@ -1,0 +1,195 @@
+"""Chaos Vantage's local command server, read-only.
+
+Vantage 3.4 runs an undocumented HTTP server on localhost (IPv6 loopback only;
+port 20702 unless Vantage's own preferences say otherwise). Chaos's 3ds Max
+scripts (dcc_scripts/3dsMax/Vantage-UtilityFunctions.ms) use it:
+GET /ping answers 200 when Vantage is ready and 503 while it initialises, and
+POST /command takes {"command": ...}. Only getStatus is sent from here. The
+interface isn't public and may change between Vantage versions.
+"""
+
+from __future__ import annotations
+
+import configparser
+import http.client
+import json
+import os
+from pathlib import Path
+from typing import Any, Optional
+
+from ..process_health import list_processes
+
+DEFAULT_COMMAND_PORT = 20702
+DEFAULT_LINK_PORT = 20703  # Live Link v2, the port V-Ray's DR2 protocol links to
+PING_TIMEOUT = 2.0
+# Chaos's scripts allow 5 s: "There are cases in which Vantage replies very slow".
+COMMAND_TIMEOUT = 5.0
+_MAX_BODY = 1 << 20
+
+# getStatus fields, as Vantage names them, and the names reported here.
+_STATUS_FIELDS = (
+    ("state", "state"),
+    ("liveLinkState", "live_link"),
+    ("offlineTaskState", "offline_task"),
+    ("offlineStartFrame", "offline_start_frame"),
+    ("offlineCurrentFrame", "offline_current_frame"),
+    ("offlineEndFrame", "offline_end_frame"),
+    ("lastProcessedTaskID", "last_task_id"),
+    ("appVersion", "version"),
+)
+OFFLINE_STATES = ("RenderingOffline", "RenderingOfflinePaused")
+OFFLINE_TASKS = ("Rendering", "Queued", "AwaitingUpdate")
+
+
+class VantageError(RuntimeError):
+    """A Vantage request or precondition failed; carries code/retryable/hint for the tool envelope."""
+
+    def __init__(self, message: str, code: str, retryable: bool = False,
+                 hint: Optional[str] = None, details: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.details = details or {}
+        payload: dict[str, Any] = {"type": "VantageError", "code": code, "retryable": retryable, "message": message}
+        if hint:
+            payload["hint"] = hint
+        if details:
+            payload["details"] = details
+        self.bridge_message = json.dumps(payload)
+
+
+def vantage_ini_path() -> Optional[Path]:
+    appdata = os.environ.get("APPDATA")
+    return Path(appdata) / "Chaos" / "Vantage" / "vantage.ini" if appdata else None
+
+
+def read_ports() -> dict[str, Any]:
+    """The command and Live Link v2 ports from Vantage's preferences, else the defaults."""
+    ports: dict[str, Any] = {"command": DEFAULT_COMMAND_PORT, "link": DEFAULT_LINK_PORT, "source": "default"}
+    path = vantage_ini_path()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace") if path else ""
+        # Qt writes this file: "key=value" lines only; keys can hold ":".
+        parser = configparser.ConfigParser(strict=False, interpolation=None, delimiters=("=",),
+                                           allow_no_value=True)
+        parser.read_string(text)
+    except (OSError, configparser.Error):
+        return ports
+    if not parser.has_section("Preferences"):
+        return ports
+    prefs = parser["Preferences"]
+    for key, name in (("commandPort", "command"), ("liveLink2Port", "link")):
+        value = (prefs.get(key) or "").strip()
+        if value.isdigit() and 0 < int(value) < 65536:
+            ports[name] = int(value)
+            ports["source"] = "vantage.ini"
+    with_app = (prefs.get("startLiveLinkServerWithApp") or "").strip().lower()
+    if with_app in ("true", "false"):
+        ports["link_server_with_app"] = with_app == "true"
+    return ports
+
+
+def _request(method: str, path: str, port: int, body: Optional[dict] = None,
+             timeout: float = COMMAND_TIMEOUT) -> tuple[int, bytes]:
+    # http.client never applies system proxies. "localhost" tries ::1 first,
+    # where Vantage listens, then 127.0.0.1.
+    conn = http.client.HTTPConnection("localhost", port, timeout=timeout)
+    try:
+        data = None
+        headers: dict[str, str] = {}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=data, headers=headers)
+        response = conn.getresponse()
+        return response.status, response.read(_MAX_BODY)
+    finally:
+        conn.close()
+
+
+def ping(port: int, timeout: float = PING_TIMEOUT) -> dict[str, Any]:
+    """{listening, status} for GET /ping; never raises."""
+    try:
+        status, _ = _request("GET", "/ping", port, timeout=timeout)
+    except ConnectionRefusedError:
+        return {"listening": False}
+    except (OSError, http.client.HTTPException) as exc:
+        return {"listening": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    return {"listening": True, "status": status}
+
+
+def get_status(port: int, timeout: float = COMMAND_TIMEOUT) -> dict[str, Any]:
+    """Vantage's getStatus reply, as Vantage sends it. Raises VantageError."""
+    try:
+        status, raw = _request("POST", "/command", port, body={"command": "getStatus"}, timeout=timeout)
+    except (OSError, http.client.HTTPException) as exc:
+        raise VantageError("Chaos Vantage didn't answer getStatus on localhost:%d (%s: %s)."
+                           % (port, type(exc).__name__, exc), "VANTAGE_UNAVAILABLE", True) from exc
+    text = raw.decode("utf-8", "replace")
+    if status != 200:
+        raise VantageError("Chaos Vantage answered getStatus with HTTP %d: %s" % (status, text[:300]),
+                           "VANTAGE_UNAVAILABLE", status >= 500)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        raise VantageError("Chaos Vantage's getStatus reply isn't a JSON object: %s" % text[:300],
+                           "VANTAGE_BAD_REPLY", False)
+    return data
+
+
+def read_status() -> dict[str, Any]:
+    """Whether Vantage runs and is ready, and its getStatus fields. Never raises."""
+    ports = read_ports()
+    pids = [p["pid"] for p in list_processes(("vantage.exe",))]
+    out: dict[str, Any] = {
+        "running": bool(pids),
+        "pids": pids,
+        "command_port": ports["command"],
+        "link_port": ports["link"],
+        "ports_from": ports["source"],
+    }
+    if "link_server_with_app" in ports:
+        out["link_server_with_app"] = ports["link_server_with_app"]
+    warnings: list[str] = []
+    if len(pids) > 1:
+        warnings.append("%d vantage.exe processes are running. A second instance can't open the Live Link "
+                        "port, but may still answer on the command port." % len(pids))
+    if not pids:
+        # No HTTP: a refused localhost connection takes about 2 s per address on Windows.
+        out.update(phase="not_running", ready=False)
+        return _with_warnings(out, warnings)
+    probe = ping(ports["command"])
+    out["listening"] = probe["listening"]
+    if not probe["listening"]:
+        if probe.get("error"):
+            out["ping_error"] = probe["error"]
+        out.update(phase="starting", ready=False)  # the command server opens about 5 s after launch
+        return _with_warnings(out, warnings)
+    if probe["status"] == 503:
+        out.update(phase="initializing", ready=False)
+        return _with_warnings(out, warnings)
+    if probe["status"] != 200:
+        out.update(phase="unexpected", ready=False, ping_status=probe["status"])
+        return _with_warnings(out, warnings)
+    out.update(phase="ready", ready=True)
+    try:
+        status = get_status(ports["command"])
+    except VantageError as exc:
+        out.update(status_error=str(exc), status_code=exc.code)
+        return _with_warnings(out, warnings)
+    for source, name in _STATUS_FIELDS:
+        if source in status:
+            out[name] = status[source]
+    out["linked"] = status.get("liveLinkState") == "Connected"
+    extra = {k: v for k, v in status.items() if k not in dict(_STATUS_FIELDS)}
+    if extra:
+        out["other_fields"] = extra
+    return _with_warnings(out, warnings)
+
+
+def _with_warnings(out: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
+    if warnings:
+        out["warnings"] = warnings
+    return out
