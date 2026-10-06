@@ -1,11 +1,12 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 
 #include <modstack.h>
 #include <GraphicsWindow.h>
 #include <set>
 #include <map>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <notify.h>
@@ -273,8 +274,23 @@ struct SceneEvent {
 static std::mutex g_eventMutex;
 static std::deque<SceneEvent> g_eventBuffer;
 static const size_t MAX_EVENTS = 500;
-static bool g_watcherActive = false;
-static bool g_callbacksRegistered = false;
+// Written on Max's main thread (start, stop, core shutdown); read there by the
+// callbacks and on pipe workers by the direct reads (get, status).
+static std::atomic<bool> g_watcherActive{false};
+static std::atomic<bool> g_callbacksRegistered{false};
+
+// Depth of watch_scene's Max callbacks (core code Max enters outside any
+// request). Core shutdown refuses while one runs: a reload's main-thread step
+// can only get here through a message loop nested inside it.
+static std::atomic<int> g_callbackDepth{0};
+struct CallbackScope {
+    CallbackScope() { ++g_callbackDepth; }
+    ~CallbackScope() { --g_callbackDepth; }
+    CallbackScope(const CallbackScope&) = delete;
+    CallbackScope& operator=(const CallbackScope&) = delete;
+};
+
+bool NativeHandlers::SceneWatcherCallbackActive() { return g_callbackDepth.load() != 0; }
 
 static void PushEvent(const std::string& type, const std::string& detail = "") {
     std::lock_guard<std::mutex> lock(g_eventMutex);
@@ -286,6 +302,7 @@ static void PushEvent(const std::string& type, const std::string& detail = "") {
 class MCPWatcherOverlay : public ViewportDisplayCallback {
 public:
     void Display(TimeValue t, ViewExp* vpt, int flags) override {
+        CallbackScope scope;
         if (!active) return;
         GraphicsWindow* gw = vpt->getGW();
         if (!gw) return;
@@ -312,7 +329,7 @@ public:
 };
 
 static MCPWatcherOverlay g_overlay;
-static bool g_overlayRegistered = false;
+static std::atomic<bool> g_overlayRegistered{false};
 
 static void RegisterOverlay() {
     if (g_overlayRegistered) return;
@@ -325,13 +342,15 @@ static void RegisterOverlay() {
     }
 }
 
-static void UnregisterOverlay() {
+// `redraw` clears the label at once; core shutdown skips it, since it can run
+// while Max exits.
+static void UnregisterOverlay(bool redraw = true) {
     if (!g_overlayRegistered) return;
     Interface* ip = GetCOREInterface();
     if (ip) {
         g_overlay.active = false;
         ip->UnRegisterViewportDisplayCallback(FALSE, &g_overlay);
-        ip->RedrawViews(ip->GetTime());
+        if (redraw) ip->RedrawViews(ip->GetTime());
         g_overlayRegistered = false;
     }
 }
@@ -348,6 +367,7 @@ static void UnregisterOverlay() {
 
 // Node created — callParam is INode*
 static void NotifyNodeCreated(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
     INode* node = GET_NOTIFY_NODE(info, NOTIFY_NODE_CREATED);
     std::string name = node ? WideToUtf8(node->GetName()) : "";
@@ -365,6 +385,7 @@ static void NotifyNodeCreated(void* param, NotifyInfo* info) {
 
 // Node deleted — callParam is INode* (NOTIFY_SCENE_PRE_DELETED_NODE)
 static void NotifyNodeDeleted(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
 #if MAX_SDK_VERSION >= 2027
     INode* node = GetNotifyParam<NOTIFY_SCENE_PRE_DELETED_NODE>(info);
@@ -377,6 +398,7 @@ static void NotifyNodeDeleted(void* param, NotifyInfo* info) {
 
 // Selection changed
 static void NotifySelectionChanged(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive) return;
     Interface* ip = GetCOREInterface();
     int count = ip->GetSelNodeCount();
@@ -396,6 +418,7 @@ static void NotifySelectionChanged(void* param, NotifyInfo* info) {
 
 // Modifier added/deleted — 2027 uses NotifyModAddDelParam* and PRE/POST codes
 static void NotifyModifierAdded(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
 #if MAX_SDK_VERSION >= 2027
     NotifyModAddDelParam* p = GetNotifyParam<NOTIFY_POST_MODIFIER_ADDED>(info);
@@ -414,6 +437,7 @@ static void NotifyModifierAdded(void* param, NotifyInfo* info) {
 }
 
 static void NotifyModifierDeleted(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
 #if MAX_SDK_VERSION >= 2027
     NotifyModAddDelParam* p = GetNotifyParam<NOTIFY_POST_MODIFIER_DELETED>(info);
@@ -433,6 +457,7 @@ static void NotifyModifierDeleted(void* param, NotifyInfo* info) {
 
 // Material assigned — callParam is INode* (NOTIFY_NODE_POST_MTL)
 static void NotifyMaterialAssigned(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
 #if MAX_SDK_VERSION >= 2027
     INode* node = GetNotifyParam<NOTIFY_NODE_POST_MTL>(info);
@@ -450,6 +475,7 @@ static void NotifyMaterialAssigned(void* param, NotifyInfo* info) {
 
 // Node renamed — callParam is NameChange*
 static void NotifyNodeRenamed(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
 #if MAX_SDK_VERSION >= 2027
     NameChange* nc = GetNotifyParam<NOTIFY_NODE_RENAMED>(info);
@@ -468,21 +494,25 @@ static void NotifyNodeRenamed(void* param, NotifyInfo* info) {
 
 // Node hide/unhide/freeze/unfreeze — callParam is INode*
 static void NotifyNodeHide(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
     INode* node = GET_NOTIFY_NODE(info, NOTIFY_NODE_HIDE);
     PushEvent("node_hidden", node ? WideToUtf8(node->GetName()) : "");
 }
 static void NotifyNodeUnhide(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
     INode* node = GET_NOTIFY_NODE(info, NOTIFY_NODE_UNHIDE);
     PushEvent("node_unhidden", node ? WideToUtf8(node->GetName()) : "");
 }
 static void NotifyNodeFreeze(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
     INode* node = GET_NOTIFY_NODE(info, NOTIFY_NODE_FREEZE);
     PushEvent("node_frozen", node ? WideToUtf8(node->GetName()) : "");
 }
 static void NotifyNodeUnfreeze(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
     INode* node = GET_NOTIFY_NODE(info, NOTIFY_NODE_UNFREEZE);
     PushEvent("node_unfrozen", node ? WideToUtf8(node->GetName()) : "");
@@ -490,6 +520,7 @@ static void NotifyNodeUnfreeze(void* param, NotifyInfo* info) {
 
 // Sub-object level change
 static void NotifySubObjectChanged(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
 #if MAX_SDK_VERSION >= 2027
     NumberChange* nc = GetNotifyParam<NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED>(info);
@@ -507,6 +538,7 @@ static void NotifySubObjectChanged(void* param, NotifyInfo* info) {
 
 // Undo/redo — callParam is const MCHAR*
 static void NotifyUndo(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
 #if MAX_SDK_VERSION >= 2027
     const MCHAR* desc = GetNotifyParam<NOTIFY_SCENE_UNDO>(info);
@@ -516,6 +548,7 @@ static void NotifyUndo(void* param, NotifyInfo* info) {
     PushEvent("undo", desc ? WideToUtf8(desc) : "");
 }
 static void NotifyRedo(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
 #if MAX_SDK_VERSION >= 2027
     const MCHAR* desc = GetNotifyParam<NOTIFY_SCENE_REDO>(info);
@@ -527,24 +560,29 @@ static void NotifyRedo(void* param, NotifyInfo* info) {
 
 // File and scene events
 static void NotifyFilePostOpen(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive) return;
     PushEvent("file_opened", "");
 }
 static void NotifySceneReset(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive) return;
     PushEvent("scene_reset", "");
 }
 static void NotifyRenderStart(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive) return;
     PushEvent("render_start", "");
 }
 static void NotifyRenderEnd(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive) return;
     PushEvent("render_end", "");
 }
 
 // Node linked/unlinked — callParam is INode*
 static void NotifyNodeLinked(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
     INode* node = GET_NOTIFY_NODE(info, NOTIFY_NODE_LINKED);
     std::string detail = node ? WideToUtf8(node->GetName()) : "";
@@ -556,6 +594,7 @@ static void NotifyNodeLinked(void* param, NotifyInfo* info) {
     PushEvent("node_linked", detail);
 }
 static void NotifyNodeUnlinked(void* param, NotifyInfo* info) {
+    CallbackScope scope;
     if (!g_watcherActive || !info) return;
     INode* node = GET_NOTIFY_NODE(info, NOTIFY_NODE_UNLINKED);
     PushEvent("node_unlinked", node ? WideToUtf8(node->GetName()) : "");
@@ -616,42 +655,78 @@ static void UnregisterWatcherCallbacks() {
     g_callbacksRegistered = false;
 }
 
+// McpCoreApi::shutdown, on Max's main thread with no request in flight: Max
+// keeps the overlay object and the notification functions, all core code, so
+// they must go before the core is unloaded. The event buffer is diagnostic
+// and dies with the core; a reloaded core starts with watching off.
+void NativeHandlers::ShutdownSceneWatcher() {
+    g_watcherActive = false;
+    UnregisterOverlay(false);
+    UnregisterWatcherCallbacks();
+}
+
 // ═════════════════════════════════════════════════════════════════
 // native:watch_scene handler
 // ═════════════════════════════════════════════════════════════════
 
+// Suspends this pipe worker's direct mode, so ExecuteSync marshals to Max's
+// main thread.
+class MainThreadScope {
+public:
+    MainThreadScope() : direct_(HostExecutor::IsDirectMode()) {
+        if (direct_) HostExecutor::DisableDirectMode();
+    }
+    ~MainThreadScope() {
+        if (!direct_) return;
+        try { HostExecutor::EnableDirectMode(); } catch (...) {}
+    }
+    MainThreadScope(const MainThreadScope&) = delete;
+    MainThreadScope& operator=(const MainThreadScope&) = delete;
+
+private:
+    bool direct_;
+};
+
 std::string NativeHandlers::WatchScene(const std::string& params, MCPBridgeGUP* gup) {
-    return gup->GetExecutor().ExecuteSync([&params]() -> std::string {
-        json p = params.empty() ? json::object() : json::parse(params, nullptr, false);
-        std::string action = p.value("action", "status");
+    json p = params.empty() ? json::object() : json::parse(params, nullptr, false);
+    const std::string action = p.value("action", "status");
 
-        if (action == "start") {
-            RegisterWatcherCallbacks();
-            g_watcherActive = true;
-            RegisterOverlay();
-            json result;
-            result["watching"] = true;
-            result["overlay"] = true;
-            result["events_tracked"] = json::array({
-                "node_created", "node_deleted", "selection_changed",
-                "modifier_added", "modifier_deleted", "material_assigned",
-                "node_renamed", "node_hidden", "node_unhidden",
-                "node_frozen", "node_unfrozen", "subobject_changed",
-                "undo", "redo", "node_linked", "node_unlinked",
-                "file_opened", "scene_reset", "render_start", "render_end"
-            });
-            return result.dump();
-        }
+    // A direct handler: get, status and clear read the mutex-guarded buffer on
+    // the pipe worker, so a busy main thread (render, long MAXScript) does not
+    // hold them up. start and stop register with Max and run on its main
+    // thread.
+    if (action == "start" || action == "stop") {
+        MainThreadScope onMainThread;
+        return gup->GetExecutor().ExecuteSync([&action]() -> std::string {
+            if (action == "start") {
+                RegisterWatcherCallbacks();
+                g_watcherActive = true;
+                RegisterOverlay();
+                json result;
+                result["watching"] = true;
+                result["overlay"] = true;
+                result["events_tracked"] = json::array({
+                    "node_created", "node_deleted", "selection_changed",
+                    "modifier_added", "modifier_deleted", "material_assigned",
+                    "node_renamed", "node_hidden", "node_unhidden",
+                    "node_frozen", "node_unfrozen", "subobject_changed",
+                    "undo", "redo", "node_linked", "node_unlinked",
+                    "file_opened", "scene_reset", "render_start", "render_end"
+                });
+                return result.dump();
+            }
 
-        if (action == "stop") {
+            // stop
             g_watcherActive = false;
             UnregisterOverlay();
             json result;
             result["watching"] = false;
             result["overlay"] = false;
             return result.dump();
-        }
+        });
+    }
 
+    return gup->GetExecutor().ExecuteSync([&p, &action]() -> std::string {
         if (action == "clear") {
             std::lock_guard<std::mutex> lock(g_eventMutex);
             g_eventBuffer.clear();
@@ -677,7 +752,7 @@ std::string NativeHandlers::WatchScene(const std::string& params, MCPBridgeGUP* 
             }
 
             json result;
-            result["watching"] = g_watcherActive;
+            result["watching"] = g_watcherActive.load();
             result["events"] = events;
             result["eventCount"] = events.size();
             result["bufferTotal"] = g_eventBuffer.size();
@@ -686,10 +761,13 @@ std::string NativeHandlers::WatchScene(const std::string& params, MCPBridgeGUP* 
 
         // status
         json result;
-        result["watching"] = g_watcherActive;
-        result["overlay"] = g_overlayRegistered;
-        result["callbacksRegistered"] = g_callbacksRegistered;
-        result["bufferedEvents"] = g_eventBuffer.size();
+        result["watching"] = g_watcherActive.load();
+        result["overlay"] = g_overlayRegistered.load();
+        result["callbacksRegistered"] = g_callbacksRegistered.load();
+        {
+            std::lock_guard<std::mutex> lock(g_eventMutex);
+            result["bufferedEvents"] = g_eventBuffer.size();
+        }
         result["maxBuffer"] = MAX_EVENTS;
         return result.dump();
     });

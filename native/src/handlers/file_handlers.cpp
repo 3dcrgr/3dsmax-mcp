@@ -1,13 +1,15 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 
 #include <triobj.h>
 #include <objbase.h>
 #include <propidl.h>
 #include <propkey.h>
-#include <future>
+#include <algorithm>
+#include <atomic>
 #include <set>
+#include <thread>
 
 using json = nlohmann::json;
 using namespace HandlerHelpers;
@@ -496,32 +498,58 @@ std::string NativeHandlers::BatchFileInfo(const std::string& params, MCPBridgeGU
 
     // For metadata-only mode, we can parallelize on worker threads
     if (!listObjects) {
-        // Launch async tasks for each file
-        std::vector<std::future<json>> futures;
-        for (const auto& fp : filePaths) {
-            futures.push_back(std::async(std::launch::async, [fp]() -> json {
-                json fileInfo;
-                fileInfo["filePath"] = fp;
+        // Workers pull files by index. Every thread is joined before this
+        // returns, so no core code runs after the request (a core reload may
+        // unload it); std::async's pool could still be finishing its task.
+        std::vector<json> infos(filePaths.size());
+        std::vector<std::string> failures(filePaths.size());
+        std::atomic<size_t> next{0};
+        const auto work = [&]() noexcept {
+            for (size_t i = next++; i < filePaths.size(); i = next++) {
+                try {
+                    const std::string& fp = filePaths[i];
+                    json fileInfo;
+                    fileInfo["filePath"] = fp;
 
-                std::wstring wpath = Utf8ToWide(fp);
-                DWORD attrib = GetFileAttributesW(wpath.c_str());
-                if (attrib == INVALID_FILE_ATTRIBUTES) {
-                    fileInfo["error"] = "File not found";
-                    return fileInfo;
+                    std::wstring wpath = Utf8ToWide(fp);
+                    DWORD attrib = GetFileAttributesW(wpath.c_str());
+                    if (attrib == INVALID_FILE_ATTRIBUTES) {
+                        fileInfo["error"] = "File not found";
+                    } else {
+                        // COM init for this file on this thread
+                        const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                        try {
+                            fileInfo["metadata"] = ReadOLEMetadata(wpath);
+                        } catch (...) {
+                            if (SUCCEEDED(com)) CoUninitialize();
+                            throw;
+                        }
+                        if (SUCCEEDED(com)) CoUninitialize();
+                    }
+                    infos[i] = std::move(fileInfo);
+                } catch (const std::exception& e) {
+                    failures[i] = e.what();
+                } catch (...) {
+                    failures[i] = "Unknown exception reading file metadata";
                 }
-
-                // COM init for this thread
-                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-                fileInfo["metadata"] = ReadOLEMetadata(wpath);
-                CoUninitialize();
-                return fileInfo;
-            }));
+            }
+        };
+        const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+        const size_t workerCount = std::min<size_t>(filePaths.size(), std::min(cores, 8u)) - 1;
+        std::vector<std::thread> workers;
+        try {
+            for (size_t i = 0; i < workerCount; ++i) workers.emplace_back(work);
+        } catch (...) {
+            // Fewer workers; this thread still finishes every file below.
         }
+        work();
+        for (auto& worker : workers) worker.join();
 
-        // Collect results
+        // Collect results; a failure fails the request, as before.
         json results = json::array();
-        for (auto& f : futures) {
-            results.push_back(f.get());
+        for (size_t i = 0; i < infos.size(); ++i) {
+            if (!failures[i].empty()) throw std::runtime_error(failures[i]);
+            results.push_back(std::move(infos[i]));
         }
 
         json response;

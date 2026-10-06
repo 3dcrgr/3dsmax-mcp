@@ -1,6 +1,6 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 #include "mcp_bridge/capture_region.h"
 
 #include <notify.h>
@@ -50,93 +50,9 @@ std::string NativeHandlers::RenderScene(const std::string& params, MCPBridgeGUP*
 // registers Max's own NOTIFY_POST_RENDER and writes a small signal file at the
 // exact completion event. An external watcher reacts to that file — nothing
 // polls Max, nothing runs inside Max except the render itself.
-
-namespace {
-
-struct RenderJobState {
-    std::mutex mtx;
-    bool active = false;          // a render_start job is in flight
-    bool registered = false;      // notifications hooked
-    bool cancel_requested = false;
-    bool started = false;
-    std::string job_id;
-    std::string output;
-    std::string signal_path;      // where to write the done-signal
-    int frames_expected = 0;
-    int frames_done = 0;
-};
-
-RenderJobState g_job;
-
-// Atomic-ish write: dump to <path>.tmp, then rename over the target so a
-// watcher never observes a half-written file.
-void WriteSignalFile(const std::string& path, const json& doc) {
-    std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) return;
-        const std::string s = doc.dump();
-        f.write(s.data(), static_cast<std::streamsize>(s.size()));
-    }
-    std::wstring wtmp = HandlerHelpers::Utf8ToWide(tmp);
-    std::wstring wdst = HandlerHelpers::Utf8ToWide(path);
-    MoveFileExW(wtmp.c_str(), wdst.c_str(), MOVEFILE_REPLACE_EXISTING);
-}
-
-// NOTIFY_POST_RENDERFRAME — fires once per completed frame.
-void OnPreRender(void*, NotifyInfo*) {
-    std::lock_guard<std::mutex> lk(g_job.mtx);
-    if(g_job.active) g_job.started=true;
-}
-
-void OnPostRenderFrame(void* /*param*/, NotifyInfo* /*info*/) {
-    std::lock_guard<std::mutex> lk(g_job.mtx);
-    if (g_job.active) g_job.frames_done++;
-}
-
-// NOTIFY_POST_RENDER — fires once when the whole render job finishes.
-void OnPostRender(void* /*param*/, NotifyInfo* /*info*/) {
-    std::string path;
-    json doc;
-    {
-        std::lock_guard<std::mutex> lk(g_job.mtx);
-        if (!g_job.active) return;  // not our render (e.g. a manual one)
-        // Report ONLY what was observed. The bridge arms before the render is
-        // fired and does not control it, so any arm-time frame prediction is
-        // unreliable (an agent must never read "1 frame" for a 101-frame render).
-        // frames_rendered is the live NOTIFY_POST_RENDERFRAME count = the truth.
-        doc["status"] = "complete";
-        doc["job_id"] = g_job.job_id;
-        doc["output"] = g_job.output;
-        doc["frames_rendered"] = g_job.frames_done;  // actual, counted per frame
-        doc["complete"] = true;                       // POST_RENDER = job finished
-        doc["cancel_requested"] = g_job.cancel_requested;
-        doc["outcome"] = "unknown"; // POST_RENDER also follows cancellation.
-        path = g_job.signal_path;
-        g_job.active = false;
-    }
-    WriteSignalFile(path, doc);
-}
-
-} // namespace
-
-void NativeHandlers::RegisterRenderNotifications() {
-    std::lock_guard<std::mutex> lk(g_job.mtx);
-    if (g_job.registered) return;
-    RegisterNotification(OnPostRenderFrame, nullptr, NOTIFY_POST_RENDERFRAME);
-    RegisterNotification(OnPreRender, nullptr, NOTIFY_PRE_RENDER);
-    RegisterNotification(OnPostRender, nullptr, NOTIFY_POST_RENDER);
-    g_job.registered = true;
-}
-
-void NativeHandlers::UnregisterRenderNotifications() {
-    std::lock_guard<std::mutex> lk(g_job.mtx);
-    if (!g_job.registered) return;
-    UnRegisterNotification(OnPostRenderFrame, nullptr, NOTIFY_POST_RENDERFRAME);
-    UnRegisterNotification(OnPreRender, nullptr, NOTIFY_PRE_RENDER);
-    UnRegisterNotification(OnPostRender, nullptr, NOTIFY_POST_RENDER);
-    g_job.registered = false;
-}
+//
+// The armed job, its notifications and the signal writer belong to the shell
+// (render_host.cpp); these handlers reach them through McpHost::RenderHost.
 
 std::string NativeHandlers::RenderStart(const std::string& params, MCPBridgeGUP* gup) {
     // This does NOT fire a render — firing a render from the bridge is what made
@@ -156,9 +72,9 @@ std::string NativeHandlers::RenderStart(const std::string& params, MCPBridgeGUP*
         // One render_start at a time. All arming happens on the main thread, so
         // this check cannot race with another start.
         {
-            std::lock_guard<std::mutex> lk(g_job.mtx);
-            if (g_job.active)
-                return std::string("BUSY:") + g_job.job_id;
+            std::string activeJob;
+            if (McpHost::RenderHost::ActiveJob(activeJob))
+                return std::string("BUSY:") + activeJob;
         }
 
         // One read, no mutation: the Render Setup time configuration + output,
@@ -210,17 +126,7 @@ std::string NativeHandlers::RenderStart(const std::string& params, MCPBridgeGUP*
         // OnPostRender writes the signal file to signal_path.
         //
         // Arm LAST — no error path above may leave a half-armed job.
-        {
-            std::lock_guard<std::mutex> lk(g_job.mtx);
-            g_job.active = true;
-            g_job.cancel_requested = false;
-            g_job.started = false;
-            g_job.job_id = jobId;
-            g_job.output = output;
-            g_job.signal_path = signalPath;
-            g_job.frames_expected = expected;
-            g_job.frames_done = 0;
-        }
+        McpHost::RenderHost::Arm(jobId, output, signalPath, expected);
 
         // No frame count is reported at arm time — it would be a guess (the render
         // is fired externally and may differ from this reading). The real count
@@ -263,28 +169,25 @@ std::string NativeHandlers::RenderCancel(const std::string& params, MCPBridgeGUP
     const auto p=params.empty() ? json::object() : json::parse(params);
     const auto expectedJob=p.value("job_id","");
     json j;
-    std::unique_lock<std::mutex> jobLock(g_job.mtx);
+    // The shell holds the job lock across the check, the report and AbortRender().
+    const auto job=McpHost::RenderHost::Cancel(expectedJob);
     {
-        if(!expectedJob.empty() && (!g_job.active || !g_job.started || expectedJob!=g_job.job_id))
+        if(job.outcome==kMcpRenderCancelRefused)
             return json({{"status","not_cancelled"},{"cancel_requested",false},
                 {"error","Render job is no longer active or does not match; no global abort was sent"}}).dump();
-        j["had_active_job"] = g_job.active;
-        if (g_job.active) {
-            j["job_id"] = g_job.job_id;
-            j["frames_done"] = g_job.frames_done;
-            j["frames_expected"] = g_job.frames_expected;
+        j["had_active_job"] = job.hadActiveJob;
+        if (job.hadActiveJob) {
+            j["job_id"] = job.jobId;
+            j["frames_done"] = job.framesDone;
+            j["frames_expected"] = job.framesExpected;
         }
     }
 
-    Interface* ip = GetCOREInterface();
-    if (!ip) {
+    if (job.outcome==kMcpRenderCancelNoInterface) {
         j["status"] = "error";
         j["error"] = "core interface unavailable";
         return j.dump();
     }
-    ip->AbortRender();
-    if(g_job.active) g_job.cancel_requested=true;
-    jobLock.unlock();
 
     j["status"] = "cancelling";
     j["cancel_requested"] = true;

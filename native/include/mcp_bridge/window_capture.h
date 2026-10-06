@@ -11,4 +11,8 @@ struct Result {
     const char* method;
 };
 Result Client(HWND window);
+// Core shutdown: releases the activation factories C++/WinRT cached for
+// capture. The cache lives in this module and has no destructor, so without
+// this every core unload would leak the OS factory references it holds.
+void ReleaseFactories() noexcept;
 }

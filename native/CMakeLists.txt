@@ -70,21 +70,44 @@ add_custom_command(
 )
 add_custom_target(gen_tool_smoke DEPENDS "${TOOL_SMOKE_INC}")
 
-# ── Sources ──────────────────────────────────────────────────────
-set(SOURCES
+# ── Shell / core partition ───────────────────────────────────────
+# SHELL: what Max loads and keeps, and everything Max holds a pointer to:
+# plugin registration, named pipe, main-thread executor, dialog monitor and its
+# Qt reader, scene journal, GDI+ lifetime, the agent viewport, render_start's
+# armed job and notifications, and undo records. It answers ping,
+# native:max_dialogs and native:core itself and reaches the core only through
+# McpCoreApi, behind the drain gate (core_control.cpp, core_host.cpp).
+set(MCP_SHELL_SOURCES
     src/dllmain.cpp
     src/bridge_gup.cpp
     src/pipe_server.cpp
-    src/command_dispatcher.cpp
     src/main_thread_executor.cpp
     src/dialog_watch.cpp
+    src/qt_dialogs.cpp
     src/gdiplus_runtime.cpp
     src/scene_journal.cpp
+    src/agent_viewport.cpp
+    src/render_host.cpp
+    src/undo_records.cpp
+    src/core_host.cpp
+    src/core_control.cpp
+)
+
+# SHARED: stateless code both sides call (agent viewport and handlers). Linked
+# once into the .gup; with MCP_HOT_CORE, into the shell and the core DLL alike.
+set(MCP_SHARED_SOURCES
+    src/spatial_snapshot.cpp
+)
+
+# CORE: command dispatch and the handlers, exported as mcp_core_api. It
+# reaches the shell only through McpHostApi (host_api.h, core_bridge.cpp).
+set(MCP_CORE_SOURCES
+    src/core_api.cpp
+    src/core_bridge.cpp
+    src/command_dispatcher.cpp
     src/handlers/scene_handlers.cpp
     src/handlers/scene_patch_handlers.cpp
     src/handlers/scene_qa_handlers.cpp
-    src/spatial_snapshot.cpp
-    src/agent_viewport.cpp
     src/handlers/object_handlers.cpp
     src/handlers/orientation_handlers.cpp
     src/handlers/modifier_handlers.cpp
@@ -112,17 +135,64 @@ set(SOURCES
     src/handlers/capabilities_handlers.cpp
     src/handlers/tool_test_handlers.cpp
     src/native_tool_registry.cpp
+    src/window_capture.cpp
 )
 
-add_library(mcp_bridge SHARED ${SOURCES})
-target_sources(mcp_bridge PRIVATE src/window_capture.cpp)
+# OFF (default): the core objects are linked into mcp_bridge.gup and the shell
+# binds mcp_core_api directly. ON: the same objects form core/mcp_core.dll,
+# which the shell maps from a shadow copy and swaps on native:core reload.
+option(MCP_HOT_CORE "Build the reloadable core as a separate DLL (dev only)" OFF)
 
-add_dependencies(mcp_bridge gen_tool_registry gen_tool_smoke)
+# ── Shared build settings ────────────────────────────────────────
+# One definition for the shell, the core objects and the core DLL, so the
+# settings that shape the ABI across the boundary cannot diverge.
+add_library(mcp_bridge_settings INTERFACE)
+target_include_directories(mcp_bridge_settings INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+    "${MAXSDK_PATH}/include"
+)
+target_compile_definitions(mcp_bridge_settings INTERFACE
+    NOMINMAX
+    _UNICODE UNICODE
+    WIN32 _WIN32
+    _USRDLL
+    _CRT_SECURE_NO_WARNINGS
+    MAX_SILENCE_DEPRECATED_MATRIX_BOOL_CTOR
+    MAX_SDK_VERSION=${MAX_VERSION}
+    MCP_BRIDGE_VERSION="${MCP_BRIDGE_VERSION}"
+)
+target_link_directories(mcp_bridge_settings INTERFACE
+    "${MAXSDK_PATH}/lib/x64/Release"
+)
+target_link_libraries(mcp_bridge_settings INTERFACE
+    core.lib
+    maxutil.lib
+    gup.lib
+    Paramblk2.lib
+    Maxscrpt.lib
+    Geom.lib
+    mesh.lib
+    ViewSystem.lib
+    comctl32.lib
+)
+if(MSVC)
+    target_compile_options(mcp_bridge_settings INTERFACE /W3 /MP /EHa)
+endif()
+
+# The runtime library is a target property, not a usage requirement.
+function(mcp_bridge_apply_settings target)
+    target_link_libraries(${target} PRIVATE mcp_bridge_settings)
+    if(MSVC)
+        set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY
+            "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    endif()
+endfunction()
 
 # ── Qt dialogs ───────────────────────────────────────────────────
-# qt_dialogs.cpp reads Qt dialogs through the Qt DLLs Max already loads; no Qt
-# binary is shipped. It compiles against vendored headers of the oldest Qt of
-# Max's major version and links import libraries generated from the vendored
+# qt_dialogs.cpp (shell) reads Qt dialogs through the Qt DLLs Max already loads;
+# no Qt binary is shipped. It compiles against vendored headers of the oldest Qt
+# of Max's major version and links import libraries generated from the vendored
 # symbol lists. Regenerate both with scripts/vendor_qt.py.
 if(MAX_VERSION GREATER_EQUAL 2025)
     set(MCP_QT_VERSION "6.5.3")
@@ -148,13 +218,29 @@ foreach(def ${MCP_QT_DEFS})
     list(APPEND MCP_QT_IMPORT_LIBS "${import_lib}")
 endforeach()
 add_custom_target(qt_import_libs DEPENDS ${MCP_QT_IMPORT_LIBS})
-add_dependencies(mcp_bridge qt_import_libs)
-target_sources(mcp_bridge PRIVATE src/qt_dialogs.cpp)
 set_source_files_properties(src/qt_dialogs.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${MCP_QT_DIR}/include"
     COMPILE_DEFINITIONS "QT_NO_VERSION_TAGGING"
     COMPILE_OPTIONS "/Zc:__cplusplus;/permissive-")
+
+# ── Object libraries ─────────────────────────────────────────────
+add_library(mcp_shared_objs OBJECT ${MCP_SHARED_SOURCES})
+mcp_bridge_apply_settings(mcp_shared_objs)
+
+add_library(mcp_core_objs OBJECT ${MCP_CORE_SOURCES})
+mcp_bridge_apply_settings(mcp_core_objs)
+# The generated native tool registry and smoke cases are core-only.
+target_include_directories(mcp_core_objs PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"          # for generated/native_tool_registry.inc
+)
+add_dependencies(mcp_core_objs gen_tool_registry gen_tool_smoke)
+
+# ── Plugin ───────────────────────────────────────────────────────
+add_library(mcp_bridge SHARED ${MCP_SHELL_SOURCES} src/mcp_bridge.def)
+mcp_bridge_apply_settings(mcp_bridge)
+target_sources(mcp_bridge PRIVATE $<TARGET_OBJECTS:mcp_shared_objs>)
 target_link_libraries(mcp_bridge PRIVATE ${MCP_QT_IMPORT_LIBS})
+add_dependencies(mcp_bridge mcp_shared_objs qt_import_libs)
 
 # Output as .gup
 set_target_properties(mcp_bridge PROPERTIES
@@ -162,50 +248,27 @@ set_target_properties(mcp_bridge PROPERTIES
     OUTPUT_NAME "mcp_bridge"
 )
 
-target_sources(mcp_bridge PRIVATE src/mcp_bridge.def)
-
-# ── Includes ─────────────────────────────────────────────────────
-target_include_directories(mcp_bridge PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    "${CMAKE_CURRENT_SOURCE_DIR}"          # for generated/native_tool_registry.inc
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
-    "${MAXSDK_PATH}/include"
-)
-
-# ── Preprocessor ─────────────────────────────────────────────────
-target_compile_definitions(mcp_bridge PRIVATE
-    NOMINMAX
-    _UNICODE UNICODE
-    WIN32 _WIN32
-    _USRDLL
-    _CRT_SECURE_NO_WARNINGS
-    MAX_SILENCE_DEPRECATED_MATRIX_BOOL_CTOR
-    MAX_SDK_VERSION=${MAX_VERSION}
-    MCP_BRIDGE_VERSION="${MCP_BRIDGE_VERSION}"
-)
-
-# ── Link ─────────────────────────────────────────────────────────
-target_link_directories(mcp_bridge PRIVATE
-    "${MAXSDK_PATH}/lib/x64/Release"
-)
-
-target_link_libraries(mcp_bridge PRIVATE
-    core.lib
-    maxutil.lib
-    gup.lib
-    Paramblk2.lib
-    Maxscrpt.lib
-    Geom.lib
-    mesh.lib
-    ViewSystem.lib
-    comctl32.lib
-)
-
-# ── MSVC ─────────────────────────────────────────────────────────
-if(MSVC)
-    target_compile_options(mcp_bridge PRIVATE /W3 /MP /EHa)
-    set_property(TARGET mcp_bridge PROPERTY MSVC_RUNTIME_LIBRARY
-        "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+if(MCP_HOT_CORE)
+    # Development layout: no install rule; the shell loads core/mcp_core.dll
+    # beside it (or MCP_CORE_DLL, or the path in mcp_core.path).
+    message(STATUS "MCP_HOT_CORE: building core/mcp_core.dll and a shell that reloads it (dev only)")
+    target_sources(mcp_bridge PRIVATE src/core_loader.cpp)
+    target_compile_definitions(mcp_core_objs PRIVATE MCP_CORE_DLL)
+    add_library(mcp_core SHARED $<TARGET_OBJECTS:mcp_core_objs> $<TARGET_OBJECTS:mcp_shared_objs>)
+    mcp_bridge_apply_settings(mcp_core)
+    add_dependencies(mcp_core mcp_core_objs mcp_shared_objs)
+    set_target_properties(mcp_core PROPERTIES
+        SUFFIX ".dll"
+        OUTPUT_NAME "mcp_core"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/core"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/core"
+        PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/core"
+    )
+    target_compile_definitions(mcp_bridge PRIVATE MCP_HOT_CORE=1)
+    add_dependencies(mcp_bridge mcp_core)
+else()
+    target_sources(mcp_bridge PRIVATE $<TARGET_OBJECTS:mcp_core_objs>)
+    add_dependencies(mcp_bridge mcp_core_objs)
 endif()
 
 # ── Deploy ───────────────────────────────────────────────────────
@@ -225,11 +288,53 @@ if(MCP_BUILD_TRANSACTION_POLICY_TESTS)
     target_include_directories(dialog_sweeper_tests PRIVATE include third_party)
     target_compile_definitions(dialog_sweeper_tests PRIVATE NOMINMAX _UNICODE UNICODE)
     add_test(NAME dialog_sweeper COMMAND dialog_sweeper_tests)
+
+    # Core lifecycle: drain gate, swap sequence, version gate, shell control
+    # protocol, envelope and source resolution, with fake cores in process.
+    add_executable(core_reload_tests tests/core_reload_tests.cpp)
+    target_include_directories(core_reload_tests PRIVATE include third_party)
+    target_compile_definitions(core_reload_tests PRIVATE NOMINMAX _UNICODE UNICODE)
+    target_compile_options(core_reload_tests PRIVATE /EHa)
+    add_test(NAME core_reload COMMAND core_reload_tests)
+
+    # The shadow-copy loader against fake core DLLs: a matching one, an older
+    # API version, one without the export, and one importing from a DLL that
+    # does not exist (its import library comes from a generated .def).
+    set(MCP_MISSING_DEF "${CMAKE_CURRENT_BINARY_DIR}/mcp_missing_dependency.def")
+    set(MCP_MISSING_LIB "${CMAKE_CURRENT_BINARY_DIR}/mcp_missing_dependency.lib")
+    file(WRITE "${MCP_MISSING_DEF}" "LIBRARY mcp_missing_dependency\nEXPORTS\n    mcp_missing_function\n")
+    add_custom_command(
+        OUTPUT "${MCP_MISSING_LIB}"
+        COMMAND "${CMAKE_AR}" /nologo "/def:${MCP_MISSING_DEF}" "/out:${MCP_MISSING_LIB}" /machine:x64
+        DEPENDS "${MCP_MISSING_DEF}"
+        COMMENT "Generating the import library of a DLL that does not exist"
+        VERBATIM)
+    add_custom_target(mcp_missing_dependency_lib DEPENDS "${MCP_MISSING_LIB}")
+    foreach(fake fake_core fake_core_v1 fake_core_noexport fake_core_badimport)
+        add_library(${fake} SHARED tests/fake_core.cpp)
+        target_include_directories(${fake} PRIVATE include)
+        target_compile_definitions(${fake} PRIVATE MCP_CORE_DLL MAX_SDK_VERSION=${MAX_VERSION})
+    endforeach()
+    target_compile_definitions(fake_core_v1 PRIVATE FAKE_CORE_API_VERSION=1)
+    target_compile_definitions(fake_core_noexport PRIVATE FAKE_CORE_NO_EXPORT)
+    target_compile_definitions(fake_core_badimport PRIVATE FAKE_CORE_MISSING_IMPORT)
+    target_link_libraries(fake_core_badimport PRIVATE "${MCP_MISSING_LIB}")
+    add_dependencies(fake_core_badimport mcp_missing_dependency_lib)
+    add_executable(core_loader_tests tests/core_loader_tests.cpp src/core_loader.cpp)
+    target_include_directories(core_loader_tests PRIVATE include)
+    target_compile_definitions(core_loader_tests PRIVATE NOMINMAX _UNICODE UNICODE MAX_SDK_VERSION=${MAX_VERSION}
+        "FAKE_CORE=\"$<TARGET_FILE:fake_core>\""
+        "FAKE_CORE_V1=\"$<TARGET_FILE:fake_core_v1>\""
+        "FAKE_CORE_NOEXPORT=\"$<TARGET_FILE:fake_core_noexport>\""
+        "FAKE_CORE_BADIMPORT=\"$<TARGET_FILE:fake_core_badimport>\"")
+    add_dependencies(core_loader_tests fake_core fake_core_v1 fake_core_noexport fake_core_badimport)
+    add_test(NAME core_loader COMMAND core_loader_tests)
 endif()
 
 option(MCP_BUILD_AGENT_VIEWPORT_PROBE "Build optional live agent viewport SDK test harness" OFF)
 if(MCP_BUILD_AGENT_VIEWPORT_PROBE)
-    add_library(agent_viewport_probe SHARED tests/agent_viewport_probe.cpp src/agent_viewport.cpp src/spatial_snapshot.cpp src/scene_journal.cpp src/handlers/viewport_handlers.cpp src/gdiplus_runtime.cpp src/main_thread_executor.cpp src/dialog_watch.cpp)
+    add_library(agent_viewport_probe SHARED tests/agent_viewport_probe.cpp src/agent_viewport.cpp src/spatial_snapshot.cpp src/scene_journal.cpp src/handlers/viewport_handlers.cpp src/gdiplus_runtime.cpp src/main_thread_executor.cpp src/dialog_watch.cpp
+        src/core_bridge.cpp src/core_host.cpp src/render_host.cpp src/undo_records.cpp)
     target_include_directories(agent_viewport_probe PRIVATE include third_party "${MAXSDK_PATH}/include")
     target_compile_definitions(agent_viewport_probe PRIVATE NOMINMAX _UNICODE UNICODE MAX_SDK_VERSION=${MAX_VERSION} MAX_SILENCE_DEPRECATED_MATRIX_BOOL_CTOR)
     target_link_directories(agent_viewport_probe PRIVATE "${MAXSDK_PATH}/lib/x64/Release")
@@ -241,7 +346,9 @@ endif()
 set(MAX_PLUGINS_DIR "C:/Program Files/Autodesk/3ds Max ${MAX_VERSION}/plugins"
     CACHE PATH "3ds Max plugins directory")
 
-install(TARGETS mcp_bridge
-    RUNTIME DESTINATION "${MAX_PLUGINS_DIR}"
-    LIBRARY DESTINATION "${MAX_PLUGINS_DIR}"
-)
+if(NOT MCP_HOT_CORE)
+    install(TARGETS mcp_bridge
+        RUNTIME DESTINATION "${MAX_PLUGINS_DIR}"
+        LIBRARY DESTINATION "${MAX_PLUGINS_DIR}"
+    )
+endif()

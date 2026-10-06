@@ -32,10 +32,18 @@ public:
     std::string ExecuteSync(std::function<std::string()> work,
                             DWORD timeout_ms = 120000);
 
-    // Direct mode control (thread-local, safe for concurrent pipe clients)
-    static void EnableDirectMode()  { tl_direct_mode_ = true; }
-    static void DisableDirectMode() { tl_direct_mode_ = false; }
-    static bool IsDirectMode()      { return tl_direct_mode_; }
+    // Direct mode control (thread-local, safe for concurrent pipe clients).
+    // Out of line: thread_local data cannot cross a DLL boundary, so the core
+    // reaches these through McpHostApi::setDirectMode/getDirectMode.
+    static void EnableDirectMode();
+    static void DisableDirectMode();
+    static bool IsDirectMode();
+
+    // True on the thread that called Initialize() (Max's main thread), where
+    // ExecuteSync runs work inline.
+    bool IsOwnThread() const {
+        return main_thread_id_ != 0 && GetCurrentThreadId() == main_thread_id_;
+    }
 
     struct WorkItem {
         std::function<std::string()> work;

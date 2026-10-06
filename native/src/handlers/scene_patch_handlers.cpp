@@ -1,8 +1,7 @@
 #include "mcp_bridge/native_handlers.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/node_ref.h"
-#include "mcp_bridge/scene_journal.h"
 
 #include <hold.h>
 
@@ -124,7 +123,7 @@ std::string FoldName(const std::string& value) {
         {"expectedSceneSeq", expected},
         {"currentSceneSeq", current},
         {"changes", expected < current
-            ? SceneJournal::MutationChangesSince(expected, 32)
+            ? McpHost::SceneJournal::MutationChangesSince(expected, 32)
             : json::array()},
         {"next", "Refresh scene state and retry with currentSceneSeq."},
     };
@@ -226,37 +225,13 @@ NodeFlags ReadFlags(INode* node) {
     return flags;
 }
 
-void ApplyFlagsSnapshot(INode* node, const NodeFlags& flags) {
-    if (!node) return;
-    node->Hide(flags.hidden ? TRUE : FALSE);
-    node->Freeze(flags.frozen ? TRUE : FALSE);
-    node->SetRenderable(flags.renderable ? TRUE : FALSE);
-    node->SetCastShadows(flags.castShadows ? TRUE : FALSE);
-    node->SetRcvShadows(flags.receiveShadows ? TRUE : FALSE);
+// The undo record lives in the shell (undo_records.cpp): Max keeps it after
+// the request, so its vtable must not point into the core.
+unsigned FlagBits(const NodeFlags& flags) {
+    return (flags.hidden ? kMcpNodeHidden : 0u) | (flags.frozen ? kMcpNodeFrozen : 0u) |
+        (flags.renderable ? kMcpNodeRenderable : 0u) | (flags.castShadows ? kMcpNodeCastShadows : 0u) |
+        (flags.receiveShadows ? kMcpNodeReceiveShadows : 0u);
 }
-
-class NodeFlagsRestore final : public RestoreObj {
-public:
-    NodeFlagsRestore(INode* node, const NodeFlags& before, const NodeFlags& after)
-        : node_(node), before_(before), after_(after) {}
-
-    void Restore(int /*isUndo*/) override {
-        ApplyFlagsSnapshot(node_, before_);
-    }
-
-    void Redo() override {
-        ApplyFlagsSnapshot(node_, after_);
-    }
-
-    int Size() override {
-        return static_cast<int>(sizeof(*this));
-    }
-
-private:
-    INode* node_ = nullptr;
-    NodeFlags before_;
-    NodeFlags after_;
-};
 
 json NullableNodeRef(INode* node) {
     return node && !node->IsRootNode() ? NodeRefs::ToJson(node) : json(nullptr);
@@ -561,7 +536,7 @@ void ApplyOperation(const PlannedOperation& item, Interface* ip, TimeValue time)
         if (item.args.contains("renderable")) after.renderable = item.args["renderable"].get<bool>();
         if (item.args.contains("cast_shadows")) after.castShadows = item.args["cast_shadows"].get<bool>();
         if (item.args.contains("receive_shadows")) after.receiveShadows = item.args["receive_shadows"].get<bool>();
-        theHold.Put(new NodeFlagsRestore(item.target, before, after));
+        McpHost::UndoRecords::PutNodeFlagsRestore(item.target, FlagBits(before), FlagBits(after));
         if (item.args.contains("hidden")) item.target->Hide(item.args["hidden"].get<bool>());
         if (item.args.contains("frozen")) item.target->Freeze(item.args["frozen"].get<bool>());
         if (item.args.contains("renderable")) item.target->SetRenderable(item.args["renderable"].get<bool>());
@@ -624,7 +599,7 @@ std::string NativeHandlers::ResolveNodeRefs(const std::string& params, MCPBridge
                 "BAD_PARAM", "refs exceeds the 256-item limit."));
         }
 
-        SceneJournal::FlushPending();
+        McpHost::SceneJournal::FlushPending();
         json resolved = json::array();
         for (size_t index = 0; index < payload["refs"].size(); ++index) {
             try {
@@ -645,9 +620,9 @@ std::string NativeHandlers::ResolveNodeRefs(const std::string& params, MCPBridge
 
         json result;
         result["refs"] = std::move(resolved);
-        result["sceneSeq"] = SceneJournal::CurrentMutationSeq();
-        result["activitySeq"] = SceneJournal::CurrentSeq();
-        result["journal"] = SceneJournal::IsRegistered();
+        result["sceneSeq"] = McpHost::SceneJournal::CurrentMutationSeq();
+        result["activitySeq"] = McpHost::SceneJournal::CurrentSeq();
+        result["journal"] = McpHost::SceneJournal::IsRegistered();
         return result.dump();
     });
 }
@@ -681,15 +656,15 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
         }
 
         const ExpectedSequence expected = ParseExpectedSequence(payload);
-        if (expected.present && !SceneJournal::IsRegistered()) {
+        if (expected.present && !McpHost::SceneJournal::IsRegistered()) {
             throw std::runtime_error(StructuredErrorPayload(
                 "SCENE_JOURNAL_UNAVAILABLE",
                 "expected_scene_seq requires the native scene journal."));
         }
 
-        SceneJournal::FlushPending();
-        const unsigned long long beforeActivitySeq = SceneJournal::CurrentSeq();
-        const unsigned long long beforeSeq = SceneJournal::CurrentMutationSeq();
+        McpHost::SceneJournal::FlushPending();
+        const unsigned long long beforeActivitySeq = McpHost::SceneJournal::CurrentSeq();
+        const unsigned long long beforeSeq = McpHost::SceneJournal::CurrentMutationSeq();
         if (expected.present && expected.value != beforeSeq) {
             ThrowSceneConflict(
                 expected.value, beforeSeq, "Scene changed since expected_scene_seq.");
@@ -701,9 +676,9 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
         std::vector<PlannedOperation> plan = BuildPlan(
             payload["operations"], ip, time, allNodes);
 
-        SceneJournal::FlushPending();
-        const unsigned long long readyActivitySeq = SceneJournal::CurrentSeq();
-        const unsigned long long readySeq = SceneJournal::CurrentMutationSeq();
+        McpHost::SceneJournal::FlushPending();
+        const unsigned long long readyActivitySeq = McpHost::SceneJournal::CurrentSeq();
+        const unsigned long long readySeq = McpHost::SceneJournal::CurrentMutationSeq();
         if (readySeq != beforeSeq) {
             ThrowSceneConflict(
                 beforeSeq, readySeq, "Scene changed while scene_patch was preflighting.");
@@ -722,7 +697,7 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
             {"after", readyActivitySeq},
         };
         if (expected.present) result["sceneSeq"]["expected"] = expected.value;
-        result["journal"] = SceneJournal::IsRegistered();
+        result["journal"] = McpHost::SceneJournal::IsRegistered();
         result["counts"] = {
             {"operations", plan.size()},
             {"changed", changedCount},
@@ -746,14 +721,14 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
             ip->RedrawViews(time);
             result["operations"] = BuildProofArray(plan, time, true);
             result["touched"] = UniqueTouchedRefs(plan);
-            DialogWatch::ThrowIfDismissed();
+            McpHost::DialogWatch::ThrowIfDismissed();
             transaction.Accept();
         } catch (const std::exception& error) {
             try {
                 transaction.Cancel();
             } catch (...) {
             }
-            SceneJournal::FlushPending();
+            McpHost::SceneJournal::FlushPending();
             json cause = json::parse(error.what(), nullptr, false);
             if (cause.is_discarded()) cause = error.what();
             throw std::runtime_error(StructuredErrorPayload(
@@ -769,26 +744,26 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
                 transaction.Cancel();
             } catch (...) {
             }
-            SceneJournal::FlushPending();
+            McpHost::SceneJournal::FlushPending();
             throw std::runtime_error(StructuredErrorPayload(
                 "PATCH_APPLY_FAILED",
                 "scene_patch failed and its native hold was cancelled.",
                 {{"operationIndex", applyingIndex}, {"rollback", "cancelled"}}));
         }
 
-        SceneJournal::FlushPending();
+        McpHost::SceneJournal::FlushPending();
         json handles = json::array();
         std::unordered_set<unsigned long long> seenHandles;
         for (const auto& item : plan) {
             const unsigned long long handle = NodeHandle(item.target);
             if (seenHandles.insert(handle).second) handles.push_back(handle);
         }
-        const unsigned long long afterSeq = SceneJournal::AppendSynthetic(
+        const unsigned long long afterSeq = McpHost::SceneJournal::AppendSynthetic(
             "scene_patch",
             {{"operationCount", plan.size()}, {"changedCount", changedCount}, {"handles", handles}});
         result["sceneSeq"]["after"] = afterSeq;
-        result["activitySeq"]["after"] = SceneJournal::CurrentSeq();
-        result["journalEventCount"] = SceneJournal::ChangesSince(beforeActivitySeq, 512).size();
+        result["activitySeq"]["after"] = McpHost::SceneJournal::CurrentSeq();
+        result["journalEventCount"] = McpHost::SceneJournal::ChangesSince(beforeActivitySeq, 512).size();
         result["undoLabel"] = label;
         return result.dump();
     });
