@@ -134,8 +134,8 @@ TOOLSET_SPECS = (
     ),
     ToolsetSpec(
         "scattering",
-        "Forest Pack scattering workflows.",
-        ("scattering",),
+        "Forest Pack: scatter, read and edit items, custom edit mode, library presets, list checks.",
+        ("scattering", "forest"),
     ),
     ToolsetSpec(
         "scene_effects",

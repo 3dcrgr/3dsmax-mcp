@@ -26,6 +26,7 @@ All notable changes to this project are documented here.
 - `install.py` now updates an existing Claude Code registration instead of skipping it, keeping its environment variables such as `MCP_TOOL_PROFILE`. Registration failures show the agent CLI's error.
 - `install.py` no longer replaces Claude Desktop, Cursor or Gemini settings it cannot parse (comments, invalid JSON), which previously deleted the other MCP servers in that file. It reads files saved with a BOM and writes settings atomically.
 - `install.py` no longer breaks the plugin package when 3ds Max is running. It used to delete the package, then fail to copy past the loaded bridge, leaving out `mcp_server.ms` (a missing-component warning at Max startup) while reporting success. It now stops with the plugin package untouched until Max is closed, and verifies every installed file.
+- Forest Pack: `scatter_forest_pack` now sets density through the tile size (`density` scales it; new `items_per_m2`), writes `direction` 100 for "up" (it wrote 1), and returns the real item count, failing with `ZERO_ITEMS` for an empty scatter. New tools: `forest_items` (instance-ready item transforms), `forest_edit_items` and `forest_set_mode` (custom edit mode), `forest_library` and `forest_from_library` (presets that scatter after retargeting), and `forest_validate` (list checks, conservative `fix`). Not tested live yet. See [docs/fork/forest-pack.md](fork/forest-pack.md).
 
 ## [1.7.3] — 2026-09-23
 

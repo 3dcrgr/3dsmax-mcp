@@ -67,6 +67,7 @@ MODULE_CATEGORY = {
     "railclone": "RailClone",
     "render": "Render",
     "scattering": "Scattering",
+    "forest": "Scattering",
     "state_sets": "State Sets",
     "tyflow": "tyFlow",
     "tool_test": "Tool Test",

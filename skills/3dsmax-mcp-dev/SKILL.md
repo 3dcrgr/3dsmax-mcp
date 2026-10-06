@@ -165,7 +165,8 @@ staleness rules, `harvest_tyflow_manifest` / `list_tyflow_operators`, `tyflow_ev
 and `capture_tyflow_editor` for foreign flows.
 
 ### Forest Pack
-- `scatter_forest_pack` — surfaces + source geometry; auto footprint per variant
+- `scatter_forest_pack` — surfaces + source geometry; auto footprint per variant. Density is the tile size (`items_per_m2`, or `density` as a % of `density_units_*_cm`); returns the real `count` and fails with `ZERO_ITEMS` when empty.
+- `forest_library` / `forest_from_library` place presets and 3D items (one-call merge with their sources, Surface Area activated, include/exclude splines, optional `matlib_renderer`); `forest_items` reads instance-ready item transforms; `forest_edit_items` needs custom edit mode (`allow_custom_edit` or `forest_set_mode`; back to procedural discards edits); run `forest_validate` on any forest with 0 items. Never write `geomlist` 3 (it crashed Max) or rely on `maxdensity` (no effect).
 
 ### RailClone (7.3.5+)
 
@@ -210,7 +211,7 @@ The `code` string is delivered as a JSON value, so it is **un-escaped once befor
 - `set_modifier_property`: `name` + `modifier_index` (1-based) for one modifier; `modifier_class` + `names` for batch. Inspect with `inspect_properties(target="modifier")` first.
 - `smart_import`: default `lod_filter="lod0"`. Shared maps match on asset id; variant meshes in a bundle folder with `Textures/` share one material key — omit `name_pattern` for all variants.
 - `palette_laydown`: `sample_mode="random_per_subfolder"` for large per-subfolder asset libraries; `overflow_mode="palette_then_library"` when more than 24 picks.
-- `scatter_forest_pack`: needs non-zero `widthlist`/`heightlist` per geometry item. Hide source meshes after scatter.
+- `scatter_forest_pack`: item width/height come from each source's bounding box (Forest Pack skips items with zero size). Hide source meshes after scatter.
 - `get_material_slots`: prefer `slot_scope="map"` unless you need every param (`slot_scope="all"` + `include_values:true` is huge on Arnold/Physical).
 - `create_object`: default `pos_mode="ground"` — `pos` is bottom-center contact, not bbox center. Tripback includes `bbox`, `placement`, `groundContact`.
 - Box: `width=X`, `length=Y`, `height=Z`.
