@@ -129,7 +129,7 @@ TOOLSET_SPECS = (
     ),
     ToolsetSpec(
         "railclone",
-        "RailClone XML style read/write and generated output inspection (7.3.5+).",
+        "RailClone inspection, exposed parameters, library search and loading, XML style read/write and generated output (RailClone 7.x).",
         ("railclone",),
     ),
     ToolsetSpec(

@@ -378,9 +378,13 @@ and existing procedural skies use the provider's dome or environment binding.
 
 | Tool | Description |
 |------|-------------|
-| `get_railclone_style` | Read complete style XML and edit token (RailClone 7.3.5+) |
+| `railclone_inspect` | Read bases, exposed parameters, segments, graph summary and output counts |
+| `railclone_set_param` | Set exposed parameters by name with limit checks, in one undo step |
+| `railclone_library` | Search the RailClone library browser roots (no Max call) |
+| `railclone_from_library` | Create a library item by validated route or name and assign splines |
+| `get_railclone_style` | Read complete style XML and edit token (RailClone 7.x) |
 | `set_railclone_style` | Replace style XML with guarded, undoable adoption |
-| `get_railclone_output` | Read generated segments, transforms, bounds, and tags |
+| `get_railclone_output` | Rebuild, then read generated segments, transforms, bounds, and tags |
 
 ### Forest Pack (WIP)
 

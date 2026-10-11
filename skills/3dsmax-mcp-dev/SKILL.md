@@ -73,7 +73,8 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 
 ### Plugins and assets
 - tyFlow graph work: read [tyflow-graphs.md](tyflow-graphs.md) completely before acting.
-- RailClone (7.3.5+): `get_railclone_style` → edit the XML → `set_railclone_style(expected_style=...)` → verify with `get_railclone_output`. Read [railclone.md](railclone.md) first.
+- RailClone (7.x): start with `railclone_inspect` (bases, exposed parameters with limits, segments, output counts). Change exposed parameters with `railclone_set_param` by exact name or id; it checks limits, which RailClone doesn't. Edit the graph with `get_railclone_style` → edit the XML → `set_railclone_style(expected_style=...)` → verify with `get_railclone_output`, which rebuilds first. Read [railclone.md](railclone.md) first.
+- RailClone library: `railclone_library` → `railclone_from_library(splines=[...])`. Never call `loadLibraryItemByPath` yourself: a wrong route opens a modal dialog. A `.rail` item loads in one undo step. A `.max` item clears Max's undo history, so it needs `allow_undo_flush=true` (ask the user first in a production scene) and can't be undone: delete its `remove_with` nodes to take it out.
 - Data Channel and Max Creation Graph: read [procedural-graphs.md](procedural-graphs.md) completely before acting.
 - Forest Pack: `scatter_forest_pack`, then hide the source meshes.
 - Cosmos: `cosmos_search` → `cosmos_download` → `cosmos_import`. Repeating a completed import adds another instance. Edit only after the import reports `safe_to_edit: true`; otherwise follow its `next` and run `pending_restore` once when it says so. Never open or close the Material Editor around an import (no `MatEditor.Close()`/`Open()` right after one), and never answer the Cosmos browser or Material Editor as a dialog: that deadlocked Max.
