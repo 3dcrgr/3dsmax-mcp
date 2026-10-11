@@ -103,7 +103,7 @@ Merges use `#autoRenameDups #useSceneMtlDups #neverReparent quiet:true`. The liv
 
 ## Limits
 
-- Tested live on Max 2026 only; the run on Max 2027 (Forest Pack 9.4.3) is pending.
+- Tested live on Max 2026 (Forest Pack 9.0) and Max 2027 (Forest Pack 9.4.3).
 - `forest_from_library` can't be undone, and it clears the undo history: delete the nodes in `remove_with` instead. Item edits aren't in undo either: pass `revert` back to `forest_edit_items`. Undoing a switch to custom edit sets `mode` back to 0, which discards the edits.
 - Undo hasn't been run on the current versions of these tools (agents don't run undo; see "Testing undo" under [Verified Forest Pack facts](#verified-forest-pack-facts)).
 - A forest whose `geomlist` holds 3 (perhaps valid with a proxy) is refused by every tool that rebuilds it.
@@ -118,4 +118,11 @@ Merges use `#autoRenameDups #useSceneMtlDups #neverReparent quiet:true`. The liv
 ## Status
 
 - **Unit tests** in `tests/test_forest_tools.py`: input validation, the generated scripts (order of build, switch, edits, rotations, deletes and creates; probe before the one-call merge; no undo step and no node deleted outside `with undo off` in `forest_from_library`; no file commands, no `geomlist` 3, balanced parentheses, one argument per `format` placeholder; the MAXScript pitfalls above: keywords as names, inline collects, IntegerPtr handles, far ray origins), parsing of canned reports, the `revert` list, the library scan on a temporary library (kinds, placeable items, macros, ambiguous names), the validator's analysis and fix plan, and registration.
-- **Tested live** on Max 2026 (Forest Pack 9.0) on 2026-10-06; Max 2027 (Forest Pack 9.4.3) pending. The fixes made after that run, including the undo-off placement in `forest_from_library`, are covered by the unit tests and wait for the Max 2027 run.
+- **Tested live** on Max 2026 (Forest Pack 9.0) on 2026-10-06.
+- **Tested live on Max 2027** (2027.2, Forest Pack Pro 9.4.3) on 2026-10-11, in a scratch Max separate from production, at `4a4023e`. All 27 Forest Pack checks passed:
+  - `scatter_forest_pack`: 300 cm tiles → 15881 items (estimate 15967), `items_per_m2=1` → 95, "up" and "normal" facing on a 30° slope (item Z tilt 3.1° and 30.4°), and `ZERO_ITEMS` for an empty scatter.
+  - `forest_items` positions lie on the slope. `forest_validate` passes a good forest and reports a broken list entry.
+  - `forest_edit_items`: refused while procedural; with `allow_custom_edit` it switches, applies moves, sizes, a 45° final rotation, deletes and creates, warns only about the create off every surface, and reports `undoable: true`. In custom edit it reports `undoable: false`, and its `revert` list put the items back exactly. Two rotations of one item in a call are refused.
+  - `forest_set_mode`: refused without `confirm_discard`, then switches.
+  - `forest_from_library`: refused without consent. Grass Base Layer 1 - Detail with the V-Ray matlib places 28224 items with every source linked (also when Max renamed duplicate sources), adds exactly the 15 nodes in `remove_with`, and leaves nothing behind. A 3D item (Cane 01) and an Autumn Leaves preset (`$(PRESET_STATE)` → `-clean`) place items. A Forest Ivy item is refused before consent is asked.
+  - Not tested: undo itself (agents don't run undo).

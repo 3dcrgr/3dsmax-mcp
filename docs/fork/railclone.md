@@ -95,9 +95,16 @@ Two live test sessions on 2026-10-06 (3ds Max 2026.3, RailClone Pro 7.1.1, V-Ray
 
 ## Status
 
-- **Tested live on Max 2026 (RailClone 7.1.1); Max 2027 (RailClone 7.3.5) pending.**
+- **Tested live on Max 2027** (2027.2, RailClone Pro 7.3.5, V-Ray 7.4) on 2026-10-11, in a scratch Max separate from production, at `4a4023e`. All 25 RailClone checks passed:
+  - Metal Fence 1 by merge, with consent: 106 items, `_RC_fencing`, `undoable: false`, `remove_with` = the RailClone only, selection kept, nothing left over. Without consent it is refused before anything is sent.
+  - Style read (12 nodes, 12 duplicate attributes removed: 7.3.5 still writes them), a round trip `Ok`, and `STALE_STYLE` for the old token.
+  - Output: stale cache with `NOT_REBUILT` when `rebuild=false`; after a 300-unit move, the rebuilt `bounds_world` is back on the spline. `railclone_inspect` reports 106 items, rebuilt.
+  - `railclone_set_param`: "20cm" halves the pickets (48 → 24). Out-of-limit and unknown names are refused. Glass Railing 03's `Spandrel Type` selector set by label (`"Glass"`, `"Solid"` for RailClone's `"Solid "`) swaps the wood and glass segments.
+  - `.rail` route loads: Baseboard 002 (5 items, 29 maps fixed, `undoable: true`, selection restored) and Glass Railing 03 (109 items, 23 placeholders, 86 placed). A wrong-case root is refused in Python.
+  - Review fixes: `TOO_MANY_SPLINES` leaves no node and keeps the selection. A single spline name works through FastMCP. 3ds Max's own root list matched the server's (no `ROOTS_*` warning). A scene material named `_RC_fencing` kept its own settings after the merge (`#useSceneMtlDups`).
+  - Not tested: undo itself. Agents don't run `max undo`/`max redo` (a redo crashed Max 2027), so only a person can check it with Ctrl+Z.
 - Unit tests: `tests/test_railclone_tools.py` (duplicate-attribute XML in get/set, placeholders and world bounds, the inspect report, parameter planning and refusals, the library index, route validation against 3ds Max's roots, the generated MAXScript for the undo step and the undo-off load, registration). A lint runs over every generated script for the live MAXScript facts: no `for ... collect` in a call's arguments, no keyword as a variable name, every `getHandleByAnim` through `as integer64`, a rebuild after every `getStyleDesc()`, and no `delete` outside a recorded undo context in a script that opens an undo step.
-- Not run live yet: the undo rework (no copy; `.max` items load with undo off; the error cleanup), reading `getStyleDesc()` before the rebuild, the read of 3ds Max's library roots and the merge's `#useSceneMtlDups`. Agents never run `max undo` or `max redo` through MCP (a redo crashed Max 2027), so the undo behaviour is safe by construction; only a person can check it with Ctrl+Z.
+- The undo behaviour is safe by construction and was not run live: agents never run `max undo` or `max redo` through MCP (a redo crashed Max 2027). Only a person can check it with Ctrl+Z.
 - Next live run (Max 2027, scratch scene; the user does any Ctrl+Z):
   1. `railclone_from_library("Metal Fence 1", ["<spline>"], allow_undo_flush=true)`: about 106 items, `undoable: false`, `remove_with` = the RailClone only, no `*_mcp_merged` node; deleting `remove_with` leaves nothing behind.
   2. The same item with `method="route"`: the undo-off route load of a `.max` item; output > 0, `remove_with` lists the RailClone.
