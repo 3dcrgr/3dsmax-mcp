@@ -20,7 +20,9 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 - Do not render unless the user asks. Viewport capture is fine when visual proof helps.
 - Verify meaningful edits with `query_scene(action="delta")`, re-inspection or a capture.
 - Keep mutating calls sequential. Concurrent writes interleave undo transactions: a crash, then persistent corruption such as phantom successes and wrong handles.
-- Multiple Max instances: the first native connection stays bound to that Max and never silently switches. Use `list_max_instances`, `select_max_instance(pid)`, `get_selected_max_instance` and `release_max_instance`. `MCP_MAX_PIPE` or `MCP_MAX_PID` pins the startup target (the pipe takes precedence); release also clears it.
+- Multiple Max instances: the first native connection stays bound to that Max and never silently switches while it runs. Use `list_max_instances`, `select_max_instance(pid)`, `get_selected_max_instance` and `release_max_instance`. `MCP_MAX_PIPE` or `MCP_MAX_PID` pins the startup target (the pipe takes precedence); release also clears it.
+  - **Shared selection:** the selection belongs to the MCP server process, so sessions that share one server share it, and one session's select moves the others. Pass `expected_pid` (every tool takes it) to any call that must reach one particular Max. A mismatch returns `TARGET_MISMATCH` with nothing sent. `selection_generation` in each reply's transport changes on every select, release or re-resolve.
+  - **Default target after a restart:** a target the server picked by itself (`target_source` "default" or "claim") re-resolves to the current default once its Max has exited, and the reply warns. Explicit and environment targets keep failing until you select or release.
 
 ## Tool Choice
 
