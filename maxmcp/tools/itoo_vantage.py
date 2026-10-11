@@ -148,7 +148,9 @@ fn ivWalkTex ss ctx t path depth = (
         append ctx[1] t
         local cls = (classOf t) as string
         if cls == "Forest_Color" or cls == "RailClone_Color" do ivColorMap ss t cls path
-        if cls == "VRayMultiSubTex" do format "MS|%|%|%\n" (ivB64 path) (ivB64 (ivName t)) (ivP t #from_id) to:ss
+        if cls == "VRayMultiSubTex" do format "MS|%|%|%|%\n" (ivB64 path) (ivB64 (ivName t)) (ivP t #from_id) (ivP t #random_by_face_mtl_id) to:ss
+        if cls == "MultiTexture" then format "IDM|%|%|%|rnd_by|%\n" (ivB64 cls) (ivB64 path) (ivB64 (ivName t)) (ivP t #rnd_by) to:ss
+        else if isProperty t #randByMat do format "IDM|%|%|%|randbymat|%\n" (ivB64 cls) (ivB64 path) (ivB64 (ivName t)) (ivP t #randByMat) to:ss
         local n = try (getNumSubTexmaps t) catch 0
         for i = 1 to n do (
             local sub = try (getSubTexmap t i) catch undefined
@@ -203,9 +205,12 @@ fn ivForest ss nd ctx = (
     for k = 1 to nI do (
         local src = ivAt cl k
         local srcOk = isValidNode src
+        local srcCls = if srcOk then ((classOf src.baseobject) as string) else ""
         local faces = -1
-        if srcOk and meshMode do faces = try (src.mesh.numfaces) catch -1
-        format "IT|%|%|%|%|%|%|%\n" k (ivV (ivAt gl k)) (ivV (ivAt pl k)) (ivB64 ((ivAt nl k) as string)) (ivB64 (if srcOk then ((classOf src.baseobject) as string) else "")) (ivB64 (if srcOk then src.name else "")) faces to:ss
+        -- A V-Ray proxy node's mesh is its viewport preview, not what renders: leave its faces unknown.
+        if srcOk and meshMode and srcCls != "VRayProxy" do faces = try (src.mesh.numfaces) catch -1
+        local ovr = (ivAt ml k) != undefined
+        format "IT|%|%|%|%|%|%|%|%\n" k (ivV (ivAt gl k)) (ivV (ivAt pl k)) (ivB64 ((ivAt nl k) as string)) (ivB64 srcCls) (ivB64 (if srcOk then src.name else "")) faces (ivV ovr) to:ss
     )
     local aa = ivArr b #pf_aractivelist
     local atype = ivArr b #artypelist
@@ -233,8 +238,10 @@ fn ivForest ss nd ctx = (
     for k = 1 to (amin ml.count nI) do (
         if ml[k] != undefined do ivWalkMtl ss ctx ml[k] ("matList[" + (k as string) + "]") 0
     )
+    -- A matList override replaces the item's source material inside forest_automat_*: that source material
+    -- doesn't render through this forest, so it isn't walked.
     for k = 1 to (amin cl.count nI) do (
-        if isValidNode cl[k] do ivWalkMtl ss ctx cl[k].material ("item " + (k as string) + " " + cl[k].name) 0
+        if isValidNode cl[k] and (ivAt ml k) == undefined do ivWalkMtl ss ctx cl[k].material ("item " + (k as string) + " " + cl[k].name) 0
     )
     ivWalkMtl ss ctx nd.material "node" 0
 )
@@ -453,7 +460,7 @@ def _dv(field: str) -> Any:
 def _new_object(kind: str, handle: int, name: str) -> dict[str, Any]:
     return {"kind": kind, "handle": handle, "name": name, "k": {}, "items": [], "areas": [], "hist": {},
             "mods": [], "out": None, "out_segs": {}, "style": None, "segs": [], "cm": [], "op": [], "fm": [],
-            "ms": [], "fpc": [], "u": [], "walk_truncated": None, "error": None, "elapsed_ms": None}
+            "ms": [], "idm": [], "fpc": [], "u": [], "walk_truncated": None, "error": None, "elapsed_ms": None}
 
 
 def parse_report(raw: Any) -> dict[str, Any]:
@@ -498,7 +505,9 @@ def parse_report(raw: Any) -> dict[str, Any]:
             elif tag == "IT":
                 current["items"].append({"index": int(f[1]), "geom": _dv(f[2]), "prob": _dv(f[3]),
                                          "name": _unb64(f[4]), "source_class": _unb64(f[5]) or None,
-                                         "source": _unb64(f[6]) or None, "faces": int(f[7])})
+                                         "source": _unb64(f[6]) or None, "faces": int(f[7]),
+                                         # older reports have no override field
+                                         "override": _dv(f[8]) if len(f) > 8 else None})
             elif tag == "AR":
                 current["areas"].append({"index": int(f[1]), "active": _dv(f[2]), "type": _dv(f[3]),
                                          "incexc": _dv(f[4]), "boundary": _dv(f[5])})
@@ -534,7 +543,12 @@ def parse_report(raw: Any) -> dict[str, Any]:
             elif tag == "FM":
                 current["fm"].append({"path": _unb64(f[1]), "name": _unb64(f[2])})
             elif tag == "MS":
-                current["ms"].append({"path": _unb64(f[1]), "name": _unb64(f[2]), "from_id": _dv(f[3])})
+                current["ms"].append({"path": _unb64(f[1]), "name": _unb64(f[2]), "from_id": _dv(f[3]),
+                                      # older reports have no random_by_face_mtl_id field
+                                      "by_face_id": _dv(f[4]) if len(f) > 4 else MISSING})
+            elif tag == "IDM":
+                current["idm"].append({"class": _unb64(f[1]), "path": _unb64(f[2]), "name": _unb64(f[3]),
+                                       "prop": f[4], "value": _dv(f[5])})
             elif tag == "FPC":
                 current["fpc"].append(_unb64(f[1]))
             elif tag == "U":
@@ -628,14 +642,16 @@ CODES: dict[str, tuple[str, str, str, str | None]] = {
     # 4. Material IDs
     "ID_MAP_IN_FOREST": (
         "warn", "doc+live",
-        "VRayMultiSubTex by face material ID (from_id 0) on a Forest item: Forest consolidates the item materials into "
-        "forest_automat_* and renumbers the face IDs, so the map picks the wrong entries.",
+        "A map keyed on face material ID on a Forest item (VRayMultiSubTex by face material ID, from_id 0, or random "
+        "with 'By face MtlID'; BerconTile / BerconGradient random by material ID): Forest consolidates the item "
+        "materials into forest_automat_* and renumbers the face IDs, so the map picks other entries or loses its "
+        "variation.",
         "Use Forest Color or VRayMultiSubTex random by node/instance, or turn Consolidate Materials off and assign a "
         "hand-built Multi/Sub to the Forest node."),
     "ID_MAP_UNCONSOLIDATED": (
         "info", "doc+live",
-        "VRayMultiSubTex by face material ID with Consolidate Materials off: the faces keep the source IDs; check "
-        "them against the node material.", None),
+        "A map keyed on face material ID with Consolidate Materials off: the faces keep the source IDs; check them "
+        "against the node material.", None),
     "FPCOLOR_HARMLESS": (
         "info", "memory",
         "'FPColor ID n' Standard materials in forest_automat_* only drive the viewport Color ID display; rendered "
@@ -651,7 +667,10 @@ CODES: dict[str, tuple[str, str, str, str | None]] = {
         "The Forest node's material isn't forest_automat_*: a manual assignment overrides Forest's consolidated "
         "material.", "Change materials on the source objects or with matList, never on the Forest node."),
     # 5. RailClone settings
-    "RC_DISABLED": ("error", "live", "The RailClone object is disabled: 0 faces and an empty output.", None),
+    "RC_DISABLED": (
+        "info", "live",
+        "The RailClone object is disabled: 0 faces and an empty output, so it renders nothing in Max or Vantage.",
+        None),
     "RC_MODIFIERS": (
         "warn", "doc",
         "Modifiers on a RailClone object are incompatible with its native instancing (memory and Vantage load grow).",
@@ -729,7 +748,7 @@ CODES: dict[str, tuple[str, str, str, str | None]] = {
         "warn", "live",
         "The estimated faces (items x segment faces; instanced items count too) are close to maxFaces: over it "
         "RailClone generates nothing.", None),
-    "FOREST_DISABLED": ("error", "doc", "The Forest object is disabled: it renders nothing.", None),
+    "FOREST_DISABLED": ("info", "doc", "The Forest object is disabled: it renders nothing in Max or Vantage.", None),
     "FOREST_NO_ITEMS": (
         "warn", "live", "trees.count() is 0: nothing to render, or the forest isn't built yet (this check never "
         "builds it).", "Run forest_validate."),
@@ -775,9 +794,16 @@ CODES: dict[str, tuple[str, str, str, str | None]] = {
         "V-Ray.", None),
     "FALLBACK": (
         "info", "doc+memory",
-        "Objects with errors have a 'fallback': convert them to plain instances (RailClone Tools Instantiate or Forest "
-        "Tools) when they can't be fixed. Never export a .vrscene.", None),
+        "Objects with a feature Vantage may not translate (colour map slot 1, CPU-only features, ID-driven maps) have "
+        "a 'fallback': convert them to plain instances (RailClone Tools Instantiate or Forest Tools) when they can't "
+        "be fixed. Never export a .vrscene.", None),
 }
+# Findings that a conversion to plain instances can work around: Vantage / V-Ray GPU translation problems. A
+# disabled object, an exceeded cap or a missing proxy file is fixed in Max, and converting wouldn't help.
+FALLBACK_CODES = frozenset({
+    "COLORMAP_SLOT1_EMPTY", "COLORMAP_SLOT1_FLAT", "CPU_ONLY_FOREST_MATERIAL", "CPU_ONLY_BILLBOARD",
+    "EDGE_MODE_ON_PROXIES", "IVY_RENDER_INSTANCING", "ID_MAP_IN_FOREST",
+})
 
 
 def _short(path: str, limit: int = 160) -> str:
@@ -948,10 +974,10 @@ def analyze_forest(obj: dict[str, Any], max_paths: int, details: bool = False) -
             rep.add("FOREST_RENDER_MAX_ITEMS_RISK", f"count {count} (x4 = {count * 4}) vs rmaxitems {rmax:g}")
         elif count >= NEAR_CAP * rmax:
             rep.add("FOREST_RENDER_MAX_ITEMS_NEAR", f"count {count} vs rmaxitems {rmax:g}")
-    faces = None
+    faces, faces_partial = None, False
     if isinstance(rendermode, int) and not isinstance(rendermode, bool) and rendermode != 0:
         rep.add("FOREST_MESH_RENDER_MODE", f"rendermode {rendermode}")
-        faces = _forest_faces(rep, obj, thinning)
+        faces, faces_partial = _forest_faces(rep, obj, thinning)
     if isinstance(k.get("rmesh"), int) and k["rmesh"] != 0:
         rep.add("FOREST_RENDER_DISPLAY", f"rmesh {k['rmesh']}")
     if isinstance(k.get("rskip"), int) and k["rskip"] > 0:
@@ -992,10 +1018,7 @@ def analyze_forest(obj: dict[str, Any], max_paths: int, details: bool = False) -
         rep.add("FOREST_NODE_MATERIAL" if consolidate is False else "FOREST_NODE_MATERIAL_REPLACED", where)
     if obj["fpc"]:
         rep.add("FPCOLOR_HARMLESS", f"{len(obj['fpc'])} FPColor material(s)")
-    for ms in obj["ms"]:
-        if ms["from_id"] == 0 and ms["from_id"] is not False:
-            rep.add("ID_MAP_IN_FOREST" if consolidate is not False else "ID_MAP_UNCONSOLIDATED",
-                    f"{ms['path']}: {ms['name']} from_id 0")
+    _id_maps(rep, obj, consolidate)
     _materials(rep, obj, {key: k.get(key) for key in ("tintmode", "tintmapmode", "tintmin", "tintmax")})
     state: dict[str, Any] = {
         "viewport_count": count, "vmaxitems": k.get("vmaxitems"), "viewport_thinning": thinning,
@@ -1007,37 +1030,75 @@ def analyze_forest(obj: dict[str, Any], max_paths: int, details: bool = False) -
     }
     if faces is not None:
         state["estimated_faces"] = faces
+        if faces_partial:
+            state["estimated_faces_partial"] = True
     if details:
         state["items"] = [{"index": it["index"], "name": it["name"], "geom": it["geom"], "probability": it["prob"],
                            "source": it["source"], "source_class": it["source_class"],
+                           "material_override": it["override"],
                            "count": obj["hist"].get(it["index"]) if obj["hist"] else None} for it in obj["items"]]
         state["areas"] = obj["areas"]
     return _object_result(obj, rep, state)
 
 
-def _forest_faces(rep: _Report, obj: dict[str, Any], thinning: str) -> int | None:
-    """Faces in Meshes render mode: items per type x the source's faces. None when unknown."""
+def _id_maps(rep: _Report, obj: dict[str, Any], consolidate: Any) -> None:
+    """Maps keyed on face material ID, whose IDs Forest renumbers when it consolidates the item materials."""
+    code = "ID_MAP_IN_FOREST" if consolidate is not False else "ID_MAP_UNCONSOLIDATED"
+    for ms in obj["ms"]:
+        from_id = ms["from_id"]
+        if isinstance(from_id, bool) or not isinstance(from_id, int):
+            continue  # unreadable: _materials lists it under unknown
+        where = f"{ms['path']}: VRayMultiSubTex '{ms['name']}'"
+        if from_id == 0:
+            rep.add(code, f"{where} from_id 0 (face material ID)")
+        elif from_id == 12 and ms["by_face_id"] is True:
+            rep.add(code, f"{where} from_id 12, random by face MtlID")
+        elif from_id == 12 and ms["by_face_id"] is not False:
+            rep.unknown_check("multisubtex_mode", f"{where}: random mode, but 'By face MtlID' "
+                                                  "(random_by_face_mtl_id) isn't readable")
+    multitex = []
+    for idm in obj["idm"]:
+        where = f"{idm['path']}: {idm['class']} '{idm['name']}'"
+        if idm["prop"] == "randbymat":
+            if idm["value"] is True:
+                rep.add(code, f"{where} random by material ID")
+            elif idm["value"] is not False:
+                rep.unknown_check("id_map", f"{where}: 'Random by material id' (randByMat) isn't readable")
+        elif idm["prop"] == "rnd_by":
+            multitex.append(f"{where} rnd_by {idm['value']}")
+    if multitex and consolidate is not False:
+        rep.unknown_check("id_map", "MultiTexture 'Randomize by' (rnd_by): which value means Material ID isn't "
+                                    "confirmed, so whether these randomise by material ID (Forest renumbers the face "
+                                    f"IDs, which would change their variation) is unknown: {multitex[:5]}")
+
+
+def _forest_faces(rep: _Report, obj: dict[str, Any], thinning: str) -> tuple[int | None, bool]:
+    """Faces in Meshes render mode: items per type x the source's faces, and whether some types had no count.
+    (None, False) when the items per type are unknown."""
     if not obj["hist"]:
         rep.unknown_check("faces", "the items per type weren't counted, so the face count is unknown")
-        return None
+        return None, False
     total, unknown = 0, []
     for it in obj["items"]:
         n = obj["hist"].get(it["index"], 0)
-        if n and it["faces"] < 0:
+        # a V-Ray proxy node's mesh is its viewport preview (12 faces live for a box preview), not what renders
+        if n and (it["faces"] < 0 or it["source_class"] == "VRayProxy"):
             unknown.append(it["name"])
         elif n:
             total += n * it["faces"]
     if unknown:
-        rep.unknown_check("faces", f"no face count for {len(unknown)} item type(s) (billboard, proxy or no mesh): "
-                                   f"{unknown[:5]}")
+        rep.unknown_check("faces", f"no face count for {len(unknown)} item type(s) (billboard, V-Ray proxy or no "
+                                   f"mesh): {unknown[:5]}; the face estimate is partial")
     cap = _num(obj["k"].get("maxfaces"))
     if cap and cap > 0:
-        note = " (a lower bound: trees.count() may be thinned)" if thinning == "possible" else ""
+        why = [w for w, on in (("trees.count() may be thinned", thinning == "possible"),
+                               ("some item types have no face count", bool(unknown))) if on]
+        note = f" (a lower bound: {'; '.join(why)})" if why else ""
         if total > cap * 1e6:
             rep.add("FOREST_MAX_FACES_EXCEEDED", f"about {total} faces{note} > {cap:g} million")
         elif total >= NEAR_CAP * cap * 1e6:
             rep.add("FOREST_MAX_FACES_NEAR", f"about {total} faces{note} vs {cap:g} million")
-    return total
+    return total, bool(unknown)
 
 
 def analyze_railclone(obj: dict[str, Any], max_paths: int, rc_version: list[int] | None,
@@ -1154,7 +1215,8 @@ def _rc_export(rep: _Report, obj: dict[str, Any], disabled: bool) -> dict[str, A
         rep.unknown_check("faces", "the export items name no source segment (a proxy cache exports them that way), so "
                                    "the faces can't be estimated")
         return export
-    faces_by_name = {s["name"]: s["faces"] for s in obj["segs"]}
+    faces_by_name = {s["name"]: -1 if "VRayProxy" in (s["ref_class"], s["source_class"]) else s["faces"]
+                     for s in obj["segs"]}
     total, unknown = 0, []
     for name, n in obj["out_segs"].items():
         faces = faces_by_name.get(name, -1)
@@ -1165,8 +1227,8 @@ def _rc_export(rep: _Report, obj: dict[str, Any], disabled: bool) -> dict[str, A
     export["estimated_faces"] = total
     if unknown:
         export["estimated_faces_partial"] = True
-        rep.unknown_check("faces", f"no face count for segment(s) {unknown[:5]} (V-Ray proxy, modified source or no "
-                                   "mesh): the face estimate is partial")
+        rep.unknown_check("faces", f"no face count for segment(s) {unknown[:5]} (V-Ray proxy, an embedded segment "
+                                   "whose source was modified, or no mesh): the face estimate is partial")
     if maxfaces is not None:
         if maxfaces == 0:
             rep.add("RC_MAXFACES_UNLIMITED")
@@ -1196,7 +1258,7 @@ def _object_result(obj: dict[str, Any], rep: _Report, state: dict[str, Any]) -> 
     result = {"name": obj["name"], "handle": obj["handle"], "kind": obj["kind"], "status": status,
               "findings": rep.sorted_findings(), "unknown": rep.unknown, "state": state,
               "elapsed_ms": obj["elapsed_ms"]}
-    if status == "error":
+    if any(f["code"] in FALLBACK_CODES for f in rep.findings):
         result["fallback"] = obj["kind"]
     return result
 
@@ -1219,7 +1281,7 @@ def analyze(facts: dict[str, Any], max_paths: int = 5, details: bool = False) ->
     renderer = scene.get("renderer")
     if isinstance(renderer, str) and not renderer.lower().startswith("v_ray"):
         srep.add("RENDERER_NOT_VRAY", renderer)
-    if any(o["status"] == "error" for o in objects):
+    if any(o.get("fallback") for o in objects):
         srep.add("FALLBACK")
     warnings = []
     before, after = scene.get("save_required_before"), scene.get("save_required_after")
@@ -1313,7 +1375,8 @@ def itoo_vantage_check(
     sobjmtl wrapping, and item/segment/face caps. Findings name a code;
     codes{} gives each code's severity (error/warn/info), basis (doc, live,
     inf, memory), message and fix. What can't be read without writing is
-    listed under unknown, and objects with errors name a fallback. It never
+    listed under unknown, and objects with a feature Vantage may not
+    translate name a fallback. It never
     rebuilds (RailClone caps come from the existing export; Forest counts are
     trees.count() as it is, which the viewport Max Items limit can thin),
     writes, selects, renders or exports. One MAXScript call: time_budget_s

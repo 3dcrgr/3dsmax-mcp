@@ -122,8 +122,9 @@ SEGS = (("allum_rail_01", 96, 80), ("allum_post_01_main", 116, 8), ("allum_picke
         ("allum_post_01_top", 118, 8))
 
 
-def item(index=1, geom=2, prob=100.0, name="Box", source_class="Box", source="Box001", faces=-1):
-    return f"IT|{index}|{v(geom)}|{v(prob)}|{b64(name)}|{b64(source_class or '')}|{b64(source or '')}|{faces}"
+def item(index=1, geom=2, prob=100.0, name="Box", source_class="Box", source="Box001", faces=-1, override=False):
+    return (f"IT|{index}|{v(geom)}|{v(prob)}|{b64(name)}|{b64(source_class or '')}|{b64(source or '')}|{faces}|"
+            f"{v(override)}")
 
 
 def area(index=1, active=True, typ=3, incexc=0, boundary=0):
@@ -291,6 +292,27 @@ class ScriptTests(unittest.TestCase):
         self.assertLess(body.index("getXMLOutput()"), body.index("getXMLStyle()"))
         self.assertNotIn("getStyleDesc", iv.MXS_LIB + iv.MXS_MAIN)
 
+    def test_forest_skips_proxy_meshes_and_overridden_sources(self):
+        body = iv.MXS_LIB[iv.MXS_LIB.index("fn ivForest"):iv.MXS_LIB.index("fn ivRail")]
+        lines = [line for line in body.splitlines() if not line.strip().startswith("--")]
+        # a VRayProxy node's .mesh is its viewport preview: its faces stay -1 (unknown), as in ivRail
+        mesh_reads = [line for line in lines if ".mesh.numfaces" in line]
+        self.assertEqual(len(mesh_reads), 1)
+        self.assertIn('srcCls != "VRayProxy"', mesh_reads[0])
+        # a matList override replaces the item's source material in forest_automat_*: don't walk the source
+        source_walks = [line for line in lines if "cl[k].material" in line]
+        self.assertEqual(len(source_walks), 1)
+        self.assertIn("(ivAt ml k) == undefined", source_walks[0])
+        self.assertLess(body.index("local ml = "), body.index('format "IT|'))
+        # the IT row carries the override flag (field 8), which parse_report reads
+        it_format = re.search(r'format "(IT\|[^"]*)\\n"', body).group(1)
+        self.assertEqual(it_format.count("%"), 8)
+
+    def test_id_capable_maps_are_reported(self):
+        walk = iv.MXS_LIB[iv.MXS_LIB.index("fn ivWalkTex"):iv.MXS_LIB.index("fn ivWalkMtl")]
+        for needle in ("#random_by_face_mtl_id", 'cls == "MultiTexture"', "#rnd_by", "isProperty t #randByMat"):
+            self.assertIn(needle, walk)
+
     def test_plugin_classes_are_compared_by_name(self):
         # Referencing Forest_Color etc. as globals fails when a plugin is missing; compare class names instead.
         for cls in ("Forest_Pro", "RailClone_Pro", "ForestIvy", "Forest_Color", "RailClone_Color", "Forest_Material",
@@ -312,6 +334,17 @@ class ParseTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(iv.ItooVantageError) as ctx:
                 iv.parse_report(raw)
             self.assertEqual(ctx.exception.code, code)
+
+    def test_optional_fields_of_older_reports(self):
+        rows = obj_rows("forest", "F", FOREST_K, [
+            f"IT|1|i2|f100|{b64('Box')}|{b64('Box')}|{b64('Box001')}|12",  # no override field
+            item(2, override=True), f"MS|{b64('p')}|{b64('m')}|i12",  # no random_by_face_mtl_id field
+            f"IDM|{b64('BerconTile')}|{b64('p/q')}|{b64('bt')}|randbymat|b1"])
+        o = iv.parse_report(report(*rows))["objects"][0]
+        self.assertEqual([it["override"] for it in o["items"]], [None, True])
+        self.assertIs(o["ms"][0]["by_face_id"], iv.MISSING)
+        self.assertEqual(o["idm"], [{"class": "BerconTile", "path": "p/q", "name": "bt", "prop": "randbymat",
+                                     "value": True}])
 
     def test_values(self):
         self.assertIsNone(iv._dv("u"))
@@ -359,7 +392,10 @@ class LiveReportTests(unittest.TestCase):
         self.assertEqual(r["scene"]["save_required_after"], True)
         self.assertEqual(set(r["codes"]), {f["code"] for o in r["objects"] for f in o["findings"]}
                          | {f["code"] for f in r["scene_findings"]})
-        self.assertEqual(set(r["fallbacks"]), {"forest", "railclone"})
+        # VC_board / IVK_fp_main / VC_edge_forest: colour-map errors; IVK_ivy: render instancing
+        self.assertEqual(set(r["fallbacks"]), {"forest", "railclone", "ivy"})
+        self.assertEqual({o["name"] for o in r["objects"] if o.get("fallback")},
+                         {"VC_board", "IVK_fp_main", "VC_edge_forest", "IVK_ivy"})
 
     def test_railclones(self):
         self.assertEqual(self.found("IVK_rc_main"), {
@@ -372,7 +408,9 @@ class LiveReportTests(unittest.TestCase):
         self.assertIn("[1] allum_rail_01: Standardmaterial", sob["where"][0])
         self.assertNotIn("[2]", sob["where"][0])  # the one-slot Multimaterial is fine
         self.assertEqual(self.found("IVK_rc_off"), {"RC_DISABLED"})
-        self.assertEqual(self.by_name["IVK_rc_off"]["fallback"], "railclone")
+        # disabled renders nothing in Max either: info, and Instantiate has nothing to convert
+        self.assertEqual(self.by_name["IVK_rc_off"]["status"], "ok")
+        self.assertNotIn("fallback", self.by_name["IVK_rc_off"])
         self.assertIn("caps", {u["check"] for u in self.by_name["IVK_rc_off"]["unknown"]})
         self.assertEqual(self.found("IVK_rc_proxy"), {"RC_PROXY_CACHE_EMBEDDED"})
         self.assertIn("faces", {u["check"] for u in self.by_name["IVK_rc_proxy"]["unknown"]})
@@ -461,18 +499,46 @@ class MaterialTests(unittest.TestCase):
         self.assertEqual((fm["count"], len(fm["where"]), fm.get("where_truncated")), (7, 2, True))
 
     def test_id_maps(self):
-        def ms(from_id, path="item 1 Box001/m/Diffuse"):
-            return f"MS|{b64(path)}|{b64('mst')}|{v(from_id)}"
+        def ms(from_id, path="item 1 Box001/m/Diffuse", by_face=False):
+            return f"MS|{b64(path)}|{b64('mst')}|{v(from_id)}|{v(by_face)}"
         found = codes(run(*forest(extra=[ms(0), ms(1, "b"), ms(12, "c")])))
         self.assertEqual(found["ID_MAP_IN_FOREST"]["count"], 1)
         self.assertEqual(found["ID_MAP_IN_FOREST"]["severity"], "warn")
+        self.assertEqual(found["ID_MAP_IN_FOREST"]["where"],
+                         ["item 1 Box001/m/Diffuse: VRayMultiSubTex 'mst' from_id 0 (face material ID)"])
         found = codes(run(*forest(k={"consmat": False}, extra=[ms(0)])))
         self.assertIn("ID_MAP_UNCONSOLIDATED", found)
         self.assertNotIn("ID_MAP_IN_FOREST", found)
         r = run(*forest(extra=[ms(iv.MISSING)]))
         self.assertIn("multisubtex_mode", unknown(r))
+        # random by composite seed with 'By face MtlID' on is keyed on face IDs too
+        found = codes(run(*forest(extra=[ms(12, "d", by_face=True)])))
+        self.assertEqual(found["ID_MAP_IN_FOREST"]["where"], ["d: VRayMultiSubTex 'mst' from_id 12, random by face MtlID"])
+        r = run(*forest(extra=[ms(12, "e", by_face=iv.MISSING)]))
+        self.assertNotIn("ID_MAP_IN_FOREST", codes(r))
+        self.assertIn("By face MtlID", unknown(r)["multisubtex_mode"])
         # RailClone doesn't consolidate: no ID-map finding there
         self.assertNotIn("ID_MAP_IN_FOREST", codes(run(*railclone(extra=rc_extra() + [ms(0)]))))
+
+    def test_other_id_maps(self):
+        def idm(cls, prop, value, path="item 1 Box001/m/Diffuse"):
+            return f"IDM|{b64(cls)}|{b64(path)}|{b64('m')}|{prop}|{v(value)}"
+        found = codes(run(*forest(extra=[idm("BerconTile", "randbymat", True), idm("BerconGradient", "randbymat",
+                                                                                   False, "b")])))
+        self.assertEqual(found["ID_MAP_IN_FOREST"]["where"],
+                         ["item 1 Box001/m/Diffuse: BerconTile 'm' random by material ID"])
+        self.assertIn("randByMat", unknown(run(*forest(extra=[idm("BerconTile", "randbymat", iv.MISSING)])))["id_map"])
+        self.assertIn("ID_MAP_UNCONSOLIDATED",
+                      codes(run(*forest(k={"consmat": False}, extra=[idm("BerconTile", "randbymat", True)]))))
+        # MultiTexture: which rnd_by value means Material ID isn't confirmed live, so it's unknown, not a finding
+        r = run(*forest(extra=[idm("MultiTexture", "rnd_by", 0)]))
+        self.assertNotIn("ID_MAP_IN_FOREST", codes(r))
+        self.assertIn("rnd_by 0", unknown(r)["id_map"])
+        self.assertEqual(r["objects"][0]["status"], "ok")
+        self.assertNotIn("id_map", unknown(run(*forest(k={"consmat": False}, extra=[idm("MultiTexture", "rnd_by", 1)]))))
+        r = run(*railclone(extra=rc_extra() + [idm("BerconTile", "randbymat", True), idm("MultiTexture", "rnd_by", 0)]))
+        self.assertNotIn("ID_MAP_IN_FOREST", codes(r))
+        self.assertNotIn("id_map", unknown(r))
 
     def test_node_material(self):
         found = codes(run(*forest(extra=[f"FPC|{b64('node/forest_automat_X[3]/FPColor ID 0')}"] * 3)))
@@ -505,10 +571,11 @@ class ForestTests(unittest.TestCase):
 
     def test_disabled_and_empty(self):
         r = run(*forest(k={"disabled": True}))
-        self.assertEqual(r["objects"][0]["status"], "error")
-        self.assertEqual(r["objects"][0]["fallback"], "forest")
-        self.assertIn("forest", r["fallbacks"])
-        self.assertIn("FALLBACK", {f["code"] for f in r["scene_findings"]})
+        self.assertEqual(codes(r)["FOREST_DISABLED"]["severity"], "info")
+        self.assertEqual(r["objects"][0]["status"], "ok")
+        self.assertNotIn("fallback", r["objects"][0])
+        self.assertEqual(r["fallbacks"], {})
+        self.assertNotIn("FALLBACK", {f["code"] for f in r["scene_findings"]})
         self.assertIn("FOREST_NO_ITEMS", codes(run(*forest(k={"count": 0}))))
         self.assertIn("count", unknown(run(*forest(k={"count": None}))))
 
@@ -538,14 +605,36 @@ class ForestTests(unittest.TestCase):
         self.assertEqual(r["objects"][0]["state"]["estimated_faces"], 50232)  # live IVK_fp_main
         self.assertIn("FOREST_MESH_RENDER_MODE", codes(r))
         self.assertIn("bb", unknown(r)["faces"])
-        found = codes(run(*forest(k={"rendermode": 1, "maxFaces": 1}, items=[item(1, faces=10)],
-                                  extra=["HIST|1|200000"])))
+        self.assertTrue(r["objects"][0]["state"]["estimated_faces_partial"])  # the billboard
+        r = run(*forest(k={"rendermode": 1, "maxFaces": 1}, items=[item(1, faces=10)], extra=["HIST|1|200000"]))
+        found = codes(r)
         self.assertIn("FOREST_MAX_FACES_EXCEEDED", found)
+        self.assertNotIn("lower bound", found["FOREST_MAX_FACES_EXCEEDED"]["where"][0])
+        self.assertNotIn("estimated_faces_partial", r["objects"][0]["state"])
+        items = [item(1, faces=10), item(2, geom=1, name="bb", source_class=None, source=None)]
+        found = codes(run(*forest(k={"rendermode": 1, "maxFaces": 1}, items=items,
+                                  extra=["HIST|1|200000", "HIST|2|5"])))
+        self.assertIn("lower bound: some item types have no face count", found["FOREST_MAX_FACES_EXCEEDED"]["where"][0])
         found = codes(run(*forest(k={"rendermode": 1, "maxFaces": 1}, items=[item(1, faces=10)],
                                   extra=["HIST|1|90000"])))
         self.assertIn("FOREST_MAX_FACES_NEAR", found)
         self.assertIn("faces", unknown(run(*forest(k={"rendermode": 1}))))  # no histogram
         self.assertNotIn("FOREST_MESH_RENDER_MODE", codes(run(*forest(k={"rendermode": 0}))))
+
+    def test_proxy_items_have_no_face_count(self):
+        # live: a VRayProxy node's .mesh read 12 faces (its box preview); a report row that still carries a count
+        # for a proxy item must not reach the estimate
+        items = [item(1, faces=12), item(2, name="tree", source_class="VRayProxy", source="tree_proxy", faces=12)]
+        r = run(*forest(k={"rendermode": 1, "maxFaces": 1}, items=items, extra=["HIST|1|10", "HIST|2|200000"]))
+        self.assertEqual(r["objects"][0]["state"]["estimated_faces"], 120)
+        self.assertTrue(r["objects"][0]["state"]["estimated_faces_partial"])
+        self.assertIn("tree", unknown(r)["faces"])
+        self.assertIn("proxy", unknown(r)["faces"])
+        self.assertFalse({"FOREST_MAX_FACES_EXCEEDED", "FOREST_MAX_FACES_NEAR"} & set(codes(r)))
+
+    def test_material_override_in_details(self):
+        r = run(*forest(items=[item(1, override=True), item(2)]), details=True)
+        self.assertEqual([it["material_override"] for it in r["objects"][0]["state"]["items"]], [True, False])
 
     def test_display_settings(self):
         found = codes(run(*forest(k={"rmesh": 2, "rskip": 1})))
@@ -614,6 +703,14 @@ class RailCloneTests(unittest.TestCase):
         self.assertEqual(r["objects"][0]["state"]["export"]["estimated_faces"], 12112 - 80 * 32)
         self.assertTrue(r["objects"][0]["state"]["export"]["estimated_faces_partial"])
         self.assertIn("allum_picket_01", unknown(r)["faces"])
+        self.assertIn("an embedded segment whose source was modified", unknown(r)["faces"])
+        # a proxy segment's preview faces never count, even if a row carries them
+        for proxy in (seg(3, "allum_picket_01", 12, ref_class="VRayProxy"),
+                      seg(3, "allum_picket_01", 12, ref_class="Box", source_class="VRayProxy", source="p")):
+            with self.subTest(proxy=proxy):
+                r = run(*railclone(seg_overrides={3: proxy}))
+                self.assertEqual(r["objects"][0]["state"]["export"]["estimated_faces"], 12112 - 80 * 32)
+                self.assertIn("allum_picket_01", unknown(r)["faces"])
         # a proxy cache exports items without source_segment
         r = run(*railclone(out=["OUT|24569|176|0"]))
         self.assertIsNone(r["objects"][0]["state"]["export"]["estimated_faces"])
@@ -667,6 +764,52 @@ class RailCloneTests(unittest.TestCase):
         self.assertNotIn("RC_SEGMENT_MATERIAL", codes(r))
 
 
+class FallbackTests(unittest.TestCase):
+    """Only findings a conversion to plain instances can work around name a fallback."""
+
+    def test_only_translation_findings_name_a_fallback(self):
+        ivy_k = {"renderinstancing": True, "maxbranches": 100, "maxleaves": 100, "material": None}
+        cases = (
+            # fixed in Max, and Instantiate has nothing (or the same capped output) to convert
+            ("disabled railclone", railclone(k={"disabled": True}, out=["OUT|26|0|0"]), None, "ok"),
+            ("disabled forest", forest(k={"disabled": True}), None, "ok"),
+            ("railclone caps", railclone(k={"maxFaces": 0.0121, "maxseg": 100}), None, "error"),
+            ("proxy file", railclone(k={"proxymode": 2, "proxyfile": "C:\\a.rcproxy", "proxyfile_exists": False}),
+             None, "error"),
+            ("forest render items", forest(k={"count": 516, "rmaxitems": 100}), None, "error"),
+            ("forest faces", forest(k={"rendermode": 1, "maxFaces": 1}, items=[item(1, faces=10)],
+                                    extra=["HIST|1|200000"]), None, "error"),
+            ("geomlist 3", forest(items=[item(1, geom=3, name="x")]), None, "error"),
+            # translation problems
+            ("forest colour map", forest(extra=[cm(s1cls="", s1name="", s1file="")]), "forest", "error"),
+            ("railclone colour map", railclone(extra=rc_extra() + [cm(cls="RailClone_Color", s1cls="VRayColor")]),
+             "railclone", "error"),
+            ("ID map", forest(extra=[f"MS|{b64('p')}|{b64('m')}|i0|b0"]), "forest", "warn"),
+            ("billboard", forest(items=[item(1, geom=1, name="bb", source_class=None, source=None)]), "forest", "warn"),
+            ("forest material", forest(extra=[f"FM|{b64('matList[1]/fm')}|{b64('fm')}"]), "forest", "warn"),
+            ("edge on proxies", forest(items=[item(1, source_class="VRayProxy", source="p")],
+                                       areas=[area(boundary=2)]), "forest", "warn"),
+            ("ivy instancing", obj_rows("ivy", "Ivy", ivy_k), "ivy", "warn"),
+        )
+        for label, rows, kind, status in cases:
+            with self.subTest(label):
+                r = run(*rows)
+                o = r["objects"][0]
+                self.assertEqual(o["status"], status)
+                self.assertEqual(o.get("fallback"), kind)
+                self.assertEqual(set(r["fallbacks"]), {kind} if kind else set())
+                self.assertEqual("FALLBACK" in {f["code"] for f in r["scene_findings"]}, kind is not None)
+
+    def test_fallback_codes(self):
+        self.assertTrue(iv.FALLBACK_CODES <= set(iv.CODES))
+        for code in ("RC_DISABLED", "FOREST_DISABLED"):
+            self.assertEqual(iv.CODES[code][0], "info")
+        for code in ("RC_DISABLED", "FOREST_DISABLED", "RC_MAXSEG_EXCEEDED", "RC_MAXFACES_EXCEEDED",
+                     "RC_PROXY_FILE_MISSING", "FOREST_RENDER_MAX_ITEMS_EXCEEDED", "FOREST_MAX_FACES_EXCEEDED",
+                     "GEOMLIST_CRASH_RISK"):
+            self.assertNotIn(code, iv.FALLBACK_CODES)
+
+
 class SceneTests(unittest.TestCase):
     def test_scene_findings_and_lists(self):
         r = run(*forest(), xshadow=[(5, "Omni001")], missing=["Nope"], not_itoo=[("Box001", "Box")],
@@ -688,9 +831,9 @@ class SceneTests(unittest.TestCase):
         self.assertTrue(any(w.startswith("TIME_BUDGET") for w in r["warnings"]))
 
     def test_summary(self):
-        r = run(*forest(k={"disabled": True}), *railclone(k={"nodemat": True}), *forest(name="ok"))
+        r = run(*forest(k={"count": 516, "rmaxitems": 100}), *railclone(k={"nodemat": True}), *forest(name="ok"))
         self.assertEqual(r["summary"]["status"], {"error": 1, "warn": 1, "ok": 1})
-        self.assertEqual(r["summary"]["findings"], {"error": 1, "warn": 1, "info": 1})  # + the scene FALLBACK info
+        self.assertEqual(r["summary"]["findings"], {"error": 1, "warn": 1, "info": 0})  # a cap: no fallback
         self.assertEqual(r["summary"]["kinds"], {"forest": 2, "railclone": 1, "ivy": 0})
 
     def test_code_table(self):

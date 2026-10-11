@@ -73,7 +73,7 @@ Checked live on 2026-10-11:
   - `vmaxitems`, and `viewport_thinning`: `none`, `unlikely`, `possible` or `unknown`;
   - `rmaxitems`, `max_faces_millions`, `render_mode`, `rmesh`, `vmesh`, `rskip`, `disabled`, `consolidate_materials`;
   - `item_types`, `billboards`, `proxy_items`, `material`, `color_maps`, `opacity_maps`;
-  - `estimated_faces`, in Meshes render mode only.
+  - `estimated_faces`, in Meshes render mode only, with `estimated_faces_partial` when some item types have no face count.
 - **RailClone:**
   - `disabled`, `instancing` (`rendermode`), `rmesh`, `vmesh`, `use_segment_material` (`nodemat`), `auto_update`, `proxy_mode`, `created_version`, `material`;
   - counts of `modifiers`, `segments`, `material_operators` and `uvw_operators`;
@@ -86,7 +86,7 @@ Checked live on 2026-10-11:
 ### 1. Colour maps (Forest Color, RailClone Color)
 
 - **Where it looks:** every `Forest_Color` and `RailClone_Color` (matched by class name, case-insensitive), wherever it sits in a walked material tree:
-  - Forest: `matList[k]`, each item source's material (`cobjlist[k].material`), then the node's `forest_automat_*` material.
+  - Forest: `matList[k]`, each item source's material (`cobjlist[k].material`) unless `matList[k]` overrides it, then the node's `forest_automat_*` material. An override replaces the source material inside `forest_automat_*` [live], so an overridden source material doesn't render through the forest and isn't checked (it's still checked through any other item that uses it without an override). `details` shows each item's `material_override`.
   - RailClone: `sobjmtl[k]`, the linked segment sources' materials when Use Segment Material is on, and the node material.
   - ForestIvy: the node material.
 - **Slot 1:** Vantage bypasses these maps and renders input slot 1. In the SDK's sub-texmap order, slot 1 is `mapbase`, labelled "Default Map" [live]. The check reads its class, name, file name (`filename` or `HDRIMapName`) and how many of its own inputs are set.
@@ -121,9 +121,12 @@ Checked live on 2026-10-11:
 
 ### 4. Material IDs under `forest_automat_*`
 
-- **ID-driven maps:** each `VRayMultiSubTex` in a forest's walk is read for `from_id`.
-  - `from_id` 0 means "Face material ID" [doc: V-Ray SDK]. With Consolidate Materials (`consmat`) on, that gives `ID_MAP_IN_FOREST` (warn): Forest renumbers face IDs into `forest_automat_*` [doc+live].
-  - With consolidation off it gives `ID_MAP_UNCONSOLIDATED` (info).
+- **ID-driven maps:** maps in a forest's walk that can be keyed on face material ID. With Consolidate Materials (`consmat`) on, each one gives `ID_MAP_IN_FOREST` (warn): Forest renumbers face IDs into `forest_automat_*` [doc+live], so the map picks other entries or loses its variation. With consolidation off it gives `ID_MAP_UNCONSOLIDATED` (info).
+  - `VRayMultiSubTex` with `from_id` 0, "Face material ID" [doc: V-Ray SDK].
+  - `VRayMultiSubTex` with `from_id` 12 (random by composite seed) and `random_by_face_mtl_id` ("By face MtlID") on. If that flag can't be read, `multisubtex_mode` is unknown.
+  - Any map with `randByMat` ("Random by material id") on: `BerconTile` and `BerconGradient` [live: PB2 labels].
+  - `MultiTexture` has `rnd_by` ("Randomize by", default 0), and its dialog offers Material ID and Object [live], but which value means Material ID wasn't confirmed. So a `MultiTexture` in a consolidated forest goes to the `id_map` unknown with its `rnd_by` value, not to a finding.
+  - Max's native maps have no ID switch on this build (only OSL maps, which Vantage doesn't support), so none is checked.
 - **FPColor materials:** `FPCOLOR_HARMLESS` (info) counts the "FPColor ID n" Standard materials. They only drive the viewport Color ID display, and Forest rebuilds them. The walk doesn't enter them.
 - **Node material:**
   - `FOREST_NO_AUTOMATERIAL` (info): the node has no material yet.
@@ -132,7 +135,7 @@ Checked live on 2026-10-11:
 
 ### 5. RailClone settings
 
-- `RC_DISABLED` (error): `disabled` is on.
+- `RC_DISABLED` (info): `disabled` is on. The object renders nothing in Max either, so Vantage matches Max.
 - **Modifiers** (`node.modifiers`; reading them fires no events [live]):
   - `RC_MODIFIERS` (warn): any modifier enabled in renders. The docs say modifiers are incompatible with native instancing.
   - `RC_MODIFIERS_OFF` (info): all of them are off in renders.
@@ -164,7 +167,7 @@ Checked live on 2026-10-11:
   - `RC_AUTOUPDATE_OFF` (info) notes that with `autoUpdate` off the export may be older than the last change.
 - **RailClone: segments.** `RC_MAXSEG_NEAR` (warn) at 80% or more of `maxseg`. `RC_MAXSEG_EXCEEDED` (error) means the export predates the cap. 0 gives `RC_MAXSEG_UNLIMITED`.
 - **RailClone: faces.** The estimate is items per segment × each segment's faces.
-  - The faces come from `sobjref[k].mesh.numfaces`, or else from the linked source node's mesh; V-Ray proxy segments are unknown.
+  - The faces come from `sobjref[k].mesh.numfaces`, or else from the linked source node's evaluated mesh (so a linked source with modifiers is counted: its `sobjref` turns into a DummyClass [live], and the node's mesh is what RailClone uses). V-Ray proxy segments are unknown, and so is an embedded segment whose `sobjref` is a DummyClass with no linked node to fall back on.
   - It is compared with `maxFaces` (in millions) as `RC_MAXFACES_NEAR` (warn) or `RC_MAXFACES_EXCEEDED` (error); 0 gives `RC_MAXFACES_UNLIMITED`. Instanced items count too [live].
   - Live, the estimate for a 176-item fence was 12,112 faces. `maxFaces` 0.0122 kept the output and 0.0121 emptied it, so the estimate was exact there.
   - Sliced or bent segments can add faces, so treat it as an estimate.
@@ -180,16 +183,18 @@ Checked live on 2026-10-11:
   - `FOREST_RENDER_MAX_ITEMS_UNLIMITED` (info): 0.
 - **Forest: render mode and faces.** Max Faces is ignored by V-Ray in Automatic render mode [doc].
   - When `rendermode` isn't 0 (Automatic, the default; Meshes otherwise [inf]), the check warns `FOREST_MESH_RENDER_MODE`.
-  - It then counts items per type with `trees.getGeomID` (up to 200,000 items) and multiplies by each source's `mesh.numfaces`, for `FOREST_MAX_FACES_NEAR` or `FOREST_MAX_FACES_EXCEEDED`. Billboards and proxies have no face count.
+  - It then counts items per type with `trees.getGeomID` (up to 200,000 items) and multiplies by each source's `mesh.numfaces`, for `FOREST_MAX_FACES_NEAR` or `FOREST_MAX_FACES_EXCEEDED`. Billboards and V-Ray proxies have no face count: a proxy node's mesh is its viewport preview (12 faces live, for the armadillo sample in box preview), so it's never read, and those item types go to the `faces` unknown.
 - **Forest: other.**
-  - `FOREST_DISABLED` (error): disabled.
+  - `FOREST_DISABLED` (info): disabled, so it renders nothing in Max either.
   - `FOREST_NO_ITEMS` (warn): count 0.
   - `FOREST_RENDER_DISPLAY` (warn): `rmesh` not 0.
   - `FOREST_RENDER_SIMPLIFICATION` (info): `rskip` > 0.
 
 ### 7. Fallback
 
-Objects with an error get `fallback` (their kind); `fallbacks` has the text, and the scene finding `FALLBACK` (info) points to it.
+Objects with a finding that Vantage may not translate get `fallback` (their kind); `fallbacks` has the text, and the scene finding `FALLBACK` (info) points to it. Those findings are the colour-map errors (`COLORMAP_SLOT1_EMPTY`, `COLORMAP_SLOT1_FLAT`), the CPU-only features (`CPU_ONLY_FOREST_MATERIAL`, `CPU_ONLY_BILLBOARD`, `EDGE_MODE_ON_PROXIES`, `IVY_RENDER_INSTANCING`) and `ID_MAP_IN_FOREST`.
+
+Other errors get no fallback, because converting can't fix them: their fix is in Max. A disabled object or one over `maxseg`/`maxFaces` generates nothing, so Instantiate has nothing to convert [live]. The same goes for a missing proxy file, `rmaxitems` or Max Faces exceeded, and `geomlist` 3.
 
 - **RailClone:** RailClone Tools `RailClone_Pro.Instantiate mode layer autoDelete separatedMeshes forceInstances disableAtEnd`. It works on the selection. Use `forceInstances=false`, because true ignores the Material and UVW operators.
 - **Forest:** Forest Tools > Instantiate (UI only). The instances keep their source material IDs.
@@ -206,7 +211,8 @@ All of these change the scene, so ask the user first. Never export a `.vrscene`:
 | `unknown.check` | Why |
 |---|---|
 | `caps` | No current RailClone export (empty or unreadable). Only a rebuild would refresh it. |
-| `faces` | A segment or item type without a face count: V-Ray proxy (preview mesh only), a modified linked source (`sobjref` is a DummyClass), a billboard, or a proxy-cached RailClone whose export doesn't name segments. |
+| `faces` | A segment or item type without a face count: a V-Ray proxy (its mesh is only the preview), an embedded segment whose source was modified (`sobjref` is a DummyClass and no source node is linked), a billboard, or a proxy-cached RailClone whose export doesn't name segments. A modified *linked* source is counted from the source node's mesh. |
+| `id_map` | A `MultiTexture` in a consolidated forest (which `rnd_by` value means Material ID isn't confirmed), or a map whose `randByMat` couldn't be read. |
 | `render_item_count` | `trees.count()` may be thinned by the viewport limit. The full count needs `vmaxitems` 0 and a rebuild. |
 | `histogram` | Meshes render mode with over 200,000 items, or the budget ran out while counting items per type. |
 | `boundary_check` | `arboundchecklist` missing or unreadable. |
@@ -218,7 +224,8 @@ All of these change the scene, so ask the user first. Never export a `.vrscene`:
 
 ## Not tested live
 
-- V-Ray proxy segments and items: no `.vrmesh` was linked into a RailClone or a Forest in the shared scratch Max. That covers `RC_PROXY_MESH_REVERTABLE`, `EDGE_MODE_ON_PROXIES` and the version read.
+- V-Ray proxy segments: no `.vrmesh` was linked into a RailClone in the shared scratch Max. That covers `RC_PROXY_MESH_REVERTABLE` and the version read. `EDGE_MODE_ON_PROXIES` wasn't run live either. A Forest with a V-Ray proxy item (V-Ray's armadillo sample) was checked: its item type goes to the `faces` unknown.
+- MultiTexture's `rnd_by` values, and whether Vantage renders BerconTile's random by material ID.
 - An external proxy cache file (`proxymode` 2).
 - ForestIvy with surfaces, and `FOREST_RENDER_DISPLAY`.
 - Every Vantage-side claim: what Vantage renders for slot 1, Opacity Maps, Use Segment Material, the Material operator, segment mapping, Edge mode. The tool says which ones are documented and which are unverified; nothing was rendered.
@@ -234,3 +241,8 @@ All of these change the scene, so ask the user first. Never export a `.vrscene`:
 - **Other session's objects:** the check was also run, read-only, on that session's `VC_` objects. It found the empty slot 1 inside a Mask on the stock Grass preset, flagged in the user's notes.
 - **Fixture report:** `tests/itoo_vantage_live_report.txt` is the raw report of one run, and the unit tests check its analysis.
 - **Whole scene:** 263 objects in 1.1 s, with no node events and unchanged exports. The report was 266 KB, mostly the compact `state` of 245 RailClones; name the objects to keep it small.
+- **Review fixes** (later the same day, under `runs-1011\vcheck-fix\`):
+  - `IVF_forest` overrides item 1's material with `matList`; `IVF_forest_ctrl` is the same forest without the override. The override replaced the source material in `forest_automat_*`. Only the control reported that source material's empty Forest Color slot 1.
+  - Item 2's material holds a `VRayMultiSubTex` (from_id 12, By face MtlID), a `BerconTile` (randByMat) and a `MultiTexture`. Both forests reported the first two as `ID_MAP_IN_FOREST` and the MultiTexture as the `id_map` unknown.
+  - The proxy forest's estimate dropped from 17,244 faces (1,437 × the 12-face preview) to 0, marked partial, with the proxy under `faces`.
+  - Whole scene, 290 objects in 1.2 s: 10 objects name a fallback and 5 are errors (all colour maps). In the earlier whole-scene run, 236 objects were errors with a fallback, and 229 of them were only disabled stock RailClones.
