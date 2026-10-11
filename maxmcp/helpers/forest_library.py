@@ -5,7 +5,8 @@ list, which can include network folders) plus %LOCALAPPDATA%\\Itoo Software\\For
 Each index.xml lists <item> entries: class "maxobject" (a Forest preset or a 3D mesh, merged from
 <maxfile> by <object> name; Forest Ivy items name an .fp file instead) or "tree_billboard" (2D).
 Matlib paths use $(LIBROOTPATH) (the root) and $(RENDERER); other relative paths are relative to the
-index.xml folder. A library-level <select setmacro="X"> defines $(X) for its items (Autumn Leaves:
+index.xml folder, also when written with a leading backslash (the docs' "\\objects\\x.max"), and a <bitmap> file
+name is in that folder's thumbnails. A library-level <select setmacro="X"> defines $(X) for its items (Autumn Leaves:
 $(PRESET_STATE) in <object> and <material>); it is expanded to its default option.
 """
 from __future__ import annotations
@@ -218,6 +219,18 @@ def expand_macros(text: str, macros: dict[str, str]) -> str:
     return _MACRO.sub(lambda m: macros.get(m.group(1).upper(), m.group(0)), text)
 
 
+def library_relative(path: str) -> str | None:
+    """The index-folder-relative part of a library path, or None when it is absolute (a drive or UNC path).
+
+    Live: index.xml paths are relative to the folder holding the index.xml (511 of 511 stock maxfiles). The
+    docs' template writes them with a leading backslash (\\objects\\x.max), which Windows reads as the drive
+    root, so one leading slash is dropped.
+    """
+    if path[:2] in ("\\\\", "//") or ntpath.splitdrive(path)[0]:
+        return None
+    return path.lstrip("\\/")
+
+
 def resolve_path(template: str, index_dir: str, root: str, renderer: str | None = None) -> str | None:
     """A library path with $(LIBROOTPATH) (and $(RENDERER) when given) resolved; relative to index_dir."""
     if not template:
@@ -225,9 +238,23 @@ def resolve_path(template: str, index_dir: str, root: str, renderer: str | None 
     path = re.sub(r"\$\(LIBROOTPATH\)", lambda _: root, template, flags=re.I)
     if renderer is not None:
         path = re.sub(r"\$\(RENDERER\)", lambda _: renderer, path, flags=re.I)
-    if not ntpath.isabs(path):
-        path = ntpath.join(index_dir, path)
+    rel = library_relative(path)
+    if rel is not None:
+        path = ntpath.join(index_dir, rel)
     return ntpath.normpath(path)
+
+
+def thumbnail_path(bitmap: str, index_dir: str) -> str | None:
+    """The <bitmap> file: under the index folder's thumbnails\\ (live: every stock one), else the index folder."""
+    if not bitmap:
+        return None
+    rel = library_relative(bitmap)
+    if rel is None:
+        return bitmap if os.path.isfile(bitmap) else None
+    for candidate in (os.path.join(index_dir, "thumbnails", rel), os.path.join(index_dir, rel)):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def matlib_renderers(template: str, index_dir: str, root: str) -> list[str]:
@@ -279,13 +306,7 @@ def parse_index(path: str, root: dict[str, str]) -> list[dict[str, Any]]:
         maxfile = resolve_path(maxfile_rel, index_dir, root["path"]) if maxfile_rel else None
         template = expand_macros(raw["matlib"] or raw["library"], used)
         obj = expand_macros(raw["object"], used)
-        bitmap = _text(element, "bitmap")
-        thumbnail = None
-        if bitmap:
-            for candidate in (os.path.join(index_dir, "thumbnails", bitmap), os.path.join(index_dir, bitmap)):
-                if os.path.isfile(candidate):
-                    thumbnail = candidate
-                    break
+        thumbnail = thumbnail_path(_text(element, "bitmap"), index_dir)
         name = _english_name(element) or obj
         description = " ".join(_text(element, "description").split())
         record = {

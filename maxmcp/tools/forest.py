@@ -55,6 +55,13 @@ def _mxs_bool(value: bool) -> str:
     return "true" if value else "false"
 
 
+def _viewport_notes(count: int | None, vmax: float | None) -> list[tuple[str, str]]:
+    """VIEWPORT_LIMIT_POSSIBLE when trees.count() may be the viewport-thinned build (no estimate to compare)."""
+    limit = int(vmax) if vmax is not None and vmax > 0 else None
+    return fh.count_checks(None, count, viewport_max=limit, maxdensity=None, candidates=None,
+                           render_max=None)["notes"]
+
+
 # --------------------------------------------------------------------------------------------
 # forest_items
 # --------------------------------------------------------------------------------------------
@@ -88,7 +95,7 @@ for i = 0 to n - 1 do (
 )
 local ss = stringStream ""
 format "FPOK\n" to:ss
-format "H|%|%|%|%|%|%\n" (fpEnc nd.name) (nd.mode as string) n nT invalid (fpF (units.decodeValue "1m")) to:ss
+format "H|%|%|%|%|%|%|%\n" (fpEnc nd.name) (nd.mode as string) n nT invalid (fpF (units.decodeValue "1m")) (fpPropV nd #vmaxitems) to:ss
 for g = 1 to nT do (
     local src = if g <= cl.count then cl[g] else undefined
     format "G|%|%|%|%|%|%|%\n" g hist[g] (if g <= gl.count then fpVal gl[g] else "-") (fpB srcOk[g]) (fpEnc (nl[g] as string)) (if g <= cn.count then fpEnc (cn[g] as string) else "") (if isValidNode src then fpEnc src.name else "") to:ss
@@ -167,6 +174,8 @@ def forest_items(
     the forest's object space. rotation_z is in degrees, scale is per axis relative to the source object, size is
     the stored [width, height] in scene units. refresh_surfaces pulses surfanim first: Forest Pack caches
     surfaces, so items keep the old Z after a surface moves until then. limit is at most 5000 (~100 bytes each).
+    The items are the viewport build: over Max items Viewport (vmaxitems) Forest Pack thins it, so count can be
+    lower than what renders (VIEWPORT_LIMIT_POSSIBLE).
     """
     fh.node_name(name, "name")
     offset = fh.integer(offset, "offset", 0, 2**31 - 2)
@@ -226,6 +235,8 @@ def forest_items(
                         "item TM (getFullTransform * objectTransform), not an instance-ready pivot")
     if mode == 0:
         warnings.append("procedural mode: indices are valid until the forest rebuilds")
+        warnings += [f"{code}: {detail}" for code, detail in
+                     _viewport_notes(count, fh.num(head[7]) if len(head) > 7 else None)]
     return {
         "name": fh.unb64(head[1]),
         "mode": fh.mode_name(mode),
@@ -813,7 +824,7 @@ try (
     -- The report, still inside the try: a failure here also removes the placed nodes
     format "FPOK\n" to:ss
     local n = if (fpGeomBad f) > 0 then -1 else f.trees.count()
-    format "F|%|%|%|%|%|%|%\n" (fpEnc f.name) kind n (fpF f.units_x) (fpF f.units_y) (f.mode as string) (fpF (units.decodeValue "1m")) to:ss
+    format "F|%|%|%|%|%|%|%|%\n" (fpEnc f.name) kind n (fpF f.units_x) (fpF f.units_y) (f.mode as string) (fpF (units.decodeValue "1m")) (fpPropV f #vmaxitems) to:ss
     local nl = f.namelist as array, cl = f.cobjlist as array, gl = f.geomlist as array, pl = f.problist as array
     for g = 1 to nl.count do (
         local c = if g <= cl.count then cl[g] else undefined
@@ -858,6 +869,10 @@ def _parse_from_library(report: list[str]) -> dict[str, Any]:
             result.update(name=fh.unb64(f[1]), kind=f[2], count=None if count < 0 else count,
                           units_x=float(f[4]), units_y=float(f[5]), mode=fh.mode_name(int(f[6])),
                           units_per_meter=float(f[7]))
+            vmax = fh.num(f[8]) if len(f) > 8 else None
+            result["viewport_max_items"] = None if vmax is None else int(vmax)
+            result["warnings"] += [f"{code}: {detail}" for code, detail in
+                                   _viewport_notes(result["count"], vmax)]
         elif tag == "G":
             geom = fh.num(f[2])
             result["items"].append({"geom_id": int(f[1]), "name": fh.unb64(f[4]), "source": fh.unb64(f[5]) or None,
@@ -1090,8 +1105,8 @@ def _fix_ops(plan: list[dict[str, Any]]) -> str:
     return "#(" + ", ".join(ops) + ")"
 
 
-def _validation(state: dict[str, Any]) -> dict[str, Any]:
-    analysis = fh.analyze(state)
+def _validation(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = frozenset()) -> dict[str, Any]:
+    analysis = fh.analyze(state, padded_gaps)
     out = {
         "name": state.get("name"),
         "ok": not analysis["errors"],
@@ -1100,14 +1115,19 @@ def _validation(state: dict[str, Any]) -> dict[str, Any]:
         "estimated_count": analysis["estimated_count"],
         "errors": analysis["errors"],
         "warnings": analysis["warnings"],
+        "notes": analysis["notes"],
         "item_types": state["lengths"].get("namelist", 0),
         "areas": [{"index": a["index"], "name": a["name"],
                    "type": "surface" if a["type"] == 3 else "spline" if a["type"] == 0 else a["type"],
                    "active": a["active"], "exclude": a["incexc"] == 1} for a in state["areas"]],
         "surfaces": [s["name"] or None for s in state["surfaces"]],
         "units": {"x": state.get("units_x"), "y": state.get("units_y"),
-                  "per_meter": state.get("upm")},
+                  "per_meter": state.get("upm"), "lock_ratio": state.get("lock_ratio")},
         "direction": state.get("direction"),
+        "limits": {"viewport_max_items": state.get("vmaxitems"), "render_max_items": state.get("rmaxitems"),
+                   "maxdensity_millions": state.get("maxdensity"), "candidate_cells": analysis["candidate_cells"],
+                   "viewport_thinned": analysis["viewport_thinned"],
+                   "estimated_viewport_count": analysis["estimated_viewport_count"]},
     }
     if analysis["estimate_note"]:
         out["estimate_note"] = analysis["estimate_note"]
@@ -1121,12 +1141,16 @@ def forest_validate(name: str, fix: bool = False) -> dict[str, Any]:
     """Check a Forest Pack object's item and area lists, then build it and report the item count.
 
     Errors: item lists shorter than namelist (the master: Forest Pack pads them with values that give nothing
-    or empty items), geomlist outside 1/2 (3 crashed Max, so the forest is then not rebuilt), sources missing,
+    or empty items), geomlist outside 0/1/2 (3 crashed Max, so the forest is then not rebuilt), sources missing,
     probabilities or sizes <= 0, area lists of unequal length, no active area, active areas without a spline or
-    surface, 0 items. Warnings: long lists, conamelist mismatches, density tile too large (estimate only for the
-    default density map), custom edit mode. fix=true pads short item lists (geomlist 2 when a source exists, else
-    0; probability 100; size from the source), relinks missing sources by a unique matching name, pads area lists,
-    in one undo step, then checks again. It never truncates lists or writes geomlist 3.
+    surface, 0 items. Warnings: long lists, conamelist mismatches, an exclude listed before an include it should
+    cut, density tile too large, the viewport Max Items limit thinning count (trees.count()), the maxdensity cap
+    (0 items, when the count is 0), custom edit mode. Notes: geomlist 0 gap items, a count that disagrees with
+    the thinning the estimate predicts. The estimate is for the stock map only. fix=true pads short item lists
+    (geomlist 2 when a source exists, else 0; probability 100; size from the source), relinks missing sources by
+    a unique matching name, pads area lists, in one undo step, then checks again. An item type it had to pad with
+    geomlist 0 (no source found) is an error after the fix, SOURCE_UNRESOLVED, not a gap note. It never
+    truncates lists or writes geomlist 3.
     """
     fh.node_name(name, "name")
     do_fix = _bool(fix, "fix")
@@ -1151,14 +1175,18 @@ def forest_validate(name: str, fix: bool = False) -> dict[str, Any]:
                            EXPECT="#(" + ", ".join(f'#("{n}", {c})' for n, c in expect) + ")",
                            OPS=_fix_ops(plan)), lib=lib)
     fixed = []
+    padded_gaps: set[int] = set()
     for line in report:
         f = line.split("|")
         if f[0] == "X":
             row = {"list": f[1], "from": int(f[2]), "to": int(f[3])}
             if f[1] == "cobjlist":
                 row["relinked"] = int(f[4])
+            elif f[1] == "geomlist":
+                # the fix wrote these entries: a 0 among them is a source it couldn't find, not a chosen gap
+                padded_gaps.update(range(row["from"] + 1, row["to"] + 1))
             fixed.append(row)
-    after = _validation(fh.parse_state(report))
+    after = _validation(fh.parse_state(report), padded_gaps)
     after["fixed"] = fixed
     after["errors_before"] = result["errors"]
     return after

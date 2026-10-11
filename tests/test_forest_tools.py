@@ -186,7 +186,9 @@ def check_script(test, script):
     test.assertNotIn("@@", script)
     test.assertEqual(script.count("("), script.count(")"))
     test.assertNotRegex(script, r"geomlist\s*=\s*#\(\s*3")
-    test.assertNotIn("maxdensity", low)
+    # maxdensity is a cap on candidate cells (live: over it, 0 items); it may be read, never written
+    test.assertNotRegex(low, r"\.maxdensity\s*=(?!=)")
+    test.assertNotRegex(low, r"setproperty\s+\w+\s+#maxdensity")
     check_formats(test, script)
     check_live_pitfalls(test, script)
 
@@ -243,6 +245,20 @@ class RegistrationTests(unittest.TestCase):
     def test_plugin_descriptor(self):
         from maxmcp.tools import plugins
         self.assertTrue(self.NEW | {"scatter_forest_pack"} <= set(plugins.PLUGIN_OVERLAYS["forestpack"]["workflow_tools"]))
+        # live (probes p13-p15): maxdensity is a cap on candidate cells (over it, 0 items), not a no-op
+        gotchas = " ".join(plugins.PLUGIN_OVERLAYS["forestpack"]["gotchas"])
+        self.assertNotIn("maxdensity does nothing", gotchas)
+        self.assertIn("maxdensity isn't a density", gotchas)
+
+    def test_railclone_guide_names_clipping_splines(self):
+        # railclone_from_library gives splines to path bases only; paving and cladding items need clipping_splines
+        from maxmcp.tools import plugins
+        overlay = plugins.PLUGIN_OVERLAYS["railclone"]
+        recipe = next(r for r in overlay["recipes"] if "railclone_from_library" in r)
+        self.assertIn("clipping_splines", recipe)
+        self.assertIn("path bases", recipe)
+        self.assertNotIn("passing the splines", recipe)
+        self.assertIn("force_rebuild", " ".join(overlay["gotchas"]))
 
 
 class HelperTests(unittest.TestCase):
@@ -280,6 +296,88 @@ class HelperTests(unittest.TestCase):
         self.assertAlmostEqual(fh.estimate_count(100.0, 10.0, 10.0), 1437.0)
         self.assertAlmostEqual(fh.units_for_items_per_m2(1437.0), 100.0)
         self.assertAlmostEqual(fh.units_for_items_per_m2(1437.0 / 9.0), 300.0)
+        # lock_ratio uses units_x for both sides: 500 x 1000 cm gave 5748 locked, 2874 unlocked (live)
+        self.assertAlmostEqual(fh.estimate_count(100.0, 5.0, 10.0, lock_ratio=True), 5748.0)
+        self.assertAlmostEqual(fh.estimate_count(100.0, 5.0, 10.0), 2874.0)
+        # a geomlist-0 gap item with half the probability: 711 of 1437 (live)
+        self.assertAlmostEqual(fh.estimate_count(100.0, 10.0, 10.0, item_share=0.5), 718.5)
+        self.assertIsNone(fh.estimate_count(100.0, 0.0, 10.0))
+
+    def test_caps(self):
+        # Max items Viewport thinning, measured on a 10 m plane (probe p27): full N, vmaxitems -> trees.count()
+        for full, vmax, measured, k in ((143700, 50000, 35800, 2), (63763, 50000, 15844, 2),
+                                        (255683, 50000, 28704, 3), (255683, 100000, 63784, 2),
+                                        (143700, 200000, 143700, 1), (16023, 50000, 16023, 1)):
+            step, shown = fh.viewport_thinning(full, vmax)
+            self.assertEqual(step, k)
+            self.assertLess(abs(shown - measured) / measured, 0.02, (full, vmax))
+        self.assertEqual(fh.viewport_thinning(143700, 0), (1, 143700))
+        # maxdensity caps candidate cells in millions: 10 m plane, 95 cm tiles = 1.11 M cells > 1 -> 0 items
+        self.assertAlmostEqual(fh.candidate_cells(100.0, 0.95, 0.95) / 1e6, 1.108, places=3)
+        out = fh.count_checks(143700.0, 35800, viewport_max=50000, maxdensity=40, candidates=1.0e6,
+                              render_max=1000000)
+        self.assertEqual((out["viewport_thinned"], out["estimated_viewport_count"]), (True, 35925))
+        self.assertEqual([c for c, _ in out["warnings"]], ["VIEWPORT_LIMIT"])
+        self.assertIn("about 143700 render", out["warnings"][0][1])
+        out = fh.count_checks(143700.0, 0, viewport_max=50000, maxdensity=1, candidates=1.108e6,
+                              render_max=100000)
+        self.assertEqual([c for c, _ in out["warnings"]], ["MAXDENSITY_CAP", "RENDER_LIMIT"])
+        self.assertIn("scatters 0 items", out["warnings"][0][1])
+        out = fh.count_checks(143700.0, None, viewport_max=0, maxdensity=1, candidates=1.108e6, render_max=None)
+        self.assertEqual([c for c, _ in out["warnings"]], ["MAXDENSITY_CAP"])  # not built: the cap is a prediction
+        out = fh.count_checks(143700.0, 143700, viewport_max=50000, maxdensity=40, candidates=1.0e6,
+                              render_max=100000)
+        self.assertFalse(out["viewport_thinned"])  # trees.count() over vmaxitems: not thinned
+        self.assertEqual([c for c, _ in out["warnings"]], ["RENDER_LIMIT"])
+        out = fh.count_checks(None, 28224, viewport_max=50000, maxdensity=None, candidates=None, render_max=None)
+        self.assertIsNone(out["viewport_thinned"])
+        self.assertEqual([c for c, _ in out["notes"]], ["VIEWPORT_LIMIT_POSSIBLE"])
+        self.assertEqual(fh.count_checks(None, 1437, viewport_max=50000, maxdensity=None, candidates=None,
+                                         render_max=None)["notes"], [])
+
+    def test_maxdensity_cap_needs_an_empty_build(self):
+        # Live (the cap is all or nothing): two stacked 10 m planes at 100 cm tiles, 2.0 M summed candidate cells,
+        # built 31582 items (vmaxitems 50000) under maxdensity 1. A build with items wasn't capped.
+        out = fh.count_checks(287400.0, 31582, viewport_max=50000, maxdensity=1, candidates=2.0e6,
+                              render_max=1000000)
+        self.assertNotIn("MAXDENSITY_CAP", [c for c, _ in out["warnings"]])
+        note = next(d for c, d in out["notes"] if c == "MAXDENSITY_SUM_OVER_CAP")
+        self.assertIn("31582 items", note)
+        self.assertIn("wasn't hit", note)
+        # under the cap: neither
+        out = fh.count_checks(143700.0, 35800, viewport_max=50000, maxdensity=40, candidates=1.0e6,
+                              render_max=1000000)
+        self.assertEqual([c for c, _ in out["notes"]], [])
+
+    def test_viewport_thinning_must_match_the_count(self):
+        # Live: thinning gives about N/k^2 (within 2%); a count that disagrees isn't called thinned
+        out = fh.count_checks(143700.0, 35800, viewport_max=50000, maxdensity=None, candidates=None,
+                              render_max=None)
+        self.assertTrue(out["viewport_thinned"])
+        # an estimate that overshoots (bounding-box area): 70000 estimated, 42000 built unthinned
+        out = fh.count_checks(70000.0, 42000, viewport_max=50000, maxdensity=None, candidates=None,
+                              render_max=None)
+        self.assertIsNone(out["viewport_thinned"])
+        self.assertIsNone(out["estimated_viewport_count"])
+        self.assertEqual(out["warnings"], [])
+        note = next(d for c, d in out["notes"] if c == "VIEWPORT_LIMIT_UNCERTAIN")
+        self.assertIn("about 17500", note)
+        self.assertIn("the count is 42000", note)
+        # live: after a distribution map was assigned and cleared, 143700 thinned to 8900, harsher than N/k^2
+        out = fh.count_checks(143700.0, 8900, viewport_max=50000, maxdensity=None, candidates=None,
+                              render_max=None)
+        self.assertIsNone(out["viewport_thinned"])
+        self.assertEqual([c for c, _ in out["notes"]], ["VIEWPORT_LIMIT_UNCERTAIN"])
+        # within the tolerance: thinned
+        self.assertTrue(fh.count_checks(143700.0, 30000, viewport_max=50000, maxdensity=None, candidates=None,
+                                        render_max=None)["viewport_thinned"])
+        # not built: the estimate is all there is
+        out = fh.count_checks(143700.0, None, viewport_max=50000, maxdensity=None, candidates=None, render_max=None)
+        self.assertTrue(out["viewport_thinned"])
+        self.assertEqual([c for c, _ in out["warnings"]], ["VIEWPORT_LIMIT"])
+        # an estimate under the limit: not thinned
+        self.assertFalse(fh.count_checks(16023.0, 16023, viewport_max=50000, maxdensity=None, candidates=None,
+                                         render_max=None)["viewport_thinned"])
 
     def test_library_script_is_balanced(self):
         self.assertEqual(fh.MXS_LIB.count("("), fh.MXS_LIB.count(")"))
@@ -323,9 +421,9 @@ class HelperTests(unittest.TestCase):
 # forest_items
 # --------------------------------------------------------------------------------------------
 
-def items_report(mode=0, count=3, items=(), types=None, invalid=0):
+def items_report(mode=0, count=3, items=(), types=None, invalid=0, vmax=None):
     types = types or [(1, 2, "2", "1", "Box", "Box", "Box"), (2, 1, "2", "0", "Tea", "Tea", "")]
-    lines = [f"H|{b64('Forest001')}|{mode}|{count}|{len(types)}|{invalid}|100"]
+    lines = [f"H|{b64('Forest001')}|{mode}|{count}|{len(types)}|{invalid}|100" + ("" if vmax is None else f"|{vmax}")]
     for g, n, geom, src_ok, label, coname, src in types:
         lines.append(f"G|{g}|{n}|{geom}|{src_ok}|{b64(label)}|{b64(coname)}|{b64(src) if src else ''}")
     lines.extend(items)
@@ -391,6 +489,16 @@ class ForestItemsTests(unittest.TestCase):
         self.assertEqual((item["item_name"], item["source"]), ("Box", "Box"))
         self.assertEqual(out["mode"], "custom_edit")
         self.assertIsNone(out["next_offset"])
+
+    def test_viewport_limit_note(self):
+        # trees.* read the viewport build, which Max items Viewport thins (live: 143700 -> 35800 at 50000)
+        out, script = self.run_items(items_report(count=35800, vmax=50000), limit=1)
+        self.assertIn("(fpPropV nd #vmaxitems)", script)
+        self.assertTrue(any(w.startswith("VIEWPORT_LIMIT_POSSIBLE") for w in out["warnings"]))
+        for report in (items_report(count=3, vmax=50000), items_report(count=35800),
+                       items_report(mode=1, count=35800, vmax=50000), items_report(count=35800, vmax=0)):
+            out, _ = self.run_items(report, limit=1)
+            self.assertFalse(any(w.startswith("VIEWPORT_LIMIT") for w in out["warnings"]))
 
     def test_params(self):
         for kw in ({"limit": 0}, {"limit": 5001}, {"offset": -1}, {"space": "local"}, {"fields": ["colour"]},
@@ -753,6 +861,33 @@ class ForestLibraryTests(LibraryFixture):
         self.assertEqual(flib.resolve_path(r"matlibs\gravel_$(RENDERER).mat", r"C:\lib\Presets\Gravel", r"C:\lib",
                                            "corona"), r"C:\lib\Presets\Gravel\matlibs\gravel_corona.mat")
         self.assertIsNone(flib.resolve_path("", "C:\\", "C:\\"))
+        # the docs' template form "\objects\x.max" is index-folder relative (live: every stock path resolves
+        # against the index folder), not the drive root; UNC and drive paths stay absolute
+        self.assertEqual(flib.resolve_path(r"\objects\x.max", r"C:\lib\Presets\Gravel", r"C:\lib"),
+                         r"C:\lib\Presets\Gravel\objects\x.max")
+        self.assertEqual(flib.resolve_path(r"\objects\x.max", r"\\srv\share\lib\Gravel", r"\\srv\share\lib"),
+                         r"\\srv\share\lib\Gravel\objects\x.max")
+        self.assertEqual(flib.resolve_path(r"\\srv\share\x.max", r"C:\lib\Gravel", r"C:\lib"), r"\\srv\share\x.max")
+        self.assertEqual(flib.resolve_path(r"D:\x.max", r"C:\lib\Gravel", r"C:\lib"), r"D:\x.max")
+
+    def test_leading_backslash_items(self):
+        folder = os.path.join(self.root, "Presets", "Lead")
+        os.makedirs(os.path.join(folder, "objects"))
+        os.makedirs(os.path.join(folder, "thumbnails"))
+        for parts in (("objects", "lead.max"), ("thumbnails", "lead.jpg")):
+            open(os.path.join(folder, *parts), "w").close()
+        with open(os.path.join(folder, "index.xml"), "w", encoding="utf-8") as fh_:
+            fh_.write('<library><item class="maxobject"><name lang="english">Lead</name>'
+                      '<bitmap>\\thumbnails\\lead.jpg</bitmap><maxfile>\\objects\\lead.max</maxfile>'
+                      '<object>_fp_lead</object></item></library>')
+        flib._scan_cache.clear()
+        item = flib.find_item("Lead")
+        self.assertEqual(item["maxfile"], os.path.join(folder, "objects", "lead.max"))
+        self.assertTrue(item["maxfile_exists"])
+        self.assertTrue(item["placeable"])
+        self.assertEqual(item["thumbnail"], os.path.join(folder, "thumbnails", "lead.jpg"))
+        self.assertEqual(flib.thumbnail_path("lead.jpg", folder), os.path.join(folder, "thumbnails", "lead.jpg"))
+        self.assertIsNone(flib.thumbnail_path("missing.jpg", folder))
 
 
 # A studio root whose folders aren't named Presets/3D/2D (the CRGR root: Трава, Камни, Растения), with a copy
@@ -1066,6 +1201,9 @@ class ForestFromLibraryTests(LibraryFixture):
         self.assertIn("act[k3] = (incs.count == 0)", script)
         self.assertIn("for s in incs do fpAppendArea f s 0 0 true", script)
         self.assertIn("for s in excs do fpAppendArea f s 0 1 true", script)
+        # live: a spline exclude cuts only include splines listed before it (and the Surface Area anywhere), so
+        # the excludes go after the includes
+        self.assertLess(script.index("for s in incs do fpAppendArea"), script.index("for s in excs do fpAppendArea"))
         self.assertIn(f'#("{b64("Hole")}")', script)
         self.assertIn("loadTempMaterialLibrary mp", script)
         self.assertIn("if true do (\n            for c in (f.cobjlist as array)", script)  # hide merged sources
@@ -1090,6 +1228,16 @@ class ForestFromLibraryTests(LibraryFixture):
         self.assertIn(f'fpDec "{b64("_fp_grass")}"', script)
         self.assertEqual(out["materials"]["swapped"], ["_fp_grass"])
         self.assertAlmostEqual(out["estimated_items_per_m2"], 159.67, places=2)
+
+    def test_viewport_limit_note(self):
+        report = ok(f"F|{b64('Lawn')}|preset|28224|203.2|25400|0|100|50000",
+                    f"G|1|2|100|{b64('_fp_wildgrass_09')}|{b64('_fp_wildgrass_09')}|n")
+        out, fake = self.run_place(report)
+        self.assertIn("(fpPropV f #vmaxitems)", fake.scripts[0])
+        self.assertEqual(out["viewport_max_items"], 50000)
+        self.assertTrue(any(w.startswith("VIEWPORT_LIMIT_POSSIBLE") for w in out["warnings"]))
+        out, _ = self.run_place(library_report())
+        self.assertFalse(any(w.startswith("VIEWPORT_LIMIT") for w in out["warnings"]))
 
     def test_3d_without_matlib_warns(self):
         out, _ = self.run_place(library_report(kind="3d", count=5), item="_fp_cane01")
@@ -1138,9 +1286,12 @@ LISTS_OK = {"namelist": 2, "cobjlist": 2, "geomlist": 2, "problist": 2, "widthli
 
 
 def collect_lines(lengths=None, items=None, areas=None, surfaces=None, count="12933|1|0", mode=0, units=100.0,
-                  ar_len=None):
+                  ar_len=None, caps=None, units_y=None, lock="1"):
     lengths = dict(LISTS_OK, **(lengths or {}))
-    out = [f"N|{b64('Forest001')}|{mode}|{units}|{units}|1|{b64('dense.bmp')}|50|0|0|0|0|2|0|100|100"]
+    out = [f"N|{b64('Forest001')}|{mode}|{units}|{units if units_y is None else units_y}|{lock}|{b64('dense.bmp')}"
+           f"|50|0|0|0|0|2|0|100|100"]
+    if caps is not None:  # vmaxitems, rmaxitems, maxdensity, pixels_x, pixels_y, distmap, scalelope
+        out.append("Q|" + caps)
     for name in fh.ITEM_LISTS:
         out.append(f"L|{name}|{lengths.get(name, 0)}")
     areas = areas if areas is not None else [(1, "3", "1", "0", "u", "", "Surface Area")]
@@ -1208,6 +1359,54 @@ class ForestValidateTests(unittest.TestCase):
         self.assertIn("CUSTOM_EDIT_MODE", codes(analysis["warnings"]))
         self.assertIn("SURFACE_AREA_MISSING", codes(analysis["warnings"]))
 
+    def test_geomlist_zero_is_a_gap_note(self):
+        # live: geomlist 0 ("Disabled") takes its probability share of positions and places nothing (711 of 1437)
+        items = [(1, "2", "50", "20", "50", "n", "Box", "1", "Box", "Box", "20", "50"),
+                 (2, "0", "50", "30", "22", "u", "", "0", "Gap", "Gap", "", "")]
+        analysis = fh.analyze(self.state(items=items, count="6466|1|0"))
+        self.assertEqual(analysis["errors"], [])
+        self.assertEqual(codes(analysis["notes"]), ["GEOM_NONE"])
+        self.assertIn("gap item", analysis["notes"][0]["detail"])
+        self.assertAlmostEqual(analysis["estimated_count"], 12933.0 / 2, places=0)
+
+    def test_caps_and_lock_ratio(self):
+        state = self.state(caps="50000|1000000|40|100|100|0|0", units_y=500.0, lock="1")
+        self.assertEqual((state["vmaxitems"], state["rmaxitems"], state["maxdensity"]), (50000, 1000000, 40))
+        self.assertEqual((state["distmap"], state["scalelope"]), (False, False))
+        analysis = fh.analyze(state)
+        self.assertAlmostEqual(analysis["estimated_count"], 12933.0, places=0)  # lock_ratio: units_x both ways
+        self.assertEqual(analysis["candidate_cells"], 90000)
+        self.assertFalse(analysis["viewport_thinned"])
+        unlocked = fh.analyze(self.state(caps="50000|1000000|40|100|100|0|0", units_y=500.0, lock="0"))
+        self.assertAlmostEqual(unlocked["estimated_count"], 12933.0 / 5, places=0)
+        # 100 m2 at 100 cm tiles: 143700 render, trees.count() 35800 (live)
+        thinned = fh.analyze(self.state(caps="50000|1000000|40|100|100|0|0", count="35800|1|0",
+                                        surfaces=[(1, "n", "Ground", "1000000")]))
+        self.assertTrue(thinned["viewport_thinned"])
+        self.assertEqual(thinned["estimated_viewport_count"], 35925)
+        self.assertIn("VIEWPORT_LIMIT", codes(thinned["warnings"]))
+        # over the maxdensity cap Forest Pack scatters nothing: NO_ITEMS says why
+        capped = fh.analyze(self.state(caps="0|1000000|1|100|100|0|0", count="0|1|0", units=95.0,
+                                       surfaces=[(1, "n", "Ground", "1000000")]))
+        self.assertIn("MAXDENSITY_CAP", codes(capped["warnings"]))
+        no_items = next(e for e in capped["errors"] if e["code"] == "NO_ITEMS")
+        self.assertIn("maxdensity=1", no_items["detail"])
+        # a custom distribution map: no estimate
+        custom = fh.analyze(self.state(caps="50000|1000000|40|100|100|1|0"))
+        self.assertIsNone(custom["estimated_count"])
+        self.assertIn("stock distribution map", custom["estimate_note"])
+
+    def test_exclude_order(self):
+        # live: a spline exclude cuts only include splines listed before it; the Surface Area at any index
+        areas = [(1, "3", "0", "0", "u", "", "Surface Area"), (2, "0", "1", "1", "n", "Hole", "Hole"),
+                 (3, "0", "1", "0", "n", "Bed", "Bed"), (4, "0", "1", "1", "n", "Hole2", "Hole2")]
+        analysis = fh.analyze(self.state(areas=areas))
+        issues = [i for i in analysis["warnings"] if i["code"] == "EXCLUDE_BEFORE_INCLUDE"]
+        self.assertEqual([(i["index"], i["include_index"]) for i in issues], [(2, 3)])
+        fine = [(1, "3", "1", "0", "u", "", "Surface Area"), (2, "0", "1", "0", "n", "Bed", "Bed"),
+                (3, "0", "1", "1", "n", "Hole", "Hole")]
+        self.assertNotIn("EXCLUDE_BEFORE_INCLUDE", codes(fh.analyze(self.state(areas=fine))["warnings"]))
+
     def test_fix_plan(self):
         state = self.state(
             lengths={"namelist": 3, "cobjlist": 2, "geomlist": 1, "problist": 3, "widthlist": 4, "heightlist": 2,
@@ -1271,6 +1470,44 @@ class ForestValidateTests(unittest.TestCase):
                                         {"list": "problist", "from": 1, "to": 2}])
         self.assertIn("ITEM_LIST_SHORT", codes(out["errors_before"]))
 
+    def test_tool_fix_reports_the_gaps_it_padded(self):
+        # namelist has 3 item types, every other list 1, and only Tree_A has a source. The fix pads geomlist with
+        # 0 for the two it can't relink: those are sources it couldn't find, not gaps the user chose (a chosen
+        # gap stays a note, test_geomlist_zero_is_a_gap_note)
+        short = {name: 1 for name in ("cobjlist", "geomlist", "problist", "widthlist", "heightlist", "conamelist")}
+        before = collect_lines(
+            lengths=dict(short, namelist=3),
+            items=[(1, "2", "100", "20", "50", "n", "Tree_A", "1", "Tree_A", "Tree_A", "20", "50"),
+                   (2, "-", "-", "-", "-", "-", "", "0", "Tree_B", "-", "", ""),
+                   (3, "-", "-", "-", "-", "-", "", "0", "Tree_C", "-", "", "")])
+        padded = {name: 3 for name in short}
+        fixed_items = [(1, "2", "100", "20", "50", "n", "Tree_A", "1", "Tree_A", "Tree_A", "20", "50"),
+                       (2, "0", "100", "20", "50", "u", "", "0", "Tree_B", "Tree_B", "", ""),
+                       (3, "0", "100", "20", "50", "u", "", "0", "Tree_C", "Tree_C", "", "")]
+        after = (["X|cobjlist|1|3|0", "X|geomlist|1|3|0", "X|problist|1|3|0", "X|widthlist|1|3|0",
+                  "X|heightlist|1|3|0", "X|conamelist|1|3|0"]
+                 + collect_lines(lengths=dict(padded, namelist=3), items=fixed_items, count="4311|1|0"))
+        fake = FakeClient(ok(*before), ok(*after))
+        with patch.object(forest, "client", fake):
+            out = forest.forest_validate("Forest001", fix=True)
+        self.assertFalse(out["ok"])
+        unresolved = [e for e in out["errors"] if e["code"] == "SOURCE_UNRESOLVED"]
+        self.assertEqual([e["index"] for e in unresolved], [2, 3])
+        self.assertIn("Tree_B", unresolved[0]["detail"])
+        self.assertNotIn("GEOM_NONE", codes(out["notes"]))
+        self.assertEqual(next(r for r in out["fixed"] if r["list"] == "cobjlist")["relinked"], 0)
+        # the same state checked on its own looks like chosen gaps: notes, with the way to fill them
+        plain = fh.analyze(fh.parse_state(collect_lines(lengths=dict(padded, namelist=3), items=fixed_items,
+                                                        count="4311|1|0")))
+        self.assertEqual(plain["errors"], [])
+        self.assertEqual(codes(plain["notes"]), ["GEOM_NONE", "GEOM_NONE"])
+        self.assertIn("set geomlist to 2", plain["notes"][0]["detail"])
+        # a geomlist entry the fix padded with 2 (a source was found) is no gap
+        relinked = [(1, "2", "100", "20", "50", "n", "Tree_A", "1", "Tree_A", "Tree_A", "20", "50"),
+                    (2, "2", "100", "20", "50", "n", "Tree_B", "1", "Tree_B", "Tree_B", "20", "50")]
+        state = fh.parse_state(collect_lines(items=relinked))
+        self.assertEqual(fh.analyze(state, {2})["errors"], [])
+
     def test_tool_fix_nothing(self):
         fake = FakeClient(ok(*collect_lines()))
         with patch.object(forest, "client", fake):
@@ -1306,10 +1543,18 @@ class ForestValidateTests(unittest.TestCase):
 # scatter_forest_pack
 # --------------------------------------------------------------------------------------------
 
-def scatter_report(count=16023, area="1000000", geometry=(("Box", "20", "50"),)):
+def scatter_report(count=16023, area="1000000", geometry=(("Box", "20", "50"),), back=None, caps=None):
     lines = [f"F|{b64('ForestScatter')}|{count}|{area}|100|300|300"]
     lines += [f"G|{b64(n)}|{w}|{h}" for n, w, h in geometry]
+    if back is not None:  # direction, scalelope, distmode, mapname, distmap, densityMap, lock_ratio
+        d, slope, mode, mapname, dmap, dens, lock = back
+        lines.append(f"D|{d}|{slope}|{mode}|{b64(mapname)}|{dmap}|{dens}|{lock}")
+    if caps is not None:  # vmaxitems, rmaxitems, maxdensity, pixels_x, pixels_y
+        lines.append("Q|" + caps)
     return ok(*lines)
+
+
+STOCK_BACK = ("0", "0", "0", "dense.bmp", "0", "0", "1")
 
 
 class ScatterTests(unittest.TestCase):
@@ -1357,11 +1602,88 @@ class ScatterTests(unittest.TestCase):
         self.assertIn("fp.direction = 0", script)
         self.assertIn('fp.units_y = units.decodeValue "400.0000cm"', script)
 
+    def test_unequal_units_turn_lock_ratio_off(self):
+        # Live: a new forest has lock_ratio on, which uses units_x for both sides (500 x 1000 cm gave 5748 locked,
+        # 2874 unlocked); unequal units must turn it off, or density_units_y_cm does nothing
+        unlocked = ("0", "0", "0", "dense.bmp", "0", "0", "0")
+        out, script = self.run_scatter(scatter_report(count=8000, back=unlocked), density_units_x_cm=300,
+                                       density_units_y_cm=600)
+        check_script(self, script)
+        self.assertIn('    fp.lock_ratio = false\n    fp.units_x = units.decodeValue "300.0000cm"', script)
+        self.assertLess(script.index("fp.lock_ratio = false"), script.index("fp.trees.update()"))
+        self.assertEqual((out["units_x_cm"], out["units_y_cm"], out["lock_ratio"]), (300.0, 600.0, False))
+        self.assertAlmostEqual(out["items_per_m2_estimate"], 1437 / 18, places=2)
+        self.assertEqual(out["estimated_count"], round(1437 * 100 / 18))
+        self.assertEqual(out["warnings"], [])
+        # equal units: the lock is left as it is (it makes no difference)
+        _, script = self.run_scatter()
+        self.assertNotIn("lock_ratio =", script)
+        # if the lock still reads on, the reported tile is the one Forest Pack uses, and it says so
+        out, _ = self.run_scatter(scatter_report(count=16000, back=STOCK_BACK), density_units_x_cm=300,
+                                  density_units_y_cm=600)
+        self.assertEqual((out["units_y_cm"], out["lock_ratio"]), (300.0, True))
+        self.assertAlmostEqual(out["items_per_m2_estimate"], 1437 / 9, places=2)
+        self.assertEqual(out["estimated_count"], round(1437 * 100 / 9))
+        self.assertTrue(any(w.startswith("UNITS_Y_IGNORED") for w in out["warnings"]))
+
     def test_zero_items(self):
         with self.assertRaises(fh.ForestError) as ctx:
             self.run_scatter(scatter_report(count=0, area="100"))
         self.assertEqual(ctx.exception.code, "ZERO_ITEMS")
         self.assertEqual(ctx.exception.details["count"], 0)
+        # over the maxdensity cap (millions of candidate cells) Forest Pack scatters nothing: the error says so
+        with self.assertRaises(fh.ForestError) as ctx:
+            self.run_scatter(scatter_report(count=0, area="1000000", back=STOCK_BACK, caps="50000|1000000|1|100|100"),
+                             items_per_m2=1437.0 / 0.95 ** 2)
+        self.assertIn("MAXDENSITY_CAP", str(ctx.exception))
+        self.assertIn("maxdensity=1", str(ctx.exception))
+
+    def test_direction_range(self):
+        # live: -100 = world down, 0 = surface normal, 100 = world up
+        for value, facing in ((-100, "down"), (-50, "custom"), (0, "normal"), (100, "up")):
+            out, script = self.run_scatter(scatter_report(back=(str(value),) + STOCK_BACK[1:]), direction=value,
+                                           facing_mode="up")
+            self.assertIn(f"fp.direction = {value}\n", script)
+            self.assertEqual((out["direction"], out["facing"]), (value, facing))
+            self.assertEqual(out["warnings"], [])
+        for bad in (-101, 101, 1.5, True, "up"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.run_scatter(direction=bad)
+
+    def test_readback_warnings(self):
+        # "Scale to fit sloped areas" forces direction to 0 (live); a default preset could turn it on
+        out, script = self.run_scatter(scatter_report(back=("0", "1") + STOCK_BACK[2:]), facing_mode="up")
+        self.assertIn('format "D|', script)
+        warning = next(w for w in out["warnings"] if w.startswith("DIRECTION_NOT_APPLIED"))
+        self.assertIn("Scale to fit sloped areas", warning)
+        # a non-stock distribution map leaves the estimate out
+        out, _ = self.run_scatter(scatter_report(back=("0", "0", "0", "dense.bmp", "1", "0", "1")))
+        self.assertIsNone(out["estimated_count"])
+        self.assertTrue(any(w.startswith("NON_DEFAULT_DISTRIBUTION") for w in out["warnings"]))
+        self.assertNotIn("scalelope =", script)  # read back, never written
+        self.assertNotIn("distmap =", script)
+
+    def test_viewport_limit(self):
+        # 100 cm tiles on 100 m2: 143700 items render, trees.count() gives 35800 (vmaxitems 50000, live)
+        out, _ = self.run_scatter(scatter_report(count=35800, back=STOCK_BACK, caps="50000|1000000|40|100|100"),
+                                  items_per_m2=1437.0)
+        self.assertEqual((out["estimated_count"], out["count"]), (143700, 35800))
+        self.assertTrue(out["viewport_thinned"])
+        self.assertEqual(out["estimated_viewport_count"], 35925)
+        self.assertEqual(out["limits"]["viewport_max_items"], 50000)
+        self.assertTrue(any(w.startswith("VIEWPORT_LIMIT:") for w in out["warnings"]))
+        self.assertFalse(any(w.startswith("far fewer") for w in out["warnings"]))
+        out, _ = self.run_scatter(scatter_report(back=STOCK_BACK, caps="50000|1000000|40|100|100"))
+        self.assertFalse(out["viewport_thinned"])
+        self.assertEqual(out["warnings"], [])
+        # a count far from the predicted thinning isn't called thinned, so the low count is reported
+        out, _ = self.run_scatter(scatter_report(count=12000, back=STOCK_BACK, caps="50000|1000000|40|100|100"),
+                                  items_per_m2=1437.0)
+        self.assertIsNone(out["viewport_thinned"])
+        self.assertIsNone(out["estimated_viewport_count"])
+        self.assertTrue(any(w.startswith("VIEWPORT_LIMIT_UNCERTAIN:") for w in out["warnings"]))
+        self.assertFalse(any(w.startswith("VIEWPORT_LIMIT:") for w in out["warnings"]))
+        self.assertTrue(any(w.startswith("far fewer") for w in out["warnings"]))
 
     def test_validation(self):
         bad = [{"surfaces": []}, {"geometry": []}, {"geometry": ["Plane"]}, {"probabilities": [1, 2]},

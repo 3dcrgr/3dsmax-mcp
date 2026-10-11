@@ -11,9 +11,19 @@ import math
 import re
 from typing import Any, Iterable
 
-# Items per units_x * units_y tile with the default density map (dense.bmp, threshold 50).
-# Measured: 1437 on a 10 m plane at 1000 cm units, 16023 at 300 cm.
+# Items per units_x * units_y tile with the stock distribution map: dense.bmp's white pixels (live: 1437 on a
+# 10 m plane at 1000 cm units, 16023 at 300 cm, 22992 = 16 x 1437 at 250 cm). threshold and mapname writes don't
+# change the stock map (it is binarised when the forest is created); threshold only applies to a distmap texture.
 ITEMS_PER_TILE = 1437
+# maxdensity caps the candidate cells, white and black pixels alike: pixels_x * pixels_y per tile, in millions
+# (default 40, 0 = no cap). Over the cap Forest Pack scatters 0 items (live: 1.11 M cells with maxdensity 1 gave 0).
+DEFAULT_PIXELS = 100
+DEFAULT_MAXDENSITY_M = 40
+# "Max items Viewport" (vmaxitems, default 50000) thins the build that trees.count() and trees.* read: over it,
+# every k-th grid row and column is kept, k = ceil(sqrt(N / vmaxitems)) (live: 143700 -> 35800 at 50000).
+DEFAULT_VIEWPORT_MAX_ITEMS = 50000
+# The render keeps every item; per the iToo docs it shows none over "Max items Render" (rmaxitems, 1 M).
+DEFAULT_RENDER_MAX_ITEMS = 1_000_000
 
 MODE_NAMES = {0: "procedural", 1: "custom_edit"}
 
@@ -74,6 +84,9 @@ fn fpVal v = (
     if v == undefined then ("u") else if (isKindOf v Number) then (fpF v) else if (isKindOf v BooleanClass) then (if v then "1" else "0") else ("?")
 )
 fn fpState v = (if v == undefined then "u" else if isValidNode v then "n" else "x")
+-- A property's number or flag, "u" when this Forest Pack build lacks it
+fn fpPropV nd p = (if isProperty nd p then fpVal (getProperty nd p) else "u")
+fn fpHasDistMap nd = (if isProperty nd #distmap and (getProperty nd #distmap) != undefined then "1" else "0")
 -- The source object's object-offset (pivot offset) TM. getFullTransform maps the source's
 -- object-space vertices, so inverse(fpOffTM src) * itemTM places the source's pivot.
 fn fpOffTM src = (scaleMatrix src.objectOffsetScale) * (src.objectOffsetRot as matrix3) * (transMatrix src.objectOffsetPos)
@@ -286,11 +299,109 @@ def integer(value: Any, label: str, low: int, high: int) -> int:
     return value
 
 
-def estimate_count(area_m2: float, units_x_m: float, units_y_m: float) -> float | None:
-    """Expected items for the default density map: 1437 per units_x * units_y tile."""
-    if units_x_m <= 0 or units_y_m <= 0:
+def tile_m2(units_x_m: float, units_y_m: float, lock_ratio: bool = False) -> float | None:
+    """One density tile in m2. With lock_ratio on, Forest Pack uses units_x for both sides (live)."""
+    side_y = units_x_m if lock_ratio else units_y_m
+    if units_x_m <= 0 or side_y <= 0:
         return None
-    return ITEMS_PER_TILE * area_m2 / (units_x_m * units_y_m)
+    return units_x_m * side_y
+
+
+def estimate_count(area_m2: float, units_x_m: float, units_y_m: float, *, lock_ratio: bool = False,
+                   item_share: float = 1.0) -> float | None:
+    """Expected items for the stock density map: 1437 per tile, times the share of positions that aren't gaps.
+
+    item_share is the probability share of item types that produce items (geomlist 0 is a gap: it takes its
+    share of positions and isn't counted). This is the full scatter, which the render gets; trees.count() can be
+    lower (viewport_thinning).
+    """
+    tile = tile_m2(units_x_m, units_y_m, lock_ratio)
+    if tile is None:
+        return None
+    return ITEMS_PER_TILE * area_m2 / tile * item_share
+
+
+def candidate_cells(area_m2: float, units_x_m: float, units_y_m: float, *, lock_ratio: bool = False,
+                    pixels: int = DEFAULT_PIXELS * DEFAULT_PIXELS) -> float | None:
+    """Candidate cells (map pixels, white and black) over the area: what maxdensity caps, in cells."""
+    tile = tile_m2(units_x_m, units_y_m, lock_ratio)
+    return None if tile is None else pixels * area_m2 / tile
+
+
+def viewport_thinning(full: float, viewport_max: int | None) -> tuple[int, float]:
+    """(grid step k, items trees.count() reports) for a full scatter under Max items Viewport (0 = no limit)."""
+    if not viewport_max or viewport_max <= 0 or full <= viewport_max:
+        return 1, full
+    k = math.ceil(math.sqrt(full / viewport_max))
+    return k, full / (k * k)
+
+
+# How far trees.count() may sit from the predicted thinned count N/k^2 and still be called thinned. Live (p27)
+# the prediction was within 2%; the estimate itself is rougher (bounding-box area, excludes, slope limits).
+THINNING_TOLERANCE = 0.25
+
+
+def count_checks(estimate: float | None, count: int | None, *, viewport_max: int | None,
+                 maxdensity: float | None, candidates: float | None,
+                 render_max: int | None) -> dict[str, Any]:
+    """What the caps do to a scatter: viewport thinning of trees.count(), the maxdensity cap, the render cap.
+
+    Returns viewport_thinned (True, False, or None when it can't be told), estimated_viewport_count, warnings and
+    notes, each a (code, detail) pair. A built count is checked against the prediction: thinning is reported only
+    when the count agrees with it, and the maxdensity cap only when the count is 0 or unknown (live, the cap is
+    all or nothing, so a build with items wasn't capped).
+    """
+    out: dict[str, Any] = {"viewport_thinned": None, "estimated_viewport_count": None, "warnings": [], "notes": []}
+    vmax = viewport_max if isinstance(viewport_max, int) and viewport_max > 0 else None
+    if vmax and count is not None and count > vmax:
+        out["viewport_thinned"] = False  # a thinned build never holds more than vmaxitems items
+    elif vmax and estimate is not None and count != 0:
+        if estimate <= vmax * 1.02:
+            out["viewport_thinned"] = False
+        else:
+            k, shown = viewport_thinning(estimate, vmax)
+            if count is None or abs(count - shown) <= THINNING_TOLERANCE * shown:
+                out["viewport_thinned"] = True
+                out["estimated_viewport_count"] = round(shown)
+                out["warnings"].append(("VIEWPORT_LIMIT", (
+                    f"the count is trees.count(), the viewport build: Max items Viewport (vmaxitems={vmax}) keeps 1 "
+                    f"in {k} grid rows and columns, so about {round(shown)} items show in the viewport and about "
+                    f"{round(estimate)} render. forest_items reads the viewport build; raise vmaxitems (0 = no "
+                    "limit) to see them all")))
+            else:
+                # The estimate says thinned, the count disagrees: the estimate can be off (bounding-box area,
+                # excludes, slope and altitude limits aren't counted), and live a forest whose distribution map
+                # was assigned and cleared thinned harder than predicted. Don't guess.
+                out["notes"].append(("VIEWPORT_LIMIT_UNCERTAIN", (
+                    f"the estimate (about {round(estimate)} items) is over Max items Viewport (vmaxitems={vmax}), "
+                    f"which would thin trees.count() to about {round(shown)}, but the count is {count}. The "
+                    "estimate counts the surfaces' upward area (their bounding box over 50000 faces) and ignores "
+                    "excludes and slope or altitude limits, so whether the viewport build is thinned can't be "
+                    "told; set vmaxitems to 0 (no limit) and count again for the full scatter")))
+    elif estimate is None and vmax and count is not None and vmax / 4 < count <= vmax:
+        out["notes"].append(("VIEWPORT_LIMIT_POSSIBLE", (
+            f"the count is trees.count(), the viewport build. When the full scatter has more than Max items "
+            f"Viewport (vmaxitems={vmax}) items, Forest Pack thins it to between a quarter of that limit and the "
+            "limit, and the render gets more; forest_validate estimates the full count for the stock map")))
+    if maxdensity and maxdensity > 0 and candidates is not None and candidates > maxdensity * 1e6:
+        if count is None or count == 0:
+            out["warnings"].append(("MAXDENSITY_CAP", (
+                f"about {candidates / 1e6:.2f} million candidate cells (map pixels per tile x tiles) exceed Max "
+                f"Density (maxdensity={maxdensity:g}, in millions), and over it Forest Pack scatters 0 items; use "
+                "larger tiles or raise maxdensity (0 = no cap)")))
+        else:
+            # Live: two surfaces of 1 M cells each built 287400 items under maxdensity 1, so the cap isn't applied
+            # to the sum over all surfaces; a build with items wasn't capped.
+            out["notes"].append(("MAXDENSITY_SUM_OVER_CAP", (
+                f"the surfaces together have about {candidates / 1e6:.2f} million candidate cells, over Max Density "
+                f"(maxdensity={maxdensity:g}, in millions), but the build has {count} items, so the cap wasn't hit "
+                "(Forest Pack doesn't apply it to the sum of several surfaces); a single surface over it would "
+                "scatter 0 items")))
+    if render_max and render_max > 0 and estimate is not None and estimate > render_max:
+        out["warnings"].append(("RENDER_LIMIT", (
+            f"about {round(estimate)} items exceed Max items Render (rmaxitems={render_max}); per the Forest Pack "
+            "docs the render then shows none")))
+    return out
 
 
 def units_for_items_per_m2(items_per_m2: float) -> float:
@@ -306,6 +417,8 @@ COLLECT_FN = r'''
 fn fpCollect nd ss doBuild = (
     local upm = units.decodeValue "1m"
     format "N|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%\n" (fpEnc nd.name) (nd.mode as string) (fpF nd.units_x) (fpF nd.units_y) (fpB nd.lock_ratio) (fpEnc (nd.mapname as string)) (nd.threshold as string) (fpB nd.densityMap) (nd.distmode as string) (fpB nd.disabled) (fpB nd.manualupdate) (nd.vmesh as string) (fpB nd.surfanim) (nd.direction as string) (fpF upm) to:ss
+    -- the caps: viewport and render item limits, the candidate-cell cap (millions) and the map's pixels
+    format "Q|%|%|%|%|%|%|%\n" (fpPropV nd #vmaxitems) (fpPropV nd #rmaxitems) (fpPropV nd #maxdensity) (fpPropV nd #pixels_x) (fpPropV nd #pixels_y) (fpHasDistMap nd) (fpPropV nd #scalelope) to:ss
     for p in @@ITEM_LISTS@@ do format "L|%|%\n" p ((getProperty nd p).count) to:ss
     local nA = 0
     for p in @@AR_LISTS@@ do (
@@ -358,6 +471,12 @@ def parse_state(report: list[str]) -> dict[str, Any]:
                          density_map=f[8] == "1", distmode=int(float(f[9])), disabled=f[10] == "1",
                          manual_update=f[11] == "1", vmesh=int(float(f[12])), surfanim=f[13] == "1",
                          direction=int(float(f[14])), upm=float(f[15]))
+        elif tag == "Q":
+            values = [num(v) for v in f[1:8]]
+            for key, value in zip(("vmaxitems", "rmaxitems", "maxdensity", "pixels_x", "pixels_y"), values):
+                state[key] = None if value is None else int(value) if value.is_integer() else value
+            state["distmap"] = f[6] == "1"
+            state["scalelope"] = f[7] == "1"
         elif tag == "L":
             state["lengths"][f[1]] = int(f[2])
         elif tag == "R":
@@ -386,10 +505,15 @@ def _issue(code: str, detail: str, **extra: Any) -> dict[str, Any]:
     return {"code": code, "detail": detail, **extra}
 
 
-def analyze(state: dict[str, Any]) -> dict[str, Any]:
-    """Errors, warnings and the density estimate for a collected forest."""
+def analyze(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = frozenset()) -> dict[str, Any]:
+    """Errors, warnings, notes and the density estimate for a collected forest.
+
+    padded_gaps are the item indices whose geomlist entry forest_validate's fix just padded: a 0 there is a gap
+    the fix made because no source was found, not one the user chose, so it is an error (SOURCE_UNRESOLVED).
+    """
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    notes: list[dict[str, Any]] = []
     lengths = state["lengths"]
     n = lengths.get("namelist", 0)
     if n == 0:
@@ -423,11 +547,19 @@ def analyze(state: dict[str, Any]) -> dict[str, Any]:
                 errors.append(_issue("CRASH_RISK", f"{label}: geomlist is 3, which crashed Max on a rebuild in "
                                      "testing (no proxy); the forest is not rebuilt", index=i))
             elif geom not in (0.0, 1.0, 2.0):
-                errors.append(_issue("GEOM_INVALID", f"{label}: geomlist is {item['geom_raw']} (valid: 1 billboard, "
-                                     "2 custom object); the forest is not rebuilt", index=i))
+                errors.append(_issue("GEOM_INVALID", f"{label}: geomlist is {item['geom_raw']} (valid: 0 gap, "
+                                     "1 billboard, 2 custom object); the forest is not rebuilt", index=i))
+            elif geom == 0 and i in padded_gaps:
+                # The fix padded it: an item type the user named whose source couldn't be found by name
+                errors.append(_issue("SOURCE_UNRESOLVED", f"{label}: the fix padded geomlist with 0 (a gap) because "
+                                     "no source object was found by a unique matching name; it takes its probability "
+                                     "share of positions and places nothing there. Link its source (cobjlist) and "
+                                     "set geomlist to 2, or remove the item type", index=i))
             elif geom == 0:
-                errors.append(_issue("GEOM_NONE", f"{label}: geomlist is 0, so this item type produces nothing",
-                                     index=i))
+                # Live: a "Disabled" item is a legitimate gap (Forest Tools' "Disable at end" writes it too)
+                notes.append(_issue("GEOM_NONE", f"{label}: geomlist is 0 (Disabled): a gap item that takes its "
+                                    "probability share of positions and places nothing there; if it should place "
+                                    "objects, link its source (cobjlist) and set geomlist to 2", index=i))
             elif geom == 2 and item["cobj"] != "n":
                 errors.append(_issue("SOURCE_MISSING", f"{label}: custom object type without a source object "
                                      "(cobjlist entry undefined); its items are empty", index=i))
@@ -463,6 +595,17 @@ def analyze(state: dict[str, Any]) -> dict[str, Any]:
         if a["type"] == 3 and not state["surfaces"]:
             errors.append(_issue("SURFACE_LIST_EMPTY", "the Surface Area is active but surflist is empty",
                                  index=a["index"]))
+    # Live: a spline exclude cuts only the include splines listed before it (a lower list index); the Surface
+    # Area is cut by an exclude anywhere in the list. So an exclude listed before an include leaves it uncut.
+    for exc in active:
+        if exc["type"] != 0 or exc["incexc"] != 1:
+            continue
+        uncut = [a for a in active if a["type"] == 0 and a["incexc"] == 0 and a["index"] > exc["index"]]
+        for inc in uncut:
+            warnings.append(_issue("EXCLUDE_BEFORE_INCLUDE", f"exclude area {exc['index']} ('{exc['name']}') is "
+                                   f"listed before include area {inc['index']} ('{inc['name']}'), so it cuts no hole "
+                                   "in it: an exclude only cuts include splines listed before it",
+                                   index=exc["index"], include_index=inc["index"]))
     for s in state["surfaces"]:
         if s["state"] != "n":
             errors.append(_issue("SURFACE_MISSING", f"surflist entry {s['index']} is undefined or deleted",
@@ -480,28 +623,63 @@ def analyze(state: dict[str, Any]) -> dict[str, Any]:
 
     estimate = None
     estimate_note = None
+    candidates = None
+    # The stock map: threshold and mapname writes don't change it (live), so only a distmap texture, the density
+    # map mode or another distribution mode make the estimate unknown. A map picked in the UI renames mapname.
     default_map = (state.get("mapname", "").lower() == "dense.bmp" and not state.get("density_map")
-                   and state.get("distmode") == 0 and state.get("threshold") == 50)
+                   and state.get("distmode") == 0 and not state.get("distmap"))
     upm = state.get("upm") or 0.0
+    lock = bool(state.get("lock_ratio"))
     surface_active = any(a["active"] and a["type"] == 3 for a in areas)
+    area_m2 = None
+    if surface_active and upm > 0:
+        area_m2 = sum(s["xy_area"] for s in state["surfaces"] if s["state"] == "n") / (upm * upm)
+        pixels = (state.get("pixels_x") or DEFAULT_PIXELS) * (state.get("pixels_y") or DEFAULT_PIXELS)
+        candidates = candidate_cells(area_m2, state["units_x"] / upm, state["units_y"] / upm, lock_ratio=lock,
+                                     pixels=pixels)
     if not default_map:
-        estimate_note = "not estimated: the forest doesn't use the default density map (dense.bmp, threshold 50)"
+        estimate_note = ("not estimated: the forest doesn't use the stock distribution map (dense.bmp, no custom "
+                         "distribution or density map)")
     elif not surface_active:
         estimate_note = "not estimated: only the Surface Area is estimated, and it is inactive"
-    elif upm > 0:
-        area_m2 = sum(s["xy_area"] for s in state["surfaces"] if s["state"] == "n") / (upm * upm)
-        value = estimate_count(area_m2, state["units_x"] / upm, state["units_y"] / upm)
+    elif area_m2 is not None:
+        share = item_share(state)
+        value = estimate_count(area_m2, state["units_x"] / upm, state["units_y"] / upm, lock_ratio=lock,
+                               item_share=share)
         if value is not None:
             estimate = round(value, 1)
-            if value < 1:
+            if value < 1 and share > 0:
+                side_y = state["units_x"] if lock else state["units_y"]
                 warnings.append(_issue("UNITS_TOO_LARGE", f"about {value:.2f} items expected: the density tile "
-                                       f"({state['units_x']:g} x {state['units_y']:g} scene units) is large for "
+                                       f"({state['units_x']:g} x {side_y:g} scene units) is large for "
                                        f"{area_m2:.2f} m2 of surface; lower units_x/units_y"))
+    caps = count_checks(estimate, state.get("count") if state.get("built") else None,
+                        viewport_max=state.get("vmaxitems"), maxdensity=state.get("maxdensity"),
+                        candidates=candidates, render_max=state.get("rmaxitems"))
+    warnings += [_issue(code, detail) for code, detail in caps["warnings"]]
+    notes += [_issue(code, detail) for code, detail in caps["notes"]]
     if state.get("crash_index"):
         errors.append(_issue("NOT_REBUILT", "the forest was not rebuilt because geomlist holds an unsafe value"))
     elif state.get("built") and state.get("count") == 0:
-        errors.append(_issue("NO_ITEMS", "the forest builds 0 items"))
-    return {"errors": errors, "warnings": warnings, "estimated_count": estimate, "estimate_note": estimate_note}
+        cap = next((d for c, d in caps["warnings"] if c == "MAXDENSITY_CAP"), None)
+        errors.append(_issue("NO_ITEMS", "the forest builds 0 items" + (f": {cap}" if cap else "")))
+    return {"errors": errors, "warnings": warnings, "notes": notes, "estimated_count": estimate,
+            "estimate_note": estimate_note, "viewport_thinned": caps["viewport_thinned"],
+            "estimated_viewport_count": caps["estimated_viewport_count"],
+            "candidate_cells": None if candidates is None else round(candidates)}
+
+
+def item_share(state: dict[str, Any]) -> float:
+    """The probability share of item types that place items (geomlist 1 or 2) among all valid ones (0 to 2)."""
+    n = state["lengths"].get("namelist", 0)
+    placed = total = 0.0
+    for item in state["items"]:
+        if item["index"] > n or item["geom"] not in (0.0, 1.0, 2.0) or item["prob"] is None or item["prob"] <= 0:
+            continue
+        total += item["prob"]
+        if item["geom"] != 0:
+            placed += item["prob"]
+    return placed / total if total > 0 else 1.0
 
 
 def fix_plan(state: dict[str, Any]) -> list[dict[str, Any]]:

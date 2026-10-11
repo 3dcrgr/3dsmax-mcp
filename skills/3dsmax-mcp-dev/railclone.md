@@ -135,9 +135,10 @@ For a newly authored graph, the observed base-object binding arrays are:
   for the untransformed recipe. These are parallel arrays indexed per segment.
 
 Inspect existing IDs and slots before extending these arrays. Preserve all other
-segment settings and source bindings. After binding or changing source geometry,
-call `n.railclone.segmentsUpdate firstIndex lastIndex`, then refresh the style token
-and reapply through the MCP setter if a graph rebuild is needed. Verify output.
+segment settings and source bindings. A segment linked through `sobjnode` follows its
+source at once (live, RailClone 7.3.5); rebuild with `n.seed = n.seed` and verify the
+output. Don't call `segmentsUpdate` for that: on 7.3.5 it ignores its arguments, changes
+no geometry, and renames every linked segment to its source node's name.
 
 **`sinstance` is Force Instance.** It is not a harmless performance preference.
 For geometry that must be clipped or deformed, use `sinstance=false` and

@@ -105,7 +105,8 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "Edit items with forest_edit_items; it needs custom edit mode (allow_custom_edit or forest_set_mode).",
         ],
         "gotchas": [
-            "Density is units_x/units_y (about 1437 items per tile with the default map); maxdensity does nothing.",
+            "Density is units_x/units_y (about 1437 items per tile with the default map). maxdensity isn't a "
+            "density: it caps candidate cells (millions, default 40), and over it a forest scatters 0 items.",
             "Never set geomlist to 3: it crashed Max. namelist is the master length of the item lists.",
             "Stock presets ship their Surface Area inactive (pf_aractivelist); retargeted they give 0 items until it is activated.",
             "Item edits apply only in custom edit mode; switching back to procedural discards them irreversibly.",
@@ -132,13 +133,17 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
         "recipes": [
             "Read railclone_inspect first: bases, exposed parameters (typed values, limits, selector options), segments and output counts.",
             "Change exposed parameters with railclone_set_param (exact name or id); it validates limits, which RailClone does not enforce.",
-            "Find library items with railclone_library and create them with railclone_from_library, passing the splines.",
+            "Find library items with railclone_library and create them with railclone_from_library: splines go to "
+            "path bases, and a clipping area (paving boundary, cladding area, window outline) takes clipping_splines. "
+            "railclone_inspect reports each base's role (path, clip, surface).",
             "Read get_railclone_style, edit its XML, then call set_railclone_style with the returned style_token as expected_style.",
             "Verify generated placements, source segments, transforms, bounds and tags with get_railclone_output.",
         ],
         "gotchas": [
             "The XML methods exist in RailClone 7.x (verified on 7.1.1 and 7.3.5); style XML does not package source geometry, materials or parameter values.",
-            "Moving or copying a RailClone does not re-evaluate it; get_railclone_output rebuilds first. Output tm/box are object space.",
+            "Moving or copying a RailClone does not re-evaluate it; the read tools rebuild first (seed = seed). With "
+            "autoUpdate off they leave it alone and return its last build unless force_rebuild=true. Output tm/box "
+            "are object space.",
             "A wrong library route makes loadLibraryItemByPath show a modal dialog; railclone_from_library validates routes first, against the library roots 3ds Max lists.",
             "Writes adopt a staged RailClone base in one undo step, preserving the scene node and modifier stack. Instanced bases and master/slave styles are refused.",
         ],

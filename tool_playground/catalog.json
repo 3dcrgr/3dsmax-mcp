@@ -6118,6 +6118,9 @@
           },
           "rebuild": {
             "type": "boolean"
+          },
+          "reload_segments": {
+            "type": "boolean"
           }
         }
       },
@@ -6177,6 +6180,12 @@
           },
           "allow_undo_flush": {
             "type": "boolean"
+          },
+          "clipping_splines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [
@@ -6206,6 +6215,9 @@
             "type": "integer"
           },
           "include_graph": {
+            "type": "boolean"
+          },
+          "reload_segments": {
             "type": "boolean"
           }
         }
@@ -6598,6 +6610,9 @@
           },
           "items_per_m2": {
             "type": "number"
+          },
+          "direction": {
+            "type": "integer"
           }
         },
         "required": [
