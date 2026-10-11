@@ -1286,10 +1286,10 @@ LISTS_OK = {"namelist": 2, "cobjlist": 2, "geomlist": 2, "problist": 2, "widthli
 
 
 def collect_lines(lengths=None, items=None, areas=None, surfaces=None, count="12933|1|0", mode=0, units=100.0,
-                  ar_len=None, caps=None, units_y=None, lock="1"):
+                  ar_len=None, caps=None, units_y=None, lock="1", distmode=0):
     lengths = dict(LISTS_OK, **(lengths or {}))
     out = [f"N|{b64('Forest001')}|{mode}|{units}|{units if units_y is None else units_y}|{lock}|{b64('dense.bmp')}"
-           f"|50|0|0|0|0|2|0|100|100"]
+           f"|50|0|{distmode}|0|0|2|0|100|100"]
     if caps is not None:  # vmaxitems, rmaxitems, maxdensity, pixels_x, pixels_y, distmap, scalelope
         out.append("Q|" + caps)
     for name in fh.ITEM_LISTS:
@@ -1537,6 +1537,244 @@ class ForestValidateTests(unittest.TestCase):
         with patch.object(forest, "client", client):
             with self.assertRaises(DialogBlocked):  # a read-only call: max_dialogs reports its result
                 forest.forest_validate("Forest001")
+
+
+# --------------------------------------------------------------------------------------------
+# Reference mode and RailClone links (issue #27)
+# --------------------------------------------------------------------------------------------
+
+def ref_rc(i=1, name="RC_Fence", handle=5793, disabled="0", proxy="0", auto="1", nexp=1, nseg=4, texp=0, nout=176,
+           created="735", tags=()):
+    """An fpRefRows E row for a RailClone, as 3ds Max writes it."""
+    return "|".join(["E", str(i), "r", b64(name), str(handle), disabled, proxy, auto, str(nexp), str(nseg),
+                     str(texp), str(nout), created, ",".join(b64(t) for t in tags)])
+
+
+def ref_head(user="1", match="0", mode="0", count=1, rcver="735"):
+    return f"D|{user}|{match}|{mode}|{count}|{rcver}"
+
+
+# A Reference-mode forest as probed live: no surface, the stock Surface Area inactive (p15: 8 posts exported)
+REF_AREAS = [(1, "3", "0", "0", "u", "", "Surface Area")]
+
+
+def ref_lines(rows, count="8|1|0", **kw):
+    kw.setdefault("areas", REF_AREAS)
+    kw.setdefault("surfaces", [])
+    return collect_lines(count=count, distmode=2, **kw) + list(rows)
+
+
+class ForestReferenceTests(unittest.TestCase):
+    """Live facts (Forest Pack 9.4.3, RailClone 7.3.5, probes p12-p22 in runs-1011\\probe-26-27)."""
+
+    def analyze(self, rows, **kw):
+        state = fh.parse_state(ref_lines(rows, **kw))
+        return state, fh.analyze(state)
+
+    def test_scripts_read_the_links_without_a_rebuild(self):
+        lib = fh.MXS_LIB
+        start = lib.index("fn fpRefRows nd ss = (")
+        body = lib[start:lib.index("\nfn ", start)]
+        for needle in ("b.sexportforest as array", "api.getXMLStyle()", "api.getXMLOutput()",
+                       "(fpPropV b #proxymode)", "(fpPropV b #disabled)", "(fpPropV b #autoUpdate)",
+                       "(fpPropV nd #distrefusercitems)", "(fpPropV nd #distrefmatchname)", "(fpPropV nd #distrefmode)",
+                       "(if anyRc then (fpRcVer()) else \"u\")"):
+            self.assertIn(needle, body)
+        # getStyleDesc empties RailClone's export until the next rebuild, and a read never rebuilds or writes
+        code = "\n".join(_code_lines(lib[lib.index("fn fpH n"):lib.index("fn fpHasDistMap")]))
+        for forbidden in ("getStyleDesc", "segmentsUpdate", "setXMLStyle", "seed =", "autoUpdate =", "setProperty",
+                          "proxymode =", "sexportforest[", "trees.update", "@@"):
+            self.assertNotIn(forbidden, code)
+        self.assertNotIn("@@", lib)
+        self.assertIn("fn fpRcVer = (\n    local v = try ((createInstance RailClone_Pro).createdversion)", lib)
+        self.assertIn(base64.b64encode(fh.EXPORT_FOREST_PATTERN.encode()).decode(), body)
+        self.assertIn(base64.b64encode(fh.TAGS_PATTERN.encode()).decode(), body)
+        self.assertIn("for i = 1 to (amin rn.count 500) do (", body)
+        self.assertIn("while seen.count < 50 do (", body)
+        # forest_validate reads the links after the build; forest_items after its own update
+        collect = fh.COLLECT_FN
+        self.assertLess(collect.index('format "C|%|1|0\\n"'), collect.index("if nd.distmode == 2 do fpRefRows nd ss"))
+        fake = FakeClient(items_report())
+        with patch.object(forest, "client", fake):
+            forest.forest_items("Forest001")
+        check_script(self, fake.scripts[0])
+        self.assertIn("if nd.distmode == 2 do fpRefRows nd ss", fake.scripts[0])
+        self.assertLess(fake.scripts[0].index("t.update()\nlocal n = t.count()"),
+                        fake.scripts[0].index("if nd.distmode == 2 do fpRefRows nd ss"))
+
+    def test_patterns(self):
+        export = re.compile(fh.EXPORT_FOREST_PATTERN)
+        style = ('<node id="{t}" on="1" baseClass="Operator" class="Transform" name="P27_T">\n'
+                 '\t\t<parameter id="_paronoff" name="On/Off" value="1"/>\n'
+                 '\t\t<parameter id="export_forest" name="Export to Forest" value="1"/>\n'
+                 '</node><node class="Transform"><parameter id="export_forest" name="Export to Forest" value="0"/>'
+                 '<parameter value="1" id="export_forest"/><parameter id="export_forest_x" value="1"/>'
+                 '<parameter id="export_forest" value="10"/><connector paramsubid="export_forest" value="1"/></node>')
+        self.assertEqual(len(export.findall(style)), 2)
+        tags = re.compile(fh.TAGS_PATTERN)
+        out = ('<item index="1" source_segment="allum_picket_01" tags="fpgeom=P27_cyl"/><item tags=""/>'
+               '<item source_tags="x" tags="proxy = chair&#10;fpgeom = Bench 01"/>')
+        found = tags.findall(out)
+        self.assertEqual(found, ["fpgeom=P27_cyl", "", "proxy = chair&#10;fpgeom = Bench 01"])
+        self.assertEqual(fh.fpgeom_names(found + ["FPGEOM=P27_cyl\r\nother=1", "fpgeom="]), ["Bench 01", "P27_cyl"])
+
+    def test_working_reference_forest_is_ok(self):
+        # Live: an 88-item Reference forest (no surface, Surface Area inactive) got NO_ACTIVE_AREA as an error
+        state, analysis = self.analyze([ref_rc(nexp=1, texp=1), ref_head()], count="88|1|0")
+        self.assertEqual(analysis["errors"], [])
+        self.assertEqual(analysis["warnings"], [])
+        self.assertEqual(codes(analysis["notes"]), ["NO_ACTIVE_AREA"])
+        self.assertTrue(analysis["notes"][0]["detail"].startswith("Reference mode (distmode 2)"))
+        self.assertIsNone(analysis["estimated_count"])
+        self.assertIn("Reference mode", analysis["estimate_note"])
+        self.assertIsNone(analysis["candidate_cells"])
+        ref = state["reference"]
+        self.assertEqual((ref["use_railclone_items"], ref["match_by_name"], ref["ref_mode"], ref["rc_runtime"]),
+                         (True, False, 0, 735))
+        self.assertEqual(ref["nodes"][0], {"index": 1, "valid": True, "name": "RC_Fence", "handle": 5793,
+                                           "railclone": True, "disabled": False, "proxymode": 0, "auto_update": True,
+                                           "exported_segments": 1, "segments": 4, "transform_exports": 1,
+                                           "output_items": 176, "createdversion": 735, "tags": []})
+        fake = FakeClient(ok(*ref_lines([ref_rc(), ref_head()], count="88|1|0")))
+        with patch.object(forest, "client", fake):
+            out = forest.forest_validate("Forest001")
+        check_script(self, fake.scripts[0])
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["distribution"], "reference")
+        self.assertEqual(out["reference"], {
+            "use_railclone_items": True, "match_by_name": False, "ref_mode": 0, "node_count": 1,
+            "rc_version": "7.3.5",
+            "nodes": [{"name": "RC_Fence", "handle": 5793, "railclone": True, "exported_segments": 1,
+                       "transform_exports": 0, "proxy_cache": False, "disabled": False, "auto_update": True,
+                       "segments": 4, "proxymode": 0, "output_items": 176, "createdversion": 735, "fpgeom": []}]})
+        # a forest in another mode has no reference field and keeps its area errors
+        fake = FakeClient(ok(*collect_lines(areas=REF_AREAS, count="0|1|0")))
+        with patch.object(forest, "client", fake):
+            out = forest.forest_validate("Forest001")
+        self.assertNotIn("reference", out)
+        self.assertIn("NO_ACTIVE_AREA", codes(out["errors"]))
+
+    def test_area_checks_are_notes_in_reference_mode(self):
+        areas = [(1, "3", "1", "0", "u", "", "Surface Area"), (2, "0", "1", "0", "u", "", "gone"),
+                 (3, "0", "1", "1", "n", "Hole", "Hole"), (4, "0", "1", "0", "n", "Bed", "Bed")]
+        _, analysis = self.analyze([ref_rc(), ref_head()], areas=areas, count="8|1|0")
+        self.assertEqual(analysis["errors"], [])
+        self.assertEqual(sorted(codes(analysis["notes"])),
+                         ["AREA_NODE_MISSING", "EXCLUDE_BEFORE_INCLUDE", "SURFACE_LIST_EMPTY"])
+        _, analysis = self.analyze([ref_rc(), ref_head()], areas=[], ar_len={}, count="8|1|0")
+        self.assertEqual(codes(analysis["notes"]), ["NO_ACTIVE_AREA", "SURFACE_AREA_MISSING"])
+
+    def test_no_export(self):
+        # Live: no Export to Forest gives 0 items, silently; NO_ITEMS had no cause
+        _, analysis = self.analyze([ref_rc(nexp=0, texp=0), ref_head()], count="0|1|0")
+        self.assertEqual(codes(analysis["errors"]), ["RC_LINK_NO_EXPORT", "NO_ITEMS"])
+        self.assertIn("none of its 4 segments has Export to Forest", analysis["errors"][0]["detail"])
+        self.assertEqual(analysis["errors"][0]["node"], "RC_Fence")
+        no_items = analysis["errors"][1]
+        self.assertEqual(no_items["causes"], ["RC_LINK_NO_EXPORT"])
+        self.assertIn("causes: RC_LINK_NO_EXPORT", no_items["detail"])
+        # a Transform export alone is an export (p16: 80 items through a Transform)
+        _, analysis = self.analyze([ref_rc(nexp=0, texp=1), ref_head()], count="80|1|0")
+        self.assertEqual(analysis["errors"], [])
+        # an unreadable style (texp -1) is no proof of a missing export
+        _, analysis = self.analyze([ref_rc(nexp=0, texp=-1), ref_head()], count="80|1|0")
+        self.assertNotIn("RC_LINK_NO_EXPORT", codes(analysis["errors"] + analysis["warnings"]))
+
+    def test_proxy_cache_disabled_and_empty(self):
+        _, analysis = self.analyze([ref_rc(proxy="1"), ref_head()], count="0|1|0")
+        self.assertEqual(codes(analysis["errors"]), ["RC_LINK_PROXY_CACHE", "NO_ITEMS"])
+        # disabled: the output is empty too, but that is the disabled RailClone, not a second cause
+        _, analysis = self.analyze([ref_rc(disabled="1", nout=0), ref_head()], count="0|1|0")
+        self.assertEqual(codes(analysis["errors"]), ["RC_LINK_DISABLED", "NO_ITEMS"])
+        _, analysis = self.analyze([ref_rc(nout=0), ref_head()], count="0|1|0")
+        self.assertEqual(codes(analysis["errors"]), ["RC_LINK_EMPTY", "NO_ITEMS"])
+        self.assertEqual(analysis["errors"][1]["causes"], ["RC_LINK_EMPTY"])
+        # next to items from another node the same links are warnings
+        rows = [ref_rc(1, "RC_Good", 10), ref_rc(2, "RC_Proxy", 11, proxy="1"), ref_rc(3, "RC_Off", 12, disabled="1",
+                                                                                       nout=0),
+                ref_rc(4, "RC_Empty", 13, nout=0), "E|5|n|%s|14" % b64("Marker"), ref_head(count=5)]
+        _, analysis = self.analyze(rows, count="9|1|0")
+        self.assertEqual(analysis["errors"], [])
+        self.assertEqual(codes(analysis["warnings"]), ["RC_LINK_PROXY_CACHE", "RC_LINK_DISABLED", "RC_LINK_EMPTY"])
+        self.assertEqual([w["node"] for w in analysis["warnings"]], ["RC_Proxy", "RC_Off", "RC_Empty"])
+
+    def test_stale_and_unsupported(self):
+        # autoUpdate off keeps the last build (p16 G)
+        _, analysis = self.analyze([ref_rc(auto="0"), ref_head()], count="80|1|0")
+        self.assertEqual(codes(analysis["warnings"]), ["RC_LINK_STALE"])
+        _, analysis = self.analyze([ref_rc(auto="0", nexp=0), ref_head()], count="0|1|0")
+        self.assertEqual(analysis["errors"][-1]["causes"], ["RC_LINK_NO_EXPORT", "RC_LINK_STALE"])
+        # RailClone before 7.3.2 has no Export to Forest
+        _, analysis = self.analyze([ref_rc(nexp=0), ref_head(rcver="731")], count="0|1|0")
+        self.assertEqual(codes(analysis["errors"]), ["RC_LINK_UNSUPPORTED", "RC_LINK_NO_EXPORT", "NO_ITEMS"])
+        self.assertIn("RailClone 7.3.1 is older than 7.3.2", analysis["errors"][0]["detail"])
+        # Forest Pack before 9.4.1 has no distrefusercitems: the RailClone is one marker
+        _, analysis = self.analyze([ref_rc(), ref_head(user="u")], count="1|1|0")
+        self.assertEqual(codes(analysis["warnings"]), ["RC_LINK_UNSUPPORTED"])
+        self.assertIn("Forest Pack 9.4.1 or later", analysis["warnings"][0]["detail"])
+        self.assertEqual(analysis["errors"], [])
+
+    def test_use_railclone_items_off(self):
+        # Live: distrefusercitems off makes a RailClone one pivot marker (p21: 1 item)
+        _, analysis = self.analyze([ref_rc(nexp=0, proxy="1"), ref_head(user="0")], count="1|1|0")
+        self.assertEqual(codes(analysis["warnings"]), ["RC_LINK_OFF"])
+        self.assertEqual(analysis["errors"], [])
+        # markers only: no RailClone checks at all
+        _, analysis = self.analyze(["E|1|n|%s|20" % b64("P27_marker"), ref_head(user="1", rcver="u")], count="1|1|0")
+        self.assertEqual((analysis["errors"], analysis["warnings"]), ([], []))
+
+    def test_no_reference_nodes(self):
+        _, analysis = self.analyze([ref_head(count=0, rcver="u")], count="0|1|0")
+        self.assertEqual(codes(analysis["errors"]), ["REF_NO_NODES", "NO_ITEMS"])
+        self.assertEqual(analysis["errors"][1]["causes"], ["REF_NO_NODES"])
+        _, analysis = self.analyze(["E|1|x", ref_head(count=1, rcver="u")], count="0|1|0")
+        self.assertIn("entries [1] are deleted", analysis["errors"][0]["detail"])
+        _, analysis = self.analyze([ref_rc(2), "E|1|x", ref_head(count=2)], count="8|1|0")
+        self.assertEqual(codes(analysis["notes"]), ["NO_ACTIVE_AREA", "REF_NODE_MISSING"])
+        # 0 items and no cause found: NO_ITEMS says so
+        _, analysis = self.analyze([ref_rc(), ref_head()], count="0|1|0")
+        self.assertEqual(codes(analysis["errors"]), ["NO_ITEMS"])
+        self.assertIn("found no cause", analysis["errors"][0]["detail"])
+        self.assertEqual(analysis["errors"][0]["causes"], [])
+
+    def test_fpgeom_tags(self):
+        # Live: fpgeom tags apply only with distrefmatchname on, and match namelist names (p17, p18)
+        tagged = ref_rc(tags=["fpgeom=Box", "fpgeom=Cyl"])
+        items = [(1, "2", "50", "20", "50", "n", "Box", "1", "Box", "Box", "20", "50"),
+                 (2, "2", "50", "30", "22", "n", "P27_cyl", "1", "Cyl", "", "30", "22")]
+        _, analysis = self.analyze([tagged, ref_head(match="0")], items=items, count="88|1|0")
+        self.assertEqual(codes(analysis["warnings"]), ["FPGEOM_IGNORED"])
+        self.assertIn("['Box', 'Cyl']", analysis["warnings"][0]["detail"])
+        _, analysis = self.analyze([tagged, ref_head(match="1")], items=items, count="88|1|0")
+        self.assertEqual(analysis["warnings"], [])
+        # the source object's name (P27_cyl) is no Geometry List name
+        renamed = ref_rc(tags=["fpgeom=P27_cyl"])
+        _, analysis = self.analyze([renamed, ref_head(match="1")], items=items, count="88|1|0")
+        self.assertEqual(codes(analysis["warnings"]), ["FPGEOM_UNMATCHED"])
+        self.assertIn("['P27_cyl']", analysis["warnings"][0]["detail"])
+        self.assertIn("item type 1", analysis["warnings"][0]["detail"])
+        # live: the match ignores case (fpgeom=P27_cyl took the Geometry List item "p27_CYL", 85 of 88 items)
+        cased = [items[0], (2, "2", "50", "30", "22", "n", "Cyl", "1", "p27_CYL", "", "30", "22")]
+        _, analysis = self.analyze([renamed, ref_head(match="1")], items=cased, count="88|1|0")
+        self.assertEqual(analysis["warnings"], [])
+
+    def test_forest_items_reference_field(self):
+        rows = [ref_rc(nexp=1, texp=2, auto="0"), "E|2|n|%s|20" % b64("P27_marker"), "E|3|x",
+                ref_head(count=3)]
+        fake = FakeClient(items_report(count=8, items=list(rows)))
+        with patch.object(forest, "client", fake):
+            out = forest.forest_items("Forest001", limit=1)
+        self.assertEqual(out["reference"], {
+            "use_railclone_items": True, "match_by_name": False,
+            "nodes": [{"name": "RC_Fence", "handle": 5793, "railclone": True, "exported_segments": 1,
+                       "transform_exports": 2, "proxy_cache": False, "disabled": False, "auto_update": False},
+                      {"name": "P27_marker", "handle": 20, "railclone": False},
+                      {"name": None, "handle": None, "railclone": False, "missing": True}]})
+        fake = FakeClient(items_report())
+        with patch.object(forest, "client", fake):
+            self.assertNotIn("reference", forest.forest_items("Forest001"))
+        many = fh.reference_view(fh.parse_reference([ref_rc(), ref_head(count=900)]))
+        self.assertTrue(many["nodes_truncated"])
 
 
 # --------------------------------------------------------------------------------------------
