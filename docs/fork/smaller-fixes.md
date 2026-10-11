@@ -1,6 +1,8 @@
 # Smaller fixes
 
-Four problems that came up during the same production work. None was dangerous, but each misled the agent or the user.
+Problems that came up during the same production work. Most of them misled the agent or the user; #12 could have lost unsaved work.
+
+**Which bridge has the native fixes.** Some fixes below are in the native bridge, so they need a fork build of it. In `native/bin/`, only the 2026 bridge is one (sha256 `d5cd6ba5…`, built from the 1.7.5 merge). It was never deployed: the production machine moved to 3ds Max 2027 on 2026-10-08. The 2023, 2024, 2025 and 2027 bridges there are upstream's stock 1.7.5 builds (2027: `2d5304d4…`). A fork bridge for Max 2027 (`48c186df…`, built from `18611d7`, with every native fix on this branch) has run in production since 2026-10-11, but it isn't committed yet, so a fresh install on Max 2027 still gets the stock bridge. The Python fixes work with any bridge, and production runs this branch's Python from source.
 
 ## `execute_maxscript` reported interrupted scripts as parse errors
 
@@ -24,10 +26,11 @@ Commit `011e547`.
 
 Tests: `tests/test_execute_failures.py`. They cover how the Python server classifies the bridge's messages, not the re-compile itself.
 
-**Status.** The check is in the native bridge, and only the 2026 bridge in `native/bin/` has it. With upstream's 1.7.5 bridges (2023, 2024, 2025 and 2027), an interrupted script gets the same reply as a syntax error: "MAXScript execution failed: <Max's error text>", with a code picked from keywords in that text, usually `BAD_PARAM`.
-- **Verified live** on 2026-10-01 with the fork's 1.7.3-based 2026 bridge: `(1 +` returned `BAD_PARAM` with the compiler's message. Quitting with `try (quitMax #noPrompt quiet:true) catch ()` was also run live: the bridge connection dropped and Max exited cleanly.
-- **Not tested live yet:** the 2026 bridge built from the 1.7.5 merge (sha256 `d5cd6ba5…`), and a bare `quitMax #noPrompt`, which should give `MAXSCRIPT_INTERRUPTED`. Run that check with the merged bridge, on a throwaway Max.
-- Since the merge, `execute_maxscript` runs in Max's quiet mode by default, except for scripts that mention a scene file command (see [#12](#quiet-mode-could-discard-unsaved-work) below).
+**Status.** The check is in the native bridge, so it needs a fork bridge (see the top of this page). With a stock 1.7.5 bridge, an interrupted script gets the same reply as a syntax error: "MAXScript execution failed: <Max's error text>", with a code picked from keywords in that text, usually `BAD_PARAM`.
+- **Verified live on Max 2026** on 2026-10-01 with the fork's 1.7.3-based bridge: `(1 +` returned `BAD_PARAM` with the compiler's message. Quitting with `try (quitMax #noPrompt quiet:true) catch ()` was also run live: the bridge connection dropped and Max exited cleanly.
+- **Verified live on Max 2027** on 2026-10-11 with the fork's 2027 bridge (`48c186df…`): a failing script returned the parse-error detail.
+- **Not tested live yet:** a bare `quitMax #noPrompt`, which should give `MAXSCRIPT_INTERRUPTED`. Run it on a throwaway Max.
+- With a fork bridge, `execute_maxscript` runs in Max's quiet mode by default, except for scripts that mention a scene file command (see [#12](#quiet-mode-could-discard-unsaved-work) below). With a stock bridge, every script sent without `quiet` runs in quiet mode.
 
 ## Failed agent scripts printed errors in the user's Listener
 
@@ -39,9 +42,11 @@ Fork issue #8. Commit `6552786`.
 
 **What changed.** `execute_maxscript`, and the native tools that run MAXScript internally, now run scripts with quiet errors. Compile errors and aborts go to Max's log, not the Listener, and the compile-only check behind the parse-error detail prints nothing either. The caller gets the same results as before: `BAD_PARAM` "MAXScript execution failed (parse error): <detail>", `MAXSCRIPT_INTERRUPTED`, and runtime errors with their message. A script's own output, such as `print`, still reaches the Listener.
 
-**Status.** This is in the native bridge. All of upstream's 1.7.5 bridges have the same change, and so does the 2026 bridge built from the merge. Verified live with the fork's 1.7.3-based 2026 bridge (sha256 `c621db10…`) on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message and left the Listener unchanged, and `print "hello"; 42` returned `42` with only `"hello"` added to the Listener. Not checked live yet with the merged bridge (sha256 `d5cd6ba5…`).
+**Status.** This is in the native bridge. All of upstream's 1.7.5 bridges have the same change, and so do the fork's bridges built from the merge.
+- **Verified live on Max 2026** with the fork's 1.7.3-based bridge (sha256 `c621db10…`) on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message and left the Listener unchanged, and `print "hello"; 42` returned `42` with only `"hello"` added to the Listener.
+- **Verified live on Max 2027** on 2026-10-11 with the fork's 2027 bridge (`48c186df…`): a failing script returned the parse detail and nothing reached the Listener.
 
-Upstream's quiet mode makes prompts take their default answer; `execute_maxscript(quiet=False)` doesn't set it. The fork changes quiet mode only on Max's main thread (`8a8b26c`, see [hung-max.md](hung-max.md#upstream-175s-dialog-handling-fixed-on-the-merge)).
+Quiet errors are not upstream's quiet mode, which makes prompts take their default answer. With `execute_maxscript(quiet=False)` prompts are shown, but errors still stay out of the Listener. The fork changes quiet mode only on Max's main thread (`8a8b26c`, see [hung-max.md](hung-max.md#upstream-175s-dialog-handling-fixed-on-the-merge)).
 
 ## Curve tools rejected Line objects
 
@@ -53,7 +58,7 @@ Commit `1261998`.
 
 Tests: `tests/test_curve_line_support.py`.
 
-**Verified live** on 2026-10-01: `inspect_curve` reads Line objects.
+**Verified live on Max 2026** on 2026-10-01: `inspect_curve` reads Line objects. This fix is Python only, so it works with any bridge.
 
 ## The agent viewport couldn't be reclaimed after a restart
 
@@ -66,11 +71,12 @@ Fork issue #11. Commit `8330c2c`.
 - `open` reclaims a tagged floating viewport only if it's the same panel window that showed the tagged slot when the scene loaded, or when the bridge first looked after a restart, and only if that window hasn't been hidden or destroyed since. Max's default floating viewport, and a user's own panel, are never taken over.
 - Scene loads (open, reset, new) are watched from the moment the bridge starts, so the first load after a restart counts.
 - `release` restores the panel's previous name, and clears the tag only if this process held the window.
+- `open` and the new `reclaim` action, which never takes a free panel, report `reclaimed`.
 - `status` reports `reclaimable`, the window and `next_action: "open"`, and errors name the stale window.
 
-**Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32. It's in the 2026 bridge in `native/bin/`, built from the 1.7.5 merge (sha256 `d5cd6ba5…`). An earlier build with it (sha256 `1cf0f9d8…`) was deployed on 2026-10-01. Unit tested in `tests/test_agent_viewport_reclaim.py`.
-- **The first live test was inconclusive.** After the restart, `open` worked, but it couldn't reclaim the restored panel, because that Hold was written by the old bridge, which never tagged it. Closing the stale panel let agent captures work again.
-- A Hold taken with the new bridge is waiting for the next restart.
+**Status.** This is in the native bridge, which now also imports `SetWindowSubclass` from COMCTL32, so it needs a fork bridge (see the top of this page). Unit tested in `tests/test_agent_viewport_reclaim.py`.
+- **On Max 2026,** a build with it (sha256 `1cf0f9d8…`) was deployed on 2026-10-01. The first live test was inconclusive: after the restart, `open` worked, but it couldn't reclaim the restored panel, because that Hold was written by the old bridge, which never tagged it. Closing the stale panel let agent captures work again. The real test, with a Hold taken under the new bridge, never ran before the move to Max 2027.
+- **Not tested live on Max 2027 yet.** The check: `agent_viewport open`, Hold, restart Max, `fetchMaxFile`, then `open` again, which should report `reclaimed: true`.
 
 ## Quiet mode could discard unsaved work
 
@@ -82,12 +88,15 @@ Fork issue #12. Commit `aa3d91d`.
 - A script that mentions `resetMaxFile`, `loadMaxFile`, `fetchMaxFile`, `quitMax`, `checkForSave`, `max reset file`, `max file new`, `max file open` or `max fetch`, or the Interface's `FileReset`, `FileFetch` or `LoadFromFile` (as reached through .NET's `COREInterface`), is never run in quiet mode by default. Its prompt reaches the agent as `BLOCKED_BY_DIALOG`, to answer with `max_dialogs` or hand to the user.
 - The check is deliberately blunt: anywhere in the text, case-insensitive, strings and comments included. A false alarm only leaves a prompt visible, and `#noPrompt` or `quiet:true` arguments still suppress it. A miss could lose a scene.
 - Merging isn't listed, because it never asks to save.
-- `quiet=False` always shows prompts. `execute_maxscript(quiet=True)` forces quiet mode on such a script only together with `allow_discard=True`, because quiet mode answers the save prompt by discarding unsaved changes. Until the 1.7.5 merge, upstream's default was an explicit `quiet=True`, so agents and saved prompts that still pass it would have bypassed the rule; `quiet=True` alone is now sent as `quiet=False` for such a script (the Python check uses the bridge's list). The bridge's own `quiet: true` request field still forces quiet mode, for example through `invoke_tool`.
+- `quiet=False` always shows prompts. `execute_maxscript(quiet=True)` forces quiet mode on such a script only together with `allow_discard=True`, because quiet mode answers the save prompt by discarding unsaved changes. Upstream's `execute_maxscript` defaults to `quiet=True`, so agents and saved prompts may pass it explicitly and would bypass the rule; on such a script `quiet=True` alone is now sent as `quiet=False` (the Python check uses the same list as the bridge). The bridge's own `quiet: true` request field still forces quiet mode, for example through `invoke_tool`.
 - When quiet mode was off for this reason, the bridge marks the response `meta.quietOverride: "file_command"` (or the client `"file_command_quiet_ignored"` when it set `quiet=True` aside). The agent sees it as `transport.quiet_override` (full tripback mode) and as a reply warning.
-- Native tools that run MAXScript internally follow the same rule. The `manage_scene` fallbacks (`resetMaxFile #noPrompt`, `fetchMaxFile quiet:true`) still run without a prompt.
+- Native tools that run MAXScript internally follow the same rule, and the native `manage_scene` reset and fetch keep quiet mode off, so their prompts show. Its MAXScript fallbacks, used without the native bridge (`resetMaxFile #noPrompt`, `fetchMaxFile quiet:true`), still run without a prompt.
 - **Limits:** the check reads only the submitted text. It doesn't see a command name built from pieces at runtime (`execute ("reset" + "MaxFile()")`), a file action run through `actionMan`, or commands inside scripts run with `fileIn`, `include`, `python.ExecuteFile` or `macros.run` (or startup and pipeline scripts called by name). Those run inside the quiet call, so their save prompts take the default answer. Agents should pass `quiet=False` when a script runs other scripts that may reset, open or quit. `#noPrompt` and `quiet:true` arguments in the script suppress the prompt whatever the bridge does, so the skill tells agents to add them only with the user's OK.
 
-**Status.** Unit tested (`native/tests/quiet_policy_tests.cpp`, `tests/test_execute_failures.py`, `tests/test_merge_review_safety.py`). It's in the 2026 bridge built from the 1.7.5 merge; not tested live yet. The second merge review added `max fetch` and the Interface spellings to the list, and the client-side `allow_discard` rule. The client side works with any bridge; the longer native list is in the 2026 bridge in `native/bin/` (`d5cd6ba5…`). The live check: on a throwaway scene with unsaved changes, `resetMaxFile()` should return `BLOCKED_BY_DIALOG` with the save prompt, not reset.
+**Status.** Unit tested (`native/tests/quiet_policy_tests.cpp`, `tests/test_execute_failures.py`, `tests/test_merge_review_safety.py`). Not tested live yet, on either Max version. The second merge review added `max fetch` and the Interface spellings to the list (`39c7e8e`), and the client-side `allow_discard` rule (`ec903a5`).
+- **With a fork bridge** (see the top of this page), the whole rule applies: the default quiet decision, `meta.quietOverride: "file_command"`, the native tools and `manage_scene`. On Max 2027 that's the fork bridge running in production.
+- **With a stock bridge** (2023, 2024 and 2025, and a fresh install on 2027 until the fork build is committed), only the Python side works, and it only turns an explicit `quiet=True` into `quiet=False`. A script that mentions a file command and is sent with no explicit `quiet` still runs in quiet mode, so its save prompt takes the default answer. MAXScript that native tools run is always quiet there too. On a stock bridge, pass `quiet=False` for such scripts.
+- **The live check:** on a throwaway scene with unsaved changes, `resetMaxFile()` should return `BLOCKED_BY_DIALOG` with the save prompt, not reset.
 
 ## `contact_check` thresholds, non-mesh nodes and dense meshes (#14, #15)
 
@@ -95,16 +104,16 @@ Fork issues #14 and #15. Commit `02cb984`.
 
 **What happened.**
 - An explicit `near_gap` or `tolerance` failed with "invalid thresholds", and one node in `against` that isn't a mesh aborted the whole call (#14).
-- Two 148k-vertex garlands kept Max's main thread busy for more than 5 minutes, long after the client had timed out (#15).
+- Two 148k-vertex garlands kept Max's main thread busy for minutes (an estimated 5 or more), long after the client had timed out (#15).
 
 **What changed.**
 - Explicit `tolerance` and `near_gap` are always millimetres (0 means the defaults, 0.1 mm and 10 mm), converted to scene units like the defaults. Results stay in scene units. Values are checked before anything is sent.
-- Nodes in `names` or `against` that can't become a mesh are skipped with a warning and listed in `skipped_nodes`. If none of the `names` nodes is a mesh, the call fails with a clear error.
-- After the bounding-box pass, the script estimates the work (vertices per candidate pair) and checks the cheapest pairs first, within a work budget. It checks a deadline, `time_budget_s`, between pairs and inside long vertex loops. The deadline is at most 45 s, below the client timeout, and counts from when the request was built, so time spent queued counts too.
-- On the budget or the deadline it stops and returns partial results: `complete: false`, `pairs_total`, `pairs_checked`, `work_estimate`, the heaviest nodes, the stop reason and `queue_wait_ms`. Check dense meshes (garlands, foliage, Mesher objects) separately.
+- Nodes in `names` or `against` that can't become a mesh are skipped with a warning and listed in `skipped_nodes`. If none of the `names` nodes (or none of the `against` nodes) is a mesh, the call fails with a clear error.
+- After the bounding-box pass, the script estimates the work (vertices per candidate pair) and checks the cheapest pairs first, within `work_budget` (default 2,000,000). It checks a deadline, `time_budget_s`, between pairs and inside long vertex loops. The deadline defaults to 30 s and is at most 45 s, below the client timeout. It counts from when the request was built, so time spent queued counts too.
+- On the budget or the deadline it stops and returns partial results: `complete: false`, `pairs_total`, `pairs_checked`, `work_estimate`, `unchecked_pairs`, `heaviest_nodes`, `stop_reason` and `queue_wait_ms`. Check dense meshes (garlands, foliage, Mesher objects) separately.
 - The report header changed, so the parser and the script ship together. The skill explains units, skipping and the budget.
 
-**Status.** Unit tested in `tests/test_contact_check.py`. Deployed (Python) on the 1.7.3-based fork on 2026-10-05; not tested live yet. On the 1.7.5 merge, the 45 s cap stays below the client's reply deadline, and a request that waited too long in the queue is cancelled and never runs.
+**Status.** Unit tested in `tests/test_contact_check.py`. Python only, so it works with any bridge. Deployed on the 1.7.3-based fork on Max 2026 on 2026-10-05, and running on Max 2027 since 2026-10-11; not tested live yet on either. On the 1.7.5 merge, the 45 s cap stays below the client's reply deadline, and a request that waited too long in the queue is cancelled and never runs.
 
 ## Cloning a closed-group member cloned the whole group (#16)
 
@@ -119,4 +128,4 @@ Fork issue #16. Commit `a83f57c`.
 - `scene_qa` has a new read-only check, `duplicate_group_heads`. It finds group heads with the same position, rotation and scale whose child lists match by class and name, ignoring case, trailing digits and the `_mcp` suffix. Near matches are reported as `name_match: "partial"`. It never deletes anything, in fix mode either.
 - **On the 1.7.5 merge** (`cb4d0ff`): if a dialog holds the read-only check that `clone_objects`, or `scene_qa` in fix mode, runs first, the call returns `BLOCKED_BY_DIALOG` with `retryable: true` and "Nothing was cloned" or "Nothing was changed". Repeat it once the dialog is answered. The queued check runs then too, harmlessly. `scene_qa` never sends its fix behind a check that couldn't run.
 
-**Status.** Unit tested in `tests/test_clone_groups.py` and `tests/test_scene_qa_groups.py`. Deployed (Python) on the 1.7.3-based fork on 2026-10-05; not tested live yet.
+**Status.** Unit tested in `tests/test_clone_groups.py` and `tests/test_scene_qa_groups.py`. Python only, so it works with any bridge. Deployed on the 1.7.3-based fork on Max 2026 on 2026-10-05, and running on Max 2027 since 2026-10-11; not tested live yet on either.

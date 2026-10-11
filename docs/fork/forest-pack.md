@@ -1,6 +1,6 @@
 # Forest Pack: items, custom edits, library presets and list checks
 
-Added on 2026-10-06, from a live study of Forest Pack Pro 9 (`Forest_Pro.version()` = 900) in a scratch 3ds Max 2026 with centimetre units.
+Added on 2026-10-06, from a live study of Forest Pack Pro 9 (`Forest_Pro.version()` = 900) in a scratch 3ds Max 2026 with centimetre units. The changes are all Python and need no bridge change.
 
 ## Why
 
@@ -16,11 +16,11 @@ The existing `scatter_forest_pack` returned success for scatters with no items. 
 - Inputs are validated in Python first; the object is created in one undo step and gets a unique name. It returns a dict, not a JSON string.
 
 **New tools** (module `maxmcp/tools/forest.py`, helpers in `maxmcp/helpers/forest.py` and `forest_library.py`):
-- **`forest_items`** (read only) pages through items: pivot `position`, an instance-ready `transform`, `geom_id`, `size`, and optionally `item_name`, `source`, `rotation_z`, `scale`, `seed`. It builds the forest first. `refresh_surfaces` pulses `surfanim`.
+- **`forest_items`** (read only) pages through items: pivot `position`, an instance-ready `transform`, `geom_id`, `size`, and optionally `item_name`, `source`, `rotation_z`, `scale`, `seed`. It builds the forest first and returns world space unless `space="object"`. `refresh_surfaces` pulses `surfanim`.
 - **`forest_edit_items`** moves, deletes, creates and resizes items, and sets rotation (the final angle, random rotation included), seed or item type. A procedural forest is refused unless `allow_custom_edit=true`, which builds it and switches it to custom edit first. Forest Pack doesn't record item edits in undo, so the result gives `undoable` (true only when the call switched the forest to custom edit) and `revert`, an edit list that puts the items back. Created items that lie off every surface are reported.
 - **`forest_set_mode`** switches between `procedural` and `custom_edit`. Going back to procedural needs `confirm_discard=true`.
-- **`forest_library`** (Python only) searches every library `index.xml`: presets, 3D items and 2D billboards.
-- **`forest_from_library`** places a preset or 3D item on surfaces, with optional include/exclude splines and a material library swap. It fails with `ZERO_ITEMS` when nothing is scattered. Merging a library file clears 3ds Max's undo history, so it needs `allow_undo_flush=true`, and the placement can't be undone: the result gives `undoable: false`, `undo_history_cleared: true` and `remove_with`, the nodes to delete to take it out again.
+- **`forest_library`** (Python only) searches every library `index.xml`: presets, 3D items and 2D billboards. Each root gets 10 s; a slow share returns what it found, with an `error` on that root. Scans are cached for 5 minutes (1 minute for a root that didn't answer).
+- **`forest_from_library`** places a preset or 3D item on surfaces, with optional include/exclude splines and a material library swap. It fails with `ZERO_ITEMS` when nothing is scattered; the nodes stay, and the error's details list them in `remove_with`. Merging a library file clears 3ds Max's undo history, so it needs `allow_undo_flush=true`, and the placement can't be undone: the result gives `undoable: false`, `undo_history_cleared: true` and `remove_with`, the nodes to delete to take it out again.
 - **`forest_validate`** checks the item and area lists, builds the forest and reports the count. `fix=true` makes conservative repairs.
 
 ## Verified Forest Pack facts
@@ -54,7 +54,7 @@ These were measured live; the tools rely on them.
 - World to object space: `p * inverse(forest.objectTransform)`.
 
 **Library and presets**
-- Library roots are listed in `HKCU\Software\Itoo Software\Forest Pack Pro\LibraryDir` (this machine has a local and a network root); the default is `%LOCALAPPDATA%\Itoo Software\Forest Pack Pro\lib`. Each folder's `index.xml` lists `<item class="maxobject">` entries (`maxfile`, `object`, `matlib`, `material`) and `tree_billboard` entries (2D, with `<library>`). `$(LIBROOTPATH)` is the root; other relative paths are relative to the index folder.
+- Library roots are listed in `HKCU\Software\Itoo Software\Forest Pack Pro\LibraryDir` (this machine has a local and a network root); the default is `%LOCALAPPDATA%\Itoo Software\Forest Pack Pro\lib`. `forest_library` scans every registry root and the default, each folder once. Each folder's `index.xml` lists `<item class="maxobject">` entries (`maxfile`, `object`, `matlib`, `material`) and `tree_billboard` entries (2D, with `<library>`). `$(LIBROOTPATH)` is the root; other relative paths are relative to the index folder.
 - Merged alone, a preset's `cobjlist` and spline `arnodelist` entries come back undefined. `conamelist` names the source objects (`namelist` is only a label and can be in another order).
 - Merging the forest and its sources in **one** `mergeMAXFile` call relinks `cobjlist`, even when Max renames a duplicate. Merging them in two calls and wiring by name broke when Max renamed `_fp_wildgrass_09` to `_fp_wildgrass_001`.
 - **Stock presets ship their Surface Area inactive.** That is why a retargeted preset gave 0 items. Activating it gave 23473 items on a 10 m plane.
@@ -63,24 +63,24 @@ These were measured live; the tools rely on them.
 **Export**
 - `Forest_Pro.ForestPack.exportData file fields` is class level (`node.ForestPack` doesn't exist). It always writes **every** forest in the scene, whatever is selected, hidden or disabled: 82 MB for 12 forests. No tool uses it; `forest_items` reads one forest through `trees.*`.
 
-**Undo** (verified in the live test of 2026-10-06)
+**Undo** (verified in the live test of 2026-10-06, on Max 2026)
 - Merging a library `.max` file clears 3ds Max's whole undo history. This holds for Forest Pack items and RailClone items alike.
 - `mergeMAXFile` is never recorded in undo, even inside `theHold`.
 - `loadTempMaterialLibrary` also clears the whole undo history. Inside an open `theHold` step it wipes that step.
 - Forest Pack per-item edits (`trees.setPosition` and the other `trees.*` edits) are never recorded in undo. Changing `.mode` is recorded.
 - **An undo crashed Max.** A draft of `forest_from_library` merged outside undo, then, inside an undo step, made copies of the merged nodes, pointed the copied forest's `cobjlist` from the merged originals to the copies (so the undo record held the originals as the old values), and deleted the originals with undo off. A later `max undo` crashed Max. The rule: never leave an undo record that refers to a node deleted with undo off. That draft was never committed; `forest_from_library` now puts nothing in an undo step.
 
-**Testing undo.** Agents can't live-test undo: the user's rule is that agents never run `max undo` or `max redo` through MCP, because a `max redo` crashed Max 2027. The tools' undo behaviour is therefore safe by construction (no undo step in `forest_from_library`; only the mode switch is recorded in `forest_edit_items`), and the unit tests check the generated scripts for it. Undo hasn't been run on the current versions of these tools.
+**Testing undo.** Agents can't live-test undo: the user's rule is that agents never run `max undo` or `max redo` through MCP, because `max undo` followed by `max redo` crashed Max 2027. The tools' undo behaviour is therefore safe by construction (no undo step in `forest_from_library`; only the mode switch is recorded in `forest_edit_items`), and the unit tests check the generated scripts for it. Undo hasn't been run on the current versions of these tools.
 
 **MAXScript pitfalls met in the live test**
 - A `for ... collect` written straight into a function call's arguments that reads the caller's locals failed with "Bad free thunk local member index", or read the wrong variable (a loop index became the stringStream). The scripts collect into a local first, then pass the local (`fpKeepAreas`, the lists in `scatter_forest_pack`).
-- Keywords can't be variable names: `local at = ...` was a parse error. It is now `atype`. The same goes for `by`, `to`, `on`, `in`, `of`, `do`, `as`, `max`, `set`, `tool`, `undo`, `from`, `with`, `where`, `while`, `collect` and the other keywords. The unit tests check every local, parameter and loop variable in the scripts.
+- Keywords can't be variable names: `local at = ...` was a parse error. It is now `atype`. The same goes for `by`, `to`, `on`, `in`, `of`, `do`, `as`, `max`, `set`, `tool`, `undo`, `from`, `with`, `where`, `while`, `collect` and the other keywords. Constants aren't reused as names either (`ok` is now `hasSrc`). The unit tests check every local, parameter and loop variable in the scripts against both.
 - `getHandleByAnim` returns an IntegerPtr; `fpMark` and `fpNewNodes` convert it with `as integer64` before comparing.
 - `intersectRay` with a ray origin at z = 1e7 missed a plane at z = 0 (float precision). The off-surface check in `forest_edit_items` starts its rays just above the surface's bounding box.
 
 ## How the tools work
 
-**`forest_items`.** One script: build (and pulse `surfanim` with `refresh_surfaces`, outside the undo stack), count items per type, then return the page. Types without a valid source return the raw item TM, flagged `no_source`. `limit` is at most 5000; a full transform costs about 100 bytes per item.
+**`forest_items`.** One script: build (and pulse `surfanim` with `refresh_surfaces`, outside the undo stack), count items per type, then return the page. Items whose type has no valid source return the raw item TM, flagged `no_source`. `limit` is at most 5000; a full transform costs about 100 bytes per item.
 
 **`forest_edit_items`.** Python validates every edit (ops, keys, indices, sizes, seeds) and refuses an index both edited and deleted. In Max: refuse an open undo, a `geomlist` crash risk, an unknown mode, or a procedural forest without `allow_custom_edit`; check item types (1 or 2, with a source for 2) and indices against the built count. Then, in one undo step, of which only the mode switch is recorded: switch to custom edit if needed (and switch back without editing if the frozen count differs), read the state of every touched item (for `revert`), apply the edits except rotations, rebuild, set the rotations as final angles, delete from the highest index, create (a ray from just above each surface checks that the point is on one), rebuild, and set the created items' rotations. Edited and created items are read back with the stored point and the actual pivot.
 
@@ -90,27 +90,27 @@ These were measured live; the tools rely on them.
 1. With undo off, merge the object alone (the probe). A Forest object gives the source names from `conamelist` (falling back to `namelist`) that exist in the file, and the names of its spline areas, which are dropped. A plain mesh makes it a 3D item. The probe is deleted.
 2. Merge the object plus its sources in one call, as before: no copies, no renames, no deleted originals. The merge has already cleared the undo history, so it and every step after it run with undo off, inside a `try` that also builds the report. On an error, every node created since the merge (a 3D item's new forest included) is deleted with undo off and the error is passed on. No undo record ever refers to these nodes. A 3D item becomes the only source of a new forest (`items_per_m2`, default 300 cm tiles).
 3. Retarget: `surflist` = the surfaces; the area lists are cut to the Surface Area; it is active unless include splines are given; include splines are appended as active spline areas and exclude splines as active exclusion areas.
-4. Optionally swap materials from the item library's `.mat` for `matlib_renderer` (presets: `matList` by name; 3D items: the `<material>` on the source). Hide the merged sources. Build and return the count, the item types and their linked sources, the areas, the merged nodes and the materials swapped or missing, with `undoable: false`, `undo_history_cleared: true` and `remove_with` (the forest, then its merged sources): delete those nodes to take the placement out again.
+4. Optionally swap materials from the item library's `.mat` for `matlib_renderer` (presets: `matList` by name; 3D items: the `<material>` on the source). With `hide_sources` (the default), hide the merged sources. Build and return the count, the item types and their linked sources, the areas, the merged nodes and the materials swapped or missing, with `undoable: false`, `undo_history_cleared: true` and `remove_with` (the forest, then its merged sources): delete those nodes to take the placement out again.
 
 Merges use `#autoRenameDups #useSceneMtlDups #neverReparent quiet:true`. The live recipe used `#useMergedMtlDups`; `#useSceneMtlDups` is used instead so a merge never replaces a material already in the scene (for example one converted for Vantage).
 
-**`forest_validate`.** One read script collects the list lengths, every item and area entry, the surfaces (with their upward area) and the count; Python analyses them. Errors: item lists shorter than `namelist`, `geomlist` 3 or another invalid value (the forest is then not rebuilt), `geomlist` 0, missing sources, probabilities or sizes ≤ 0, unequal area lists, more than one Surface Area, no active area, an active spline area without a spline, an active Surface Area with no surfaces, missing surfaces, 0 items. Warnings: lists longer than `namelist`, short auxiliary lists, `conamelist` mismatches, a missing Surface Area entry, a tile too large for the surface, custom edit mode, disabled or manual update. The estimate covers the Surface Area with the default density map only.
+**`forest_validate`.** One read script collects the list lengths, every item and area entry, the surfaces (with their upward area) and the count; Python analyses them. Errors: an empty `namelist`, item lists shorter than `namelist`, `geomlist` 3 or another invalid value (the forest is then not rebuilt), `geomlist` 0, missing sources, probabilities or sizes ≤ 0, unequal area lists, more than one Surface Area, no active area, an active spline area without a spline, an active Surface Area with no surfaces, missing surfaces, 0 items. Warnings: lists longer than `namelist`, short auxiliary lists, `conamelist` mismatches, a missing Surface Area entry, a tile too large for the surface, custom edit mode, disabled or manual update. The estimate covers the Surface Area with the default density map only.
 
-`fix=true` pads short item lists (sources relinked by a unique matching name, `geomlist` 2 where a source exists and 0 otherwise, probability 100, size from the source's bounding box), relinks missing sources of type-2 items the same way, and pads short area lists with the defaults of a new spline area (inactive), in one undo step. A second script checks the lengths it read haven't changed (`STALE`), applies the plan and checks again. It never truncates a list (a long list may mean `namelist` lost an entry), never changes `geomlist` 3, and never activates an area. If a dialog in Max holds the first, read-only script of a `fix=true` call, the fix is never sent: the call fails with a retryable `BLOCKED_BY_DIALOG` that says nothing was fixed (1.7.5's `PrecheckBlocked`, as in `clone_objects`), so answer the dialog and repeat it. Without `fix`, or for a dialog during the fix itself, it's the usual `BLOCKED_BY_DIALOG`, which must not be repeated.
+`fix=true` pads short item lists (sources relinked by a unique matching name, `geomlist` 2 where a source exists and 0 otherwise, probability 100, size from the source's bounding box), relinks missing sources of type-2 items the same way, and pads short area lists with the defaults of a new spline area (inactive), in one undo step. A second script checks the lengths it read haven't changed (`STALE`), applies the plan and checks again. It never truncates a list (a long list may mean `namelist` lost an entry), never changes `geomlist` 3, and never activates an area. If a dialog in Max holds the first, read-only script of a `fix=true` call, the fix is never sent: the call fails with a retryable `BLOCKED_BY_DIALOG` that says nothing was fixed (`PrecheckBlocked` from `cb4d0ff`, as in `clone_objects`), so answer the dialog and repeat it. Without `fix`, or for a dialog during the fix itself, it's the usual `BLOCKED_BY_DIALOG`, which must not be repeated.
 
 ## Limits
 
-- Tested live on Max 2026 only; the run on Max 2027 (Forest Pack 9.4.3) is pending.
 - `forest_from_library` can't be undone, and it clears the undo history: delete the nodes in `remove_with` instead. Item edits aren't in undo either: pass `revert` back to `forest_edit_items`. Undoing a switch to custom edit sets `mode` back to 0, which discards the edits.
 - Undo hasn't been run on the current versions of these tools (agents don't run undo; see "Testing undo" under [Verified Forest Pack facts](#verified-forest-pack-facts)).
 - A forest whose `geomlist` holds 3 (perhaps valid with a proxy) is refused by every tool that rebuilds it.
 - Indices in procedural mode change when the forest rebuilds.
 - Include splines with the Surface Area inactive were verified with the spline at the surface's height only.
-- 2D billboard items can't be placed. `.pmat` material libraries are refused.
+- 2D billboard items can't be placed. `matlib_renderer` refuses `.pmat` material libraries.
 - 3D library items get Forest Pack's default viewport mode; the presets use `vmesh = 3`, which shows no meshes in viewports (not an error).
 - The density estimate assumes the default density map and counts the Surface Area only.
 
 ## Status
 
 - **Unit tests** in `tests/test_forest_tools.py`: input validation, the generated scripts (order of build, switch, edits, rotations, deletes and creates; probe before the one-call merge; no undo step and no node deleted outside `with undo off` in `forest_from_library`; no file commands, no `geomlist` 3, balanced parentheses, one argument per `format` placeholder; the MAXScript pitfalls above: keywords as names, inline collects, IntegerPtr handles, far ray origins), parsing of canned reports, the `revert` list, the library scan on a temporary library, the validator's analysis and fix plan, and registration.
-- **Tested live** on Max 2026 (Forest Pack 9.0) on 2026-10-06; Max 2027 (Forest Pack 9.4.3) pending. The fixes made after that run, including the undo-off placement in `forest_from_library`, are covered by the unit tests and wait for the Max 2027 run.
+- **Tested live** on Max 2026 (Forest Pack 9.0) on 2026-10-06; Max 2027 (Forest Pack 9.4.3) pending. The fixes made after that run (`e95b693`), including the undo-off placement in `forest_from_library`, are covered by the unit tests and wait for the Max 2027 run.
+- Commits: `b8345c7` (fixes and tools), `e95b693` (fixes from the live test), merged into `merge-1.7.5` at `fb7c84e`.
