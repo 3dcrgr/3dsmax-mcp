@@ -296,6 +296,10 @@ def remove_retired_chat_macros() -> None:
 def package_contents_xml(app_version: str) -> str:
     if PACKAGE_CONTENTS_TEMPLATE.exists():
         text = PACKAGE_CONTENTS_TEMPLATE.read_text(encoding="utf-8")
+        # Autodesk reads AppVersion as dotted numbers; a local label such as "+fork.1" stays in FriendlyVersion.
+        numeric = re.match(r"\d+(?:\.\d+)*", app_version)
+        text = text.replace(f'AppVersion="{APP_VERSION_PLACEHOLDER}"',
+                            f'AppVersion="{numeric.group(0) if numeric else app_version}"')
         return text.replace(APP_VERSION_PLACEHOLDER, app_version)
     raise FileNotFoundError(f"Missing bundle template: {PACKAGE_CONTENTS_TEMPLATE}")
 

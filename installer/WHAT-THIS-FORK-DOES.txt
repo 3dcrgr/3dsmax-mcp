@@ -1,0 +1,97 @@
+3dsmax-mcp 1.7.5-fork.1 - what this fork does
+=============================================
+
+This installs the 3dcrgr fork of 3dsmax-mcp (github.com/3dcrgr/3dsmax-mcp),
+based on upstream cl0nazepamm/3dsmax-mcp 1.7.5. It replaces an existing
+upstream install (same folder, same bridge bundle, same client setup).
+Upstream's own installer can replace it again later.
+
+196 tools: all 179 of upstream's, plus 17 new ones.
+Tested in production on 3ds Max 2027.2 (and 2026), V-Ray 7 GPU,
+Chaos Cosmos, Chaos Vantage 3.4, RailClone 7.3.5 and Forest Pack 9.4.3.
+
+
+WHAT IT FIXES
+
+When 3ds Max hangs or is busy
+ 1. A hung Max gives MAX_BUSY / MAX_NOT_RESPONDING with a process diagnosis,
+    not a bare timeout. Requests that may already have run are never replayed.
+ 2. get_bridge_status answers from a pipe thread even while Max's main
+    thread is blocked, and says what holds it.
+ 3. Max no longer stalls on exit when MCP requests are queued.
+ 4. An MCP server whose client crashed exits with it.
+
+Dialogs and unsaved work
+ 5. Quiet mode never answers a "Save changes?" prompt by itself: scripts
+    that reset, open, fetch or quit run with quiet mode off.
+ 6. Fixes to 1.7.5's dialog handling: a hung main thread is a hang, not a
+    dialog; the Cosmos browser, Material Editor and agent viewport are never
+    treated as dialogs; dialogs of other threads are never pressed.
+ 7. A script interrupted by quitMax is reported as MAXSCRIPT_INTERRUPTED,
+    not as a parse error.
+
+Several sessions or several 3ds Max instances
+ 8. Every tool takes an optional expected_pid: a call is refused, nothing
+    sent, if it would reach another Max. Replies carry selection_generation.
+ 9. A default target whose Max exited re-resolves when that is unambiguous.
+
+Chaos Cosmos
+10. cosmos_import no longer stalls or deadlocks Max, polls lightly, finds
+    what it created by handle, keeps the active Material Editor slot and
+    minimizes the browser it opened.
+
+Materials
+11. replace_material matches Multi/Sub slots, finds sources outside the
+    scene, warns on no_match; batch entries apply in order.
+12. material_roles reads Revit (Autodesk Bitmap) texture paths and flags
+    unreadable ones.
+
+Modeling, scene, viewport
+13. Curve tools accept Line objects.
+14. contact_check: thresholds in millimetres, non-mesh nodes skipped,
+    a time budget on dense meshes.
+15. Cloning a closed-group member clones only that member; scene_qa flags
+    stacked duplicate groups.
+16. agent_viewport reclaims its own viewport after a restart, and its V-Ray
+    previews work with V-Ray GPU.
+
+RailClone and Forest Pack (existing tools)
+17. RailClone styles with repeated attributes load; output is rebuilt before
+    it is read; reads never re-capture segment geometry.
+18. scatter_forest_pack: density through the tile size, "up" facing, the real
+    item count, never the crashing geomlist 3.
+
+
+WHAT IT ADDS (17 tools)
+
+ - capture_hang_diagnostics: native stacks of a hung Max.
+ - resting_check, drop_to_surface: props floating above or sunk into the
+   surface below them, and dropping them onto it.
+ - vantage_status, vantage_get_image, vantage_live_link: Chaos Vantage state,
+   its current frame as a PNG, V-Ray GPU Live Link on request.
+ - railclone_inspect, railclone_set_param, railclone_library,
+   railclone_from_library.
+ - forest_items, forest_edit_items, forest_set_mode, forest_library,
+   forest_from_library, forest_validate.
+ - itoo_vantage_check: read-only readiness check of Forest Pack, RailClone
+   and ForestIvy objects for Chaos Vantage.
+
+
+WHAT IT REMOVES OR CHANGES
+
+Nothing of upstream's is removed. Behaviour changes on purpose:
+ - Quiet mode is off for scripts that mention reset, open, fetch or quit.
+ - batch_replace_materials applies entries in order (no swaps).
+ - RailClone reads no longer call segmentsUpdate (reload_segments=true does).
+ - scatter_forest_pack: density means tile size; "up" = direction 100.
+ - The 2026 and 2027 native bridges are fork builds. 2023-2025 are upstream's.
+
+
+BEFORE YOU INSTALL
+
+ - Close 3ds Max and your AI clients.
+ - After installing, start 3ds Max and a NEW client session: clients cache
+   the tool list.
+ - This installer is not code-signed, so Windows SmartScreen may warn.
+
+Full details: github.com/3dcrgr/3dsmax-mcp (README.md and docs/FORK.md).
