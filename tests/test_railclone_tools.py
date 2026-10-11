@@ -290,9 +290,9 @@ class InspectTests(unittest.TestCase):
         for forbidden in ("theHold.Begin", "segmentsUpdate 1", "setXMLStyle"):
             self.assertNotIn(forbidden, self.script.replace(rc._FUNCTIONS, ""))
         body = self.script.replace(rc._FUNCTIONS, "")
-        # rebuilt (undo off) before reading, and getStyleDesc last: it empties the output export (live)
+        # getStyleDesc empties the output export until the next rebuild (live): read it, rebuild, read output
+        self.assertLess(body.index("getStyleDesc"), body.index("rcRebuild base"))
         self.assertLess(body.index("rcRebuild base"), body.index("api.getXMLOutput()"))
-        self.assertLess(body.index("api.getXMLOutput()"), body.index("getStyleDesc"))
 
     def test_node(self):
         node = self.out["node"]
@@ -400,6 +400,8 @@ class SetParamTests(unittest.TestCase):
         write = setp_raw({("before", 1, "paunitval"): 10.0, ("after", 1, "paunitval"): 60.0})
         out, sent = self.run_set({"Pickets Distance": "60cm"}, write)
         self.assertEqual(len(sent), 2)
+        # the read doesn't call getStyleDesc: it would empty the output export until a rebuild (live)
+        self.assertNotIn("getStyleDesc", sent[0])
         script = sent[1]
         self.assertIn("base.paunitval[2] = 60.0", script)
         self.assertIn('if (rcH base) != "602062" do throw "STALE_PARAMS', script)
@@ -557,7 +559,7 @@ class LibraryFixture(unittest.TestCase):
 class LibraryTests(LibraryFixture):
     def test_exact_name_ranks_first(self):
         from maxmcp.helpers import railclone_lib as rclib
-        items = [{"name": n, "route": "\L\\" + n, "category": "Fences\Metal", "names": [n]}
+        items = [{"name": n, "route": "\\L\\" + n, "category": "Fences\\Metal", "names": [n]}
                  for n in ("2 Red Brick Wall Fence 1 1m", "Metal Fence 10", "Metal Fence 1", "Old Metal Fence 1x")]
         ranked = [it["name"] for it in rclib.match_items(items, "metal fence 1")]
         self.assertEqual(ranked[:3], ["Metal Fence 1", "Metal Fence 10", "Old Metal Fence 1x"])
@@ -631,16 +633,91 @@ class FromLibraryTests(LibraryFixture):
         return out, scripts(client)[0]
 
     def test_max_item_needs_undo_flush_consent(self):
-        exc = self.refused(ValueError, item="Metal Fence 1", splines=["Path600"])
-        self.assertIn("clears 3ds Max's undo history", str(exc))
+        for item in ("Metal Fence 1", "Saepes"):  # .max by merge, .max by route (.pmat matlib)
+            exc = self.refused(ValueError, item=item, splines=["Path600"])
+            self.assertIn("clears 3ds Max's undo history", str(exc))
+            self.assertIn("allow_undo_flush=true", str(exc))
+            self.assertIn("remove_with", str(exc))
+        exc = self.refused(ValueError, item=self.ROUTE1, method="route")
         self.assertIn("allow_undo_flush=true", str(exc))
+
+    def assert_undo_off_load(self, script, load_call):
+        """The whole load runs with undo off: no undo step, no copy, nothing deleted unless it fails."""
+        body = mxs_body(script)
+        self.assertNotIn("theHold", body.split("if theHold.Holding()", 1)[1].split("\n", 1)[1])
+        self.assertNotIn("copy ", body)
+        self.assertNotIn("mergedRc", body)
+        start = body.index("with undo off (\n    try (\n")
+        catch = body.index("    ) catch (", start)
+        end = body.index("\n)\n", catch)
+        load = body.index(load_call)
+        self.assertLess(start, load)
+        for step in ("base.banode[spIdx[k]] = splines[k]", "o.pos = splines[1].pos",
+                     "setProperty pair[1] pair[2] cand"):
+            self.assertLess(load, body.index(step))
+            self.assertLess(body.index(step), catch)
+        self.assertLess(body.index("loaded = true"), load)
+        # deletes happen only in the error path, with undo off; the history is cleared once more after a load
+        self.assertEqual(body.count("delete n"), 1)
+        self.assertTrue(start < body.index("delete n") and catch < body.index("delete n") < end)
+        self.assertIn("if loaded do (try (clearUndoBuffer()) catch ())", body)
+        self.assertLess(body.index("delete n"), body.index("clearUndoBuffer()"))
+        self.assertNotIn('undo "', script)
+
+    def test_merge_runs_with_undo_off(self):
         out, script = self.call(lib_raw(), item="Metal Fence 1", splines=["Path600"])
-        self.assertTrue(out["undo_history_cleared"])
-        # the material library is loaded before the undo step (inside, it wipes the step)
-        self.assertLess(script.index("loadTempMaterialLibrary matPath"), script.index("theHold.Begin()"))
-        self.assertLess(script.index("mergeMAXFile maxFile"), script.index("theHold.Begin()"))
-        self.assertIn("o = copy mergedRc", script)
-        self.assertIn("if mergedRc != undefined do with undo off (delete mergedRc)", script)
+        self.assert_undo_off_load(script, "mergeMAXFile maxFile")
+        body = mxs_body(script)
+        self.assertLess(body.index("mergeMAXFile maxFile"), body.index("loadTempMaterialLibrary matPath"))
+        self.assertLess(body.index("loadTempMaterialLibrary matPath"), body.index("    ) catch ("))
+        self.assertIn("if libMtl != undefined then o.material = libMtl", body)
+        self.assertEqual((out["undoable"], out["undo"], out["undo_history_cleared"]), (False, None, True))
+        self.assertEqual(out["remove_with"], [{"name": "RC_Metal_Fence_1", "handle": 900}])
+
+    def test_route_for_max_item_runs_with_undo_off(self):
+        raw = lib_raw(extra=["N|" + V({"name": "Leftover", "handle": 901})])
+        out, script = self.call(raw, item="Saepes", splines=["Path600"])
+        self.assertIn('local methodName = "route"', script)
+        self.assert_undo_off_load(script, "api.loadLibraryItemByPath routeArg")
+        self.assertNotIn("mergeMAXFile", mxs_body(script))
+        self.assertEqual((out["undoable"], out["undo"], out["undo_history_cleared"]), (False, None, True))
+        self.assertEqual(out["extra_nodes"], ["Leftover"])
+        self.assertEqual(out["remove_with"], [{"name": "RC_Metal_Fence_1", "handle": 900},
+                                              {"name": "Leftover", "handle": 901}])
+
+    def test_rail_route_is_one_undo_step(self):
+        out, script = self.call(lib_raw(), item=self.ROUTE_RAIL, splines=["Path600"], allow_undo_flush=False)
+        self.assertIn('theHold.Accept "MCP RailClone from library"', script)
+        self.assertIn('undo "MCP RailClone cleanup" on', script)
+        body = mxs_body(script)
+        begin = body.index("theHold.Begin()")
+        accept = body.index('theHold.Accept ""')
+        for step in ("o = RailClone_Pro()", "api.loadLibraryItemByPath routeArg", "base.banode[spIdx[k]] = splines[k]",
+                     "setProperty pair[1] pair[2] cand"):
+            self.assertTrue(begin < body.index(step) < accept, step)
+        # nothing is deleted with undo off: the cancel removes the node, leftovers go in a recorded step
+        self.assertNotIn("with undo off", body)
+        self.assertNotIn("clearUndoBuffer", body)
+        self.assertNotIn("copy ", body)
+        self.assertEqual(body.count("delete n"), 1)
+        self.assertIn('if left.count > 0 do undo "" on (for n in left do (try (delete n) catch ()))', body)
+        cancel = body.index("if ownsHold do (try (theHold.Cancel()) catch ())")
+        self.assertTrue(accept < cancel < body.index("delete n"))
+        self.assertEqual((out["undoable"], out["undo"], out["undo_history_cleared"]),
+                         (True, "MCP RailClone from library", False))
+        self.assertEqual(out["remove_with"], [{"name": "RC_Metal_Fence_1", "handle": 900}])
+
+    def test_merge_never_in_an_undo_step(self):
+        entry = {"route": self.ROUTE1, "maxfile": "x.max", "object": "o", "material": "m"}
+        with self.assertRaises(ValueError):
+            rc._from_library_body(entry, "merge", [], "", "RC_x", "", "", undo_step=True)
+
+    def test_style_desc_read_before_the_rebuild(self):
+        _, script = self.call(lib_raw(), item=self.ROUTE_RAIL, allow_undo_flush=False)
+        body = script.replace(rc._FUNCTIONS, "")
+        # getStyleDesc empties the output export until the next rebuild (live)
+        self.assertLess(body.index("getStyleDesc()"), body.index("rcRebuild rcBase"))
+        self.assertLess(body.index("rcRebuild rcBase"), body.index(".getXMLOutput()"))
 
     def refused(self, exc_type, **kw):
         with patch.object(rc, "client", client_with()) as client:
@@ -664,8 +741,7 @@ class FromLibraryTests(LibraryFixture):
                                                                 "$(RENDERER)_v2.mat"))])
         self.assertFalse(any(s.endswith(".pmat") for s in strings))
         self.assertIn("loadTempMaterialLibrary matPath", script)
-        self.assertIn('theHold.Accept "MCP RailClone from library"', script)
-        self.assertIn("theHold.Cancel()", script)
+        self.assertNotIn("theHold.Accept", script)  # a merge clears the undo history: no undo step
         self.assertIn("rcRebuild rcBase", script)
         self.assertEqual((out["method"], out["route"], out["handle"]), ("merge", self.ROUTE1, 900))
         self.assertTrue(out["verified"])
@@ -746,6 +822,132 @@ class FromLibraryTests(LibraryFixture):
             with self.assertRaises(rclib.RailCloneError) as ctx:
                 rc.railclone_from_library(item=self.ROUTE_RAIL)
         self.assertEqual(ctx.exception.code, "LOAD_FAILED")
+
+
+MXS_KEYWORDS = frozenset("""about and animate as at by case catch collect continue coordsys do dontcollect else exit
+    fn for from function global if in local macroscript mapped max not of off on or parameters persistent plugin
+    rcmenu return rollout set struct then throw to tool try undo utility when where while with""".split())
+
+
+def mxs_code(line):
+    """A MAXScript line without its string literals and its -- comment."""
+    out, i, quoted = [], 0, False
+    while i < len(line):
+        ch = line[i]
+        if quoted:
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                quoted = False
+                out.append('""')
+        elif ch == '"':
+            quoted = True
+        elif line.startswith("--", i):
+            break
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def mxs_body(script):
+    """A sent script without the shared functions, string literals and comments."""
+    return "\n".join(mxs_code(line) for line in script.replace(rc._FUNCTIONS, "").split("\n"))
+
+
+def generated_scripts():
+    """Every MAXScript the RailClone tools send, generated against a mocked bridge."""
+    out = {"functions": rc._FUNCTIONS}
+    calls = {
+        "get_style": lambda: rc.get_railclone_style(name="RC"),
+        "set_style": lambda: rc.set_railclone_style(STYLE_DUP, TOKEN, name="RC"),
+        "output": lambda: rc.get_railclone_output(name="RC"),
+        "inspect": lambda: rc.railclone_inspect(handle=7, name="RC"),
+        "set_param": lambda: rc.railclone_set_param({"Pickets Distance": 20, "Mirror": False}, name="RC_Fence"),
+    }
+    for label, call in calls.items():
+        with patch.object(rc, "client", client_with(read_raw(), "RCERROR|-- stop")) as client:
+            try:
+                call()
+            except (rclib.RailCloneError, ValueError):
+                pass
+        for n, script in enumerate(scripts(client)):
+            out[f"{label}#{n}"] = script
+    entry = {"route": "\\L\\Cat\\Item", "maxfile": "C:\\lib\\item.max", "object": "rc_item", "material": "mtl"}
+    for method, step in (("merge", False), ("route", False), ("route", True)):
+        out[f"from_library_{method}_{step}"] = rc._from_library_body(
+            entry, method, ["Path600"], "Name", "RC_Item", "C:\\m.mat", "C:\\maps\\", undo_step=step)
+    return out
+
+
+class MaxScriptLintTests(unittest.TestCase):
+    """Live MAXScript facts (3ds Max 2026, RailClone 7.1.1) checked on every generated script."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scripts = generated_scripts()
+
+    def test_scripts_were_generated(self):
+        self.assertTrue({"get_style#0", "set_style#0", "output#0", "inspect#0", "set_param#0", "set_param#1",
+                         "from_library_route_True"} <= set(self.scripts))
+
+    def test_no_for_collect_in_call_arguments(self):
+        # Live: a for-collect in a call's arguments that reads the caller's locals failed with
+        # "Bad free thunk local member index" or read the wrong variable. Collect into a local first.
+        allowed = re.compile(r"(?:.*\b(?:do|then|else)\s+)?(?:local\s+)?\w+\s*=")
+        for label, script in self.scripts.items():
+            for line in script.split("\n"):
+                code = mxs_code(line)
+                for match in re.finditer(r"\bfor\b", code):
+                    if not re.search(r"\bcollect\b", code[match.end():]):
+                        continue
+                    prefix = code[:match.start()].strip()
+                    self.assertTrue(prefix == "" or allowed.fullmatch(prefix), f"{label}: {line.strip()}")
+
+    def test_no_keyword_variable_names(self):
+        # Live: "local at = ..." was a parse error
+        for label, script in self.scripts.items():
+            code = "\n".join(mxs_code(line) for line in script.split("\n"))
+            names = re.findall(r"\blocal\s+(\w+)", code) + re.findall(r"\bfor\s+(\w+)\s+(?:in|=)", code)
+            for params in re.findall(r"\bfn\s+\w+\s+([^=\n]*)=", code):
+                names += [p.lstrip("&") for p in params.split()]
+            bad = sorted({n for n in names if n.lower() in MXS_KEYWORDS})
+            self.assertEqual(bad, [], label)
+
+    def test_handles_converted_before_formatting(self):
+        # Live: getHandleByAnim returns an IntegerPtr; it must go through "as integer64"
+        for label, script in self.scripts.items():
+            code = "\n".join(mxs_code(line) for line in script.split("\n"))
+            total = len(re.findall(r"\bgetHandleByAnim\b", code))
+            converted = len(re.findall(r"\(getHandleByAnim [\w.]+\) as integer64", code))
+            self.assertEqual(total, converted, label)
+
+    def test_style_desc_is_followed_by_a_rebuild(self):
+        # Live: getStyleDesc() empties the output export until the next rebuild; never leave it empty
+        seen = 0
+        for label, script in self.scripts.items():
+            code = script.replace(rc._FUNCTIONS, "")
+            for match in re.finditer(r"getStyleDesc", code):
+                seen += 1
+                after = code[match.end():]
+                self.assertIn("rcRebuild", after, label)
+                if "getXMLOutput()" in after:
+                    self.assertLess(after.index("rcRebuild"), after.index("getXMLOutput()"), label)
+        self.assertGreaterEqual(seen, 4)  # inspect, and the three from-library scripts
+
+    def test_undo_records_never_outlive_their_nodes(self):
+        # Live: an undo record that refers to a node deleted with undo off crashed a later undo
+        holds = 0
+        for label, script in self.scripts.items():
+            if "theHold.Begin()" not in script:
+                continue
+            holds += 1
+            for line in script.split("\n"):
+                code = mxs_code(line)
+                if re.search(r"\bdelete\b", code):
+                    self.assertIn('undo "', line, f"{label}: a script with an undo step deletes without undo: "
+                                                  f"{line.strip()}")
+        self.assertGreaterEqual(holds, 3)  # set_style, set_param, from-library .rail
 
 
 class DecodeTests(unittest.TestCase):

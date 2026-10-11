@@ -24,6 +24,7 @@ TOKEN = re.compile(r"[0-9A-F]{2}(?:-[0-9A-F]{2}){31}")
 MS_ERROR = "__MCP_MS_ERR__:"
 UNDO_PARAMS = "MCP RailClone params"
 UNDO_LIBRARY = "MCP RailClone from library"
+UNDO_CLEANUP = "MCP RailClone cleanup"
 
 
 def _b64(text: str) -> str:
@@ -433,7 +434,7 @@ local shared = for n in (rcShared obj) collect (rcEncode n.name)
                         "its output to one node only, so positions may belong to another instance")
     if not rebuild:
         warnings.append("NOT_REBUILT: this is RailClone's last export; it can be stale after moves and copies, "
-                        "and empty after other RailClone calls (getStyleDesc clears it)")
+                        "and empty after a script calls getStyleDesc() (it clears the export until a rebuild)")
     if summary["placed"] == 0:
         warnings.append("EMPTY_OUTPUT: no placed items (no spline assigned, or the style produces nothing)")
     result.update(
@@ -470,7 +471,7 @@ local api = getInterface base #railclone
 if api == undefined do throw "NOT_RAILCLONE: target has no RailClone interface"
 local ss = stringStream ""
 format "RCINSPECT\\n" to:ss
-rcRow ss #("K", "handle", rcV (getHandleByAnim obj))
+rcRow ss #("K", "handle", rcV ((getHandleByAnim obj) as integer64))
 rcRow ss #("K", "name", rcV obj.name)
 rcRow ss #("K", "class", rcV ((classOf base) as string))
 rcRow ss #("K", "base_handle", rcV (rcH base))
@@ -500,14 +501,15 @@ for n in (rcShared obj) do rcRow ss #("D", rcV n)
 ) else rcRow ss #("W", rcEncode "XML_API_UNAVAILABLE: no getXMLStyle; graph skipped")
 '''
     if output:
+        # getStyleDesc() empties RailClone's output export until the next rebuild (live), so it is read
+        # before the rebuild; the export is full again afterwards. Without the output it isn't read at all.
+        body += 'rcRow ss #("K", "style_desc", rcV (try (api.getStyleDesc()) catch undefined))\n'
         body += f'''if isProperty api #getXMLOutput then (
     rcRebuild base
     local ox = api.getXMLOutput()
     if ox.count > {MAX_XML_CHARS} then rcRow ss #("W", rcEncode "XML_TOO_LARGE: output XML over the limit; output skipped") else rcRow ss #("O", rcEncode ox)
 ) else rcRow ss #("W", rcEncode "XML_API_UNAVAILABLE: no getXMLOutput; output skipped")
 '''
-    # getStyleDesc() empties RailClone's output export (live), so it is read last
-    body += 'rcRow ss #("K", "style_desc", rcV (try (api.getStyleDesc()) catch undefined))\n'
     return body + 'format "END\\n" to:ss\nss as string\n'
 
 
@@ -554,7 +556,8 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
     uses (0 int, 1 angle, 2 percent, 3 distance in scene units plus value_mm,
     4 bool, 5 selector with options, 7 separator), their limits (RailClone does
     not enforce them) and, with include_graph, which graph inputs use them. The
-    output summary is not rebuilt; use get_railclone_output for positions.
+    output counts come after a rebuild (undo off); use get_railclone_output for
+    positions.
     """
     if type(include_graph) is not bool:
         raise ValueError("include_graph must be boolean")
@@ -786,7 +789,7 @@ def railclone_library(query: str = "", category: str = "", root: str = "", limit
             "warnings": warnings + scan["warnings"]}
 
 
-_FROM_LIBRARY = r'''
+_FROM_LIBRARY_HEAD = r'''
 local methodName = "@@METHOD@@"
 local maxFile = rcDecode "@@MAXFILE@@"
 local objName = rcDecode "@@OBJECT@@"
@@ -825,96 +828,122 @@ if methodName == "merge" do (
     if not (doesFileExist maxFile) do throw ("FILE_MISSING: " + maxFile)
     if (findItem (getMAXFileObjectNames maxFile quiet:true) objName) == 0 do throw ("OBJECT_MISSING: " + objName + " is not in " + maxFile)
 )
-local seen = Dictionary #string
-if methodName == "merge" do for n in objects do PutDictValue seen (rcH n) true
 local prevSel = for n in selection collect n
 local o = undefined
 local created = #()
-local merged = #()
-local mergedRc = undefined
+local loaded = false
 local fixed = 0
 local missing = #()
-local ownsHold = false
--- Live facts: merging a RailClone library .max item clears the undo history, and so does
--- loadTempMaterialLibrary; called inside an undo step it also wipes that step. mergeMAXFile is
--- never recorded in undo. So merge and load the material first, make the result a copy inside
--- the undo step, and delete the merged original without undo once the step is accepted.
-local libMtl = undefined
-if methodName == "merge" do (
-    local ok = mergeMAXFile maxFile #(objName) #autoRenameDups #useMergedMtlDups #neverReparent quiet:true
-    merged = for n in objects where not (HasDictValue seen (rcH n)) collect n
-    local rcs = for n in merged where (classOf n.baseObject) == RailClone_Pro collect n
-    if ok != true or rcs.count != 1 do (
-        with undo off (for n in merged where isValidNode n do (try (delete n) catch ()))
-        if ok != true do throw ("MERGE_FAILED: mergeMAXFile returned " + (ok as string))
-        throw ("MERGE_FAILED: expected one new RailClone, found " + (rcs.count as string))
-    )
-    mergedRc = rcs[1]
-    if matPath != "" do (
-        local lib = loadTempMaterialLibrary matPath
-        if lib != undefined do (for i = 1 to lib.count while libMtl == undefined do (if lib[i].name == matName do libMtl = lib[i]))
-        if libMtl == undefined do append warnings ("NO_MATERIAL: " + matName + " is not in " + matPath)
-    )
+'''
+
+# Merge: only for .max items, so only inside the undo-off wrapper.
+_LOAD_MERGE = r'''
+loaded = true
+local ok = mergeMAXFile maxFile #(objName) #autoRenameDups #useMergedMtlDups #neverReparent quiet:true
+created = for n in objects where not (HasDictValue seen (rcH n)) collect n
+local rcs = for n in created where (classOf n.baseObject) == RailClone_Pro collect n
+if ok != true do throw ("MERGE_FAILED: mergeMAXFile returned " + (ok as string))
+if rcs.count != 1 do throw ("MERGE_FAILED: expected one new RailClone, found " + (rcs.count as string))
+o = rcs[1]
+if wantName != "" do o.name = wantName
+if matPath != "" do (
+    local lib = loadTempMaterialLibrary matPath
+    local libMtl = undefined
+    if lib != undefined do (for i = 1 to lib.count while libMtl == undefined do (if lib[i].name == matName do libMtl = lib[i]))
+    if libMtl != undefined then o.material = libMtl else append warnings ("NO_MATERIAL: " + matName + " is not in " + matPath)
 )
-try (
-    theHold.Begin()
-    ownsHold = true
-    if methodName == "merge" then (
-        local finalName = if wantName != "" then wantName else mergedRc.name
-        with undo off (mergedRc.name = finalName + "_mcp_merged")
-        o = copy mergedRc
-        o.name = finalName
-        append created o
-        if libMtl != undefined do o.material = libMtl
-    ) else (
-        o = RailClone_Pro()
-        o.name = (if wantName != "" then wantName else (if (getNodeByName defaultName exact:true) == undefined then defaultName else uniqueName (defaultName + "_")))
-        append created o
-        -- loadLibraryItemByPath loads into the first SELECTED RailClone: select only this one.
-        select o
-        -- A load that fails shows a modal dialog; never call it unless o is the only selected node.
-        if not (selection.count == 1 and selection[1] == o) do throw "SELECT_FAILED: the new RailClone could not be selected (hidden or frozen current layer?)"
-        local api = rcApi o.baseObject #loadLibraryItemByPath
-        local routeArg = route
-        local code = api.loadLibraryItemByPath routeArg
-        rcRestoreSel prevSel
-        if code != 0 do throw ("LOAD_FAILED: loadLibraryItemByPath returned " + (code as string) + " for " + route)
-    )
-    local base = o.baseObject
-    local types = rcArr base #batype
-    local spIdx = for i = 1 to types.count where types[i] == 0 collect i
-    if splines.count > spIdx.count do throw ("TOO_MANY_SPLINES: the item has " + (spIdx.count as string) + " spline base(s)")
-    for k = 1 to splines.count do base.banode[spIdx[k]] = splines[k]
-    if splines.count > 0 do o.pos = splines[1].pos
-    if o.material != undefined do (
-        local maps = for b in (getClassInstances BitmapTexture target:o.material) collect #(b, #filename)
-        if isKindOf VRayBitmap MAXClass do (for b in (getClassInstances VRayBitmap target:o.material) do append maps #(b, #HDRIMapName))
-        for pair in maps do (
-            local f = try (getProperty pair[1] pair[2]) catch undefined
-            if isKindOf f String and f != "" and not (doesFileExist f) do (
-                local short = filenameFromPath f
-                if (mapPaths.getFullFilePath short) == "" do (
-                    local cand = if mapsDir != "" then (mapsDir + short) else ""
-                    if cand != "" and (doesFileExist cand) then (setProperty pair[1] pair[2] cand; fixed += 1) else appendIfUnique missing f
-                )
+'''
+
+_LOAD_ROUTE = r'''
+o = RailClone_Pro()
+o.name = (if wantName != "" then wantName else (if (getNodeByName defaultName exact:true) == undefined then defaultName else uniqueName (defaultName + "_")))
+append created o
+-- loadLibraryItemByPath loads into the first SELECTED RailClone: select only this one.
+select o
+-- A load that fails shows a modal dialog; never call it unless o is the only selected node.
+if not (selection.count == 1 and selection[1] == o) do throw "SELECT_FAILED: the new RailClone could not be selected (hidden or frozen current layer?)"
+local api = rcApi o.baseObject #loadLibraryItemByPath
+local routeArg = route
+loaded = true
+local code = api.loadLibraryItemByPath routeArg
+rcRestoreSel prevSel
+if code != 0 do throw ("LOAD_FAILED: loadLibraryItemByPath returned " + (code as string) + " for " + route)
+'''
+
+_SETUP = r'''
+local base = o.baseObject
+local types = rcArr base #batype
+local spIdx = for i = 1 to types.count where types[i] == 0 collect i
+if splines.count > spIdx.count do throw ("TOO_MANY_SPLINES: the item has " + (spIdx.count as string) + " spline base(s)")
+for k = 1 to splines.count do base.banode[spIdx[k]] = splines[k]
+if splines.count > 0 do o.pos = splines[1].pos
+if o.material != undefined do (
+    local maps = for b in (getClassInstances BitmapTexture target:o.material) collect #(b, #filename)
+    if isKindOf VRayBitmap MAXClass do (for b in (getClassInstances VRayBitmap target:o.material) do append maps #(b, #HDRIMapName))
+    for pair in maps do (
+        local f = try (getProperty pair[1] pair[2]) catch undefined
+        if isKindOf f String and f != "" and not (doesFileExist f) do (
+            local short = filenameFromPath f
+            if (mapPaths.getFullFilePath short) == "" do (
+                local cand = if mapsDir != "" then (mapsDir + short) else ""
+                if cand != "" and (doesFileExist cand) then (setProperty pair[1] pair[2] cand; fixed += 1) else appendIfUnique missing f
             )
         )
     )
+)
+'''
+
+# Any item but a .rail route load (live: a .max item clears the undo history, by merge or by route).
+_UNDO_OFF = r'''
+-- Live facts: loading a .max library item clears 3ds Max's whole undo history, by merge or by
+-- route; loadTempMaterialLibrary clears it too, and mergeMAXFile is never recorded in undo. So the
+-- whole load runs with undo off, with no copy and nothing deleted; the result lists the new nodes.
+local seen = Dictionary #string
+for n in objects do PutDictValue seen (rcH n) true
+with undo off (
+    try (
+@@LOAD@@
+@@SETUP@@
+    ) catch (
+        -- Nothing above was recorded, so the new nodes are deleted with undo off. Once the load has
+        -- run, the history is cleared again: no record the load made can outlive the deleted nodes.
+        local left = for n in objects where not (HasDictValue seen (rcH n)) collect n
+        for n in left where isValidNode n do (try (delete n) catch ())
+        if loaded do (try (clearUndoBuffer()) catch ())
+        try (rcRestoreSel prevSel) catch ()
+        throw()
+    )
+)
+created = for n in objects where not (HasDictValue seen (rcH n)) collect n
+'''
+
+# A .rail route load: it keeps the undo history and is recorded (live), so it is one undo step.
+_UNDO_STEP = r'''
+-- Nothing in or after this undo step is deleted with undo off, so no undo record can refer to a
+-- node that is gone (a later undo would crash 3ds Max).
+local ownsHold = false
+try (
+    theHold.Begin()
+    ownsHold = true
+@@LOAD@@
+@@SETUP@@
     theHold.Accept "@@UNDO@@"
     ownsHold = false
-    if mergedRc != undefined do with undo off (delete mergedRc)
 ) catch (
-    if ownsHold do theHold.Cancel()
-    with undo off (
-        for n in created where isValidNode n do (try (delete n) catch ())
-        for n in merged where isValidNode n do (try (delete n) catch ())
-    )
+    if ownsHold do (try (theHold.Cancel()) catch ())
+    -- The cancel removes the new node. Anything left is deleted in an undo step of its own.
+    local left = for n in created where isValidNode n collect n
+    if left.count > 0 do undo "@@CLEANUP@@" on (for n in left do (try (delete n) catch ()))
     try (rcRestoreSel prevSel) catch ()
     throw()
 )
-local extras = for n in merged where isValidNode n and n != o collect n
-if extras.count > 0 do append warnings ("EXTRA_NODES_NOT_UNDOABLE: the merge also brought " + (extras.count as string) + " other node(s); merges aren't recorded in undo, so they stay after an undo")
+'''
+
+_FROM_LIBRARY_TAIL = r'''
+local extras = for n in created where isValidNode n and n != o collect n
 local rcBase = o.baseObject
+-- getStyleDesc() empties the output export until the next rebuild (live), so it is read first.
+local styleDesc = try ((getInterface rcBase #railclone).getStyleDesc()) catch undefined
 -- The node is committed now; report a failed rebuild/readback as a warning, not an error.
 local stats = try (
     rcRebuild rcBase
@@ -925,10 +954,10 @@ local stats = try (
 )
 local ss = stringStream ""
 format "RCLIB\n" to:ss
-rcRow ss #("K", "handle", rcV (getHandleByAnim o))
+rcRow ss #("K", "handle", rcV ((getHandleByAnim o) as integer64))
 rcRow ss #("K", "name", rcV o.name)
 rcRow ss #("K", "style", rcV (if isProperty rcBase #style then rcBase.style else undefined))
-rcRow ss #("K", "style_desc", rcV (try ((getInterface rcBase #railclone).getStyleDesc()) catch undefined))
+rcRow ss #("K", "style_desc", rcV styleDesc)
 rcRow ss #("K", "material", rcV o.material)
 rcRow ss #("K", "renderer", rcV renderer)
 rcRow ss #("K", "matlib", rcV matPath)
@@ -950,8 +979,20 @@ ss as string
 '''
 
 
+def _indent(block: str, depth: int) -> str:
+    return "\n".join(("    " * depth + line) if line else line for line in block.strip("\n").split("\n"))
+
+
 def _from_library_body(entry: dict[str, Any], method: str, splines: list[str], name: str, default_name: str,
-                       matlib: str, maps_dir: str) -> str:
+                       matlib: str, maps_dir: str, *, undo_step: bool) -> str:
+    """The from-library script: an undo step for a .rail route load, otherwise the whole load with undo off."""
+    if method == "merge" and undo_step:
+        raise ValueError("internal: a merge clears the undo history; it never runs in an undo step")
+    load = _LOAD_MERGE if method == "merge" else _LOAD_ROUTE
+    wrapper, depth = (_UNDO_STEP, 1) if undo_step else (_UNDO_OFF, 2)
+    body = (_FROM_LIBRARY_HEAD
+            + wrapper.replace("@@LOAD@@", _indent(load, depth)).replace("@@SETUP@@", _indent(_SETUP, depth))
+            + _FROM_LIBRARY_TAIL)
     values = {
         "@@METHOD@@": method,
         "@@MAXFILE@@": _b64(entry.get("maxfile") or ""),
@@ -964,8 +1005,8 @@ def _from_library_body(entry: dict[str, Any], method: str, splines: list[str], n
         "@@MAPS@@": _b64(maps_dir),
         "@@SPLINES@@": ", ".join(f'rcDecode "{_b64(s)}"' for s in splines),
         "@@UNDO@@": UNDO_LIBRARY,
+        "@@CLEANUP@@": UNDO_CLEANUP,
     }
-    body = _FROM_LIBRARY
     for key, value in values.items():
         body = body.replace(key, value)
     return body
@@ -982,12 +1023,13 @@ def railclone_from_library(
 ) -> dict[str, Any]:
     """Create a RailClone from a library item (route or exact name), assign splines and verify its output.
 
-    Loading a .max library item clears 3ds Max's undo history (RailClone's own
-    browser does too), so it is refused unless allow_undo_flush=true; .rail items
-    keep it. The item is validated first: a wrong route opens a modal dialog.
-    method: auto (merge .max items with a .mat matlib, route .rail/.pmat items),
-    merge or route. splines go to the spline bases in order. One undo removes the
-    new RailClone; returns the node, method, material, output counts and warnings.
+    A .rail item loads by route in one undo step. Loading a .max item clears 3ds
+    Max's undo history (RailClone's own browser does too), so it is refused unless
+    allow_undo_flush=true, then runs with undo off and can't be undone: delete the
+    nodes in remove_with to remove it. The item is validated first: a wrong route
+    opens a modal dialog. method: auto (merge .max items with a .mat matlib, route
+    .rail/.pmat items), merge or route. splines go to the spline bases in order.
+    Returns the node, method, material, output counts, remove_with and warnings.
     """
     if method not in ("auto", "merge", "route"):
         raise ValueError("method must be 'auto', 'merge' or 'route'")
@@ -1012,11 +1054,21 @@ def railclone_from_library(
                          ".max object; use method='route'")
     if not entry.get("maxfile") or not os.path.isfile(entry["maxfile"]):
         raise RailCloneError("FILE_MISSING", f"library file not found: {entry.get('maxfile')}")
-    flushes = entry["maxfile_ext"] == ".max"  # merge or route alike (live)
-    if flushes and not allow_undo_flush:
-        raise ValueError(f"{entry['route']!r} is a .max library item. Loading it clears 3ds Max's undo history "
-                         "(RailClone's library browser does the same), so earlier steps can no longer be undone. "
-                         "Pass allow_undo_flush=true to load it anyway; one undo still removes the new RailClone. "
+    ext = entry["maxfile_ext"]
+    # Live: a .rail route load keeps the undo history and is recorded, so it gets an undo step. A .max
+    # item clears the history, by merge or by route, so it is loaded with undo off (no copy, nothing
+    # deleted). Any other file type is treated like a .max item.
+    undo_step = chosen == "route" and ext == ".rail"
+    if not undo_step and not allow_undo_flush:
+        if ext == ".max":
+            why = ("is a .max library item. Loading it clears 3ds Max's undo history (RailClone's library "
+                   "browser does the same)")
+        else:
+            why = (f"is a {ext} library item, and only .rail items are known to keep 3ds Max's undo history. "
+                   "Loading it can clear the history")
+        raise ValueError(f"{entry['route']!r} {why}, so earlier steps can no longer be undone. Pass "
+                         "allow_undo_flush=true to load it anyway: it then runs with undo off and can't be "
+                         "undone, and remove_with lists the nodes to delete to remove it. "
                          "Nothing was sent to 3ds Max.")
     matlib = ""
     if chosen == "merge":
@@ -1026,7 +1078,8 @@ def railclone_from_library(
     maps_dir = os.path.join(entry["category_dir"], "maps")
     maps_dir = maps_dir + "\\" if fix_maps and os.path.isdir(maps_dir) else ""
     default_name = "RC_" + (re.sub(r"\W+", "_", entry["name"]).strip("_") or "RailClone")
-    raw = _send(_from_library_body(entry, chosen, splines, name, default_name, matlib, maps_dir))
+    raw = _send(_from_library_body(entry, chosen, splines, name, default_name, matlib, maps_dir,
+                                   undo_step=undo_step))
     info: dict[str, Any] = {}
     extra, bases, missing, stats = [], [], [], None
     try:
@@ -1063,13 +1116,17 @@ def railclone_from_library(
         warnings.append(f"MISSING_MAPS: {len(missing)} bitmap file(s) do not resolve")
     item_out = {k: entry.get(k) for k in ("route", "root", "category", "name", "maxfile", "object", "material",
                                           "matlib", "uuid")}
+    extra_nodes = [e for e in extra if isinstance(e, dict)]
     return {
         "handle": info["handle"], "name": info.get("name"), "method": chosen, "route": entry["route"],
         "item": item_out, "style": info.get("style") or "", "style_desc": info.get("style_desc"),
         "material": info.get("material"), "renderer": info.get("renderer"), "matlib": info.get("matlib") or None,
         "bases": bases, "item_count": stats["placed"], "output": stats, "verified": verified,
         "maps": {"fixed": info.get("fixed_maps") or 0, "missing": missing},
-        "extra_nodes": [e["name"] for e in extra if isinstance(e, dict)],
-        # one undo removes the RailClone; nodes a merge brings along aren't in undo
-        "undoable": not extra, "undo": UNDO_LIBRARY, "undo_history_cleared": flushes, "warnings": warnings,
+        "extra_nodes": [e["name"] for e in extra_nodes],
+        "undoable": undo_step, "undo": UNDO_LIBRARY if undo_step else None,
+        "undo_history_cleared": not undo_step,
+        # the nodes this call created; deleting them removes the load (agents don't run undo through MCP)
+        "remove_with": [{"name": info.get("name"), "handle": info["handle"]}] + extra_nodes,
+        "warnings": warnings,
     }
