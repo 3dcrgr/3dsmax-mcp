@@ -39,7 +39,7 @@ Checked live on 2026-10-11:
 ```
 {
   "complete": bool, "read_only": true,
-  "scene": {renderer, max_version, railclone_version, save_required_before, save_required_after, elapsed_ms},
+  "scene": {renderer, max_version, railclone_version, railclone_full_mesh_proxy, save_required_before, save_required_after, elapsed_ms},
   "summary": {objects, kinds{forest,railclone,ivy}, status{error,warn,ok}, findings{error,warn,info}, unknown},
   "objects": [
     {"name", "handle", "kind": "forest"|"railclone"|"ivy", "status": "error"|"warn"|"ok",
@@ -47,7 +47,7 @@ Checked live on 2026-10-11:
      "unknown": [{"check", "reason"}],
      "state": {...}, "elapsed_ms", "fallback"?: "railclone"|"forest"|"ivy"}
   ],
-  "scene_findings": [...],
+  "scene_findings": [...], "scene_unknown": [{"check", "reason"}],
   "codes": {CODE: {severity, basis, message, fix?}},   // only the codes that occur
   "fallbacks": {kind: text},                            // for the kinds named by an object
   "basis": {doc, live, inf, memory},
@@ -156,6 +156,11 @@ Checked live on 2026-10-11:
   - Live: after a proxy was linked as a segment (`sobjnode[k]`), `sobjref[k]` read `Editable_mesh`, not `VRayProxy`, so the linked node is what identifies it. A proxy segment with no linked node left would read as a mesh, with its preview faces.
   - Since RailClone 7, proxies no longer need full mesh mode for GPU/Vantage.
   - The version is the file version of the loaded `railclone*.dlo` module. It's read only when needed, because enumerating the modules takes about a second.
+- **fullMeshProxy:** RailClone's registry value `HKCU\Software\Itoo Software\RailClone Pro\fullMeshProxy` (RC 7.1.4 and later; 1, the default, converts V-Ray Proxy segments to full mesh).
+  - The check reads it inside 3ds Max with the .NET registry, read-only, once per call and only when a RailClone is checked. A Max started from inside an MSIX-packaged app (such as Claude Desktop) sees a private registry where iToo's keys can be hidden; then the value is unknown, never assumed fine.
+  - `FULL_MESH_PROXY_ON` (warn, scene finding, once): the value is 1, or not set (the default applies), on RailClone 7 or later.
+  - `RC_PROXY_FULL_MESH` (info) on each RailClone that actually has V-Ray Proxy segments while it's on.
+  - **Policy (user, 2026-10-11):** the setting is allowed, but any suggestion to turn it ON, from the user or an agent, gets a warning first. It's not recommended on RailClone 7+: no longer needed for V-Ray GPU/Vantage, and it costs memory and translation time. Change it only in RailClone's settings; this tool never writes the registry.
 - **Segment materials:** `RC_SOBJMTL_NOT_ONE_SLOT_MULTI` (warn) for `sobjmtl` entries that aren't one-slot Multimaterials (`getNumSubMtls` 1).
   - Vantage 3.4 logged "Unsupported nested MtlSingleBRDF" for them, and the one-slot wrap fixed it [memory].
   - Writing `sobjmtl` changed no face IDs in the viewport [live].
@@ -206,7 +211,7 @@ All of these change the scene, so ask the user first. Never export a `.vrscene`:
 
 ### Scene findings
 
-`XSHADOW_LIGHT`, `RENDERER_NOT_VRAY` (info: the current renderer isn't V-Ray) and `FALLBACK`.
+`XSHADOW_LIGHT`, `RENDERER_NOT_VRAY` (info: the current renderer isn't V-Ray), `FULL_MESH_PROXY_ON` (warn) and `FALLBACK`. Scene-level unknowns are in `scene_unknown`.
 
 ## What stays unknown, and why
 
@@ -220,6 +225,7 @@ All of these change the scene, so ask the user first. Never export a `.vrscene`:
 | `boundary_check` | `arboundchecklist` missing or unreadable. |
 | `proxy_items` | V-Ray proxy items are found by class only. Whether a UI-picked proxy gets another `geomlist` value wasn't probed. |
 | `railclone_version` | The loaded RailClone module's version couldn't be read, so `RC_PROXY_MESH_REVERTABLE` can't be decided. |
+| `full_mesh_proxy` (in `scene_unknown`) | This Max can't see `HKCU\Software\Itoo Software\RailClone Pro` (an MSIX-packaged parent hides it), the read failed, the value is unexpected, or it's on but the RailClone version is unknown. |
 | `forest_color_gpu_mode`, `multisubtex_mode`, `material_operator`, `rmesh`, `proxymode` | A value that couldn't be read, or isn't a documented value. |
 | any property name | That property doesn't exist on this build ("no such property"). |
 | `materials`, `read` | The material walk stopped at its cap or the budget, or reading the object failed part-way (`PARTIAL_READ`). |

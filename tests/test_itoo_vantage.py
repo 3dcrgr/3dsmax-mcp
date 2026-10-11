@@ -810,6 +810,57 @@ class FallbackTests(unittest.TestCase):
             self.assertNotIn(code, iv.FALLBACK_CODES)
 
 
+class FullMeshProxyTests(unittest.TestCase):
+    """fullMeshProxy: allowed, but warned about on RailClone 7+ (once per scene, a note per proxy RailClone)."""
+
+    PROXY = {3: seg(3, "allum_picket_01", -1, ref_class="", source_class="VRayProxy", source="picket_proxy")}
+    RC7 = {"railclone_version": "7,3,5,687"}
+
+    def scene_codes(self, r):
+        return {f["code"]: f for f in r["scene_findings"]}
+
+    def test_on_warns_once_and_notes_proxy_railclones(self):
+        scene = {**self.RC7, "rc_full_mesh_proxy": 1, "rc_full_mesh_proxy_read": "ok"}
+        r = run(*railclone(name="A", seg_overrides=self.PROXY), *railclone(name="B"), scene=scene)
+        self.assertEqual(self.scene_codes(r)["FULL_MESH_PROXY_ON"]["count"], 1)
+        self.assertEqual(r["codes"]["FULL_MESH_PROXY_ON"]["severity"], "warn")
+        self.assertIn("Not recommended", r["codes"]["FULL_MESH_PROXY_ON"]["message"])
+        self.assertEqual(codes(r, 0)["RC_PROXY_FULL_MESH"]["where"], ["[3] allum_picket_01"])
+        self.assertNotIn("RC_PROXY_FULL_MESH", codes(r, 1))
+        self.assertIs(r["scene"]["railclone_full_mesh_proxy"], True)
+
+    def test_off_old_railclone_and_no_railclone(self):
+        off = {**self.RC7, "rc_full_mesh_proxy": 0, "rc_full_mesh_proxy_read": "ok"}
+        r = run(*railclone(seg_overrides=self.PROXY), scene=off)
+        self.assertNotIn("FULL_MESH_PROXY_ON", self.scene_codes(r))
+        self.assertNotIn("RC_PROXY_FULL_MESH", codes(r))
+        old = {"railclone_version": "6,4,3,0", "rc_full_mesh_proxy": 1, "rc_full_mesh_proxy_read": "ok"}
+        self.assertNotIn("FULL_MESH_PROXY_ON", self.scene_codes(run(*railclone(), scene=old)))
+        r = run(*forest(), scene={**self.RC7, "rc_full_mesh_proxy": 1, "rc_full_mesh_proxy_read": "ok"})
+        self.assertEqual(r["scene_findings"], [])
+        self.assertEqual(r["scene_unknown"], [])
+
+    def test_unset_value_means_the_default_on(self):
+        r = run(*railclone(), scene={**self.RC7, "rc_full_mesh_proxy_read": "no_value"})
+        self.assertIn("FULL_MESH_PROXY_ON", self.scene_codes(r))
+
+    def test_unreadable_is_unknown_not_ok(self):
+        for read, words in (("no_key", "can't see"), ("error", "couldn't be read")):
+            r = run(*railclone(seg_overrides=self.PROXY), scene={**self.RC7, "rc_full_mesh_proxy_read": read})
+            self.assertNotIn("FULL_MESH_PROXY_ON", self.scene_codes(r))
+            self.assertIn(words, {u["check"]: u["reason"] for u in r["scene_unknown"]}["full_mesh_proxy"])
+            self.assertIsNone(r["scene"]["railclone_full_mesh_proxy"])
+            self.assertGreaterEqual(r["summary"]["unknown"], 1)
+        r = run(*railclone(), scene={"rc_full_mesh_proxy": 1, "rc_full_mesh_proxy_read": "ok"})  # no version
+        self.assertIn("full_mesh_proxy", {u["check"] for u in r["scene_unknown"]})
+
+    def test_script_reads_the_registry_read_only_for_railclones(self):
+        script = iv.build_script([], 1000)
+        self.assertIn('OpenSubKey @"Software\\Itoo Software\\RailClone Pro"', script)
+        self.assertNotIn("SetValue", script)
+        self.assertNotIn("CreateSubKey", script)
+
+
 class SceneTests(unittest.TestCase):
     def test_scene_findings_and_lists(self):
         r = run(*forest(), xshadow=[(5, "Omni001")], missing=["Nope"], not_itoo=[("Box001", "Box")],

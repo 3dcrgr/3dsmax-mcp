@@ -368,6 +368,25 @@ if wanted.count == 0 then (
     )
 )
 format "S|targets|%\n" (ivV targets.count) to:ss
+local anyRc = false
+for o in targets where ((classOf o.baseobject) as string) == "RailClone_Pro" do anyRc = true
+if anyRc do (
+    -- fullMeshProxy, read-only, as this Max sees HKCU (a Max started inside an MSIX app can't see iToo's keys)
+    needVer[1] = true
+    local fmp = undefined
+    local fmpRead = "error"
+    try (
+        local rk = (dotNetClass "Microsoft.Win32.Registry").CurrentUser.OpenSubKey @"Software\Itoo Software\RailClone Pro"
+        if rk == undefined then fmpRead = "no_key"
+        else (
+            fmp = rk.GetValue "fullMeshProxy"
+            fmpRead = if fmp == undefined then "no_value" else "ok"
+            rk.Close()
+        )
+    ) catch (fmpRead = "error")
+    format "S|rc_full_mesh_proxy|%\n" (ivV fmp) to:ss
+    format "S|rc_full_mesh_proxy_read|%\n" (ivV fmpRead) to:ss
+)
 for i = 1 to targets.count do (
     local nd = targets[i]
     if (ivNow t0) > deadline then format "SKIP|%|%\n" (ivH nd) (ivB64 nd.name) to:ss
@@ -716,6 +735,17 @@ CODES: dict[str, tuple[str, str, str, str | None]] = {
         "info", "doc",
         "V-Ray proxy segments with the instancing engine off: since RailClone 7, V-Ray proxies no longer need full "
         "mesh mode for V-Ray GPU and Vantage, so instancing can go back on.", None),
+    "FULL_MESH_PROXY_ON": (
+        "warn", "doc",
+        "RailClone fullMeshProxy is on (HKCU\\Software\\Itoo Software\\RailClone Pro): V-Ray Proxy segments are "
+        "converted to full mesh. Not recommended on RailClone 7+: no longer needed for V-Ray GPU/Vantage, and it costs "
+        "memory and translation time. Allowed: change it only in RailClone's settings if wanted.",
+        "Leave it, or set fullMeshProxy to 0 in RailClone's settings. Don't suggest turning it on for V-Ray GPU or "
+        "Vantage on RailClone 7+."),
+    "RC_PROXY_FULL_MESH": (
+        "info", "doc",
+        "This RailClone has V-Ray Proxy segments, and fullMeshProxy is on, so they are rendered as full mesh "
+        "(see FULL_MESH_PROXY_ON).", None),
     "RC_SOBJMTL_NOT_ONE_SLOT_MULTI": (
         "warn", "memory+live",
         "Segment materials (sobjmtl) that aren't one-slot Multimaterials: Vantage 3.4 logged 'Unsupported nested "
@@ -1101,8 +1131,27 @@ def _forest_faces(rep: _Report, obj: dict[str, Any], thinning: str) -> tuple[int
     return total, bool(unknown)
 
 
+def _full_mesh_proxy(scene: dict[str, Any]) -> tuple[bool | None, str | None]:
+    """RailClone's fullMeshProxy as this Max reads it: (on, why it's unknown). on is None when unknown."""
+    read, value = scene.get("rc_full_mesh_proxy_read"), scene.get("rc_full_mesh_proxy")
+    if read is None:
+        return None, None  # not read: no RailClone in this check
+    if read == "ok":
+        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            value = int(value)
+        if isinstance(value, (bool, int)):
+            return bool(value), None
+        return None, f"fullMeshProxy holds an unexpected value: {value!r}"
+    if read == "no_value":
+        return True, None  # not set: RailClone's documented default, 1, applies
+    if read == "no_key":
+        return None, ("this 3ds Max can't see HKCU\\Software\\Itoo Software\\RailClone Pro (a Max started from inside "
+                      "an MSIX-packaged app sees a private registry), so fullMeshProxy is unknown")
+    return None, "fullMeshProxy couldn't be read from the registry"
+
+
 def analyze_railclone(obj: dict[str, Any], max_paths: int, rc_version: list[int] | None,
-                      details: bool = False) -> dict[str, Any]:
+                      details: bool = False, full_mesh_proxy: bool | None = None) -> dict[str, Any]:
     rep = _Report(max_paths)
     k = obj["k"]
     _common(rep, obj)
@@ -1158,6 +1207,8 @@ def analyze_railclone(obj: dict[str, Any], max_paths: int, rc_version: list[int]
                                                    "proxy segments still need Mesh mode is unknown")
         elif rc_version[0] >= 7:
             rep.add("RC_PROXY_MESH_REVERTABLE", ", ".join(f"[{s['index']}] {s['name']}" for s in proxy_segs))
+    if proxy_segs and full_mesh_proxy is True:
+        rep.add("RC_PROXY_FULL_MESH", ", ".join(f"[{s['index']}] {s['name']}" for s in proxy_segs))
     bad = [s for s in obj["segs"]
            if s["sobjmtl_class"] and not (_cls(s["sobjmtl_class"]) == "multimaterial" and s["sobjmtl_subs"] == 1)]
     if bad:
@@ -1267,15 +1318,24 @@ def analyze(facts: dict[str, Any], max_paths: int = 5, details: bool = False) ->
     """The report: per-object findings, scene findings, a code legend and a summary."""
     scene = facts["scene"]
     rc_version = _version(scene.get("railclone_version"))
+    full_mesh_proxy, fmp_unknown = _full_mesh_proxy(scene)
     objects = []
     for obj in facts["objects"]:
         if obj["kind"] == "forest":
             objects.append(analyze_forest(obj, max_paths, details))
         elif obj["kind"] == "railclone":
-            objects.append(analyze_railclone(obj, max_paths, rc_version, details))
+            objects.append(analyze_railclone(obj, max_paths, rc_version, details, full_mesh_proxy))
         else:
             objects.append(analyze_ivy(obj, max_paths, details))
     srep = _Report(max_paths)
+    if any(o["kind"] == "railclone" for o in facts["objects"]):
+        if fmp_unknown:
+            srep.unknown_check("full_mesh_proxy", fmp_unknown)
+        elif full_mesh_proxy and rc_version is None:
+            srep.unknown_check("full_mesh_proxy", "fullMeshProxy is on, but the RailClone version couldn't be read, "
+                                                  "so whether it is still needed is unknown")
+        elif full_mesh_proxy and rc_version[0] >= 7:
+            srep.add("FULL_MESH_PROXY_ON")
     for light in facts["xshadow_lights"]:
         srep.add("XSHADOW_LIGHT", light["name"])
     renderer = scene.get("renderer")
@@ -1319,12 +1379,14 @@ def analyze(facts: dict[str, Any], max_paths: int = 5, details: bool = False) ->
         "scene": {
             "renderer": renderer, "max_version": scene.get("max_version"),
             "railclone_version": scene.get("railclone_version"),
+            "railclone_full_mesh_proxy": full_mesh_proxy,
             "save_required_before": before, "save_required_after": after, "elapsed_ms": scene.get("elapsed_ms"),
         },
         "summary": {"objects": len(objects), "kinds": kinds, "status": statuses, "findings": findings,
-                    "unknown": sum(len(o["unknown"]) for o in objects)},
+                    "unknown": sum(len(o["unknown"]) for o in objects) + len(srep.unknown)},
         "objects": objects,
         "scene_findings": srep.sorted_findings(),
+        "scene_unknown": srep.unknown,
         "codes": codes,
         "fallbacks": {kind: FALLBACK[kind] for kind in fallbacks},
         "basis": BASIS,
