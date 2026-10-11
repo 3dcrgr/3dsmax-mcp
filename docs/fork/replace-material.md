@@ -1,6 +1,6 @@
 # `replace_material` that "replaced" nothing
 
-Fork issue #3. Commits `a9d2a0d`, `16528de`, `cd85cd2` and `a670484` (review fixes).
+Fork issue #3. Commits `a9d2a0d`, `16528de`, `cd85cd2`, `a670484` (review fixes) and `86ea1b8` (bridge tool registry).
 
 ## What happened
 
@@ -18,7 +18,7 @@ Three other limitations made the tool fail on real scenes. The first two failed 
 
 ## What changed
 
-**The direction is documented** (`a9d2a0d`). Both docstrings say: source = the material to apply, target = the material to replace. They also give the order the source is searched in and the batch order. Since the 1.7.5 merge (`a07ef93`), the skill guide is upstream's shorter one plus a one-line fork rule for this tool: the direction, and what to do on `no_match` and `blocked`.
+**The direction is documented** (`a9d2a0d`). Both docstrings say: source = the material to apply, target = the material to replace. They also give the order the source is searched in and the batch order. Since the 1.7.5 merge (`a07ef93`), the skill guide is upstream's shorter one plus a one-line fork rule for this tool: the direction, what to do on `no_match` and `blocked`, and (since `ec903a5`) `source_from` for a re-imported Cosmos copy.
 
 **Nothing matched → `no_match`; everything skipped → `blocked`** (`a9d2a0d`, refined in `16528de` and `a670484`).
 - **`no_match`:** no object and no sub-material slot uses the target. The warning explains the direction and where the source can come from.
@@ -47,7 +47,7 @@ The result reports `source_found_in`: `node`, `sub_material`, `material_editor`,
 **`source_from` picks where the source comes from** (`a670484`). It takes one of those five places and limits the search to it.
 - Typical use: you re-imported a Cosmos material, and the copy in the Material Editor has the same name as the one already on objects. `source_from="material_editor"` applies the new copy.
 - An invalid value fails before anything is sent to Max.
-- A bridge without this fix ignores `source_from`; in this fork only the 2026 bridge has it. The result then carries a warning that the bridge may have searched everywhere.
+- A stock bridge ignores `source_from` (see below). The result then carries a warning that the bridge didn't echo it back and may have ignored it.
 - If the source and target names are equal and `source_from` isn't set, the call warns. Without `source_from`, the first match is the target itself.
 
 **A preview with a missing source no longer fails.** It returns `source_exists: false` together with what the target would affect. That lets the agent see that it probably swapped the arguments.
@@ -75,13 +75,18 @@ New result fields:
 
 **The MAXScript fallback matches the native handler.** This is the fallback used when the native bridge isn't available. It has the same lookup order and slot matching, and a single call returns the same keys and runs inside one undo step. Its `status` on success is still `"success"`, where native returns `"replaced"`. Its loop guard has no `TestForLoop` check, so it never reports `reference_loop`. In `batch_replace_materials` it runs each entry as its own call and undo step, so its entries keep the single-call shape: `affected_*` keys in a preview, and objects listed by name.
 
+**With a stock bridge, only the Python side changes.** Sub-material matching, the source search, `source_from`, the loop guard, a preview without a source and the in-order batch are all in the native handler, so they need the fork's bridge.
+- In `native/bin/`, only the 2026 bridge is a fork build (sha256 `d5cd6ba5…`). The fork's 2027 bridge is deployed on the production machine but not committed yet, so a fresh install on Max 2027, like one on 2023–2025, gets upstream's 1.7.5 bridge.
+- Upstream's handler, the same in 1.7.3 and 1.7.5, matches object materials only and needs the source on an object; a preview without one fails. Its batch still plans every entry from one snapshot taken up front, the old behaviour described above.
+- The Python side still turns zero matches into `no_match` and warns about an ignored `source_from`. It also adds `depends_on_entries` with a warning that the entries apply in order, which isn't true of upstream's batch. Nothing warns that sub-material slots weren't searched, and the `no_match` warning still says "top-level or sub-material".
+
 **An error box fails the call** (upstream `5c44e76`, merged in `a07ef93`). If Max shows a MAXScript error box during a real run, from a callback script or a scripted material for example, the bridge acknowledges it and the call fails with `MAX_DIALOG_ERROR`. The same happens if the agent presses OK on it with `max_dialogs`. As the error says, check the scene before retrying.
-- **Native handler:** the dispatcher rolls back the call's undo transaction. A `batch_replace_materials` call is one transaction, so every entry is undone. With upstream's 1.7.5 bridges, which this fork ships for 2023–2025 and 2027, the call could commit before the error was recorded; the 2026 bridge waits for it (`ffccbab`, see [hung-max.md](hung-max.md#upstream-175s-dialog-handling-fixed-on-the-merge)).
+- **Native handler:** the dispatcher rolls back the call's undo transaction. A `batch_replace_materials` call is one transaction, so every entry is undone. A stock 1.7.5 bridge could commit the call before the error was recorded; the fork's bridges wait for it (`ffccbab`, see [hung-max.md](hung-max.md#upstream-175s-dialog-handling-fixed-on-the-merge)).
 - **MAXScript fallback:** it runs over the TCP listener, which has no dialog monitor, so it never returns `MAX_DIALOG_ERROR`. Its batch has no rollback either. Each entry is its own call and undo step, and a call that fails outright (a MAXScript error or a timeout, not a missing source) stops the batch with that error. The entries before it stay applied, the ones after it don't run, and the error doesn't say which ran.
 
-**Quiet mode** (upstream `5c44e76`). MAXScript run through the bridge now uses Max's quiet mode by default, so prompts take their default answer; `execute_maxscript(quiet=False)` shows them. This doesn't change `replace_material`: the native handler runs no MAXScript, and the TCP listener doesn't use quiet mode.
+**Quiet mode** (upstream `5c44e76`). MAXScript run through the bridge now uses Max's quiet mode by default, so prompts take their default answer; `execute_maxscript(quiet=False)` shows them. The fork's bridge leaves it off by default for scripts that mention a reset, open, fetch or quit command, and a stock bridge doesn't (#12, see [smaller-fixes.md](smaller-fixes.md#quiet-mode-could-discard-unsaved-work)). None of this changes `replace_material`: the native handler runs no MAXScript, and the TCP listener the fallback uses has no quiet mode.
 
-**`invoke_tool` can run `replace_material` again** (`86ea1b8`). The bridge build generates its own tool registry from the Python tools, and the generator only finds a tool's native command in the tool's own body. `a9d2a0d` had moved that call into a helper, so every fork bridge built since then, the deployed one included, answered `invoke_tool("replace_material")` with "Unknown tool". Agents calling `replace_material` directly were never affected. The call is inline again, and a unit test checks that the generator finds both tools. The 2026 bridge in `native/bin/` (sha256 `d5cd6ba5…`) has the fix. Upstream's bridges never had the problem.
+**`invoke_tool` can run `replace_material` again** (`86ea1b8`). The bridge build generates its own tool registry from the Python tools, and the generator only finds a tool's native command in the tool's own body. `a9d2a0d` had moved that call into a helper, so every fork bridge built from then until this fix, the ones deployed on Max 2026 included, answered `invoke_tool("replace_material")` with "Unknown tool". Agents calling `replace_material` directly were never affected. The call is inline again, and a unit test checks that the generator finds both tools. The fork's bridges built since have the fix: the 2026 one in `native/bin/` (sha256 `d5cd6ba5…`) and the 2027 one deployed on 2026-10-11. Upstream's bridges never had the problem.
 
 ## Examples
 
@@ -100,17 +105,18 @@ replace_material(source_material="Plaster", target_material="Cosmos_Plaster")   
 
 ## How it was verified
 
-- **The direction docs and `no_match`** (`a9d2a0d`) were verified live on 2026-10-01.
+- **The direction docs and `no_match`** (`a9d2a0d`) were verified live on Max 2026 on 2026-10-01. The bridge then still had upstream's handler, so this is also the Python side working with a stock handler.
   - `replace_material(source="Glass", target="NoSuchMaterial_xyz", preview=True)` returned `no_match` with the direction warning.
   - The correct direction still listed the affected objects.
-- **Sub-material matching, the source search, `source_from`, `blocked` and the loop guard** (`16528de`, `a670484`) have Python unit tests in `tests/test_material_replace.py`, but they mock the bridge. They check the payload, the text of the generated MAXScript and the Python post-processing (`no_match`, `blocked`, the `source_from` checks, warnings, `depends_on_entries`). The matching, the source search and the loop guard only run inside Max, so the unit tests don't cover them. An adversarial review covered native undo, reference lifetimes, the `TestForLoop` direction, and search side effects. The Python side was deployed on 2026-10-01. The native handler is in the rebuilt 2026 bridge (sha256 `5f49226e…`, shipped in `53cd33a`), deployed the same day.
-  - The native handler was checked live at 12:30 on a Multi/Sub whose source was only in the Material Editor. The preview gave `source_found_in` "material_editor", one affected slot and an empty `skipped`. The real run replaced the slot, and `undo_last` put it back.
+- **Sub-material matching, the source search, `source_from`, `blocked` and the loop guard** (`16528de`, `a670484`) have Python unit tests in `tests/test_material_replace.py`, but they mock the bridge. They check the payload, the text of the generated MAXScript and the Python post-processing (`no_match`, `blocked`, the `source_from` checks, warnings, `depends_on_entries`). The matching, the source search and the loop guard only run inside Max, so the unit tests don't cover them. An adversarial review covered native undo, reference lifetimes, the `TestForLoop` direction, and search side effects. The Python side was deployed on Max 2026 on 2026-10-01. The native handler is in the rebuilt 2026 bridge (sha256 `5f49226e…`, shipped in `53cd33a`), deployed the same day.
+  - The native handler was checked live on Max 2026 at 12:30 on a Multi/Sub whose source was only in the Material Editor. The preview gave `source_found_in` "material_editor", one affected slot and an empty `skipped`. The real run replaced the slot, and `undo_last` put it back.
   - That empty `skipped` was the check that mattered most: a normal Multi/Sub slot isn't reported as `reference_loop`, so the SDK's `TestForLoop` result is read the right way round.
   - Not run in Max yet: nested Multi/Sub, the loop guard's skips, `source_from`, `blocked`, Hebrew names, batch, plugin parents such as VRayBlendMtl and Shell_Material, and the MAXScript fallback.
-- **The 1.7.5 merge** didn't change how a replacement runs, native or Python. The 2026 bridge built from it (sha256 `d5cd6ba5…`, from `ec903a5`) isn't deployed or tested live yet.
+- **The 1.7.5 merge** didn't change how a replacement runs, native or Python. The 2026 bridge built from it (sha256 `d5cd6ba5…`, from `ec903a5`) was never deployed: production moved to Max 2027 on 2026-10-08.
+  - **Max 2027:** the Python side runs from this branch's source, and the fork's 2027 bridge, built from `18611d7` with the same native code, was deployed on 2026-10-11. Its live checks that day were read-only and didn't include `replace_material`, so nothing on this page has been tested live on Max 2027 yet.
   - The rollback after an error box hasn't been tried in Max. `native/tests/dialog_watch_tests.cpp` checks, without Max, that an acknowledged error box fails the operation where it resumes (`ffccbab`).
   - The fallback batch stopping at a failed call comes from reading the code; no test covers it.
 
 ## Upstream status
 
-Not fixed upstream as of 2026-10-01, v1.7.5 included. The older, explicit docstring survives in kanzaka110's fork.
+Not fixed upstream in v1.7.5, or in upstream master up to `29aed53`, the last upstream commit merged here. The older, explicit docstring survives in kanzaka110's fork.

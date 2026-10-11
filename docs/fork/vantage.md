@@ -5,7 +5,7 @@ Added on the `merge-1.7.5` branch (2026-10-06). Chaos is working on an official 
 ## What they use
 
 - **Vantage's local command server.** Vantage 3.4 runs an undocumented HTTP server on localhost, on the IPv6 loopback only. The port is 20702 unless Vantage's preferences (`%APPDATA%\Chaos\Vantage\vantage.ini`, `commandPort`) say otherwise. `GET /ping` answers 200 when Vantage is ready and 503 while it initialises. `POST /command` takes `{"command": ...}`. Chaos's own 3ds Max scripts (`dcc_scripts\3dsMax\Vantage-UtilityFunctions.ms` in the Vantage install) use it the same way. It isn't a public interface, so a Vantage update can change it.
-- **V-Ray's MAXScript Live Link functions,** on V-Ray builds with distributed-rendering protocol 2 (DR2), V-Ray 7.3 and later. This machine runs V-Ray GPU 7.40.04 DR2.
+- **V-Ray's MAXScript Live Link functions,** on V-Ray builds with distributed-rendering protocol 2 (DR2), V-Ray 7.3 and later. The tools were written against V-Ray GPU 7.40.04 DR2 on 3ds Max 2026.
   - The calls are `vrayGPUSetLiveLinkServers #("localhost:20703")`, `vrayGPUStartIPR liveLinkMode:true` and `vrayGPUStopIPR()`.
   - That's the minimal path in Chaos's `Vantage-LiveLink.ms`, without its renderer switch, message boxes, sleeps and timers.
   - The link port is Vantage's `liveLink2Port`, 20703 by default.
@@ -43,6 +43,7 @@ Saves the frame Vantage is showing as a PNG under `%TEMP%\3dsmax-mcp\` and retur
   - `VANTAGE_TIMEOUT`: the samples weren't reached in time (not retryable), or, without `minimum_samples`, Vantage's command queue didn't advance (it may be paused, or another getImage is waiting; retry at most once).
   - `VANTAGE_FRAME_TOO_LARGE` for a reply over 512 MB (frames above roughly 13K × 7.5K).
   - `VANTAGE_NO_HOST` when Vantage found no supported DCC process. It also happens when 3ds Max runs as administrator and Vantage doesn't.
+  - `VANTAGE_BAD_REPLY` when the reply or its BMP can't be read.
 - **Don't poll.** Each `getImage` call leaks handles inside Vantage 3.4: it opens running processes one by one to look for a DCC and never closes them. That's one handle for every process it scans before finding 3ds Max, often dozens, and all of them when it finds none. Call it when an image is needed, never in a loop.
 
 **The protocol**, worked out from `vantage.exe` 3.4.0 because Chaos doesn't document it:
@@ -80,12 +81,13 @@ Only on request. `action` is required.
   - V-Ray must report protocol 2 (`UNSUPPORTED` otherwise). On protocol 1, Chaos's script links over Live Link v1 (port 20701) and turns off Cryptomatte and Enhancer VFB output with message boxes.
   - No V-Ray IPR may be running, and no V-Ray viewport IPR checked in the active viewport (`RENDER_BUSY`). The exception is the link this MCP server started, which is still connecting: that gives `changed: false`, and the tool waits for it.
   - Then the call sets the link server, starts the Live Link IPR and stores a new token in the Max global `mcp_vantageLiveLink`.
+  - A MAXScript error gives `LIVE_LINK_FAILED`.
 - **Not detected:** a production render in progress.
 - **Then it polls Vantage, never Max,** every 0.5 s for up to `wait_seconds` (default 20, at most 60). The result is one of:
   - `linked`, on `Connected`.
   - `link_failed`, if Vantage reports `Offline`.
   - `starting`, on timeout. The IPR keeps running, because large scenes take longer to translate.
-  - `start_failed`, if no V-Ray IPR runs in Max afterwards.
+  - `start_failed`, if no V-Ray IPR runs in Max afterwards (checked when `wait_seconds` is 2 or more).
   - `requested`, with `wait_seconds=0`.
 - **Afterwards,** one read-only probe reports `vrayIsRenderingIPR()` as `vray_ipr`, and any dialog open in Max is listed under `dialogs`.
 - **If the start request's reply is lost** (`REQUEST_OUTCOME_UNKNOWN`), the link may have started. Check `vantage_status` before doing anything else.
@@ -103,11 +105,12 @@ Any call that sees no IPR running clears the global. After an MCP server restart
   - Any other link gives `LIVE_LINK_NOT_OWNED`.
   - With `force=true`, whatever V-Ray GPU IPR runs in this Max is stopped, since Vantage doesn't say which DCC is linked. Use it only when the user asked.
 - **Without a connected link:** only the tool's own link that never reached `Connected` is stopped, for example after `starting` or `link_failed`. A link that connected and then dropped may have been replaced by the user's own IPR, so it's left alone, and `force` changes nothing. Otherwise the result is `not_linked`, and nothing is sent to Max.
+- **A dialog open in Max** gives `BLOCKED_BY_DIALOG`, as for start, and nothing is sent.
 - **In one MAXScript call:**
   - No IPR running gives `not_linked`.
   - A production renderer other than V-Ray GPU gives `UNSUPPORTED`.
   - Otherwise it calls `vrayGPUStopIPR()`, never `vrayStopIPR()`, clears the global, and reports `vray_ipr_after`.
-- **Then,** if a link was connected, it polls Vantage for up to 15 s until the link is no longer `Connected`.
+- **Then,** if a link was connected, it polls Vantage for up to `wait_seconds` (at most 15 s) until the link is no longer `Connected`.
 
 **Nothing else is changed.**
 - `rt_system_vrayLog_show` isn't touched. Chaos's scripts set it to 0 on start, then to 2 once Vantage answers the ping, on timeout and on stop, without restoring the user's value.
@@ -136,15 +139,16 @@ Any call that sees no IPR running clears the global. After an MCP server restart
   - The HTTP client runs against a real local server on `::1`, and against a socket that accepts but never answers.
   - The tool's checks, refusals, ownership rules, polling and MAXScript text are tested against a mocked bridge.
   - Every script is checked against the side-effecting calls Chaos's toolbar makes: renderer assignment, `VRayVantage_*`, `ShellLaunch`, `queryBox`, `messageBox`, `sleep`, `vrayExportVRScene`, `openFile`, `vrayStopIPR`, .NET, `rt_system_vrayLog_show`, `distributed_rendering` and callbacks. None mentions a file command (#12). Besides the three Live Link calls, they only read state.
-- **An adversarial review** (four lenses, each finding checked by a skeptic) found two majors. Both are fixed:
+- **An adversarial review** of `vantage_status` and `vantage_live_link` (four lenses, each finding checked by a skeptic) found two majors. Both are fixed in `d4d1222`:
   - Ownership could go stale.
   - A link that never connected couldn't be stopped.
-- **Live, read-only, on 2026-10-06:** `read_status()`, all that `vantage_status` does, run from this checkout against Vantage 3.4.0 with Max linked. It returned `ready`, `RenderingInteractive`, `Connected` and version 3.4.0, in 20 ms.
-- **Not tested live yet:** starting and stopping the link. Test it on a small throwaway scene first, then check:
+- **`vantage_get_image`** had its own review in two lenses, fixed in `5ef90c0`.
+- **Live, read-only, on 2026-10-06:** `read_status()`, all that `vantage_status` does, run from this branch's source against Vantage 3.4.0, with 3ds Max 2026 linked. It returned `ready`, `RenderingInteractive`, `Connected` and version 3.4.0, in 20 ms.
+- **Not tested live yet, on any Max version:** starting and stopping the link. Test it on a small throwaway scene first, then check:
   - which `vrayIsRenderingIPR()` value a Live Link IPR reports;
   - how long Vantage takes to report `Connected`;
   - what `liveLinkState` reports when idle, after a stop, and with the Live Link server off;
   - whether V-Ray shows a dialog, the VFB or the V-Ray Messages window;
   - how the agent viewport behaves while linked.
 - **`vantage_get_image`:** the decoder and every error path are tested against a local stub server that serves the protocol above. It hasn't been run against a real Vantage yet; Vantage wasn't running when it was built. Check the colours and orientation against Vantage's window on the first live use.
-- The tools are on `merge-1.7.5` only and aren't deployed. They need the 1.7.5 bridge, for quiet mode and the dialog monitor, so don't backport them to the 1.7.3-based line as they are.
+- **Where they run:** the tools are on the 1.7.5-based line (`fix/fork-fixes` and `merge-1.7.5`). Since 2026-10-11 the MCP server runs from this branch's source on 3ds Max 2027, so they're live there, but none of them has been tested on 2027 yet. They're Python only, and need a 1.7.5 bridge, stock or the fork's, for its quiet mode and dialog monitor. Don't backport them to the 1.7.3-based line as they are.

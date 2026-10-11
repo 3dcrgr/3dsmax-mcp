@@ -1,10 +1,12 @@
 # Cosmos imports that stall or deadlock 3ds Max
 
-Fork issues #1, #2, #7, #9 and #10. Commits `25bb1fc`, `ed1fb1c`, `2853b1c` (#9), `c1e09a7` (#10) and `c88975e` (#9, #10). Dialog handling came with the upstream 1.7.5 merge: `a07ef93`, `6e03f99`, `f70b0cc` and `34a7ce5`.
+Fork issues #1, #2, #7, #9, #10 and #13. Commits `25bb1fc`, `ed1fb1c`, `2853b1c` (#9), `c1e09a7` (#10), `c88975e` (#9, #10) and `3b3210d` (#13). Dialog handling came with the upstream 1.7.5 merge: `a07ef93`, `6e03f99`, `f70b0cc`, `34a7ce5` and `cb4d0ff`.
+
+All of this is in the Python server, so it works with any bridge, with three exceptions. The dialog checks need the dialog monitor of a 1.7.5 bridge; an older bridge skips them. Only the fork's bridge reports a hung main thread, so with upstream's a dialog always counts. The native half of `6e03f99` needs the fork's bridge; with upstream's, the client filters the same windows.
 
 ## What happened
 
-On a V-Ray 7 GPU scene, `cosmos_import` reported success, and then the next call that edited the scene hung 3ds Max. Max stopped responding but used almost no CPU. This happened in about two of five imports. The first sessions were killed after a minute or two, which lost unsaved work. From the agent's side, every later tool call simply timed out.
+On 3ds Max 2026 with a V-Ray 7 GPU scene, `cosmos_import` reported success, and then the next call that edited the scene hung 3ds Max. Max stopped responding but used almost no CPU. This happened in about two of five imports. The first sessions were killed after a minute or two, which lost unsaved work. From the agent's side, every later tool call simply timed out.
 
 ## Why
 
@@ -28,19 +30,20 @@ The MCP made both problems worse in three ways:
 `cosmos_import` now runs these steps. Before the first, and again before the second, it checks that no dialog holds Max (see [Dialogs during an import](#dialogs-during-an-import-upstream-175)).
 
 1. **Make sure a main-thread Cosmos browser exists.** This check is done from the OS, with no bridge call.
+   - If Max's main window is already hung, it fails at once with `IMPORT_SETTLING` and sends nothing.
    - If no browser window belongs to Max's main thread, it runs the renderer's "Cosmos browser" action. The action is looked up by name in the action tables, never by index. It then waits up to 15 s for the window.
    - If a browser is already on the main thread but doesn't answer because Max's main thread is busy, it doesn't run the action. It only waits, from the OS, up to 15 s for the window to answer.
    - If a browser on another thread is already hung, it refuses and sends nothing. The result is `state: "browser_hung"` with code `IMPORT_SETTLING`.
 2. **Prepare.** One bridge call records what already exists: nodes tagged with the asset's Cosmos ID, materials and maps whose names or file names match, and (since #9) the handles of every existing material and Material Editor slot. That's how the import's new resources are told apart later. The same call records the Material Editor renderer and, when the swap is on, switches it to Default Scanline. Last, it clears the selection, remembering it first. The native importer otherwise auto-assigns the new material to whatever is selected.
    - Just before this call, it waits up to 15 s for Max's main window to answer. If it doesn't, nothing more is sent. The result is `state: "not_imported"` with code `IMPORT_SETTLING`.
 3. **Dispatch the import**, then poll lightly for the result (#2). The polls are read-only and back off. They're also probes: they're never sent into a main window that's already hung, and they're dropped at their deadline.
-4. **Wait for Max to settle**, judged from the OS. The main window and every Cosmos browser window, hidden ones included, must answer for a streak longer than 6 s. (`IsHungAppWindow` only reports a window as hung after about 5 s.)
+4. **Wait for Max to settle**, judged from the OS. The main window and every Cosmos browser window, hidden ones included, must answer for a streak of at least 6 s. (`IsHungAppWindow` only reports a window as hung after about 5 s.)
    - Max's CPU use must also fall back near its level before the import. If the windows answer but the CPU stays busy, it stops waiting 10 s later and adds a warning that textures may still be loading.
-5. **Restore the selection.** It never calls `MatEditor.Close()` or `MatEditor.Open()`.
+5. **Confirm and restore.** One full snapshot confirms what the import created, then one call restores the selection (and the Material Editor renderer and slot, see below). It never calls `MatEditor.Close()` or `MatEditor.Open()`.
 6. **If Max is still busy after `settle_seconds`**, the result has `state: "settling"` and `safe_to_edit: false`. Once `get_bridge_status` reports Max responding, run `pending_restore.maxscript` once with `execute_maxscript`.
    - It also arms an `IMPORT_SETTLING` guard. Until that Max's windows pump messages again, further calls from this server to it fail fast and aren't sent. The guard expires after 15 minutes at most.
 
-The same guard covers the import itself: while it runs, other calls from this server to that Max fail at once with `IMPORT_SETTLING`. It's also armed when step 1 or 2 refuses the import as described above.
+The same guard covers the import itself: while it runs, other calls from this server to that Max fail at once with `IMPORT_SETTLING`. `get_bridge_status` and `max_dialogs` still answer, over the control channel. It's also armed when a hung browser (step 1) or a main window that doesn't answer (step 2) refuses the import.
 
 New parameters:
 
@@ -49,6 +52,7 @@ New parameters:
 | `swap_medit_renderer` | `false` | Use Default Scanline as the Material Editor renderer during the import. This is turned on automatically when step 1 ends without a responsive browser on Max's main thread. |
 | `restore_medit_renderer` | `true` | Put the original Material Editor renderer back once Max is idle and the editor is closed. If the editor is open, it stays Scanline and a warning gives the restore script. |
 | `settle_seconds` | `90` (0–300, at least 8 used) | How long to wait for Max to settle before returning `safe_to_edit: false`. |
+| `minimize_browser` | `true` | Minimize the Cosmos browser after a quiet import, if the import showed it (#13, below). |
 
 New result fields:
 - `state` can also be `settling` (dispatched, but Max is still busy; `detected` says whether the new resource was seen), `dialog_open` (dispatched, but a dialog holds Max; see below), `browser_hung` or `not_imported` (nothing imported, `dispatched: false`).
@@ -82,7 +86,7 @@ New result fields:
   - `asset_name` comes with `material_name` or `map_name`, plus a `note` when they differ.
 - Nothing is renamed. The behaviour from the steps above is unchanged: no new bridge calls, the OS-only settle, the main-thread browser, the `IMPORT_SETTLING` guard, and never opening or closing the Material Editor.
 
-**Status.** Unit tested in `tests/test_cosmos_import.py`, and verified live on 2026-10-01. Re-importing "Steel Blurry" returned `imported` with `primary_material` "Steel_Polished #0" (`medit_slot` 13, `primary_reason` `only_new`), `asset_name` "Steel Blurry" and the note about the different name. The scene's existing "Steel_Blurry" was correctly not reported as new. The follow-up that keeps other plugins' items apart (`c88975e`) was deployed the same day and hasn't been retested live.
+**Status.** Unit tested in `tests/test_cosmos_import.py`, and verified live on Max 2026 (2026-10-01). Re-importing "Steel Blurry" returned `imported` with `primary_material` "Steel_Polished #0" (`medit_slot` 13, `primary_reason` `only_new`), `asset_name` "Steel Blurry" and the note about the different name. The scene's existing "Steel_Blurry" was correctly not reported as new. The follow-up that keeps other plugins' items apart (`c88975e`) was deployed the same day; the Forest Pack case hasn't been re-run live.
 
 ### Keeping the user's Material Editor slot (#10, `c1e09a7`)
 
@@ -93,7 +97,7 @@ New result fields:
   - A slot counts as free only if its material is pristine: used by no object, no sub-materials or maps, and every property equal to a fresh one.
   - Pristine slots with a default-style name come first: "NN - Default", or V-Ray's "Material #N" (`c88975e`; the first live test found only V-Ray slots, so nothing counted as free). If there are none, any pristine slot is used. A pristine material with its own name that gets replaced is kept alive too, and reported (`switched_over`, `moved_over`).
   - The slot check runs before the baseline snapshot, so the materials it creates for comparison never show up as new.
-  - So if the snapshot fails with a MAXScript error, the slot is already switched. The result is `not_imported` with the script that switches it back. Since the 1.7.5 merge (not deployed yet), the same goes for Esc, `message` has the MAXScript error, and an open undo operation is raised as `USER_BUSY` instead, since it's checked first and nothing was changed then.
+  - So if the snapshot fails with a MAXScript error, the slot is already switched. The result is `not_imported` with the script that switches it back. Since the 1.7.5 merge, the same goes for Esc, and `message` has the MAXScript error. An open undo operation fails with `USER_BUSY` instead: it's checked first, so nothing was changed.
   - The kept material is held by a MAXScript global meanwhile, so Max can't auto-delete it.
 - **After a quiet settle:** if a material was still displaced, and the slot's new material is the import's (newer than every handle recorded before dispatch), the finalize call puts the kept one back, moves the import to a free slot, and makes the original slot active again.
   - This only happens when no undo operation is open and the scene wasn't reset or replaced. That's checked by file name and by the other slots' materials, so an untitled scene counts too.
@@ -105,13 +109,13 @@ New result fields:
   - `medit_slot_restored`;
   - `medit_slot` now reports where the import ended up.
 
-**Status.** Unit tested and deployed (Python) on 2026-10-01.
-- **The first live test (`c1e09a7`) was a partial pass.** The displaced material was kept alive, and the restore hint was right. But slots 16–24 held untouched V-Ray materials named "Material #16" to "Material #24", so no slot counted as free, and the import still landed in the user's active slot.
+**Status.** Unit tested and deployed (Python) on Max 2026 (2026-10-01).
+- **The first live test (`c1e09a7`, Max 2026) was a partial pass.** The displaced material was kept alive, and the restore hint was right. But slots 16–24 held untouched V-Ray materials named "Material #16" to "Material #24", so no slot counted as free, and the import still landed in the user's active slot.
 - `c88975e` fixes that and was deployed the same day; it hasn't been retested live yet.
 
 ### Model nodes, slot noise and the browser (#13, `3b3210d`)
 
-**What happened.** Importing the Cosmos model "Rug 002" created a VRayProxy, "Rug 002_001", but the tool polled for 31 s and returned `imported_unverified` with no nodes. `other_new_materials` listed 10 untouched "Material #N" materials from Material Editor slots. The Cosmos browser the import had opened stayed on top of other windows, Vantage included.
+**What happened.** Importing the Cosmos model "Rug 002" created a VRayProxy, "Rug 002_001", but the tool polled for 31 s and returned `imported_unverified` with no nodes. `other_new_materials` listed 10 untouched "Material #N" VRayMtls, most likely Material Editor slot defaults. The Cosmos browser the import had opened stayed on top of other windows, Vantage included.
 
 **What changed.**
 - **Model nodes by handle.** The prepare call also records the newest node handle. A new node above it, of any class or name (VRayProxy, container, group, helper), is tied to the import when it's named like the asset, carries a material newer than the dispatch or named like the asset, or is related to a tied node or one tagged with the Cosmos ID.
@@ -120,17 +124,17 @@ New result fields:
 - **Slot noise.** Untouched default-named slot materials (no maps or sub-materials, unused, pristine when confirmed) are ignored, and only counted in `default_materials_ignored`.
 - **The browser.** If the import showed the Cosmos browser, it's minimized after a quiet, confirmed import and its finalize, with `ShowWindowAsync(SW_SHOWMINNOACTIVE)`. The call is posted, never activates or closes a window, and only touches main-thread browser windows of this Max. It's skipped if any browser runs on another thread, or Max is busy.
   - `minimize_browser=False` opts out. The result reports `cosmos_browser.shown_before`, `iconic_before`, `minimized_after` and `minimize_skipped`.
-  - On the 1.7.5 merge it's also skipped when a dialog interrupted the confirming snapshot (`not_confirmed`) or the restore call's result is unknown (`restore_unknown`).
+  - On the 1.7.5 merge it's also skipped when error dialogs stopped the confirming snapshot (`not_confirmed`) or the restore call's result is unknown (`restore_unknown`, `cb4d0ff`).
 - No new bridge calls. The #1, #9 and #10 behaviour is unchanged.
 
-**Status.** Unit tested in `tests/test_cosmos_import.py`. Deployed (Python) on the 1.7.3-based fork on 2026-10-05; not tested live yet.
+**Status.** Unit tested in `tests/test_cosmos_import.py`. Deployed (Python) with the 1.7.3-based fork on Max 2026, on 2026-10-05; not tested live yet.
 
 ### Dialogs during an import (upstream 1.7.5)
 
 Upstream 1.7.5 (`5c44e76`) added blocking-dialog handling: a call held by a modal dialog returns `BLOCKED_BY_DIALOG`, `max_dialogs` reads and answers the dialog, and a recognised MAXScript error box during a call is acknowledged and fails that call with `MAX_DIALOG_ERROR`. A modal dialog keeps Max's windows answering, so the OS checks above can't see it. Since the merge (`a07ef93`, `f70b0cc`, `34a7ce5`), `cosmos_import` handles it:
 
 - **A dialog before step 1.** It asks the bridge's dialog monitor, which answers from a pipe thread without touching Max's main thread. If a dialog holds Max's main thread, nothing else is sent and nothing is imported: `state: "not_imported"`, `dispatched: false`, `safe_to_edit: true`, and the `dialogs`. Answer the dialog, then retry. Otherwise the browser action, the preparation and the import would all run inside the dialog's loop.
-  - A dialog doesn't count while the monitor reports that Max's main thread stopped pumping. That's a hang, and the OS checks handle it. A bridge without the monitor skips this check.
+  - A dialog doesn't count while the monitor reports that Max's main thread stopped pumping. That's a hang, and the OS checks handle it. Upstream's bridges don't report that, so with them a dialog always counts. A bridge without the monitor skips this check.
   - It asks again right before the preparation call, because the browser action (run with quiet mode off) and the OS waits after it can take 30 s. If a dialog holds Max then, the result is the same, and nothing more is sent (at most the browser action was).
 - **A call held by a dialog** (`BLOCKED_BY_DIALOG`) on the browser action or the preparation gives `not_imported` with `safe_to_edit: false` and the `dialogs`. The held call still runs once the dialog is answered. No `IMPORT_SETTLING` guard is armed, since a dialog hangs nothing.
 - **`MAX_DIALOG_ERROR` on the preparation call.** The call ran, maybe not to its end, and Max showed an error box that the bridge acknowledged, and the bridge returned that error instead of the call's result. The result is `not_imported` with `code: "MAX_DIALOG_ERROR"`, `safe_to_edit: false` and the acknowledged `dialogs`.
@@ -141,9 +145,9 @@ Upstream 1.7.5 (`5c44e76`) added blocking-dialog handling: a call held by a moda
 - **`MAX_DIALOG_ERROR` after the settle.** The result gets `code: "MAX_DIALOG_ERROR"` and the acknowledged `dialogs`.
   - On the confirming snapshot, which only reads, the snapshot is taken once more. If that fails too, the restore call isn't sent: `import_unknown`, `safe_to_edit: false` and `pending_restore`.
   - On the restore call, the call ran but may not have reached its end. The error box may come, for example, from a selection callback that the restored selection set off. As its last step, the call keeps its result in a MAXScript global, and one read-only call reads it back. If it's there, the call reached its end, and `medit_active_slot` and a displaced material are reported as usual. If it isn't, or the read fails, the slot state is `unknown`, and a warning says what to check. The restore isn't offered again, since it already ran.
-- **The browser action runs with quiet mode off** (`quiet: false`). 1.7.5 runs agent MAXScript in Max's quiet mode by default, which might stop the action from showing its window. The action was verified live before quiet mode existed, so it stays this way until it's re-tested under quiet mode.
+- **The browser action runs with quiet mode off** (`quiet: false`). 1.7.5 runs agent MAXScript in Max's quiet mode by default, which might stop the action from showing its window. The action was verified live on Max 2026 (2026-10-01), before quiet mode existed, so it stays this way until it's re-tested under quiet mode.
 
-**Status.** Unit tested in `tests/test_cosmos_import.py`. The merge isn't deployed, so none of this has run in Max yet.
+**Status.** Unit tested in `tests/test_cosmos_import.py`. The merge was never deployed on Max 2026. It has run on Max 2027 since 2026-10-11, but no import has been tested live with it yet.
 
 ### Windows that are never dialogs (`6e03f99`)
 
@@ -156,11 +160,14 @@ The fork's monitor:
 
 With upstream's bridges, the client applies the same titles: replies don't list these windows, the automatic inspect doesn't run while one is open, and `cosmos_import`'s dialog checks ignore them. Only titles are matched, so a real message box titled exactly like one of these windows wouldn't be reported.
 
-**Status.** Unit tested in `native/tests/dialog_watch_tests.cpp`, which counts every message the monitor sends these windows, and on the client side in `tests/test_hang_diagnosis.py` and `tests/test_cosmos_import.py`. It's in the 2026 bridge built from the merge (`d5cd6ba5…`), which isn't deployed or tested live yet.
+**Status.** Unit tested in `native/tests/dialog_watch_tests.cpp`, which counts every message the monitor sends these windows, and on the client side in `tests/test_hang_diagnosis.py` and `tests/test_cosmos_import.py`.
+- It's in the fork's 2026 bridge in `native/bin` (`d5cd6ba5…`), which was never deployed.
+- It's also in the fork's 2027 bridge, built from `18611d7` and deployed on 2026-10-11 (`48c186df…`). That build isn't committed: `native/bin/mcp_bridge_2027.gup` is still upstream's stock 1.7.5 build (`2d5304d4…`), so a fresh install on Max 2027 gets only the client-side filtering.
+- Not tested live with these windows. The 2026-10-11 checks on Max 2027 only showed that `max_dialogs` runs the fork's monitor.
 
 ## How it was verified
 
-Live on 3ds Max 2026 with V-Ray 7 update 4 hotfix 2 (GPU production renderer), on 2026-10-01:
+Live on 3ds Max 2026 with V-Ray 7 update 4 hotfix 2 (GPU production renderer), on 2026-10-01, with the 1.7.3-based fork (before the 1.7.5 merge):
 
 - **Action lookup:** found both `V-Ray | Chaos Cosmos browser` and `Chaos Corona | Corona Open Cosmos Browser`.
 - **Import with default settings:**
@@ -169,6 +176,8 @@ Live on 3ds Max 2026 with V-Ray 7 update 4 hotfix 2 (GPU production renderer), o
   - The user's selection came back, and the material wasn't auto-assigned to it.
 - **`cosmos_search`:** answered with `renderer_source: "scene"`, because V-Ray and Corona both registered an importer for that Max.
 - **Import on a freshly started Max with no browser open:** the "Steel Blurry" re-import at 13:08 ran right after a Max restart. `cosmos_import` opened the browser on Max's main thread through the V-Ray "Chaos Cosmos browser" action, the Material Editor renderer wasn't swapped, and the import returned `imported` and `safe_to_edit: true` after about 17 s.
+
+No import has been run on Max 2027 yet. Since 2026-10-11, the server that drives Max 2027 runs this code from the fork's source, with the fork's 2027 bridge, but the live checks logged that day were read-only, and none was a Cosmos import.
 
 Unit tests are in `tests/test_cosmos_import.py`. They use fake windows to cover a hung browser, a missing browser, settle streaks, the guard expiring, and the Scanline fallback. They also cover the dialog cases above.
 
@@ -179,7 +188,7 @@ Unit tests are in `tests/test_cosmos_import.py`. They use fake windows to cover 
   - The cross-thread deadlock never cleared. If Max is still blocked after about 10 minutes, treat it as a deadlock.
 - **Run `capture_hang_diagnostics`** and keep the file it saves. It tells the two cases apart:
   - Main thread inside `vray.dll`, called from `mtl.dll`: that's the preview render.
-  - Main thread in a USER32 call while a "Chaos Cosmos Browser" thread waits in `galaxyimporter2026.dll`: that's the window deadlock.
+  - Main thread in a USER32 call while a "Chaos Cosmos Browser" thread waits in the Cosmos importer (`galaxyimporter2026.dll` on Max 2026): that's the window deadlock.
 - **Don't open or close the Material Editor** while Max is in this state.
 - **`dialog_open` isn't a hang.** Max is waiting on a dialog: read it with `max_dialogs(action="inspect")` and ask the user how to answer it.
 

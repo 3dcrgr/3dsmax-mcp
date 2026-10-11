@@ -1,6 +1,6 @@
 # Texture paths missing from Revit (Autodesk) materials
 
-Fork issue #5. Commits `a5e1e91`, `baafe0a` and `1492831`.
+Fork issue #5. Commits `a5e1e91`, `baafe0a` and `1492831`. Most of the fix is native, so it needs a fork build of the bridge; see [Which bridge has it](#which-bridge-has-it).
 
 ## What happened
 
@@ -32,15 +32,29 @@ Python (`material_roles`):
 - A file-bearing map with no path now gives a `FILE_PATH_UNREADABLE` warning and `complete: false`. File-bearing here means Bitmap, Autodesk Bitmap, VRayBitmap/HDRI, CoronaBitmap, aiImage, or an OSL image loader with no file feeding it.
 - A file-bearing map whose file parameters are all empty (`fileUnset`) gives `FILE_NOT_ASSIGNED` instead, and the audit stays complete. Autodesk Bitmap is the exception: empty parameters prove nothing there, so an unset one still gives `FILE_PATH_UNREADABLE` and `complete: false`.
 
+## Which bridge has it
+
+Everything under "Native" above runs in the bridge:
+- In `native/bin/`, only `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) is a fork build with this fix. The 2023, 2024, 2025 and 2027 files are upstream's 1.7.5 builds.
+- On the production machine, Max 2027 runs a fork bridge (sha256 `48c186df…`) built from `18611d7` with the Max 2027 SDK, deployed on 2026-10-11. It isn't committed yet, so a fresh install from the fork on Max 2027 still gets upstream's bridge.
+
+The Python checks work with any bridge. With an upstream bridge:
+- Autodesk Bitmap paths still read as empty, but each such map gives `FILE_PATH_UNREADABLE` and `complete: false`, so the audit no longer looks clean.
+- There's no `fileUnset`, so an empty Bitmap slot gives `FILE_PATH_UNREADABLE` too, not `FILE_NOT_ASSIGNED`.
+- Cosmos VRayBitmaps still get the extra package-relative row and its false `FILE_MISSING`.
+- There's no `classInternal`, so on a localized Max a file-bearing map whose translated class name doesn't match isn't recognised, and isn't checked.
+
 ## How it was verified
 
-Live on 3ds Max 2026, 2026-10-01:
-- **An Autodesk Bitmap on a Revit furniture fabric** now reports its path, from parameter `Parameters_Source`: `C:\Program Files (x86)\Common Files\Autodesk Shared\Materials\Textures\1\Mats\Furnishings.Fabrics.Linen.White.jpg`. It also reports `exists: false`, which is correct, because that texture library isn't installed on the machine.
+Live on 3ds Max 2026, 2026-10-01, with the 1.7.3-based fork's bridge. The material graph code hasn't changed since `1492831`, so the fork's 1.7.5-based bridges (the 2026 one in `native/bin/` and the deployed 2027 one) have the same code. The 2026 one hasn't run in Max.
+- **An Autodesk Bitmap on a Revit furniture fabric** now reports its path, from parameter `Parameters_Source`: `C:\Program Files (x86)\Common Files\Autodesk Shared\Materials\Textures\1\Mats\Furnishings.Fabrics.Linen.White.jpg`. It also reports `exists: false`, which is correct, because that texture library isn't installed on the machine. Checked at 10:46 and again at 11:06.
 - **Unset Autodesk Metal relief and cutout bitmaps** give `FILE_PATH_UNREADABLE`, and the audit reports `complete: false`.
 - **Cosmos VRayBitmaps:** the duplicate package-relative row first showed up in the 10:46 live check. `baafe0a`, deployed at 11:02 to remove it, didn't (checked at 11:06). At 11:20 the row was traced to the unnamed parameter. The fix (`1492831`) was deployed with the rebuilt bridge at 12:22. At 12:30 `material_roles` on the Cosmos material `Tiles_B_130cm` gave one row per VRayBitmap (`HDRIMapName`, `exists: true`), no package-relative rows, and `complete: true`.
+
+Live on 3ds Max 2027, 2026-10-11 09:25, with the fork's 2027 bridge (`48c186df…`): `material_roles` read VRayBitmap paths, one row per slot. Autodesk Bitmap paths and `FILE_PATH_UNREADABLE` aren't tested live on Max 2027 yet, and `FILE_NOT_ASSIGNED` hasn't been tested live on either version.
 
 Unit tests: `tests/test_material_roles_files.py`, for the Python warnings. The native path reading has no automated tests.
 
 ## Upstream status
 
-Not fixed upstream as of 2026-10-01. `material_roles` came from EdgecraftStudio's upstream PR 29, which was tested on Corona scenes, so this is a natural follow-up to raise with them.
+Not fixed upstream: v1.7.5 and upstream `master` (`29aed53`) don't have it. `material_roles` came from EdgecraftStudio's upstream PR 29, which was tested on Corona scenes, so this is a natural follow-up to raise with them.
