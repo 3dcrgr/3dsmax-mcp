@@ -198,6 +198,9 @@ fn rcBaseRoles base = (
         for i = 0 to conns.Count - 1 do (
             local c = conns.Item i
             local own = c.ParentNode
+            -- A connector in a <groupConnectors> list (an operator's variable inputs, such as Basic Ops'
+            -- Splines) is an input of the node around the list
+            if own != undefined and own.Name == "groupConnectors" do own = own.ParentNode
             local t = toLower (c.GetAttribute "target_id")
             if t != "" and own != undefined and own.Name == "node" do (
                 append cIds (toLower (c.GetAttribute "id"))

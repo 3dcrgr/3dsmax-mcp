@@ -118,7 +118,10 @@ def base_roles(root: ET.Element, base_ids: Iterable[Any]) -> list[str]:
     for node in root.iter("node"):
         owner = (node.get("id") or "").lower()
         owner_class = node.get("baseClass") or ""
-        for conn in node.findall("connector"):
+        # A node's inputs are its own <connector>s and those in its <groupConnectors> lists (an operator's
+        # variable inputs, e.g. Basic Ops' "Splines": new_spline). Live: 12 stock .rail styles reach their only
+        # path through such a list (Glass Railing 03, the Industrial pipes and ducts).
+        for conn in node.findall("connector") + node.findall("groupConnectors/connector"):
             target = (conn.get("target_id") or "").lower()
             if target:
                 connectors.append(((conn.get("id") or "").lower(), target, owner, owner_class))

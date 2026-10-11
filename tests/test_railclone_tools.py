@@ -1332,8 +1332,18 @@ ROLE_STYLE = """<scene version="400">
   <node id="{U}" baseClass="Object" class="Spline" name="Unused"/>
   <node id="{M}" baseClass="Object" class="Spline" name="Both"/>
   <node id="{G}" baseClass="Object" class="Spline" name="Odd"/>
+  <node id="{B}" baseClass="Object" class="Spline" name="Spline"/>
   <node id="op1" baseClass="Operator" class="Offset" name="Offset">
     <connector id="node" name="Spline" target_id="{O}"/>
+  </node>
+  <node id="op2" baseClass="Operator" class="Basic Ops" name="Spline Op1">
+    <groupConnectors id="nodes" name="Splines">
+      <connector id="new_spline" name="Spline" target_id="{B}"/>
+      <connector id="new_spline" name="&lt;empty spline&gt;" target_id=""/>
+    </groupConnectors>
+  </node>
+  <node id="g5" baseClass="Generator" class="Linear1S" name="Glass">
+    <connector id="spline" target_id="op2"/>
   </node>
   <node id="g1" baseClass="Generator" class="Linear1S" name="L1S">
     <connector id="spline" target_id="{p}"/>
@@ -1374,7 +1384,7 @@ class BaseRoleTests(unittest.TestCase):
     """The role of each base from the style graph (live probes p12/p13 on RailClone 7.3.5)."""
 
     def test_roles(self):
-        ids = ["{P}", "{C}", "{X}", "{W}", "{N}", "{O}", "{S}", "{U}", "{M}", "{G}"]
+        ids = ["{P}", "{C}", "{X}", "{W}", "{N}", "{O}", "{S}", "{U}", "{M}", "{G}", "{B}"]
         roles = dict(zip(ids, rclib.base_roles(ET.fromstring(ROLE_STYLE), ids)))
         self.assertEqual(roles, {
             "{P}": "path",      # L1S spline input (ids match case-insensitively; _exp_ connectors are parameters)
@@ -1387,6 +1397,8 @@ class BaseRoleTests(unittest.TestCase):
             "{U}": "unused",
             "{M}": "mixed",
             "{G}": "unknown",   # a generator input that is no path, clipping area or surface
+            # an operator input in a <groupConnectors> list (live: Glass Railing 03's Basic Ops "Splines")
+            "{B}": "path",
         })
         self.assertEqual(rclib.combine_roles({"path", "unknown"}), "path")
         self.assertEqual(rclib.combine_roles({"segment", "unknown"}), "unknown")
@@ -1400,6 +1412,7 @@ class BaseRoleTests(unittest.TestCase):
             self.assertIn(f'if mt == {kind} then appendIfUnique found "{role}"', rc._FUNCTIONS)
         self.assertIn('else if cKinds[k] == "Operator" then append queue cOwners[k]', rc._FUNCTIONS)
         self.assertIn(f"steps < {rclib.ROLE_STEPS}", rc._FUNCTIONS)
+        self.assertIn('if own != undefined and own.Name == "groupConnectors" do own = own.ParentNode', rc._FUNCTIONS)
 
 
 class DecodeTests(unittest.TestCase):
