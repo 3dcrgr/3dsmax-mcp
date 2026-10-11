@@ -17,6 +17,8 @@ assert Path(max_client.__file__).resolve().parent.parent == REPO_ROOT, max_clien
 OLD, NEW = 4242, 5151
 OLD_PIPE = rf"\\.\pipe\3dsmax-mcp-pid-{OLD}"
 NEW_PIPE = rf"\\.\pipe\3dsmax-mcp-pid-{NEW}"
+THIRD = 6262
+THIRD_PIPE = rf"\\.\pipe\3dsmax-mcp-pid-{THIRD}"
 HANDLE = 777
 REPLY = b'{"success": true, "result": "ok", "requestId": ""}\n'
 
@@ -45,6 +47,7 @@ class _Case(unittest.TestCase):
         self.gone: set[int] = set()
         self.live = {OLD_PIPE: True, NEW_PIPE: True}
         self.default_pipe = OLD_PIPE
+        self.default_source = "default"
         self.kernel = FakeKernel()
         self.opened: list[str] = []
         for target, value in (
@@ -59,7 +62,8 @@ class _Case(unittest.TestCase):
         for name, value in (
             ("_ensure_pipe_handle", lambda client, deadline, pipe: self._open(client, deadline, pipe)),
             ("_await_response", lambda *a, **k: REPLY),
-            ("_default_target", lambda client: client._target(self.default_pipe, "default")),
+            ("_default_target", lambda client: client._target(self.default_pipe, self.default_source)),
+            ("_live_instances", lambda client: [{"pipe": pipe, "updated": 0} for pipe, up in self.live.items() if up]),
             ("_probe_pipe_available", lambda client, pipe=None: self.live.get(pipe, False)),
         ):
             p = mock.patch.object(MaxClient, name, value)
@@ -97,6 +101,29 @@ class DefaultRebindTests(_Case):
         self.assertEqual(moved["retargeted_from"], {"pid": OLD, "pipe": OLD_PIPE, "source": "default"})
         self.assertGreater(moved["selection_generation"], first["selection_generation"])
         self.assertNotIn("retargeted_from", self.send())  # reported once
+
+    def test_two_other_instances_refuse_instead_of_guessing(self):
+        self.send()
+        self.max_exits()
+        self.live[THIRD_PIPE] = True  # e.g. a production Max and a scratch Max both running
+        self.default_pipe = NEW_PIPE
+        with self.assertRaisesRegex(max_client.AmbiguousMaxInstanceError, f"PIDs {NEW}, {THIRD}") as ctx:
+            self.send()
+        self.assertIn("Nothing was sent", str(ctx.exception))
+        self.assertEqual(self.client._bound_target["target_pid"], OLD)
+        self.assertEqual(self.opened, [OLD_PIPE])
+        self.default_source = "claim"  # the user claimed one in Max: unambiguous again
+        self.assertEqual(self.send()["target_pid"], NEW)
+
+    def test_auto_transport_keeps_the_ambiguity_error(self):
+        client = MaxClient()
+        self.send(client)
+        self.max_exits()
+        self.live[THIRD_PIPE] = True
+        with mock.patch.object(MaxClient, "_send_via_tcp") as tcp:
+            with self.assertRaises(max_client.AmbiguousMaxInstanceError):
+                client.send_command("1")
+        tcp.assert_not_called()
 
     def test_claimed_target_also_re_resolves(self):
         self.client._bind(self.client._target(OLD_PIPE, "claim"))

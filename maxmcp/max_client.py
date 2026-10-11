@@ -539,6 +539,7 @@ class MaxClient:
     def _drop_exited_default(self) -> None:
         """Forget a default/claim target whose Max has exited, so the next call re-resolves (#22).
 
+        Only when the new default is unambiguous: at most one other Max runs, or one is claimed.
         Explicit and environment targets keep failing hard, and a busy or hung Max is never dropped.
         """
         target = self._bound_target
@@ -548,6 +549,12 @@ class MaxClient:
         pid = target.get("target_pid")
         if not pid or not process_gone(pid, self._bound_started):
             return
+        others = [item for item in self._live_instances() if item["pipe"] != target.get("target_pipe")]
+        if len(others) > 1 and self._default_target()["target_source"] != "claim":
+            pids = ", ".join(str(self._pid_for_pipe(item["pipe"]) or item["pipe"]) for item in others)
+            raise AmbiguousMaxInstanceError(
+                f"The default 3ds Max target (PID {pid}) has exited and {len(others)} other instances are running "
+                f"(PIDs {pids}). Nothing was sent. Call select_max_instance with the one you mean.")
         self._close_pipe_handle()
         self._selected_pipe_name = None
         self._bound_target = None
