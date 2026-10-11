@@ -336,39 +336,67 @@ def viewport_thinning(full: float, viewport_max: int | None) -> tuple[int, float
     return k, full / (k * k)
 
 
+# How far trees.count() may sit from the predicted thinned count N/k^2 and still be called thinned. Live (p27)
+# the prediction was within 2%; the estimate itself is rougher (bounding-box area, excludes, slope limits).
+THINNING_TOLERANCE = 0.25
+
+
 def count_checks(estimate: float | None, count: int | None, *, viewport_max: int | None,
                  maxdensity: float | None, candidates: float | None,
                  render_max: int | None) -> dict[str, Any]:
     """What the caps do to a scatter: viewport thinning of trees.count(), the maxdensity cap, the render cap.
 
     Returns viewport_thinned (True, False, or None when it can't be told), estimated_viewport_count, warnings and
-    notes, each a (code, detail) pair.
+    notes, each a (code, detail) pair. A built count is checked against the prediction: thinning is reported only
+    when the count agrees with it, and the maxdensity cap only when the count is 0 or unknown (live, the cap is
+    all or nothing, so a build with items wasn't capped).
     """
     out: dict[str, Any] = {"viewport_thinned": None, "estimated_viewport_count": None, "warnings": [], "notes": []}
     vmax = viewport_max if isinstance(viewport_max, int) and viewport_max > 0 else None
     if vmax and count is not None and count > vmax:
         out["viewport_thinned"] = False  # a thinned build never holds more than vmaxitems items
     elif vmax and estimate is not None and count != 0:
-        thinned = estimate > vmax * 1.02
-        out["viewport_thinned"] = thinned
-        if thinned:
+        if estimate <= vmax * 1.02:
+            out["viewport_thinned"] = False
+        else:
             k, shown = viewport_thinning(estimate, vmax)
-            out["estimated_viewport_count"] = round(shown)
-            out["warnings"].append(("VIEWPORT_LIMIT", (
-                f"the count is trees.count(), the viewport build: Max items Viewport (vmaxitems={vmax}) keeps 1 in "
-                f"{k} grid rows and columns, so about {round(shown)} items show in the viewport and about "
-                f"{round(estimate)} render. forest_items reads the viewport build; raise vmaxitems (0 = no "
-                "limit) to see them all")))
+            if count is None or abs(count - shown) <= THINNING_TOLERANCE * shown:
+                out["viewport_thinned"] = True
+                out["estimated_viewport_count"] = round(shown)
+                out["warnings"].append(("VIEWPORT_LIMIT", (
+                    f"the count is trees.count(), the viewport build: Max items Viewport (vmaxitems={vmax}) keeps 1 "
+                    f"in {k} grid rows and columns, so about {round(shown)} items show in the viewport and about "
+                    f"{round(estimate)} render. forest_items reads the viewport build; raise vmaxitems (0 = no "
+                    "limit) to see them all")))
+            else:
+                # The estimate says thinned, the count disagrees: the estimate can be off (bounding-box area,
+                # excludes, slope and altitude limits aren't counted), and live a forest whose distribution map
+                # was assigned and cleared thinned harder than predicted. Don't guess.
+                out["notes"].append(("VIEWPORT_LIMIT_UNCERTAIN", (
+                    f"the estimate (about {round(estimate)} items) is over Max items Viewport (vmaxitems={vmax}), "
+                    f"which would thin trees.count() to about {round(shown)}, but the count is {count}. The "
+                    "estimate counts the surfaces' upward area (their bounding box over 50000 faces) and ignores "
+                    "excludes and slope or altitude limits, so whether the viewport build is thinned can't be "
+                    "told; set vmaxitems to 0 (no limit) and count again for the full scatter")))
     elif estimate is None and vmax and count is not None and vmax / 4 < count <= vmax:
         out["notes"].append(("VIEWPORT_LIMIT_POSSIBLE", (
             f"the count is trees.count(), the viewport build. When the full scatter has more than Max items "
             f"Viewport (vmaxitems={vmax}) items, Forest Pack thins it to between a quarter of that limit and the "
             "limit, and the render gets more; forest_validate estimates the full count for the stock map")))
     if maxdensity and maxdensity > 0 and candidates is not None and candidates > maxdensity * 1e6:
-        out["warnings"].append(("MAXDENSITY_CAP", (
-            f"about {candidates / 1e6:.2f} million candidate cells (map pixels per tile x tiles) exceed Max Density "
-            f"(maxdensity={maxdensity:g}, in millions), and over it Forest Pack scatters 0 items; use larger tiles "
-            "or raise maxdensity (0 = no cap)")))
+        if count is None or count == 0:
+            out["warnings"].append(("MAXDENSITY_CAP", (
+                f"about {candidates / 1e6:.2f} million candidate cells (map pixels per tile x tiles) exceed Max "
+                f"Density (maxdensity={maxdensity:g}, in millions), and over it Forest Pack scatters 0 items; use "
+                "larger tiles or raise maxdensity (0 = no cap)")))
+        else:
+            # Live: two surfaces of 1 M cells each built 287400 items under maxdensity 1, so the cap isn't applied
+            # to the sum over all surfaces; a build with items wasn't capped.
+            out["notes"].append(("MAXDENSITY_SUM_OVER_CAP", (
+                f"the surfaces together have about {candidates / 1e6:.2f} million candidate cells, over Max Density "
+                f"(maxdensity={maxdensity:g}, in millions), but the build has {count} items, so the cap wasn't hit "
+                "(Forest Pack doesn't apply it to the sum of several surfaces); a single surface over it would "
+                "scatter 0 items")))
     if render_max and render_max > 0 and estimate is not None and estimate > render_max:
         out["warnings"].append(("RENDER_LIMIT", (
             f"about {round(estimate)} items exceed Max items Render (rmaxitems={render_max}); per the Forest Pack "
@@ -477,8 +505,12 @@ def _issue(code: str, detail: str, **extra: Any) -> dict[str, Any]:
     return {"code": code, "detail": detail, **extra}
 
 
-def analyze(state: dict[str, Any]) -> dict[str, Any]:
-    """Errors, warnings, notes and the density estimate for a collected forest."""
+def analyze(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = frozenset()) -> dict[str, Any]:
+    """Errors, warnings, notes and the density estimate for a collected forest.
+
+    padded_gaps are the item indices whose geomlist entry forest_validate's fix just padded: a 0 there is a gap
+    the fix made because no source was found, not one the user chose, so it is an error (SOURCE_UNRESOLVED).
+    """
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     notes: list[dict[str, Any]] = []
@@ -517,10 +549,17 @@ def analyze(state: dict[str, Any]) -> dict[str, Any]:
             elif geom not in (0.0, 1.0, 2.0):
                 errors.append(_issue("GEOM_INVALID", f"{label}: geomlist is {item['geom_raw']} (valid: 0 gap, "
                                      "1 billboard, 2 custom object); the forest is not rebuilt", index=i))
+            elif geom == 0 and i in padded_gaps:
+                # The fix padded it: an item type the user named whose source couldn't be found by name
+                errors.append(_issue("SOURCE_UNRESOLVED", f"{label}: the fix padded geomlist with 0 (a gap) because "
+                                     "no source object was found by a unique matching name; it takes its probability "
+                                     "share of positions and places nothing there. Link its source (cobjlist) and "
+                                     "set geomlist to 2, or remove the item type", index=i))
             elif geom == 0:
                 # Live: a "Disabled" item is a legitimate gap (Forest Tools' "Disable at end" writes it too)
                 notes.append(_issue("GEOM_NONE", f"{label}: geomlist is 0 (Disabled): a gap item that takes its "
-                                    "probability share of positions and places nothing there", index=i))
+                                    "probability share of positions and places nothing there; if it should place "
+                                    "objects, link its source (cobjlist) and set geomlist to 2", index=i))
             elif geom == 2 and item["cobj"] != "n":
                 errors.append(_issue("SOURCE_MISSING", f"{label}: custom object type without a source object "
                                      "(cobjlist entry undefined); its items are empty", index=i))

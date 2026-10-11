@@ -179,7 +179,9 @@ class OutputTests(unittest.TestCase):
         script = scripts(client)[0]
         # Live (RC 7.3.5): seed = seed rebuilds without touching the segments; segmentsUpdate renames linked
         # segments to their source node, so a read never runs it unless reload_segments asks for it
-        self.assertIn("xml = rcRebuildOutput base false\nrebuilt = true", script)
+        self.assertIn("rebuilt = false or not autoOff\n"
+                      "xml = if rebuilt then (rcRebuildOutput base false) else (api.getXMLOutput())", script)
+        self.assertLess(script.index("local autoOff ="), script.index("rebuilt = false or not autoOff"))
         self.assertNotIn("segmentsUpdate", script.replace(rc._FUNCTIONS, ""))
         self.assertIn("if reloadSegs then (", rc._FUNCTIONS)
         self.assertIn(") else (base.seed = base.seed)", rc._FUNCTIONS)
@@ -221,7 +223,7 @@ class OutputTests(unittest.TestCase):
     def test_reload_segments_is_opt_in(self):
         with patch.object(rc, "client", client_with(out_raw())) as client:
             out = rc.get_railclone_output(name="RC_Fence", reload_segments=True)
-        self.assertIn("xml = rcRebuildOutput base true", scripts(client)[0])
+        self.assertIn("(rcRebuildOutput base true)", scripts(client)[0])
         self.assertTrue(out["segments_reloaded"])
         self.assertTrue(any(w.startswith("SEGMENTS_RELOADED") and "renamed every linked segment" in w
                             for w in out["warnings"]))
@@ -230,20 +232,42 @@ class OutputTests(unittest.TestCase):
                 rc.get_railclone_output(name="RC_Fence", rebuild=False, reload_segments=True)
             with self.assertRaises(ValueError):
                 rc.get_railclone_output(name="RC_Fence", reload_segments="yes")
+            with self.assertRaises(ValueError):
+                rc.get_railclone_output(name="RC_Fence", rebuild=False, force_rebuild=True)
+            with self.assertRaises(ValueError):
+                rc.get_railclone_output(name="RC_Fence", force_rebuild=1)
         client.send_command.assert_not_called()
 
     def test_auto_update_off(self):
-        # Live: with autoUpdate off no scripted call rebuilds; it is pulsed on around the read
+        # Live: with autoUpdate off no scripted call rebuilds; a forced read pulses it on around the read
         self.assertIn("if wasOff do base.autoUpdate = true", rc._FUNCTIONS)
         functions = rc._FUNCTIONS
         pulse = functions.index("if wasOff do base.autoUpdate = true")
         self.assertLess(pulse, functions.index("xml = api.getXMLOutput()"))
         self.assertLess(functions.index("xml = api.getXMLOutput()"),
                         functions.index("if wasOff do base.autoUpdate = false", pulse))
-        with patch.object(rc, "client", client_with(out_raw(auto_off="1"))):
+        # By default a manual-mode RailClone is left alone: the pulse would replace the geometry the user froze
+        with patch.object(rc, "client", client_with(out_raw(auto_off="1", rebuilt="0"))) as client:
             out = rc.get_railclone_output(name="RC_Fence")
-        self.assertFalse(out["auto_update"])
-        self.assertTrue(any(w.startswith("AUTO_UPDATE_OFF") for w in out["warnings"]))
+        self.assertIn("rebuilt = false or not autoOff", scripts(client)[0])
+        self.assertEqual((out["auto_update"], out["rebuilt"]), (False, False))
+        kept = [w for w in out["warnings"] if w.startswith("AUTO_UPDATE_OFF")]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("left alone", kept[0])
+        self.assertIn("force_rebuild=true", kept[0])
+        # force_rebuild=true does the pulse and says the new geometry is kept
+        with patch.object(rc, "client", client_with(out_raw(auto_off="1"))) as client:
+            out = rc.get_railclone_output(name="RC_Fence", force_rebuild=True)
+        self.assertIn("rebuilt = true or not autoOff", scripts(client)[0])
+        self.assertTrue(out["rebuilt"])
+        forced = [w for w in out["warnings"] if w.startswith("AUTO_UPDATE_OFF")]
+        self.assertEqual(forced, [rc._AUTO_UPDATE_NOTE])
+        # reload_segments on a manual-mode RailClone without force: segmentsUpdate isn't run (it is a rebuild)
+        with patch.object(rc, "client", client_with(out_raw(auto_off="1", rebuilt="0"))):
+            out = rc.get_railclone_output(name="RC_Fence", reload_segments=True)
+        self.assertFalse(out["segments_reloaded"])
+        self.assertTrue(any(w.startswith("RELOAD_SKIPPED") for w in out["warnings"]))
+        self.assertFalse(any(w.startswith("SEGMENTS_RELOADED") for w in out["warnings"]))
         with patch.object(rc, "client", client_with(out_raw(auto_off="1", rebuilt="0"))):
             out = rc.get_railclone_output(name="RC_Fence", rebuild=False)
         self.assertTrue(any(w.startswith("NOT_REBUILT") and "autoUpdate is off" in w for w in out["warnings"]))
@@ -290,9 +314,10 @@ def head_rows(handle=602061, base_handle="602062"):
     ]
 
 
-def inspect_raw(extra_params=()):
+def inspect_raw(extra_params=(), rebuilt=True):
     rows = ["RCINSPECT"] + head_rows() + [
-        "K|plugin_version|" + V(400), "K|style_desc|" + V("Parametric fence"),
+        "K|plugin_version|" + V(400), "K|rebuilt|" + V(rebuilt)] + (
+        ["K|style_desc|" + V("Parametric fence")] if rebuilt else []) + [
         "K|style|" + V(""), "K|savedversion|" + V("2.4.2b Pro"), "K|disabled|" + V(False),
         "K|seed|" + V(123456), "K|gscale|" + V(100.0), "K|vmesh|" + V(2), "K|rmesh|" + V(0),
         "K|stylelink|" + V(None), "K|maxseg|" + V(5000),
@@ -328,14 +353,33 @@ class InspectTests(unittest.TestCase):
         for forbidden in ("theHold.Begin", "segmentsUpdate", "setXMLStyle"):
             self.assertNotIn(forbidden, self.script.replace(rc._FUNCTIONS, ""))
         body = self.script.replace(rc._FUNCTIONS, "")
-        # getStyleDesc empties the output export until the next rebuild (live): read it, then rebuild and read
-        # the output (seed = seed: the segments are never reloaded by a read)
-        self.assertLess(body.index("getStyleDesc"), body.index("local ox = rcRebuildOutput base false"))
+        # getStyleDesc empties the output export until the next rebuild (live): read it only when this call
+        # rebuilds, then rebuild and read the output (seed = seed: the segments are never reloaded by a read)
+        self.assertIn("local rcBuild = true and (false or not ((isProperty base #autoUpdate) and "
+                      "base.autoUpdate == false))", body)
+        self.assertIn('if rcBuild do rcRow ss #("K", "style_desc", rcV (try (api.getStyleDesc())', body)
+        self.assertIn("local ox = if rcBuild then (rcRebuildOutput base false) else (api.getXMLOutput())", body)
+        self.assertLess(body.index("local rcBuild"), body.index("getStyleDesc"))
+        self.assertLess(body.index("getStyleDesc"), body.index("(rcRebuildOutput base false)"))
+
+    def test_segments_are_read_after_the_rebuild(self):
+        # Live: segmentsUpdate (reload_segments) renames each linked segment and the output's source_segment to
+        # the source node's name. Read before the rebuild, sname kept the old name and items came out 0.
+        body = self.script.replace(rc._FUNCTIONS, "")
+        self.assertLess(body.index("(rcRebuildOutput base false)"), body.index('local row = #("S", '))
+        self.assertLess(body.index("#sname"), body.index('format "END'))
+        renamed = inspect_raw().replace(V("post"), V("P23_srcBox2")).replace(
+            b64(OUTPUT), b64(OUTPUT.replace('source_segment="post"', 'source_segment="P23_srcBox2"')))
+        with patch.object(rc, "client", client_with(renamed)) as client:
+            out = rc.railclone_inspect(name="RC_Fence", reload_segments=True)
+        body = scripts(client)[0].replace(rc._FUNCTIONS, "")
+        self.assertLess(body.index("(rcRebuildOutput base true)"), body.index('local row = #("S", '))
+        self.assertEqual([(s["name"], s["items"]) for s in out["segments"]], [("rail", 1), ("P23_srcBox2", 1)])
 
     def test_reload_segments(self):
         with patch.object(rc, "client", client_with(inspect_raw())) as client:
             out = rc.railclone_inspect(name="RC_Fence", reload_segments=True)
-        self.assertIn("local ox = rcRebuildOutput base true", scripts(client)[0])
+        self.assertIn("local ox = if rcBuild then (rcRebuildOutput base true)", scripts(client)[0])
         self.assertTrue(out["output"]["segments_reloaded"])
         self.assertFalse(self.out["output"]["segments_reloaded"])
         self.assertTrue(any(w.startswith("SEGMENTS_RELOADED") for w in out["warnings"]))
@@ -343,13 +387,43 @@ class InspectTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rc.railclone_inspect(name="RC_Fence", reload_segments=1)
 
-    def test_auto_update_off_note(self):
-        raw = inspect_raw().replace("K|seed|", "K|autoUpdate|b0\nK|seed|")
+    def test_auto_update_off_is_left_alone(self):
+        # A manual-mode RailClone isn't rebuilt by a read: the last build is returned, style_desc left out
+        raw = inspect_raw(rebuilt=False).replace("K|seed|", "K|autoUpdate|b0\nK|seed|")
         with patch.object(rc, "client", client_with(raw)):
             out = rc.railclone_inspect(name="RC_Fence")
         self.assertIs(out["node"]["settings"]["autoUpdate"], False)
-        self.assertTrue(any(w.startswith("AUTO_UPDATE_OFF") for w in out["warnings"]))
+        self.assertIsNone(out["node"]["style_desc"])
+        self.assertFalse(out["output"]["rebuilt"])
+        kept = [w for w in out["warnings"] if w.startswith("AUTO_UPDATE_OFF")]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("left alone", kept[0])
+        self.assertIn("style_desc is left out", kept[0])
         self.assertFalse(any(w.startswith("AUTO_UPDATE_OFF") for w in self.out["warnings"]))
+        with patch.object(rc, "client", client_with(raw)):
+            out = rc.railclone_inspect(name="RC_Fence", reload_segments=True)
+        self.assertFalse(out["output"]["segments_reloaded"])
+        self.assertTrue(any(w.startswith("RELOAD_SKIPPED") for w in out["warnings"]))
+        # force_rebuild=true pulses autoUpdate and says the new geometry is kept
+        forced = inspect_raw().replace("K|seed|", "K|autoUpdate|b0\nK|seed|")
+        with patch.object(rc, "client", client_with(forced)) as client:
+            out = rc.railclone_inspect(name="RC_Fence", force_rebuild=True)
+        self.assertIn("local rcBuild = true and (true or not", scripts(client)[0])
+        self.assertTrue(out["output"]["rebuilt"])
+        self.assertIn(rc._AUTO_UPDATE_NOTE, out["warnings"])
+
+    def test_rebuild_false(self):
+        with patch.object(rc, "client", client_with(inspect_raw(rebuilt=False))) as client:
+            out = rc.railclone_inspect(name="RC_Fence", rebuild=False)
+        self.assertIn("local rcBuild = false and (false or not", scripts(client)[0])
+        self.assertFalse(out["output"]["rebuilt"])
+        self.assertTrue(any(w.startswith("NOT_REBUILT") for w in out["warnings"]))
+        with patch.object(rc, "client", client_with()) as client:
+            for kw in ({"rebuild": False, "reload_segments": True}, {"rebuild": False, "force_rebuild": True},
+                       {"rebuild": "no"}, {"force_rebuild": 1}):
+                with self.subTest(kw=kw), self.assertRaises(ValueError):
+                    rc.railclone_inspect(name="RC_Fence", **kw)
+        client.send_command.assert_not_called()
 
     def test_node(self):
         node = self.out["node"]

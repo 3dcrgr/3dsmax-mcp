@@ -54,7 +54,8 @@ undo "MCP Forest scatter" on (
     fp.heightlist = hs
     -- Density is the tile size: about 1437 items per units_x * units_y tile with the stock map. The
     -- maxdensity setting is a cap on candidate cells (millions), not a density: it is never written.
-    fp.units_x = units.decodeValue "@@UNITS_X@@cm"
+    -- A new forest has lock_ratio on, which uses units_x for both sides (live): unequal units turn it off.
+@@UNLOCK@@    fp.units_x = units.decodeValue "@@UNITS_X@@cm"
     fp.units_y = units.decodeValue "@@UNITS_Y@@cm"
     fp.seed = @@SEED@@
     fp.iconSize = units.decodeValue "@@ICON@@cm"
@@ -124,7 +125,8 @@ def scatter_forest_pack(
     Density is Forest Pack's tile size (units_x/units_y): about 1437 items per tile with the default density
     map, so the full scatter is ~ 1437 * surface area / (units_x * units_y) (estimated_count). items_per_m2 sets
     both units to 100 * sqrt(1437 / items_per_m2) cm. Otherwise density is a percentage of density_units_x/y_cm:
-    100 keeps them, 200 gives twice the items (units / sqrt(2)). count is trees.count(), the viewport build:
+    100 keeps them, 200 gives twice the items (units / sqrt(2)). Unequal units turn lock_ratio off (a new forest
+    has it on, which uses units_x for both sides). count is trees.count(), the viewport build:
     over Max items Viewport (vmaxitems, 50000) Forest Pack thins it (100 cm tiles on 100 m2: 35800 shown,
     143700 rendered), reported as VIEWPORT_LIMIT. Over maxdensity (millions of candidate cells) it scatters 0.
     facing_mode 0/'normal' aligns items to the surface normal, 1/'up' to world up (direction 0 and 100);
@@ -177,11 +179,13 @@ def scatter_forest_pack(
         units_x, units_y = base_x / factor, base_y / factor
     if min(units_x, units_y) < 1.0:
         raise ValueError("the density tile would be under 1 cm; lower density or items_per_m2")
+    square = f"{units_x:.4f}" == f"{units_y:.4f}"
 
     report = fh.lines(client.send_command(fh.wrap(fh.fill(
         _SCATTER_BODY,
         SURFACES=fh.mxs_b64_array(surface_names), GEOMETRY=fh.mxs_b64_array(geometry_names),
         NAME=fh.b64(name), PROBS="#(" + ", ".join(fh.mxs_float(w) for w in weights) + ")",
+        UNLOCK="" if square else "    fp.lock_ratio = false\n",
         FALLBACK_W=f"{fallback_w:.4f}", FALLBACK_H=f"{fallback_h:.4f}", UNITS_X=f"{units_x:.4f}",
         UNITS_Y=f"{units_y:.4f}", SEED=seed, ICON=f"{icon_cm:.4f}", VMESH=vmesh, RMESH=rmesh, DIRECTION=direction,
         SMIN=int(round(smin)), SMAX=int(round(smax)), RMIN=int(round(rmin)), RMAX=int(round(rmax))))))
@@ -210,7 +214,13 @@ def scatter_forest_pack(
         warnings.append(f"DIRECTION_NOT_APPLIED: direction reads {settings['direction']:g}, not {direction}"
                         + ("; 'Scale to fit sloped areas' is on, which forces it to 0" if settings["scale_to_slope"]
                            else ""))
-    lock = bool(settings.get("lock_ratio"))
+    # The lock as read back (on when the units are equal: a new forest has it on, and it's only written off).
+    # With it on Forest Pack uses units_x for both sides, so the reported tile is the one it uses.
+    lock = bool(settings.get("lock_ratio")) if settings else square
+    effective_y = units_x if lock else units_y
+    if lock and not square:
+        warnings.append(f"UNITS_Y_IGNORED: lock_ratio reads on, so Forest Pack uses units_x ({units_x:g} cm) for "
+                        f"both sides and ignores units_y ({units_y:g} cm)")
     estimate = fh.estimate_count(area_m2, units_x / 100.0, units_y / 100.0, lock_ratio=lock) if stock_map else None
     limits: dict[str, Any] = {}
     if caps is not None and len(caps) >= 6:
@@ -232,8 +242,9 @@ def scatter_forest_pack(
         "geometry": [{"name": fh.unb64(f[1]), "width": float(f[2]), "height": float(f[3])}
                      for f in (line.split("|") for line in report if line.startswith("G|"))],
         "units_x_cm": round(units_x, 3),
-        "units_y_cm": round(units_y, 3),
-        "items_per_m2_estimate": round(fh.ITEMS_PER_TILE / ((units_x / 100.0) * (units_y / 100.0)), 3),
+        "units_y_cm": round(effective_y, 3),
+        "lock_ratio": lock,
+        "items_per_m2_estimate": round(fh.ITEMS_PER_TILE / ((units_x / 100.0) * (effective_y / 100.0)), 3),
         "facing": _FACING_NAMES.get(direction, "custom"),
         "direction": direction,
         "seed": seed,

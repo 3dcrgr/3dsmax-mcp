@@ -28,11 +28,19 @@ MS_ERROR = "__MCP_MS_ERR__:"
 UNDO_PARAMS = "MCP RailClone params"
 UNDO_LIBRARY = "MCP RailClone from library"
 UNDO_CLEANUP = "MCP RailClone cleanup"
-_AUTO_UPDATE_NOTE = ("AUTO_UPDATE_OFF: autoUpdate is off, so no scripted call rebuilds this RailClone; it was "
-                     "switched on for the read and back off (undo off), and the rebuilt output is kept")
+_AUTO_UPDATE_NOTE = ("AUTO_UPDATE_OFF: autoUpdate is off (manual mode); force_rebuild=true switched it on for the "
+                     "read and back off (undo off), so the RailClone was rebuilt and keeps the new geometry, which "
+                     "can't be undone")
+_AUTO_UPDATE_KEPT = ("AUTO_UPDATE_OFF: autoUpdate is off (manual mode), so the RailClone was left alone and this is "
+                     "its last build: it can be stale after moves or edits, and empty after a script called "
+                     "getStyleDesc(). force_rebuild=true builds it (autoUpdate on for the read and back off, undo "
+                     "off); the new geometry is kept, can't be undone, and a heavy RailClone blocks Max while it "
+                     "builds")
 _RELOAD_NOTE = ("SEGMENTS_RELOADED: segmentsUpdate ran (reload_segments). On RailClone 7.3.5 it changed no "
                 "geometry, but it renamed every linked segment (sname) to its source node's name, so sname can "
                 "differ from the segment's name in the style XML; it isn't undoable")
+_RELOAD_SKIPPED = ("RELOAD_SKIPPED: nothing was rebuilt (autoUpdate is off), so segmentsUpdate didn't run; "
+                   "force_rebuild=true runs it")
 
 
 def _b64(text: str) -> str:
@@ -135,7 +143,8 @@ fn rcRestoreSel prevSel = (
 -- segments. segmentsUpdate changes no geometry there, but renames every linked segment (sname) to
 -- its source node's name, so it runs only when reloadSegs is true. With autoUpdate off no scripted
 -- call rebuilds and the build is lazy: autoUpdate goes on, the export is read, then it goes back
--- off (the rebuilt output is kept). All with undo off.
+-- off (the rebuilt output is kept). All with undo off. The read tools call it on a RailClone with
+-- autoUpdate off only when asked to (force_rebuild): it replaces the geometry the user froze.
 fn rcRebuildOutput base reloadSegs = (
     local api = rcApi base #getXMLOutput
     local xml = undefined
@@ -518,12 +527,16 @@ def get_railclone_output(
     include_xml: bool = False,
     rebuild: bool = True,
     reload_segments: bool = False,
+    force_rebuild: bool = False,
 ) -> dict[str, Any]:
     """Inspect RailClone getXMLOutput at the current frame, without rendering.
 
     rebuild (default) re-evaluates first with seed = seed, undo off: moving or
     copying a RailClone does not, so cached output goes stale. It doesn't touch the
-    segments. With autoUpdate off it is switched on for the read and back off.
+    segments. A RailClone with autoUpdate off (manual mode) is left alone and its
+    last build returned (AUTO_UPDATE_OFF), unless force_rebuild=true: that switches
+    autoUpdate on for the read and back off, and keeps the new geometry (not
+    undoable; a heavy RailClone blocks Max while it builds).
     reload_segments=true also runs segmentsUpdate: on RailClone 7.3.5 that changed
     no geometry but renamed each linked segment to its source node. Items keep
     RailClone's attributes verbatim (index, source_segment, instanced, tm, box,
@@ -538,12 +551,16 @@ def get_railclone_output(
     integer(limit, "limit", high=10000)
     if type(include_xml) is not bool:
         raise ValueError("include_xml must be boolean")
-    if type(rebuild) is not bool or type(reload_segments) is not bool:
-        raise ValueError("rebuild and reload_segments must be boolean")
-    if reload_segments and not rebuild:
-        raise ValueError("reload_segments rebuilds the RailClone; it can't be combined with rebuild=false")
+    if type(rebuild) is not bool or type(reload_segments) is not bool or type(force_rebuild) is not bool:
+        raise ValueError("rebuild, reload_segments and force_rebuild must be boolean")
+    if (reload_segments or force_rebuild) and not rebuild:
+        raise ValueError("reload_segments and force_rebuild rebuild the RailClone; they can't be combined with "
+                         "rebuild=false")
     if rebuild:
-        read_code = f"xml = rcRebuildOutput base {_mxs_bool(reload_segments)}\nrebuilt = true\n"
+        # autoUpdate off is the user's manual mode: rebuilding it replaces the geometry they froze
+        read_code = (f"rebuilt = {_mxs_bool(force_rebuild)} or not autoOff\n"
+                     f"xml = if rebuilt then (rcRebuildOutput base {_mxs_bool(reload_segments)}) "
+                     "else (api.getXMLOutput())\n")
     else:
         read_code = "xml = api.getXMLOutput()\n"
     raw = _send(_target(name, handle) + f'''
@@ -566,6 +583,8 @@ local shared = for n in (rcShared obj) collect (rcEncode n.name)
     except (ValueError, UnicodeError) as exc:
         raise RailCloneError("INVALID_READBACK", "Incomplete output response; inspect before retrying") from exc
     auto_off = parts[6] == "1"
+    rebuilt = parts[5] == "1"
+    reloaded = reload_segments and rebuilt
     node_rows = rclib.parse_matrix(parts[3])
     root = _xml(xml, "RailClone")
     items = [dict(item.attrib) for item in root.findall("item")]
@@ -582,15 +601,17 @@ local shared = for n in (rcShared obj) collect (rcEncode n.name)
                         "and empty after a script calls getStyleDesc() (it clears the export until a rebuild)"
                         + ("; autoUpdate is off, so it is stale until a rebuild" if auto_off else ""))
     elif auto_off:
-        warnings.append(_AUTO_UPDATE_NOTE)
-    if reload_segments:
+        warnings.append(_AUTO_UPDATE_NOTE if rebuilt else _AUTO_UPDATE_KEPT)
+    if reloaded:
         warnings.append(_RELOAD_NOTE)
+    elif reload_segments:
+        warnings.append(_RELOAD_SKIPPED)
     if summary["placed"] == 0:
         warnings.append("EMPTY_OUTPUT: no placed items (no spline assigned, or the style produces nothing)")
     result.update(
         schema=dict(root.attrib), total=len(items), offset=offset, items=items[offset:end],
         truncated=end < len(items), next_offset=end if end < len(items) else None,
-        rebuilt=parts[5] == "1", segments_reloaded=reload_segments, auto_update=not auto_off,
+        rebuilt=rebuilt, segments_reloaded=reloaded, auto_update=not auto_off,
         space="object", node_tm=node_rows,
         placed=summary["placed"], placeholders=summary["placeholders"], by_segment=summary["by_segment"],
         bounds_object=summary["bounds_object"], bounds_world=summary["bounds_world"],
@@ -615,7 +636,8 @@ def _rows(tag: str, fields: tuple[str, ...]) -> str:
             ')\n')
 
 
-def _inspect_body(*, graph: bool, output: bool, bases: bool, segments: bool, reload: bool = False) -> str:
+def _inspect_body(*, graph: bool, output: bool, bases: bool, segments: bool, reload: bool = False,
+                  rebuild: bool = True, force: bool = False) -> str:
     body = '''
 local base = obj.baseObject
 local api = getInterface base #railclone
@@ -643,8 +665,6 @@ for n in (rcShared obj) do rcRow ss #("D", rcV n)
     if bases:
         body += _rows("B", rclib.BASE_FIELDS)
     body += _rows("P", rclib.PARAM_FIELDS)
-    if segments:
-        body += _rows("S", rclib.SEGMENT_FIELDS)
     if graph:
         body += f'''if isProperty api #getXMLStyle then (
     local sx = api.getXMLStyle()
@@ -652,14 +672,23 @@ for n in (rcShared obj) do rcRow ss #("D", rcV n)
 ) else rcRow ss #("W", rcEncode "XML_API_UNAVAILABLE: no getXMLStyle; graph skipped")
 '''
     if output:
-        # getStyleDesc() empties RailClone's output export until the next rebuild (live), so it is read
-        # before the rebuild; the export is full again afterwards. Without the output it isn't read at all.
-        body += 'rcRow ss #("K", "style_desc", rcV (try (api.getStyleDesc()) catch undefined))\n'
+        # A RailClone with autoUpdate off (manual mode) is rebuilt only on request (force): rebuilding replaces
+        # the geometry the user froze. getStyleDesc() empties RailClone's output export until the next rebuild
+        # (live), so it is read only when this call rebuilds, before the rebuild; the export is full again
+        # afterwards. Without a rebuild (or without the output) it isn't read at all.
+        body += (f'local rcBuild = {_mxs_bool(rebuild)} and ({_mxs_bool(force)} or not ((isProperty base '
+                 '#autoUpdate) and base.autoUpdate == false))\n')
+        body += 'rcRow ss #("K", "rebuilt", rcV rcBuild)\n'
+        body += 'if rcBuild do rcRow ss #("K", "style_desc", rcV (try (api.getStyleDesc()) catch undefined))\n'
         body += f'''if isProperty api #getXMLOutput then (
-    local ox = rcRebuildOutput base {_mxs_bool(reload)}
+    local ox = if rcBuild then (rcRebuildOutput base {_mxs_bool(reload)}) else (api.getXMLOutput())
     if ox.count > {MAX_XML_CHARS} then rcRow ss #("W", rcEncode "XML_TOO_LARGE: output XML over the limit; output skipped") else rcRow ss #("O", rcEncode ox)
 ) else rcRow ss #("W", rcEncode "XML_API_UNAVAILABLE: no getXMLOutput; output skipped")
 '''
+    if segments:
+        # After the rebuild: segmentsUpdate (reload) renames linked segments, and the output's source_segment
+        # with them (live), so the names read here match the output's
+        body += _rows("S", rclib.SEGMENT_FIELDS)
     return body + 'format "END\\n" to:ss\nss as string\n'
 
 
@@ -700,23 +729,34 @@ def _node_ref(value: Any) -> dict[str, Any] | None:
 
 @mcp.tool()
 def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = True,
-                      reload_segments: bool = False) -> dict[str, Any]:
+                      reload_segments: bool = False, rebuild: bool = True,
+                      force_rebuild: bool = False) -> dict[str, Any]:
     """Read one RailClone: settings, bases, exposed parameters, segments, graph summary and output counts.
 
-    Read only, one call. Parameters report the value from the array their type
+    One call. Parameters report the value from the array their type
     uses (0 int, 1 float, 2 percent, 3 distance in scene units plus value_mm,
     4 bool, 5 selector with options, 6 string (read only), 7 separator), their
     limits (RailClone does not enforce them) and, with include_graph, which graph
     inputs use them and each base's role (path, clip, surface) from the graph.
     The output counts come after a rebuild with seed = seed (undo off), which
     doesn't touch the segments; reload_segments=true runs segmentsUpdate instead
-    (on RailClone 7.3.5 it renamed linked segments to their source nodes). Use
-    get_railclone_output for positions.
+    (on RailClone 7.3.5 it renamed linked segments to their source nodes).
+    rebuild=false reads the last export (no style_desc then: reading it empties
+    the export until a rebuild). A RailClone with autoUpdate off (manual mode) is
+    never rebuilt unless force_rebuild=true, which switches autoUpdate on for the
+    read and back off and keeps the new geometry (not undoable; a heavy RailClone
+    blocks Max while it builds). Use get_railclone_output for positions.
     """
-    if type(include_graph) is not bool or type(reload_segments) is not bool:
-        raise ValueError("include_graph and reload_segments must be boolean")
+    for label, value in (("include_graph", include_graph), ("reload_segments", reload_segments),
+                         ("rebuild", rebuild), ("force_rebuild", force_rebuild)):
+        if type(value) is not bool:
+            raise ValueError(f"{label} must be boolean")
+    if (reload_segments or force_rebuild) and not rebuild:
+        raise ValueError("reload_segments and force_rebuild rebuild the RailClone; they can't be combined with "
+                         "rebuild=false")
     raw = _send(_target(name, handle) + _inspect_body(graph=include_graph, output=True, bases=True,
-                                                       segments=True, reload=reload_segments))
+                                                       segments=True, reload=reload_segments, rebuild=rebuild,
+                                                       force=force_rebuild))
     data = _parse_inspect(raw)
     info, warnings = data["info"], list(data["warnings"])
     upm = info.get("upm") if isinstance(info.get("upm"), float) and info.get("upm") > 0 else None
@@ -766,19 +806,27 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
         except ValueError as exc:
             warnings.append(f"GRAPH_UNREADABLE: {exc}")
     output = None
+    rebuilt = info.get("rebuilt") is True
     if data["output"] is not None:
         try:
             items = [dict(it.attrib) for it in _xml(data["output"], "RailClone").findall("item")]
             summary = rclib.summarize_items(items)
             output = {k: summary[k] for k in ("total", "placed", "placeholders", "by_segment")}
-            output["rebuilt"] = True
-            output["segments_reloaded"] = reload_segments
+            output["rebuilt"] = rebuilt
+            output["segments_reloaded"] = reload_segments and rebuilt
         except ValueError as exc:
             warnings.append(f"OUTPUT_UNREADABLE: {exc}")
-    if data["output"] is not None and info.get("autoUpdate") is False:
-        warnings.append(_AUTO_UPDATE_NOTE)
+    if data["output"] is not None:
+        if not rebuild:
+            warnings.append("NOT_REBUILT: the output counts are RailClone's last export; they can be stale after "
+                            "moves and copies, and empty after a script called getStyleDesc(). style_desc is left "
+                            "out: reading it empties the export until a rebuild")
+        elif info.get("autoUpdate") is False:
+            warnings.append(_AUTO_UPDATE_NOTE if rebuilt else
+                            _AUTO_UPDATE_KEPT + "; style_desc is left out: reading it empties the export until a "
+                            "rebuild")
     if reload_segments:
-        warnings.append(_RELOAD_NOTE)
+        warnings.append(_RELOAD_NOTE if rebuilt else _RELOAD_SKIPPED)
     segments = []
     for i, s in enumerate(data["segments"], 1):
         ref, mtl = s["sobjref"], s["sobjmtl"]

@@ -1105,8 +1105,8 @@ def _fix_ops(plan: list[dict[str, Any]]) -> str:
     return "#(" + ", ".join(ops) + ")"
 
 
-def _validation(state: dict[str, Any]) -> dict[str, Any]:
-    analysis = fh.analyze(state)
+def _validation(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = frozenset()) -> dict[str, Any]:
+    analysis = fh.analyze(state, padded_gaps)
     out = {
         "name": state.get("name"),
         "ok": not analysis["errors"],
@@ -1145,10 +1145,12 @@ def forest_validate(name: str, fix: bool = False) -> dict[str, Any]:
     probabilities or sizes <= 0, area lists of unequal length, no active area, active areas without a spline or
     surface, 0 items. Warnings: long lists, conamelist mismatches, an exclude listed before an include it should
     cut, density tile too large, the viewport Max Items limit thinning count (trees.count()), the maxdensity cap
-    (0 items), custom edit mode. Notes: geomlist 0 gap items. The estimate is for the stock map only. fix=true
-    pads short item lists (geomlist 2 when a source exists, else 0; probability 100; size from the source),
-    relinks missing sources by a unique matching name, pads area lists, in one undo step, then checks again. It
-    never truncates lists or writes geomlist 3.
+    (0 items, when the count is 0), custom edit mode. Notes: geomlist 0 gap items, a count that disagrees with
+    the thinning the estimate predicts. The estimate is for the stock map only. fix=true pads short item lists
+    (geomlist 2 when a source exists, else 0; probability 100; size from the source), relinks missing sources by
+    a unique matching name, pads area lists, in one undo step, then checks again. An item type it had to pad with
+    geomlist 0 (no source found) is an error after the fix, SOURCE_UNRESOLVED, not a gap note. It never
+    truncates lists or writes geomlist 3.
     """
     fh.node_name(name, "name")
     do_fix = _bool(fix, "fix")
@@ -1173,14 +1175,18 @@ def forest_validate(name: str, fix: bool = False) -> dict[str, Any]:
                            EXPECT="#(" + ", ".join(f'#("{n}", {c})' for n, c in expect) + ")",
                            OPS=_fix_ops(plan)), lib=lib)
     fixed = []
+    padded_gaps: set[int] = set()
     for line in report:
         f = line.split("|")
         if f[0] == "X":
             row = {"list": f[1], "from": int(f[2]), "to": int(f[3])}
             if f[1] == "cobjlist":
                 row["relinked"] = int(f[4])
+            elif f[1] == "geomlist":
+                # the fix wrote these entries: a 0 among them is a source it couldn't find, not a chosen gap
+                padded_gaps.update(range(row["from"] + 1, row["to"] + 1))
             fixed.append(row)
-    after = _validation(fh.parse_state(report))
+    after = _validation(fh.parse_state(report), padded_gaps)
     after["fixed"] = fixed
     after["errors_before"] = result["errors"]
     return after
