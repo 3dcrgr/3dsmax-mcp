@@ -182,6 +182,16 @@ After deletion, verify the scene object count, remaining base references, genera
 output, and a fresh viewport capture. Save the editable scene to the task's output
 location. Do not reset the user's scene or render unless asked.
 
+## RailClone settings that affect rendering and loading
+
+- **`fullMeshProxy`** (`HKCU\Software\Itoo Software\RailClone Pro`, RailClone 7.1.4+; 1 is the default):
+  - With 1, V-Ray Proxy segments are converted to full mesh.
+  - It's allowed, but **warn before suggesting to turn it on**, whoever proposes it. On RailClone 7+ it's not needed for V-Ray GPU or Chaos Vantage any more, and it costs memory and translation time.
+  - Never write it from a tool. `itoo_vantage_check` reports it (`FULL_MESH_PROXY_ON`) after reading it inside 3ds Max, because the MCP process may not see iToo's registry keys.
+- **`libUpdateStyles`** (same key, 1 on the production machine):
+  - Loading a library style may update every scene RailClone that uses the same style. Before `railclone_from_library` loads a style the scene already uses, say that existing objects may change.
+  - Verification on 7.3.5 is pending (MCP_ISSUES).
+
 ## Official references
 
 Read the relevant page when authoring an unfamiliar rule:
