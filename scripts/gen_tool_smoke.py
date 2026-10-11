@@ -35,6 +35,7 @@ SKIP_DEFAULT = {
     "vantage_status",
     "vantage_get_image",
     "vantage_live_link",
+    "itoo_vantage_check",
     "script_controller",
     "resting_check",
     "drop_to_surface",

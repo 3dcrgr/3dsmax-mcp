@@ -98,11 +98,13 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "forest_edit_items",
             "forest_set_mode",
             "forest_validate",
+            "itoo_vantage_check",
         ],
         "recipes": [
             "Create with scatter_forest_pack or forest_from_library; both return the real item count.",
             "Run forest_validate when a forest shows 0 items; read items with forest_items.",
             "Edit items with forest_edit_items; it needs custom edit mode (allow_custom_edit or forest_set_mode).",
+            "Before rendering in Chaos Vantage, run itoo_vantage_check (read-only): Forest Color slot 1, opacity, CPU-only features, caps.",
         ],
         "gotchas": [
             "Density is units_x/units_y (about 1437 items per tile with the default map); maxdensity does nothing.",
@@ -128,8 +130,10 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "get_railclone_style",
             "set_railclone_style",
             "get_railclone_output",
+            "itoo_vantage_check",
         ],
         "recipes": [
+            "Before rendering in Chaos Vantage, run itoo_vantage_check (read-only): RailClone Color slot 1, render settings, sobjmtl wrapping, caps.",
             "Read railclone_inspect first: bases, exposed parameters (typed values, limits, selector options), segments and output counts.",
             "Change exposed parameters with railclone_set_param (exact name or id); it validates limits, which RailClone does not enforce.",
             "Find library items with railclone_library and create them with railclone_from_library, passing the splines.",

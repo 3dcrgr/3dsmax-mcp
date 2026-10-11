@@ -67,6 +67,7 @@ MODULE_CATEGORY = {
     "railclone": "RailClone",
     "render": "Render",
     "vantage": "Render",
+    "itoo_vantage": "Render",
     "scattering": "Scattering",
     "forest": "Scattering",
     "state_sets": "State Sets",

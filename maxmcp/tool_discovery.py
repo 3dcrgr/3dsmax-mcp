@@ -144,8 +144,8 @@ TOOLSET_SPECS = (
     ),
     ToolsetSpec(
         "rendering",
-        "Render configuration, render automation drivers, and Chaos Vantage status, frame grab and Live Link.",
-        ("render", "render_automations", "vantage"),
+        "Render configuration, render automation drivers, Chaos Vantage status, frame grab and Live Link, and the iToo (Forest Pack, RailClone) Vantage readiness check.",
+        ("render", "render_automations", "vantage", "itoo_vantage"),
     ),
 )
 
