@@ -91,6 +91,93 @@ def check_formats(test, script):
             test.assertEqual(fmt.count("%"), len(_top_level_args(rest)), rest)
 
 
+# MAXScript reserved keywords (a local named "at" was a parse error, live), plus predefined constants that
+# shouldn't be shadowed.
+MXS_RESERVED = frozenset("""about and animate as at attributes by case catch collect continue coordsys do else
+exit fn for from function global if in local macroscript mapped max not of off on or parameters persistent plugin
+rcmenu return rollout set struct then throw to tool try undo utility when where while with true false ok undefined
+unsupplied dontcollect pi e""".split())
+
+
+def _code_lines(script):
+    """Script lines with -- comments removed (the scripts keep no "--" inside strings)."""
+    return [line.split("--")[0] for line in script.splitlines()]
+
+
+def _split_top_level(text):
+    parts, depth, current, in_string = [], 0, "", False
+    for ch in text:
+        if in_string:
+            in_string = ch != '"'
+        elif ch == '"':
+            in_string = True
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += ch
+    return parts + [current]
+
+
+def declared_names(script):
+    """Names declared as locals, function parameters and loop variables."""
+    names = []
+    for code in _code_lines(script):
+        for m in re.finditer(r"\blocal\s+(.*)", code):
+            names += [n.group(1) for n in (re.match(r"\s*(\w+)", p) for p in _split_top_level(m.group(1))) if n]
+        m = re.match(r"\s*fn\s+\w+((?:\s+\w+)*)\s*=", code)
+        if m:
+            names += m.group(1).split()
+        names += re.findall(r"\bfor\s+(\w+)\s+(?:in|=)", code)
+    return names
+
+
+def deletes_outside_undo_off(script):
+    """Node deletes that are not inside a `with undo off (...)` block."""
+    found, stack, in_string = [], [], False
+    text = "\n".join(_code_lines(script))
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            in_string = ch != '"'
+        elif ch == '"':
+            in_string = True
+        elif text.startswith("with undo off (", i):
+            stack.append(True)
+            i += len("with undo off (")
+            continue
+        elif ch == "(":
+            stack.append(False)
+        elif ch == ")":
+            stack.pop()
+        elif text.startswith("delete ", i) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "._")):
+            if not any(stack):
+                end = text.find("\n", i)
+                found.append(text[i:end if end >= 0 else len(text)])
+        i += 1
+    return found
+
+
+def check_live_pitfalls(test, script):
+    """The MAXScript pitfalls met in the live test (docs/fork/forest-pack.md)."""
+    for name in declared_names(script):
+        test.assertNotIn(name.lower(), MXS_RESERVED, f"'{name}' is a MAXScript keyword or constant")
+    for code in _code_lines(script):
+        # a for-collect only straight into a local (or as a function's whole body), never inside another
+        # expression: written into a call's arguments it failed with "Bad free thunk local member index"
+        if re.search(r"\bcollect\b", code):
+            test.assertRegex(code, r"^\s*(local \w+ = for |fn \w+[\w ]*= \(for )", code)
+        # getHandleByAnim returns an IntegerPtr
+        test.assertGreaterEqual(code.count("as integer64"), code.count("getHandleByAnim"), code)
+    # a ray from z = 1e7 missed a plane at z = 0 (float precision)
+    test.assertNotRegex(script, r"\bray\s*\[[^\]]*\d[eE][+-]?\d")
+
+
 def check_script(test, script):
     low = script.lower()
     for word in FORBIDDEN:
@@ -100,6 +187,7 @@ def check_script(test, script):
     test.assertNotRegex(script, r"geomlist\s*=\s*#\(\s*3")
     test.assertNotIn("maxdensity", low)
     check_formats(test, script)
+    check_live_pitfalls(test, script)
 
 
 class ImportTargetTests(unittest.TestCase):
@@ -195,6 +283,23 @@ class HelperTests(unittest.TestCase):
         for name in fh.AREA_LISTS:
             self.assertIn(f'"{name}"', fh.MXS_LIB)
         check_formats(self, fh.COLLECT_FN)
+
+    def test_live_pitfall_checks(self):
+        """The script checks catch each MAXScript failure met in the live test."""
+        check_live_pitfalls(self, fh.MXS_LIB + fh.COLLECT_FN)
+        bad = ["local an = #(), at = #()",  # keyword as a name: parse error
+               "fn f nd to = (nd)",
+               "for by in #(1) do print by",
+               "local ok = true",
+               "setProperty nd p (for k in keep where k <= v.count collect v[k])",  # Bad free thunk
+               "fp.namelist = for g in geos collect g.name",
+               "format \"%\" ((getHandleByAnim o) as string) to:ss",  # IntegerPtr
+               "intersectRay s (ray [p.x, p.y, 1e7] [0, 0, -1])"]  # missed a plane at z = 0
+        for script in bad:
+            with self.subTest(script=script), self.assertRaises(AssertionError):
+                check_live_pitfalls(self, script)
+        self.assertEqual(deletes_outside_undo_off("with undo off (\n    (for o in a do delete o)\n)\ndelete b\n"
+                                                  "t.delete 3\nundo on (delete c)"), ["delete b", "delete c)"])
 
     def test_name_list(self):
         self.assertEqual(fh.name_list("A", "x"), ["A"])
@@ -331,10 +436,22 @@ class ForestEditTests(unittest.TestCase):
         self.assertLess(script.index("t.update()\nlocal n0 = t.count()"), script.index("nd.mode = 1"))
         self.assertLess(script.index('undo "MCP Forest edit items" on'), script.index("nd.mode = 1"))
         self.assertEqual(script.count("undo \"MCP"), 1)
-        self.assertLess(script.index("for op in mods do"), script.index("for d in dels do t.delete d"))
+        self.assertLess(script.index("for op in mods where op[1] != #rotation do"), script.index("for d in dels do t.delete d"))
+        # rotations after the other edits, as final angles (random part subtracted), before the deletes
+        self.assertLess(script.index("for op in mods where op[1] != #rotation do"),
+                        script.index("for op in mods where op[1] == #rotation do fpSetAngle t nd op[2] op[3]"))
+        self.assertLess(script.index("fpSetAngle t nd op[2] op[3]"), script.index("for d in dels do t.delete d"))
+        self.assertIn("t.setRotation i [0, 0, target - (degToRad randomPart)]", script)
+        self.assertIn("if not (fpOnSurface nd c[1]) do append offSurface j", script)
+        # the off-surface ray starts just above the surface's bounding box (from 1e7 it missed, live)
+        self.assertIn("local z0 = s.max.z + 1.0 + 0.01 * (s.max.z - s.min.z)", script)
+        self.assertIn("(intersectRay s (ray [p.x, p.y, z0] [0, 0, -1]))", script)
+        # item state before the edits, read in custom edit mode, for the revert list
+        self.assertLess(script.index("nd.mode = 1"), script.index('format "P|'))
+        self.assertLess(script.index('format "P|'), script.index("for op in mods where op[1] != #rotation do"))
+        self.assertIn("for i in #(1, 3, 4, 5, 6, 7, 12, 20) do", script)
         self.assertLess(script.index("for d in dels do t.delete d"), script.index("t.create (fpToObj"))
         self.assertIn("q * inv", script)  # world -> object: p * inverse(objectTransform)
-        self.assertIn("[0, 0, op[3]]", script)  # rotation about Z only
         # readback: original index -> index after the deletes below it
         self.assertIn("#(#(5, 4), #(3, 2), #(4, 3), #(6, 5), #(7, 6))", script)
         self.assertEqual(out["applied"], {"move": 1, "set_rotation": 1, "delete": 3, "create": 1, "set_size": 1,
@@ -385,6 +502,41 @@ class ForestEditTests(unittest.TestCase):
         self.assertTrue(out["changed"][2]["created"])
         self.assertTrue(any("random translation" in w for w in out["warnings"]))
         self.assertFalse(any("expected" in w for w in out["warnings"]))
+
+    def test_undo_and_revert(self):
+        edits = [{"op": "move", "index": 5, "position": [40, 3010]},
+                 {"op": "set_rotation", "index": 3, "rotation_z": 45},
+                 {"op": "delete", "index": 1},
+                 {"op": "create", "position": [1, 2], "geom_id": 2},
+                 {"op": "set_seed", "index": 6, "seed": 777}]
+        report = ["C|5|4|1|1|40,3010,50|40,3010,0|20|50|0|13",
+                  "C|3|2|1|1|7,8,9|7,8,0|20|50|45|12",
+                  "C|6|5|1|1|1,1,1|1,1,0|25|60|10|777",
+                  "C|new|9|2|1|1,2,3|1,2,0|25|60|0|5",
+                  "P|1|10,20,0|20|50|30|11|1",
+                  "P|3|7,8,0|20|50|15|12|1",
+                  "P|5|40,3000,0|20|50|0|13|2",
+                  "P|6|1,1,0|25|60|90|14|1"]
+        out, _ = self.run_edit(edits, response=edit_report(m0=1, mode=1, n0=10, n2=10, switched=0, changed=report))
+        # Forest Pack doesn't record item edits in undo (live): only revert puts them back
+        self.assertFalse(out["undoable"])
+        self.assertTrue(any("undo can't revert them" in w for w in out["warnings"]))
+        self.assertEqual(out["revert"], [
+            {"op": "delete", "index": 9},
+            {"op": "set_rotation", "index": 2, "rotation_z": 15.0},
+            {"op": "move", "index": 4, "position": [40.0, 3000.0]},
+            {"op": "set_seed", "index": 5, "seed": 14},
+            {"op": "set_rotation", "index": 5, "rotation_z": 90.0},
+            {"op": "create", "position": [10.0, 20.0], "geom_id": 1, "width": 20.0, "height": 50.0,
+             "rotation_z": 30.0, "seed": 11},
+        ])
+        forest._edit_plan(out["revert"])  # a valid edit list for forest_edit_items
+        # switching out of procedural is recorded in undo, and undoing it drops every edit
+        out, _ = self.run_edit([{"op": "delete", "index": 0}], allow_custom_edit=True,
+                               response=edit_report(m0=0, mode=1, n0=10, n2=9, switched=1))
+        self.assertTrue(out["undoable"])
+        self.assertTrue(out["switched_to_custom_edit"])
+        self.assertFalse(any("undo can't revert them" in w for w in out["warnings"]))
 
     def test_move_not_applied_warning(self):
         changed = ["C|0|0|1|1|0,0,0|0,0,0|20|50|0|1"]
@@ -600,7 +752,7 @@ def library_report(count=23473, kind="preset", extra=()):
              f"A|1|3|1|0|{b64('Surface Area')}",
              f"A|2|0|1|1|{b64('Hole')}",
              f"S|{b64('Ground')}",
-             f"M|{b64('_fp_common_grass_01')}|{b64('Forest_Pro')}",
+             f"M|{b64('Lawn')}|{b64('Forest_Pro')}",
              f"M|{b64('_fp_wildgrass_09')}|{b64('Editable_mesh')}",
              f"P|{b64('_fp_wildgrass_09')}",
              f"D|{b64('area2m')}",
@@ -611,11 +763,42 @@ def library_report(count=23473, kind="preset", extra=()):
 class ForestFromLibraryTests(LibraryFixture):
     def run_place(self, response, **kw):
         fake = FakeClient(response)
-        args = {"item": "_fp_common_grass_01", "surfaces": ["Ground"]}
+        args = {"item": "_fp_common_grass_01", "surfaces": ["Ground"], "allow_undo_flush": True}
         args.update(kw)
         with patch.object(forest, "client", fake):
             out = forest.forest_from_library(**args)
         return out, fake
+
+    def test_needs_undo_flush_consent(self):
+        fake = FakeClient(library_report())
+        with patch.object(forest, "client", fake), self.assertRaises(ValueError) as ctx:
+            forest.forest_from_library(item="_fp_common_grass_01", surfaces=["Ground"])
+        self.assertIn("clears 3ds Max's undo history", str(ctx.exception))
+        self.assertEqual(fake.scripts, [])  # refused before anything reaches Max
+        for kw in ({"allow_undo_flush": "yes"}, {"allow_undo_flush": 1}):
+            fake = FakeClient(library_report())
+            with self.subTest(kw=kw), patch.object(forest, "client", fake), self.assertRaises(ValueError):
+                forest.forest_from_library(item="_fp_common_grass_01", surfaces=["Ground"], **kw)
+            self.assertEqual(fake.scripts, [])
+        # item and file checks come first: a bad item fails with its own error, not the consent one
+        with self.assertRaises(fh.ForestError) as ctx:
+            forest.forest_from_library(item="Almond", surfaces=["Ground"])
+        self.assertEqual(ctx.exception.code, "UNSUPPORTED_ITEM")
+        out, _ = self.run_place(library_report())
+        self.assertTrue(out["undo_history_cleared"])
+        self.assertFalse(out["undoable"])
+        self.assertNotIn("undo", out)
+        # the nodes to delete by hand: the forest, then its merged sources
+        self.assertEqual(out["remove_with"], ["Lawn", "_fp_wildgrass_09"])
+
+    def test_3d_remove_with_lists_the_new_forest(self):
+        report = ok(f"F|{b64('Forest_cane')}|3d|220|300|300|0|100",
+                    f"G|1|2|100|{b64('_fp_cane01')}|{b64('_fp_cane01')}|n",
+                    f"M|{b64('_fp_cane01')}|{b64('Editable_mesh')}")
+        out, _ = self.run_place(report, item="_fp_cane01")
+        self.assertEqual(out["merged_nodes"], [{"name": "_fp_cane01", "class": "Editable_mesh"}])
+        self.assertEqual(out["remove_with"], ["Forest_cane", "_fp_cane01"])
+        self.assertFalse(out["undoable"])
 
     def test_preset_script(self):
         out, fake = self.run_place(library_report(), exclude_splines=["Hole"], name="Lawn", matlib_renderer="vray")
@@ -631,7 +814,29 @@ class ForestFromLibraryTests(LibraryFixture):
         phase2 = script.index("mergeMAXFile libfile (#(objname) + deps)")
         self.assertLess(probe, script.index("for o in probeNodes where isValidNode o do delete o"))
         self.assertLess(script.index("for o in probeNodes where isValidNode o do delete o"), phase2)
-        self.assertLess(script.index('undo "MCP Forest from library" on'), phase2)
+        # Library merges clear the undo history and aren't recorded (live), so nothing goes in an undo step:
+        # phase 2 merges the object and its sources in one call, then retargets, swaps materials and hides,
+        # all with undo off. No copies, renames or deleted originals (an undo record that referred to
+        # originals deleted with undo off crashed Max on undo).
+        self.assertNotRegex(script, r'\bundo\s+(on|true|")')
+        for gone in ("copy o", "_mcp_merged", "copies", "merged["):
+            self.assertNotIn(gone, script)
+        self.assertEqual(deletes_outside_undo_off(forest._FROM_LIBRARY_BODY), [])
+        phase2_try = script.index("try (\n    with undo off (\n        mergeMAXFile libfile (#(objname) + deps) ")
+        catch_at = script.index(") catch (\n    -- fpNewNodes again")
+        self.assertLess(phase2_try, phase2)
+        for step in ("newNodes = fpNewNodes mark2", "f.surflist = surfs", "loadTempMaterialLibrary mp",
+                     "hide c", "f.trees.update()\n    )\n", 'format "FPOK\\n" to:ss',
+                     'for x in notes do format "W|%\\n" x to:ss'):
+            with self.subTest(step=step):
+                self.assertLess(phase2, script.index(step, phase2))
+                self.assertLess(script.index(step, phase2), catch_at)
+        self.assertLess(script.index("local mark2 = fpMark()"), phase2_try)
+        # on an error: delete everything created since the merge (a 3D item's new forest included), rethrow
+        self.assertIn(") catch (\n    -- fpNewNodes again: it also finds a 3D item's new forest and nodes merged "
+                      "before the error\n    leftovers = fpNewNodes mark2\n    with undo off (for o in leftovers "
+                      "where isValidNode o do delete o)\n    throw()\n)\nss as string", script)
+        self.assertIn("if f == undefined and src == undefined do throw (\"MERGE_FAILED:", script)
         self.assertEqual(script.count("mergeMAXFile"), 2)
         self.assertEqual(script.count("#useSceneMtlDups"), 2)  # never replaces the scene's materials
         self.assertNotIn("#useMergedMtlDups", script)
@@ -875,8 +1080,12 @@ class ScatterTests(unittest.TestCase):
         out, script = self.run_scatter()
         check_script(self, script)
         self.assertIn("fp.pf_aractivelist = #(true)", script)
-        self.assertIn("fp.conamelist = for g in geos collect g.name", script)
-        self.assertIn("fp.geomlist = for g in geos collect 2", script)
+        # lists collected into locals before the undo step, never inline (live: "Bad free thunk")
+        self.assertLess(script.index("local geoNames = for g in geos collect g.name"),
+                        script.index('undo "MCP Forest scatter" on'))
+        self.assertLess(script.index("local geoTypes = for g in geos collect 2"),
+                        script.index('undo "MCP Forest scatter" on'))
+        self.assertIn("fp.namelist = geoNames\n    fp.conamelist = geoNames\n    fp.geomlist = geoTypes", script)
         self.assertIn('fp.units_x = units.decodeValue "300.0000cm"', script)
         self.assertIn("fp.direction = 0", script)
         self.assertIn("fp.trees.update()\nlocal n = fp.trees.count()", script)

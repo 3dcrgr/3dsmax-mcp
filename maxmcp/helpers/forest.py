@@ -134,7 +134,10 @@ fn fpXYArea nd maxFaces = (
 fn fpKeepAreas nd keep = (
     for p in @@AR_LISTS@@ do (
         local v = (getProperty nd p) as array
-        setProperty nd p (for k in keep where k <= v.count collect v[k])
+        -- Collect into a local first: a for-collect written into a call's arguments that reads the
+        -- caller's locals fails in MAXScript ("Bad free thunk local member index", seen live)
+        local kept = for k in keep where k <= v.count collect v[k]
+        setProperty nd p kept
     )
 )
 fn fpAppendArea nd shp atype incexc isOn = (
@@ -325,11 +328,11 @@ fn fpCollect nd ss doBuild = (
         )
         format "I|%|%|%|%|%|%|%|%|%|%|%|%\n" i (if i <= gl.count then fpVal gl[i] else "-") (if i <= pl.count then fpVal pl[i] else "-") (if i <= wl.count then fpVal wl[i] else "-") (if i <= hl.count then fpVal hl[i] else "-") (if i <= cl.count then fpState cl[i] else "-") (if isValidNode src then fpEnc src.name else "") sg (if i <= nl.count then fpEnc (nl[i] as string) else "-") (if i <= cn.count then fpEnc (cn[i] as string) else "-") sw sh to:ss
     )
-    local at = nd.artypelist as array, aa = nd.pf_aractivelist as array, ai = nd.arincexclist as array
+    local atype = nd.artypelist as array, aa = nd.pf_aractivelist as array, ai = nd.arincexclist as array
     local an = nd.arnodelist as array, anm = nd.arnamelist as array
     for i = 1 to nA do (
         local ar = if i <= an.count then an[i] else undefined
-        format "A|%|%|%|%|%|%|%\n" i (if i <= at.count then fpVal at[i] else "-") (if i <= aa.count then fpVal aa[i] else "-") (if i <= ai.count then fpVal ai[i] else "-") (if i <= an.count then fpState an[i] else "-") (if isValidNode ar then fpEnc ar.name else "") (if i <= anm.count then fpEnc (anm[i] as string) else "-") to:ss
+        format "A|%|%|%|%|%|%|%\n" i (if i <= atype.count then fpVal atype[i] else "-") (if i <= aa.count then fpVal aa[i] else "-") (if i <= ai.count then fpVal ai[i] else "-") (if i <= an.count then fpState an[i] else "-") (if isValidNode ar then fpEnc ar.name else "") (if i <= anm.count then fpEnc (anm[i] as string) else "-") to:ss
     )
     local sl = nd.surflist as array
     for i = 1 to sl.count do (

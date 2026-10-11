@@ -32,6 +32,10 @@ for g in geos do (
     append ws w
     append hs h
 )
+-- Lists are collected into locals first: a for-collect written into an expression that reads the
+-- caller's locals can fail in MAXScript ("Bad free thunk local member index", seen live)
+local geoNames = for g in geos collect g.name
+local geoTypes = for g in geos collect 2
 local fp = undefined
 undo "MCP Forest scatter" on (
     fp = Forest_Pro name:(fpUnique (fpDec "@@NAME@@")) pos:[0, 0, 0]
@@ -39,9 +43,9 @@ undo "MCP Forest scatter" on (
     -- A new forest has one Surface Area entry, inactive: activating it is what makes items appear.
     fp.pf_aractivelist = #(true)
     fp.cobjlist = geos
-    fp.namelist = for g in geos collect g.name
-    fp.conamelist = for g in geos collect g.name
-    fp.geomlist = for g in geos collect 2
+    fp.namelist = geoNames
+    fp.conamelist = geoNames
+    fp.geomlist = geoTypes
     fp.problist = @@PROBS@@
     fp.widthlist = ws
     fp.heightlist = hs

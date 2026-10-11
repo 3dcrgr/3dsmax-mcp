@@ -109,6 +109,9 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "Never set geomlist to 3: it crashed Max. namelist is the master length of the item lists.",
             "Stock presets ship their Surface Area inactive (pf_aractivelist); retargeted they give 0 items until it is activated.",
             "Item edits apply only in custom edit mode; switching back to procedural discards them irreversibly.",
+            "Item edits aren't recorded in undo: forest_edit_items returns revert, an edit list that puts them back.",
+            "forest_from_library clears Max's undo history (needs allow_undo_flush=true) and isn't undoable; "
+            "delete its remove_with nodes to take it out.",
         ],
     },
     "railclone": {

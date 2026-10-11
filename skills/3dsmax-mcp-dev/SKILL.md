@@ -166,7 +166,7 @@ and `capture_tyflow_editor` for foreign flows.
 
 ### Forest Pack
 - `scatter_forest_pack` — surfaces + source geometry; auto footprint per variant. Density is the tile size (`items_per_m2`, or `density` as a % of `density_units_*_cm`); returns the real `count` and fails with `ZERO_ITEMS` when empty.
-- `forest_library` / `forest_from_library` place presets and 3D items (one-call merge with their sources, Surface Area activated, include/exclude splines, optional `matlib_renderer`); `forest_items` reads instance-ready item transforms; `forest_edit_items` needs custom edit mode (`allow_custom_edit` or `forest_set_mode`; back to procedural discards edits); run `forest_validate` on any forest with 0 items. Never write `geomlist` 3 (it crashed Max) or rely on `maxdensity` (no effect).
+- `forest_library` / `forest_from_library` place presets and 3D items (one-call merge with their sources, Surface Area activated, include/exclude splines, optional `matlib_renderer`). `forest_from_library` needs `allow_undo_flush=true` (the merge clears Max's undo history) and isn't undoable: delete its `remove_with` nodes to take it out. `forest_items` reads instance-ready item transforms; `forest_edit_items` needs custom edit mode (`allow_custom_edit` or `forest_set_mode`; back to procedural discards edits), and since item edits aren't in undo it returns `revert`, an edit list that puts them back. Run `forest_validate` on any forest with 0 items. Never write `geomlist` 3 (it crashed Max) or rely on `maxdensity` (no effect).
 
 ### RailClone (7.3.5+)
 

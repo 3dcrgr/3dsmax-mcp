@@ -97,10 +97,10 @@ local i1 = amin (n - 1) (i0 + @@LIMIT@@ - 1)
 for i = i0 to i1 do (
     local g = t.getGeomID i
     local tm = t.getFullTransform i
-    local ok = g >= 1 and g <= nT and srcOk[g]
-    local piv = if ok then (offInv[g] * tm) else tm
+    local hasSrc = g >= 1 and g <= nT and srcOk[g]
+    local piv = if hasSrc then (offInv[g] * tm) else tm
     if @@WORLD@@ do piv = piv * objTM
-    local line = "T|" + (i as string) + "|" + (g as string) + "|" + (fpB ok)
+    local line = "T|" + (i as string) + "|" + (g as string) + "|" + (fpB hasSrc)
     if @@F_POSITION@@ do line += "|" + (fpP piv.row4)
     if @@F_TRANSFORM@@ do line += "|" + (fpTM piv)
     if @@F_ROTATION_Z@@ do line += "|" + (fpF (atan2 piv.row1.y piv.row1.x))
@@ -249,16 +249,43 @@ fn fpToObj p hasZ inv baseZ = (
     local q = if hasZ then p else [p.x, p.y, baseZ]
     q * inv
 )
+fn fpWorldAngle t nd i = (
+    local cl = nd.cobjlist as array
+    local g = t.getGeomID i
+    local src = if g >= 1 and g <= cl.count then cl[g] else undefined
+    local tm = t.getFullTransform i
+    local piv = (if isValidNode src then (inverse (fpOffTM src)) * tm else tm) * nd.objectTransform
+    atan2 piv.row1.y piv.row1.x
+)
+-- Forest Pack adds the stored rotation to the item's random one (live: stored 0 gave 54.3 deg,
+-- stored 45 gave 99.3 deg), so store the target minus the random part: rotation_z is final
+fn fpSetAngle t nd i target = (
+    local randomPart = (fpWorldAngle t nd i) - (radToDeg ((t.getRotation i).z))
+    t.setRotation i [0, 0, target - (degToRad randomPart)]
+)
+-- The ray starts just above the surface's bounding box: from z = 1e7 it missed a plane at z = 0 (live,
+-- float precision)
+fn fpOnSurface nd p = (
+    local hit = false
+    local sl = nd.surflist as array
+    for s in sl while not hit do (
+        if isValidNode s do (
+            local z0 = s.max.z + 1.0 + 0.01 * (s.max.z - s.min.z)
+            if (intersectRay s (ray [p.x, p.y, z0] [0, 0, -1])) != undefined do hit = true
+        )
+    )
+    hit
+)
 fn fpItemLine t nd i tag = (
     local cl = nd.cobjlist as array
     local g = t.getGeomID i
     local tm = t.getFullTransform i
     local src = if g >= 1 and g <= cl.count then cl[g] else undefined
-    local ok = isValidNode src
-    local piv = (if ok then (inverse (fpOffTM src)) * tm else tm) * nd.objectTransform
+    local hasSrc = isValidNode src
+    local piv = (if hasSrc then (inverse (fpOffTM src)) * tm else tm) * nd.objectTransform
     local pt = t.getPosition i
     local ptw = if pt == undefined then "" else fpP (pt * nd.objectTransform)
-    "C|" + tag + "|" + (i as string) + "|" + (g as string) + "|" + (fpB ok) + "|" + (fpP piv.row4) + "|" + ptw + "|" + (fpF (t.getWidth i)) + "|" + (fpF (t.getHeight i)) + "|" + (fpF (atan2 piv.row1.y piv.row1.x)) + "|" + ((t.getSeed i) as string)
+    "C|" + tag + "|" + (i as string) + "|" + (g as string) + "|" + (fpB hasSrc) + "|" + (fpP piv.row4) + "|" + ptw + "|" + (fpF (t.getWidth i)) + "|" + (fpF (t.getHeight i)) + "|" + (fpF (atan2 piv.row1.y piv.row1.x)) + "|" + ((t.getSeed i) as string)
 )
 if fpBusy() do throw "USER_BUSY: an undo operation is open in 3ds Max; finish it first"
 local nd = fpForest "@@NAME@@"
@@ -291,7 +318,8 @@ for c in adds do (
 t.update()
 local n0 = t.count()
 if @@MAX_INDEX@@ >= n0 do throw ("BAD_INDEX: index @@MAX_INDEX@@ is outside 0.." + ((n0 - 1) as string) + " (" + (n0 as string) + " items)")
-local switched = false, mismatch = -1, created = #()
+local switched = false, mismatch = -1, created = #(), offSurface = #()
+local pre = stringStream ""
 undo "MCP Forest edit items" on (
     local n1 = n0
     if m0 == 0 do (
@@ -307,27 +335,35 @@ undo "MCP Forest edit items" on (
     ) else (
         local inv = inverse nd.objectTransform
         local baseZ = nd.objectTransform.row4.z
-        for op in mods do (
+        for i in @@TOUCHED@@ do (
+            local pt = t.getPosition i
+            format "P|%|%|%|%|%|%|%\n" i (if pt == undefined then "" else fpP (pt * nd.objectTransform)) (fpF (t.getWidth i)) (fpF (t.getHeight i)) (fpF (fpWorldAngle t nd i)) ((t.getSeed i) as string) ((t.getGeomID i) as string) to:pre
+        )
+        for op in mods where op[1] != #rotation do (
             local i = op[2]
             case op[1] of (
                 #move: t.setPosition i (fpToObj op[3] op[4] inv baseZ)
                 #width: t.setWidth i op[3]
                 #height: t.setHeight i op[3]
                 #size: t.setSize i [op[3], op[3], op[4]]
-                #rotation: t.setRotation i [0, 0, op[3]]
                 #seed: t.setSeed i op[3]
                 #geom: t.setGeomID i op[3]
             )
         )
+        -- rotations last: the random part depends on the seed and the item type
+        t.update()
+        for op in mods where op[1] == #rotation do fpSetAngle t nd op[2] op[3]
         for d in dels do t.delete d
         for k = 1 to adds.count do (
             local c = adds[k]
             t.create (fpToObj c[1] c[2] inv baseZ) addW[k] addH[k] c[3]
             local j = t.count() - 1
-            if c[6] != undefined do t.setRotation j [0, 0, c[6]]
             if c[7] != undefined do t.setSeed j c[7]
             append created j
+            if not (fpOnSurface nd c[1]) do append offSurface j
         )
+        t.update()
+        for k = 1 to adds.count where adds[k][6] != undefined do fpSetAngle t nd created[k] adds[k][6]
         t.update()
     )
 )
@@ -338,6 +374,8 @@ format "E|%|%|%|%|%|%\n" (fpEnc nd.name) m0 nd.mode n0 (t.count()) (fpB switched
 local nAfter = t.count()
 for r in @@READBACK@@ where r[2] < nAfter do format "%\n" (fpItemLine t nd r[2] (r[1] as string)) to:ss
 for k = 1 to (amin created.count @@MAX_READBACK@@) do format "%\n" (fpItemLine t nd created[k] "new") to:ss
+for j in offSurface do format "O|%\n" j to:ss
+format "%" (pre as string) to:ss
 ss as string
 '''
 
@@ -361,6 +399,7 @@ def _edit_plan(edits: Any) -> dict[str, Any]:
     creates: list[str] = []
     geom_ids: set[int] = set()
     modified: list[int] = []
+    touched_ops: dict[int, set[str]] = {}
     counts: dict[str, int] = {}
     for k, edit in enumerate(edits):
         label = f"edits[{k}]"
@@ -416,6 +455,7 @@ def _edit_plan(edits: Any) -> dict[str, Any]:
         elif op == "set_geom":
             mods.append(f"#(#geom, {index}, {geom})")
         modified.append(index)
+        touched_ops.setdefault(index, set()).add(op)
     clash = sorted(set(modified) & set(deletes))
     if clash:
         raise ValueError(f"indices {clash} are both edited and deleted; drop one of the edits")
@@ -433,7 +473,37 @@ def _edit_plan(edits: Any) -> dict[str, Any]:
         "counts": counts,
         "n_deletes": len(deletes),
         "n_creates": len(creates),
+        "deletes_list": list(deletes),
+        "touched_ops": touched_ops,
+        "touched": "#(" + ", ".join(str(i) for i in sorted(set(modified) | set(deletes))) + ")",
     }
+
+
+def _revert_edits(plan: dict[str, Any], before: dict[int, dict[str, Any]], created: list[int]) -> list[dict]:
+    """Edits that put the items back (deleted items come back at the end of the list)."""
+    deletes = plan["deletes_list"]
+    out: list[dict[str, Any]] = [{"op": "delete", "index": j} for j in sorted(created, reverse=True)]
+    for i, ops in sorted(plan["touched_ops"].items()):
+        b = before.get(i)
+        if b is None:
+            continue
+        ni = i - sum(1 for d in deletes if d < i)
+        if "move" in ops and b["point"]:
+            out.append({"op": "move", "index": ni, "position": b["point"][:2]})
+        if ops & {"set_size", "set_width", "set_height"}:
+            out.append({"op": "set_size", "index": ni, "width": b["width"], "height": b["height"]})
+        if "set_seed" in ops:
+            out.append({"op": "set_seed", "index": ni, "seed": b["seed"]})
+        if "set_geom" in ops:
+            out.append({"op": "set_geom", "index": ni, "geom_id": b["geom_id"]})
+        if ops & {"set_rotation", "set_seed", "set_geom"}:
+            out.append({"op": "set_rotation", "index": ni, "rotation_z": b["rotation_z"]})
+    for i in sorted(deletes):
+        b = before.get(i)
+        if b is not None and b["point"]:
+            out.append({"op": "create", "position": b["point"][:2], "geom_id": b["geom_id"], "width": b["width"],
+                        "height": b["height"], "rotation_z": b["rotation_z"], "seed": b["seed"]})
+    return out
 
 
 def _changed_row(f: list[str]) -> dict[str, Any]:
@@ -460,12 +530,17 @@ def forest_edit_items(name: str, edits: DictList, allow_custom_edit: bool = Fals
     edits: [{op, index, ...}], indices 0-based as forest_items returns them, all referring to the items before
     this call. move {index, position}; create {position, geom_id=1, width, height, rotation_z, seed} (size
     defaults to the item type's width/height; created items are appended); delete {index}; set_size {index,
-    width, height}; set_width; set_height; set_rotation {index, rotation_z} (degrees, about Z; Forest Pack
-    ignores X and Y); set_seed; set_geom {index, geom_id} (1-based). Positions are world [x, y] or [x, y, z] in
-    scene units; Forest Pack projects items onto the surfaces, and with random translation on, the pivot lands
-    off the point. Edits run first, then deletes (highest index first), then creates, in one undo step.
-    Returns counts before/after and the edited items read back (point = stored distribution point, position =
-    pivot).
+    width, height}; set_width; set_height; set_rotation {index, rotation_z} (the final angle in degrees about
+    world Z, random rotation included; Forest Pack ignores X and Y); set_seed; set_geom {index, geom_id}
+    (1-based). Positions are world [x, y] or [x, y, z] in scene units; Forest Pack projects items onto the
+    surfaces, and with random translation on, the pivot lands off the point. Edits run first (rotations last),
+    then deletes (highest index first), then creates. Returns counts before/after and the edited items read
+    back (point = stored distribution point, position = pivot).
+
+    Forest Pack doesn't record item edits in undo (verified live). undoable is true only when this call
+    switched the forest to custom edit: undo then switches it back to procedural, which drops every edit.
+    revert is an edit list that puts the items back when passed to forest_edit_items (deleted items come back
+    at the end of the list).
     """
     fh.node_name(name, "name")
     allow = _bool(allow_custom_edit, "allow_custom_edit")
@@ -473,7 +548,7 @@ def forest_edit_items(name: str, edits: DictList, allow_custom_edit: bool = Fals
     report = _send(fh.fill(
         _EDIT_BODY, NAME=fh.b64(name), ALLOW=_mxs_bool(allow), MODS=plan["mods"], DELETES=plan["deletes"],
         CREATES=plan["creates"], GEOM_IDS=plan["geom_ids"], MAX_INDEX=plan["max_index"],
-        READBACK=plan["readback"], MAX_READBACK=MAX_READBACK))
+        READBACK=plan["readback"], MAX_READBACK=MAX_READBACK, TOUCHED=plan["touched"]))
     head = next((line.split("|") for line in report if line.startswith("E|")), None)
     if head is None:
         raise ForestError("INVALID_READBACK", "forest_edit_items got no header line")
@@ -496,18 +571,35 @@ def forest_edit_items(name: str, edits: DictList, allow_custom_edit: bool = Fals
             elif math.dist(row["point"][:2], row["position"][:2]) > 1e-3:
                 warnings.append(f"item {row['index']}: random translation offsets the pivot from the requested "
                                 "point (position is the actual pivot)")
-    if plan["n_creates"]:
-        warnings.append("created items off every surface are kept at the given point without projection")
+    off = [int(line.split("|")[1]) for line in report if line.startswith("O|")]
+    if off:
+        warnings.append(f"created items {off} lie off every surface, so they were kept at the given point "
+                        "without projection")
     created = [row["index"] for row in changed if row.get("created")]
+    before: dict[int, dict[str, Any]] = {}
+    for line in report:
+        if line.startswith("P|"):
+            f = line.split("|")
+            before[int(f[1])] = {"point": fh.floats(f[2]) if f[2] else None, "width": float(f[3]),
+                                 "height": float(f[4]), "rotation_z": float(f[5]), "seed": int(f[6]),
+                                 "geom_id": int(f[7])}
+    switched = head[6] == "1"
+    if not switched:
+        # Forest Pack doesn't record item edits in the undo stack (live): undo can't revert them
+        warnings.append("Forest Pack doesn't record item edits in the undo stack, so undo can't revert them; "
+                        "pass revert to forest_edit_items to put the items back")
     return {
         "name": fh.unb64(head[1]),
         "mode": fh.mode_name(int(head[3])),
-        "switched_to_custom_edit": head[6] == "1",
+        "switched_to_custom_edit": switched,
         "count_before": count_before,
         "count_after": count_after,
         "applied": plan["counts"],
         "created_indices": created,
         "changed": changed,
+        # undo works only when this call switched the forest out of procedural mode: it goes back to procedural
+        "undoable": switched,
+        "revert": _revert_edits(plan, before, created),
         "warnings": warnings,
     }
 
@@ -623,28 +715,31 @@ with undo off (
                 if (findItem fileNames nm) > 0 do appendIfUnique deps nm
             )
         )
-        local an = probe.arnamelist as array, at = probe.artypelist as array
-        for i = 1 to an.count do (if not (i <= at.count and at[i] == 3) do append dropped (an[i] as string))
+        local an = probe.arnamelist as array, atype = probe.artypelist as array
+        for i = 1 to an.count do (if not (i <= atype.count and atype[i] == 3) do append dropped (an[i] as string))
     )
     for o in probeNodes where isValidNode o do delete o
 )
 if kind == "" do throw ("UNSUPPORTED_ITEM: '" + objname + "' merged neither a Forest Pack object nor geometry")
 -- Phase 2: the object and its sources in ONE merge, so Max relinks cobjlist (also through renames).
-local f = undefined, src = undefined, newNodes = #(), err = ""
+-- Live: merging a library file clears 3ds Max's whole undo history and is never recorded in undo, and
+-- loadTempMaterialLibrary clears the history too, so this placement can't be undone. The merge and every
+-- change after it run with undo off, so no undo record refers to these nodes. On an error, everything
+-- created since mark2 is deleted (with undo off) and the error is passed on.
+local f = undefined, src = undefined, newNodes = #(), leftovers = #()
 local swapped = #(), missing = #(), hidden = #(), notes = #()
-undo "MCP Forest from library" on (
-    local mark2 = fpMark()
-    mergeMAXFile libfile (#(objname) + deps) #autoRenameDups #useSceneMtlDups #neverReparent quiet:true
-    newNodes = fpNewNodes mark2
-    if kind == "preset" then (
-        for o in newNodes while f == undefined do (if classOf o.baseObject == Forest_Pro do f = o)
-    ) else (
-        for o in newNodes while src == undefined do (if superclassOf o == GeometryClass and classOf o.baseObject != Forest_Pro do src = o)
-    )
-    if f == undefined and src == undefined then (
-        err = "MERGE_FAILED: merging '" + objname + "' again created nothing usable"
-        for o in newNodes where isValidNode o do delete o
-    ) else (
+local ss = stringStream ""
+local mark2 = fpMark()
+try (
+    with undo off (
+        mergeMAXFile libfile (#(objname) + deps) #autoRenameDups #useSceneMtlDups #neverReparent quiet:true
+        newNodes = fpNewNodes mark2
+        if kind == "preset" then (
+            for o in newNodes while f == undefined do (if classOf o.baseObject == Forest_Pro do f = o)
+        ) else (
+            for o in newNodes while src == undefined do (if superclassOf o == GeometryClass and classOf o.baseObject != Forest_Pro do src = o)
+        )
+        if f == undefined and src == undefined do throw ("MERGE_FAILED: merging '" + objname + "' again created nothing usable")
         local wantName = fpDec "@@NEWNAME@@"
         if kind == "3d" then (
             f = Forest_Pro name:(fpUnique (if wantName != "" then wantName else ("Forest_" + objname))) pos:[0, 0, 0]
@@ -707,27 +802,31 @@ undo "MCP Forest from library" on (
         )
         if (fpGeomBad f) > 0 then append notes "CRASH_RISK" else f.trees.update()
     )
+    -- The report, still inside the try: a failure here also removes the placed nodes
+    format "FPOK\n" to:ss
+    local n = if (fpGeomBad f) > 0 then -1 else f.trees.count()
+    format "F|%|%|%|%|%|%|%\n" (fpEnc f.name) kind n (fpF f.units_x) (fpF f.units_y) (f.mode as string) (fpF (units.decodeValue "1m")) to:ss
+    local nl = f.namelist as array, cl = f.cobjlist as array, gl = f.geomlist as array, pl = f.problist as array
+    for g = 1 to nl.count do (
+        local c = if g <= cl.count then cl[g] else undefined
+        format "G|%|%|%|%|%|%\n" g (if g <= gl.count then fpVal gl[g] else "-") (if g <= pl.count then fpVal pl[g] else "-") (fpEnc (nl[g] as string)) (if isValidNode c then fpEnc c.name else "") (fpState c) to:ss
+    )
+    local atype = f.artypelist as array, aa = f.pf_aractivelist as array, ai = f.arincexclist as array, anm = f.arnamelist as array
+    for i = 1 to atype.count do format "A|%|%|%|%|%\n" i (fpVal atype[i]) (if i <= aa.count then fpVal aa[i] else "-") (if i <= ai.count then fpVal ai[i] else "-") (if i <= anm.count then fpEnc (anm[i] as string) else "") to:ss
+    for s in (f.surflist as array) where isValidNode s do format "S|%\n" (fpEnc s.name) to:ss
+    for o in newNodes where isValidNode o do format "M|%|%\n" (fpEnc o.name) (fpEnc ((classOf o) as string)) to:ss
+    for x in deps do format "P|%\n" (fpEnc x) to:ss
+    for x in dropped do format "D|%\n" (fpEnc x) to:ss
+    for x in swapped do format "X|swapped|%\n" (fpEnc x) to:ss
+    for x in missing do format "X|missing|%\n" (fpEnc x) to:ss
+    for x in hidden do format "Z|%\n" (fpEnc x) to:ss
+    for x in notes do format "W|%\n" x to:ss
+) catch (
+    -- fpNewNodes again: it also finds a 3D item's new forest and nodes merged before the error
+    leftovers = fpNewNodes mark2
+    with undo off (for o in leftovers where isValidNode o do delete o)
+    throw()
 )
-if err != "" do throw err
-local ss = stringStream ""
-format "FPOK\n" to:ss
-local n = if (fpGeomBad f) > 0 then -1 else f.trees.count()
-format "F|%|%|%|%|%|%|%\n" (fpEnc f.name) kind n (fpF f.units_x) (fpF f.units_y) (f.mode as string) (fpF (units.decodeValue "1m")) to:ss
-local nl = f.namelist as array, cl = f.cobjlist as array, gl = f.geomlist as array, pl = f.problist as array
-for g = 1 to nl.count do (
-    local c = if g <= cl.count then cl[g] else undefined
-    format "G|%|%|%|%|%|%\n" g (if g <= gl.count then fpVal gl[g] else "-") (if g <= pl.count then fpVal pl[g] else "-") (fpEnc (nl[g] as string)) (if isValidNode c then fpEnc c.name else "") (fpState c) to:ss
-)
-local at = f.artypelist as array, aa = f.pf_aractivelist as array, ai = f.arincexclist as array, anm = f.arnamelist as array
-for i = 1 to at.count do format "A|%|%|%|%|%\n" i (fpVal at[i]) (if i <= aa.count then fpVal aa[i] else "-") (if i <= ai.count then fpVal ai[i] else "-") (if i <= anm.count then fpEnc (anm[i] as string) else "") to:ss
-for s in (f.surflist as array) where isValidNode s do format "S|%\n" (fpEnc s.name) to:ss
-for o in newNodes where isValidNode o do format "M|%|%\n" (fpEnc o.name) (fpEnc ((classOf o) as string)) to:ss
-for x in deps do format "P|%\n" (fpEnc x) to:ss
-for x in dropped do format "D|%\n" (fpEnc x) to:ss
-for x in swapped do format "X|swapped|%\n" (fpEnc x) to:ss
-for x in missing do format "X|missing|%\n" (fpEnc x) to:ss
-for x in hidden do format "Z|%\n" (fpEnc x) to:ss
-for x in notes do format "W|%\n" x to:ss
 ss as string
 '''
 
@@ -791,8 +890,13 @@ def forest_from_library(
     matlib_renderer: str = "",
     hide_sources: bool = True,
     items_per_m2: float | None = None,
+    allow_undo_flush: bool = False,
 ) -> dict[str, Any]:
     """Place a Forest Pack library preset or 3D item on surfaces; returns the forest, item count and sources.
+
+    Merging a library file clears 3ds Max's whole undo history (verified live), so this is refused unless
+    allow_undo_flush=true. The placement itself can't be undone either: it returns undoable=false and
+    remove_with, the new forest and the merged sources, which are the nodes to delete to take it out again.
 
     item: a uuid, object or English name from forest_library. A preset is merged with its source objects in one
     merge (a probe merge first finds them; Max relinks cobjlist only when they arrive together), then
@@ -801,7 +905,7 @@ def forest_from_library(
     then inactive, since areas add up); exclude_splines cut holes. A 3D item becomes the source of a new forest
     (items_per_m2 sets its density; default 300 cm tiles, about 160 per m2). matlib_renderer (vray, corona, ...)
     swaps materials for the item library's .mat ones by name. Fails with ZERO_ITEMS when nothing is scattered.
-    One undo step (not verified live for the merge itself). 2D billboards are not supported.
+    2D billboards are not supported.
     """
     if not isinstance(item, str) or not item.strip() or len(item) > 300:
         raise ValueError("item must be a library uuid, object name or English name")
@@ -836,6 +940,11 @@ def forest_from_library(
         if matlib_renderer.lower() not in [r.lower() for r in entry["matlib_renderers"]]:
             raise ForestError("FILE_NOT_FOUND", f"no material library for '{matlib_renderer}' ({matlib}); available: "
                               f"{', '.join(entry['matlib_renderers']) or 'none'}")
+    if not _bool(allow_undo_flush, "allow_undo_flush"):
+        raise ValueError("Placing a library item merges a .max file, which clears 3ds Max's undo history, so "
+                         "earlier steps can no longer be undone, and the placement itself can't be undone either "
+                         "(the result lists the nodes to delete in remove_with). Pass allow_undo_flush=true to "
+                         "place it anyway. Nothing was sent to 3ds Max.")
     units_cm = fh.units_for_items_per_m2(density) if density else DEFAULT_3D_UNITS_CM
     report = _send(fh.fill(
         _FROM_LIBRARY_BODY, FILE=fh.b64(entry["maxfile"]), OBJECT=fh.b64(entry["object"]),
@@ -846,6 +955,11 @@ def forest_from_library(
     if "name" not in result:
         raise ForestError("INVALID_READBACK", "forest_from_library got no result line")
     result["library_item"] = {k: entry[k] for k in ("uuid", "name", "object", "maxfile", "kind", "category")}
+    # The merge cleared the undo history (live) and the script ran with undo off: undo can't remove the
+    # placement, so the caller deletes these nodes instead (the forest first, then its merged sources)
+    result["undoable"] = False
+    result["undo_history_cleared"] = True
+    result["remove_with"] = list(dict.fromkeys([result["name"]] + [m["name"] for m in result["merged_nodes"]]))
     if matlib:
         result["materials"]["matlib"] = matlib
     if density and result.get("kind") == "preset":
@@ -856,7 +970,8 @@ def forest_from_library(
             result["warnings"].append("3D library meshes carry no material; pass matlib_renderer to load one")
     if result.get("count") == 0:
         raise ForestError("ZERO_ITEMS", f"'{result['name']}' was placed but scatters 0 items; run forest_validate "
-                          "on it, check the surfaces and splines, or delete it", details=result)
+                          "on it, check the surfaces and splines, or delete the nodes in details.remove_with",
+                          details=result)
     return result
 
 

@@ -17,10 +17,10 @@ The existing `scatter_forest_pack` returned success for scatters with no items. 
 
 **New tools** (module `maxmcp/tools/forest.py`, helpers in `maxmcp/helpers/forest.py` and `forest_library.py`):
 - **`forest_items`** (read only) pages through items: pivot `position`, an instance-ready `transform`, `geom_id`, `size`, and optionally `item_name`, `source`, `rotation_z`, `scale`, `seed`. It builds the forest first. `refresh_surfaces` pulses `surfanim`.
-- **`forest_edit_items`** moves, deletes, creates and resizes items, and sets rotation, seed or item type, in one undo step. A procedural forest is refused unless `allow_custom_edit=true`, which builds it and switches it to custom edit first.
+- **`forest_edit_items`** moves, deletes, creates and resizes items, and sets rotation (the final angle, random rotation included), seed or item type. A procedural forest is refused unless `allow_custom_edit=true`, which builds it and switches it to custom edit first. Forest Pack doesn't record item edits in undo, so the result gives `undoable` (true only when the call switched the forest to custom edit) and `revert`, an edit list that puts the items back. Created items that lie off every surface are reported.
 - **`forest_set_mode`** switches between `procedural` and `custom_edit`. Going back to procedural needs `confirm_discard=true`.
 - **`forest_library`** (Python only) searches every library `index.xml`: presets, 3D items and 2D billboards.
-- **`forest_from_library`** places a preset or 3D item on surfaces, with optional include/exclude splines and a material library swap. It fails with `ZERO_ITEMS` when nothing is scattered.
+- **`forest_from_library`** places a preset or 3D item on surfaces, with optional include/exclude splines and a material library swap. It fails with `ZERO_ITEMS` when nothing is scattered. Merging a library file clears 3ds Max's undo history, so it needs `allow_undo_flush=true`, and the placement can't be undone: the result gives `undoable: false`, `undo_history_cleared: true` and `remove_with`, the nodes to delete to take it out again.
 - **`forest_validate`** checks the item and area lists, builds the forest and reports the count. `fix=true` makes conservative repairs.
 
 ## Verified Forest Pack facts
@@ -48,7 +48,7 @@ These were measured live; the tools rely on them.
 - Per-item writes work only in custom edit mode, `mode = 1`. In `mode = 0` every write is ignored.
 - Switching to `mode = 1` freezes the items as last built; on a forest never built it froze an empty set. So the forest is built in mode 0 first.
 - Setting `mode = 0` discards the edits for good; setting it back to 1 doesn't bring them back. Edits survive seed and tile changes, node moves, surface refreshes and save/merge.
-- `setRotation` takes radians and only Z takes effect. `setSize` takes absolute sizes `[w, w, h]`. `create p w h geomid` appends at index count−1 and projects onto the surface; a point off every surface is kept unprojected.
+- `setRotation` takes radians and only Z takes effect. The stored value is an offset **added** to the item's random rotation, so the final angle is random + stored: stored 0 gave 54.3°, stored 45° gave 99.3°. `forest_edit_items` stores the target minus the random part, so `rotation_z` is the final angle, and it sets rotations after the seed and item-type edits, which can change the random part. `setSize` takes absolute sizes `[w, w, h]`. `create p w h geomid` appends at index count−1 and projects onto the surface; a point off every surface is kept unprojected.
 - Deletes shift the later indices down at once, so the tools delete highest first.
 - With random translation on, a moved item's pivot lands off the requested point.
 - World to object space: `p * inverse(forest.objectTransform)`.
@@ -63,17 +63,34 @@ These were measured live; the tools rely on them.
 **Export**
 - `Forest_Pro.ForestPack.exportData file fields` is class level (`node.ForestPack` doesn't exist). It always writes **every** forest in the scene, whatever is selected, hidden or disabled: 82 MB for 12 forests. No tool uses it; `forest_items` reads one forest through `trees.*`.
 
+**Undo** (verified in the live test of 2026-10-06)
+- Merging a library `.max` file clears 3ds Max's whole undo history. This holds for Forest Pack items and RailClone items alike.
+- `mergeMAXFile` is never recorded in undo, even inside `theHold`.
+- `loadTempMaterialLibrary` also clears the whole undo history. Inside an open `theHold` step it wipes that step.
+- Forest Pack per-item edits (`trees.setPosition` and the other `trees.*` edits) are never recorded in undo. Changing `.mode` is recorded.
+- **An undo crashed Max.** A draft of `forest_from_library` merged outside undo, then, inside an undo step, made copies of the merged nodes, pointed the copied forest's `cobjlist` from the merged originals to the copies (so the undo record held the originals as the old values), and deleted the originals with undo off. A later `max undo` crashed Max. The rule: never leave an undo record that refers to a node deleted with undo off. That draft was never committed; `forest_from_library` now puts nothing in an undo step.
+
+**Testing undo.** Agents can't live-test undo: the user's rule is that agents never run `max undo` or `max redo` through MCP, because a `max redo` crashed Max 2027. The tools' undo behaviour is therefore safe by construction (no undo step in `forest_from_library`; only the mode switch is recorded in `forest_edit_items`), and the unit tests check the generated scripts for it. Undo hasn't been run on the current versions of these tools.
+
+**MAXScript pitfalls met in the live test**
+- A `for ... collect` written straight into a function call's arguments that reads the caller's locals failed with "Bad free thunk local member index", or read the wrong variable (a loop index became the stringStream). The scripts collect into a local first, then pass the local (`fpKeepAreas`, the lists in `scatter_forest_pack`).
+- Keywords can't be variable names: `local at = ...` was a parse error. It is now `atype`. The same goes for `by`, `to`, `on`, `in`, `of`, `do`, `as`, `max`, `set`, `tool`, `undo`, `from`, `with`, `where`, `while`, `collect` and the other keywords. The unit tests check every local, parameter and loop variable in the scripts.
+- `getHandleByAnim` returns an IntegerPtr; `fpMark` and `fpNewNodes` convert it with `as integer64` before comparing.
+- `intersectRay` with a ray origin at z = 1e7 missed a plane at z = 0 (float precision). The off-surface check in `forest_edit_items` starts its rays just above the surface's bounding box.
+
 ## How the tools work
 
 **`forest_items`.** One script: build (and pulse `surfanim` with `refresh_surfaces`, outside the undo stack), count items per type, then return the page. Types without a valid source return the raw item TM, flagged `no_source`. `limit` is at most 5000; a full transform costs about 100 bytes per item.
 
-**`forest_edit_items`.** Python validates every edit (ops, keys, indices, sizes, seeds) and refuses an index both edited and deleted. In Max: refuse an open undo, a `geomlist` crash risk, an unknown mode, or a procedural forest without `allow_custom_edit`; check item types (1 or 2, with a source for 2) and indices against the built count. Then, in one undo step: switch to custom edit if needed (and switch back without editing if the frozen count differs), apply edits, then deletes from the highest index, then creates, then rebuild. Edited and created items are read back with the stored point and the actual pivot.
+**`forest_edit_items`.** Python validates every edit (ops, keys, indices, sizes, seeds) and refuses an index both edited and deleted. In Max: refuse an open undo, a `geomlist` crash risk, an unknown mode, or a procedural forest without `allow_custom_edit`; check item types (1 or 2, with a source for 2) and indices against the built count. Then, in one undo step, of which only the mode switch is recorded: switch to custom edit if needed (and switch back without editing if the frozen count differs), read the state of every touched item (for `revert`), apply the edits except rotations, rebuild, set the rotations as final angles, delete from the highest index, create (a ray from just above each surface checks that the point is on one), rebuild, and set the created items' rotations. Edited and created items are read back with the stored point and the actual pivot.
 
-**`forest_from_library`.** Python finds the item by uuid, object or English name (ambiguous names list the uuids). In Max:
-1. Outside the undo stack, merge the object alone (the probe). A Forest object gives the source names from `conamelist` (falling back to `namelist`) that exist in the file, and the names of its spline areas, which are dropped. A plain mesh makes it a 3D item. The probe is deleted.
-2. In one undo step, merge the object plus its sources in one call. A 3D item becomes the only source of a new forest (`items_per_m2`, default 300 cm tiles).
+`revert` deletes the created items, puts back the position, size, seed, item type and rotation of each edited item (at its index after the deletes), and creates the deleted items again at the end of the list. `undoable` is true only when the call switched a procedural forest to custom edit: undo switches it back, which drops every edit.
+
+**`forest_from_library`.** Python finds the item by uuid, object or English name (ambiguous names list the uuids) and checks the file and the material library. Then it refuses the call unless `allow_undo_flush=true`, before anything is sent to Max. In Max:
+1. With undo off, merge the object alone (the probe). A Forest object gives the source names from `conamelist` (falling back to `namelist`) that exist in the file, and the names of its spline areas, which are dropped. A plain mesh makes it a 3D item. The probe is deleted.
+2. Merge the object plus its sources in one call, as before: no copies, no renames, no deleted originals. The merge has already cleared the undo history, so it and every step after it run with undo off, inside a `try` that also builds the report. On an error, every node created since the merge (a 3D item's new forest included) is deleted with undo off and the error is passed on. No undo record ever refers to these nodes. A 3D item becomes the only source of a new forest (`items_per_m2`, default 300 cm tiles).
 3. Retarget: `surflist` = the surfaces; the area lists are cut to the Surface Area; it is active unless include splines are given; include splines are appended as active spline areas and exclude splines as active exclusion areas.
-4. Optionally swap materials from the item library's `.mat` for `matlib_renderer` (presets: `matList` by name; 3D items: the `<material>` on the source). Hide the merged sources. Build and return the count, the item types and their linked sources, the areas, the merged nodes and the materials swapped or missing.
+4. Optionally swap materials from the item library's `.mat` for `matlib_renderer` (presets: `matList` by name; 3D items: the `<material>` on the source). Hide the merged sources. Build and return the count, the item types and their linked sources, the areas, the merged nodes and the materials swapped or missing, with `undoable: false`, `undo_history_cleared: true` and `remove_with` (the forest, then its merged sources): delete those nodes to take the placement out again.
 
 Merges use `#autoRenameDups #useSceneMtlDups #neverReparent quiet:true`. The live recipe used `#useMergedMtlDups`; `#useSceneMtlDups` is used instead so a merge never replaces a material already in the scene (for example one converted for Vantage).
 
@@ -83,8 +100,9 @@ Merges use `#autoRenameDups #useSceneMtlDups #neverReparent quiet:true`. The liv
 
 ## Limits
 
-- Not tested live yet. The MAXScript recipes underneath were verified one by one, but these tools as a whole haven't run in Max.
-- Whether Max's undo restores a merge, and whether Forest Pack records custom item edits in the undo stack, is not verified. Undoing a switch to custom edit sets `mode` back to 0, which discards the edits.
+- Tested live on Max 2026 only; the run on Max 2027 (Forest Pack 9.4.3) is pending.
+- `forest_from_library` can't be undone, and it clears the undo history: delete the nodes in `remove_with` instead. Item edits aren't in undo either: pass `revert` back to `forest_edit_items`. Undoing a switch to custom edit sets `mode` back to 0, which discards the edits.
+- Undo hasn't been run on the current versions of these tools (agents don't run undo; see "Testing undo" under [Verified Forest Pack facts](#verified-forest-pack-facts)).
 - A forest whose `geomlist` holds 3 (perhaps valid with a proxy) is refused by every tool that rebuilds it.
 - Indices in procedural mode change when the forest rebuilds.
 - Include splines with the Surface Area inactive were verified with the spline at the surface's height only.
@@ -94,5 +112,5 @@ Merges use `#autoRenameDups #useSceneMtlDups #neverReparent quiet:true`. The liv
 
 ## Status
 
-- **Unit tests** in `tests/test_forest_tools.py`: input validation, the generated scripts (order of build, switch, edits, deletes and creates; probe before the one-call merge; no file commands, no `geomlist` 3, balanced parentheses, one argument per `format` placeholder), parsing of canned reports, the library scan on a temporary library, the validator's analysis and fix plan, and registration.
-- **Not tested live yet.**
+- **Unit tests** in `tests/test_forest_tools.py`: input validation, the generated scripts (order of build, switch, edits, rotations, deletes and creates; probe before the one-call merge; no undo step and no node deleted outside `with undo off` in `forest_from_library`; no file commands, no `geomlist` 3, balanced parentheses, one argument per `format` placeholder; the MAXScript pitfalls above: keywords as names, inline collects, IntegerPtr handles, far ray origins), parsing of canned reports, the `revert` list, the library scan on a temporary library, the validator's analysis and fix plan, and registration.
+- **Tested live** on Max 2026 (Forest Pack 9.0) on 2026-10-06; Max 2027 (Forest Pack 9.4.3) pending. The fixes made after that run, including the undo-off placement in `forest_from_library`, are covered by the unit tests and wait for the Max 2027 run.
