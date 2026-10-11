@@ -101,7 +101,8 @@ def agent_viewport(
     if it supports ActiveShade. vray_ipr uses the current V-Ray CPU/GPU renderer.
     vray_vfb and corona_vfb open their renderer's VFB IPR locked to the agent view.
     Corona requires the current production renderer and preserves its denoising settings. V-Ray previews temporarily
-    enable progressive IPR and a denoiser, restoring settings on stop. Other renderers
+    enable a denoiser (and progressive IPR on V-Ray CPU; V-Ray GPU IPR is always progressive), restoring settings
+    on stop. Other renderers
     expose different denoisers; ActiveShade does not promise automatic denoising.
     Existing renders in other views or the VFB are refused. shaded stops the owned preview.
     capture chooses the agent viewport or visible VFB automatically. Optional crop
