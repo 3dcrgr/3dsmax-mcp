@@ -139,7 +139,7 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
         "gotchas": [
             "The XML methods exist in RailClone 7.x (verified on 7.1.1 and 7.3.5); style XML does not package source geometry, materials or parameter values.",
             "Moving or copying a RailClone does not re-evaluate it; get_railclone_output rebuilds first. Output tm/box are object space.",
-            "A wrong library route makes loadLibraryItemByPath show a modal dialog; railclone_from_library validates routes first.",
+            "A wrong library route makes loadLibraryItemByPath show a modal dialog; railclone_from_library validates routes first, against the library roots 3ds Max lists.",
             "Writes adopt a staged RailClone base in one undo step, preserving the scene node and modifier stack. Instanced bases and master/slave styles are refused.",
         ],
     },

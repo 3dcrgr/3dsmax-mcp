@@ -13,6 +13,7 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Any
 
+from ..coerce import StrList
 from ..helpers import railclone_lib as rclib
 from ..helpers.mesh import integer
 from ..helpers.precheck import PrecheckBlocked
@@ -775,7 +776,8 @@ def railclone_library(query: str = "", category: str = "", root: str = "", limit
     object; category is a substring of the category path; root names one library
     root. Each item has the route railclone_from_library loads, its .max/.rail
     file, object, material, matlib, uuid and thumbnail. Unreachable roots are
-    skipped with a warning.
+    skipped with a warning. The roots come from this server's registry view;
+    railclone_from_library checks them against 3ds Max's own roots.
     """
     for label, value in (("query", query), ("category", category), ("root", root)):
         if not isinstance(value, str) or "\x00" in value or len(value) > 500:
@@ -793,6 +795,65 @@ def railclone_library(query: str = "", category: str = "", root: str = "", limit
             "items": [rclib.public_item(it) for it in matches[:limit]],
             "truncated": len(matches) > limit, "complete": scan["complete"],
             "warnings": warnings + scan["warnings"]}
+
+
+# Read only: the library roots as 3ds Max's own registry lists them. The server can read a stale private
+# copy of HKCU (Claude Desktop's package keeps one), and a route RailClone doesn't know opens a modal dialog.
+_ROOTS_BODY = r'''
+local keyPath = rcDecode "@@KEY@@"
+local ss = stringStream ""
+format "RCROOTS\n" to:ss
+local rk = (dotNetClass "Microsoft.Win32.Registry").CurrentUser.OpenSubKey keyPath
+if rk == undefined then rcRow ss #("X", "missing") else (
+    local valueNames = rk.GetValueNames()
+    for nm in valueNames do (
+        local v = rk.GetValue nm
+        if isKindOf v String do rcRow ss #("R", rcEncode nm, rcEncode v)
+    )
+    rk.Close()
+)
+format "END\n" to:ss
+ss as string
+'''
+
+
+def _max_library_roots() -> tuple[list[dict[str, str]] | None, str | None]:
+    """The roots in 3ds Max's registry (one read-only call), or None and why they couldn't be read."""
+    try:
+        raw = _send(_ROOTS_BODY.replace("@@KEY@@", _b64(rclib.LIBRARY_KEY)))
+    except DialogBlocked as exc:
+        raise PrecheckBlocked(exc, "railclone_from_library", "Nothing was loaded") from exc
+    except RailCloneError as exc:
+        return None, f"{exc.code}: {exc}"
+    roots = []
+    try:
+        for row in _records(raw, "RCROOTS"):
+            if row[0] == "R":
+                name, data = _unb64(row[1]), _unb64(row[2])
+                if name and data.strip():
+                    roots.append({"name": name, "path": os.path.expandvars(data.strip())})
+    except (RailCloneError, ValueError, IndexError, UnicodeError) as exc:
+        return None, f"unreadable roots report: {exc}"
+    return roots, None
+
+
+def _from_library_roots() -> tuple[list[dict[str, str]], list[str]]:
+    """The roots a load resolves against: 3ds Max's own, or the server's view when Max's can't be read."""
+    server_roots, server_warnings = rclib.library_roots()
+    max_roots, why = _max_library_roots()
+    if max_roots is None:
+        return server_roots, server_warnings + [
+            f"ROOTS_NOT_CHECKED: 3ds Max's library roots could not be read ({why}); the item was checked against "
+            "this server's registry view only"]
+    if not max_roots:
+        raise RailCloneError("NO_LIBRARY_ROOTS", "3ds Max's registry lists no RailClone library roots "
+                             f"(HKCU\\{rclib.LIBRARY_KEY}); open RailClone's library browser in 3ds Max once")
+    differences = rclib.root_differences(server_roots, max_roots)
+    if not differences:
+        return max_roots, []
+    return max_roots, ["ROOTS_DIFFER: this server's registry view differs from 3ds Max's (it can be a stale "
+                       "private copy); this call used 3ds Max's roots, and railclone_library may list stale "
+                       "routes: " + "; ".join(differences)]
 
 
 _FROM_LIBRARY_HEAD = r'''
@@ -845,7 +906,8 @@ local missing = #()
 # Merge: only for .max items, so only inside the undo-off wrapper.
 _LOAD_MERGE = r'''
 loaded = true
-local ok = mergeMAXFile maxFile #(objName) #autoRenameDups #useMergedMtlDups #neverReparent quiet:true
+-- #useSceneMtlDups: a merged material never replaces a scene material of the same name.
+local ok = mergeMAXFile maxFile #(objName) #autoRenameDups #useSceneMtlDups #neverReparent quiet:true
 created = for n in objects where not (HasDictValue seen (rcH n)) collect n
 local rcs = for n in created where (classOf n.baseObject) == RailClone_Pro collect n
 if ok != true do throw ("MERGE_FAILED: mergeMAXFile returned " + (ok as string))
@@ -1021,7 +1083,7 @@ def _from_library_body(entry: dict[str, Any], method: str, splines: list[str], n
 @mcp.tool()
 def railclone_from_library(
     item: str,
-    splines: list[str] | None = None,
+    splines: StrList | None = None,
     name: str = "",
     method: str = "auto",
     fix_maps: bool = True,
@@ -1032,10 +1094,13 @@ def railclone_from_library(
     A .rail item loads by route in one undo step. Loading a .max item clears 3ds
     Max's undo history (RailClone's own browser does too), so it is refused unless
     allow_undo_flush=true, then runs with undo off and can't be undone: delete the
-    nodes in remove_with to remove it. The item is validated first: a wrong route
-    opens a modal dialog. method: auto (merge .max items with a .mat matlib, route
-    .rail/.pmat items), merge or route. splines go to the spline bases in order.
-    Returns the node, method, material, output counts, remove_with and warnings.
+    nodes in remove_with to remove it. The item is validated first, against the
+    library roots 3ds Max lists: a wrong route opens a modal dialog. method: auto
+    (route for .rail files, .pmat matlibs and items without an object; merge for
+    every other .max item), merge or route. A merged item without a .mat matlib
+    keeps the materials from its file (NO_MATERIAL warning). splines go to the
+    spline bases in order. Returns the node, method, material, output counts,
+    remove_with and warnings.
     """
     if method not in ("auto", "merge", "route"):
         raise ValueError("method must be 'auto', 'merge' or 'route'")
@@ -1050,7 +1115,10 @@ def railclone_from_library(
         raise ValueError("splines must be a list of at most 64 node names")
     if len(set(splines)) != len(splines):
         raise ValueError("splines lists a node twice")
-    roots, warnings = rclib.library_roots()
+    if not isinstance(item, str) or not item.strip() or "\x00" in item:
+        raise ValueError("item must be a library route or an exact item name")
+    # One read-only call: 3ds Max's own roots are the authority for the route and the item's folder.
+    roots, warnings = _from_library_roots()
     entry, scan_warnings = rclib.resolve_item(item, roots,
                                               deadline=time.monotonic() + rclib.DEFAULT_SCAN_SECONDS)
     warnings += scan_warnings
@@ -1075,7 +1143,7 @@ def railclone_from_library(
         raise ValueError(f"{entry['route']!r} {why}, so earlier steps can no longer be undone. Pass "
                          "allow_undo_flush=true to load it anyway: it then runs with undo off and can't be "
                          "undone, and remove_with lists the nodes to delete to remove it. "
-                         "Nothing was sent to 3ds Max.")
+                         "Nothing was loaded; only the library roots were read from 3ds Max.")
     matlib = ""
     if chosen == "merge":
         matlib, why = rclib.matlib_template(entry)

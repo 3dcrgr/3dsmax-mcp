@@ -396,7 +396,7 @@ and existing procedural skies use the provider's dome or environment binding.
 | `forest_items` | Read items, paged: pivot position, instance-ready transform, item type and size |
 | `forest_edit_items` | Move, delete, create or resize items in custom edit mode; returns a revert list (item edits aren't in undo) |
 | `forest_set_mode` | Switch between procedural and custom edit mode |
-| `forest_library` | Search the Forest Pack library: presets, 3D items and billboards (no Max call) |
+| `forest_library` | Search the Forest Pack library: presets, 3D items, billboards and Forest Ivy items (no Max call) |
 | `forest_from_library` | Place a library preset or 3D item on surfaces (clears the undo history; needs `allow_undo_flush`) |
 | `forest_validate` | Check the item and area lists and the item count; `fix=true` pads short lists |
 

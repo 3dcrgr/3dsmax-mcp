@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -225,6 +226,13 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(MODULE_CATEGORY["forest"], "Scattering")
         self.assertEqual(set(_module_tool_names(Path(forest.__file__))), self.NEW)
         self.assertEqual(_module_tool_names(Path(scattering.__file__)), ("scatter_forest_pack",))
+
+    def test_advanced_docs_list_every_specialty_module(self):
+        # docs/ADVANCED.md says which modules the core profile leaves out; forest and vantage were missing
+        from maxmcp import server
+        text = (REPO / "docs" / "ADVANCED.md").read_text(encoding="utf-8")
+        line = next(ln for ln in text.splitlines() if ln.startswith("Specialty modules in full profile:"))
+        self.assertEqual(sorted(re.findall(r"`(\w+)`", line)), sorted(server.SPECIALTY_TOOL_MODULES))
 
     def test_docstrings(self):
         for fn in (forest.forest_items, forest.forest_edit_items, forest.forest_set_mode, forest.forest_library,
@@ -744,6 +752,218 @@ class ForestLibraryTests(LibraryFixture):
         self.assertEqual(flib.resolve_path(r"matlibs\gravel_$(RENDERER).mat", r"C:\lib\Presets\Gravel", r"C:\lib",
                                            "corona"), r"C:\lib\Presets\Gravel\matlibs\gravel_corona.mat")
         self.assertIsNone(flib.resolve_path("", "C:\\", "C:\\"))
+
+
+# A studio root whose folders aren't named Presets/3D/2D (the CRGR root: Трава, Камни, Растения), with a copy
+# of a stock 3D item
+STUDIO_XML = """<?xml version="1.0" encoding="utf-8"?>
+<library version="100" order="1" masterScale="0.393701">
+  <item class="maxobject">
+    <name lang="english">Grass</name>
+    <name lang="latin">Grass</name>
+    <family>Grass</family>
+    <material/>
+    <matlib/>
+    <maxfile>..\\Grass\\Grass.max</maxfile>
+    <object>Forest - Grass</object>
+  </item>
+  <item class="maxobject">
+    <uuid>83351937-f8a1-4627-8c20-150547ad9382</uuid>
+    <name lang="english">Cane 01</name>
+    <maxfile>..\\Grass\\cane_copy.max</maxfile>
+    <object>_fp_cane01</object>
+  </item>
+</library>
+"""
+
+SHRUBS_XML = """<?xml version="1.0" encoding="utf-8"?>
+<library version="100">
+  <item class="tree_billboard">
+    <uuid>07390047-fe92-41b3-97fb-cad895cb824b</uuid>
+    <name lang="english">Grass</name>
+    <library>$(LIBROOTPATH)\\..\\matlib\\2d_std_$(RENDERER).mat</library>
+    <material>grass</material>
+  </item>
+</library>
+"""
+
+IVY_XML = """<?xml version="1.0" encoding="utf-8"?>
+<library version="100">
+  <select class="material" setmacro="RENDERER">
+    <option value="@forestlib.ms:getRenderer()">Automatic Selector</option>
+    <option value="vray">VRay</option>
+  </select>
+  <item class="maxobject">
+    <uuid>d796847d-d368-4eca-8f62-7881d431c336</uuid>
+    <name lang="english">Peppermint</name>
+    <material>fp_peppermint</material>
+    <matlib>matlibs\\climbing_plants_$(RENDERER).pmat</matlib>
+    <maxfile>objects\\fp_peppermint.fp</maxfile>
+    <object>fp_peppermint</object>
+  </item>
+</library>
+"""
+
+AUTUMN_XML = """<?xml version="1.0" encoding="utf-8"?>
+<library version="100" masterScale="1">
+  <uuid>495926d9-0549-4c09-85ff-c2c77763f902</uuid>
+  <select class="material" setmacro="RENDERER">
+    <option value="@forestlib.ms:getRenderer()">Automatic Selector</option>
+    <option value="vray">VRay</option>
+  </select>
+  <select class="quality" setmacro="PRESET_QUALITY">
+    <option value="high">Two Sided Mtl</option>
+    <option value="low" default="1">One Sided Mtl</option>
+  </select>
+  <select class="state" label="State (Clean/Dirty)" setmacro="PRESET_STATE">
+    <option value="clean">Clean</option>
+    <option value="dirty">Dirty</option>
+  </select>
+  <item class="maxobject">
+    <uuid>6531368f-a71b-48ad-82bb-52acaad77136</uuid>
+    <name lang="english">GS-1g</name>
+    <name lang="latin">_fp_L-GS-1g</name>
+    <material>_fp_leaves_$(PRESET_STATE)</material>
+    <matlib>matlibs\\_fp_Leaves_$(renderer)_$(Preset_Quality).mat</matlib>
+    <maxfile>objects\\Leaves_Groups.max</maxfile>
+    <object>_fp_L-GS-1g-$(PRESET_STATE)</object>
+  </item>
+</library>
+"""
+
+SAMPLES_XML = """<?xml version="1.0" encoding="utf-8"?>
+<library version="100">
+  <item class="maxobject">
+    <name lang="english">Bougainvillea Hanging 1</name>
+    <maxfile>objects\\bougainvillea.max</maxfile>
+    <object>Bougainvillea_hanging-1</object>
+    <uuid>29ab1166-2457-4c59-860e-9dbf2768c8dd</uuid>
+  </item>
+  <item class="maxobject">
+    <name lang="english">Blue sedge 1</name>
+    <maxfile>objects\\carex_flacca-1.max</maxfile>
+    <object>carex flacca 1</object>
+    <uuid>29ab1166-2457-4c59-860e-9dbf2768c8dd</uuid>
+  </item>
+</library>
+"""
+
+
+class ForestLibraryKindsTests(LibraryFixture):
+    """Items outside Presets/3D/2D folders, Forest Ivy .fp items, library macros and ambiguous names."""
+
+    def setUp(self):
+        super().setUp()
+        self.studio = os.path.join(self.tmp, "Studio", "Forest")
+        files = {
+            (self.studio, "Трава", "index.xml"): STUDIO_XML,
+            (self.studio, "Grass", "Grass.max"): "x",
+            (self.studio, "Grass", "cane_copy.max"): "x",
+            (self.root, "2D", "Shrubs", "index.xml"): SHRUBS_XML,
+            (self.root, "ForestIvy", "Climbing Plants", "index.xml"): IVY_XML,
+            (self.root, "ForestIvy", "Climbing Plants", "objects", "fp_peppermint.fp"): "x",
+            (self.root, "Presets", "Autumn Leaves", "index.xml"): AUTUMN_XML,
+            (self.root, "Presets", "Autumn Leaves", "objects", "Leaves_Groups.max"): "x",
+            (self.root, "Presets", "Autumn Leaves", "matlibs", "_fp_Leaves_vray_low.mat"): "x",
+            (self.root, "Samples", "The3dGarden", "index.xml"): SAMPLES_XML,
+            (self.root, "Samples", "The3dGarden", "objects", "bougainvillea.max"): "x",
+            (self.root, "Samples", "The3dGarden", "objects", "carex_flacca-1.max"): "x",
+        }
+        for parts, text in files.items():
+            path = os.path.join(*parts)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh_:
+                fh_.write(text)
+        self.patches[0].stop()
+        roots = [{"label": "CRGR", "path": self.studio, "source": "registry"},
+                 {"label": "Forest Library", "path": self.root, "source": "default"}]
+        self.patches[0] = patch.object(flib, "library_roots", return_value=roots)
+        self.patches[0].start()
+        for cache in (flib._scan_cache, flib._parse_cache, flib._renderer_cache):
+            cache.clear()
+
+    def test_default_kind_finds_the_studio_library(self):
+        out = forest.forest_library("grass")
+        self.assertEqual(out["kind"], "all")
+        first, second = out["items"][:2]
+        # an exact name first, the item forest_from_library can place before the billboard
+        self.assertEqual((first["name"], first["kind"], first["root"], first["object"], first["placeable"]),
+                         ("Grass", "other", "CRGR", "Forest - Grass", True))
+        self.assertEqual((second["name"], second["kind"], second["placeable"]), ("Grass", "2d", False))
+        self.assertNotIn("Forest - Grass", [i["object"] for i in forest.forest_library("grass", "presets")["items"]])
+        self.assertEqual([i["object"] for i in forest.forest_library("grass", "other")["items"]], ["Forest - Grass"])
+
+    def test_forest_ivy_items(self):
+        out = forest.forest_library("peppermint", "ivy")
+        self.assertEqual(out["total"], 1)
+        item = out["items"][0]
+        self.assertEqual((item["kind"], item["class"], item["placeable"]), ("ivy", "maxobject", False))
+        self.assertTrue(item["maxfile_exists"])
+        self.assertEqual(forest.forest_library("peppermint", "other")["total"], 0)
+
+    def test_library_macros_take_their_default_option(self):
+        item = flib.find_item("GS-1g")
+        self.assertEqual(item["object"], "_fp_L-GS-1g-clean")  # no default="1" option: the first one
+        self.assertEqual(item["object_template"], "_fp_L-GS-1g-$(PRESET_STATE)")
+        self.assertEqual(item["material"], "_fp_leaves_clean")
+        self.assertEqual(item["macros"], {"PRESET_STATE": "clean", "PRESET_QUALITY": "low"})  # default="1"
+        self.assertTrue(item["matlib"].endswith("_fp_Leaves_$(renderer)_low.mat"))
+        self.assertEqual(item["matlib_renderers"], ["vray"])
+        self.assertTrue(item["placeable"])
+        for key in ("_fp_L-GS-1g-clean", "_fp_l-gs-1g-$(preset_state)", "6531368F-a71b-48ad-82bb-52acaad77136"):
+            self.assertEqual(flib.find_item(key)["object"], "_fp_L-GS-1g-clean", key)
+        fake = FakeClient(library_report())
+        with patch.object(forest, "client", fake):
+            out = forest.forest_from_library(item="GS-1g", surfaces=["Ground"], matlib_renderer="vray",
+                                             allow_undo_flush=True)
+        script = fake.scripts[0]
+        self.assertIn(f'fpDec "{b64("_fp_L-GS-1g-clean")}"', script)
+        self.assertIn(b64(os.path.join(self.root, "Presets", "Autumn Leaves", "matlibs", "_fp_Leaves_vray_low.mat")),
+                      script)
+        self.assertEqual(out["library_item"]["object"], "_fp_L-GS-1g-clean")
+
+    def test_select_macros(self):
+        library = ET.fromstring(
+            '<library><select setmacro="RENDERER"><option value="vray" default="1"/></select>'
+            '<select setmacro="Scripted"><option value="@x.ms:f()" default="1"/><option value="b"/></select>'
+            '<select setmacro="Texty"><option>plain</option></select>'
+            '<select setmacro="LIBROOTPATH"><option value="C:\\elsewhere"/></select>'
+            '<select setmacro="EMPTY"/><select><option value="no macro name"/></select></library>')
+        self.assertEqual(flib.select_macros(library), {"TEXTY": "plain"})
+        self.assertEqual(flib.expand_macros("a_$(texty)_$(RENDERER)_$(OTHER)", {"TEXTY": "plain"}),
+                         "a_plain_$(RENDERER)_$(OTHER)")
+
+    def test_items_that_cant_be_placed_never_make_a_name_ambiguous(self):
+        item = flib.find_item("Grass")  # the studio preset and a 2D billboard
+        self.assertEqual((item["root"], item["object"]), ("CRGR", "Forest - Grass"))
+        # only unplaceable items match: forest_from_library refuses them before anything is sent
+        for key, why in (("07390047-fe92-41b3-97fb-cad895cb824b", "2D billboard"), ("Peppermint", ".fp file"),
+                         ("fp_peppermint", ".fp file")):
+            fake = FakeClient()
+            with self.subTest(key=key), patch.object(forest, "client", fake):
+                with self.assertRaises(fh.ForestError) as ctx:
+                    forest.forest_from_library(item=key, surfaces=["Ground"])
+                self.assertEqual(ctx.exception.code, "UNSUPPORTED_ITEM")
+                self.assertIn(why, str(ctx.exception))
+                self.assertEqual(fake.scripts, [])
+
+    def test_ambiguous_names_a_key_for_each_item(self):
+        with self.assertRaises(fh.ForestError) as ctx:
+            flib.find_item("29ab1166-2457-4c59-860e-9dbf2768c8dd")  # one uuid, two items (stock index)
+        text = str(ctx.exception)
+        self.assertEqual(ctx.exception.code, "AMBIGUOUS")
+        self.assertIn("pass 'Bougainvillea Hanging 1': Bougainvillea Hanging 1 (object 'Bougainvillea_hanging-1' "
+                      "in " + os.path.join(self.root, "Samples", "The3dGarden", "objects", "bougainvillea.max"), text)
+        self.assertIn("pass 'Blue sedge 1'", text)
+        self.assertEqual(flib.find_item("Blue sedge 1")["object"], "carex flacca 1")
+        with self.assertRaises(fh.ForestError) as ctx:
+            flib.find_item("Common grass 01 (detail)")
+        self.assertIn("pass '7507a9b2-bdcb-4a99-a8a1-bfbf9e256abd'", str(ctx.exception))
+        self.assertIn("pass '99999999-2222-3333-4444-555555555555'", str(ctx.exception))
+        # a copy of a stock item in another root: same uuid, name and object, only the file differs
+        with self.assertRaises(fh.ForestError) as ctx:
+            flib.find_item("_fp_cane01")
+        self.assertEqual(str(ctx.exception).count("no uuid, name or object finds it alone"), 2)
 
 
 def library_report(count=23473, kind="preset", extra=()):

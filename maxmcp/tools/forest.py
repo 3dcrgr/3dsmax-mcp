@@ -664,13 +664,15 @@ def forest_set_mode(name: str, mode: str = "custom_edit", confirm_discard: bool 
 # --------------------------------------------------------------------------------------------
 
 @mcp.tool()
-def forest_library(query: str = "", kind: str = "presets", limit: int = 50) -> dict[str, Any]:
-    """Search the Forest Pack library: presets, 3D items and 2D billboards from every index.xml. Python only.
+def forest_library(query: str = "", kind: str = "all", limit: int = 50) -> dict[str, Any]:
+    """Search the Forest Pack library: presets, 3D items, 2D billboards and Forest Ivy items. Python only.
 
     Roots: Forest Pack's LibraryDir registry list plus %LOCALAPPDATA%\\Itoo Software\\Forest Pack Pro\\lib. query
-    matches words in the name, object, family, category or uuid (all words must match). Each item gives name,
-    kind, category, maxfile, object, matlib ($(RENDERER) left in), matlib_renderers, material and thumbnail.
-    Place one with forest_from_library (by uuid, object or name). kind: presets, 3d, 2d or all.
+    matches words in the name, object, family, category or uuid (all words must match). kind: all (default),
+    presets, 3d or 2d (items under folders of those names), ivy (Forest Ivy .fp items) or other (every other
+    item, such as a studio library's). Each item gives name, kind, placeable (forest_from_library can place it,
+    by uuid, object or name), category, maxfile, object, matlib ($(RENDERER) left in), matlib_renderers,
+    material and thumbnail. Other library macros, such as $(PRESET_STATE), take their default option.
     """
     if not isinstance(query, str) or len(query) > 200:
         raise ValueError("query must be a string of at most 200 characters")
@@ -907,7 +909,7 @@ def forest_from_library(
     then inactive, since areas add up); exclude_splines cut holes. A 3D item becomes the source of a new forest
     (items_per_m2 sets its density; default 300 cm tiles, about 160 per m2). matlib_renderer (vray, corona, ...)
     swaps materials for the item library's .mat ones by name. Fails with ZERO_ITEMS when nothing is scattered.
-    2D billboards are not supported.
+    2D billboards and Forest Ivy (.fp) items can't be placed (placeable=false in forest_library).
     """
     if not isinstance(item, str) or not item.strip() or len(item) > 300:
         raise ValueError("item must be a library uuid, object name or English name")
@@ -926,9 +928,17 @@ def forest_from_library(
     density = None if items_per_m2 is None else fh.finite(items_per_m2, "items_per_m2", 0.0, 100000.0,
                                                           low_open=True)
     entry = flib.find_item(item)
-    if entry["class"] == "tree_billboard" or not entry["maxfile"] or not entry["object"]:
-        raise ForestError("UNSUPPORTED_ITEM", f"'{entry['name']}' is a {entry['class'] or 'non-object'} item; only "
-                          "presets and 3D objects (class maxobject) can be placed")
+    if not entry["placeable"]:
+        if entry["class"] == "tree_billboard":
+            what = "a 2D billboard (tree_billboard)"
+        elif entry["kind"] == "ivy":
+            what = "a Forest Ivy item: its file is an .fp file, not a .max file"
+        elif not entry["maxfile"] or not entry["object"]:
+            what = "an item without a library file or object name"
+        else:
+            what = f"an item whose library file isn't a .max file ({entry['maxfile']})"
+        raise ForestError("UNSUPPORTED_ITEM", f"'{entry['name']}' is {what}; only presets and 3D objects merged "
+                          "from a .max file can be placed. Nothing was sent to 3ds Max.")
     if not entry["maxfile_exists"]:
         raise ForestError("FILE_NOT_FOUND", f"the library file {entry['maxfile']} is missing")
     matlib = ""

@@ -422,6 +422,23 @@ def library_roots() -> tuple[list[dict[str, str]], list[str]]:
     return roots, []
 
 
+def _same_dir(a: str, b: str) -> bool:
+    def key(path: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.expandvars(path.strip()))).rstrip("\\/")
+    return key(a) == key(b)
+
+
+def root_differences(server: list[dict[str, str]], max_side: list[dict[str, str]]) -> list[str]:
+    """How the server's root list differs from 3ds Max's: roots only on one side or with another folder."""
+    theirs = {r["name"]: r["path"] for r in max_side}
+    ours = {r["name"]: r["path"] for r in server}
+    out = [f"{n!r} is only in 3ds Max ({p})" for n, p in theirs.items() if n not in ours]
+    out += [f"{n!r} is not in 3ds Max (this server sees {p})" for n, p in ours.items() if n not in theirs]
+    out += [f"{n!r} is {theirs[n]} in 3ds Max, {p} here" for n, p in ours.items()
+            if n in theirs and not _same_dir(p, theirs[n])]
+    return out
+
+
 def probe_dir(path: str, timeout: float = PROBE_SECONDS) -> str | None:
     """None when path is a reachable folder, else why not (unreachable shares can block for long)."""
     outcome: dict[str, Any] = {}

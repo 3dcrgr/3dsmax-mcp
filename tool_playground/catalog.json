@@ -6444,7 +6444,7 @@
     },
     {
       "name": "forest_library",
-      "description": "Search the Forest Pack library: presets, 3D items and 2D billboards from every index.xml. Python only.",
+      "description": "Search the Forest Pack library: presets, 3D items, 2D billboards and Forest Ivy items. Python only.",
       "category": "Scattering",
       "group": "Specialty",
       "module": "forest",

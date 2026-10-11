@@ -3,8 +3,10 @@
 Roots are the values of HKCU\\Software\\Itoo Software\\Forest Pack Pro\\LibraryDir (Forest Pack's own
 list, which can include network folders) plus %LOCALAPPDATA%\\Itoo Software\\Forest Pack Pro\\lib.
 Each index.xml lists <item> entries: class "maxobject" (a Forest preset or a 3D mesh, merged from
-<maxfile> by <object> name) or "tree_billboard" (2D). Matlib paths use $(LIBROOTPATH) (the root)
-and $(RENDERER); other relative paths are relative to the index.xml folder.
+<maxfile> by <object> name; Forest Ivy items name an .fp file instead) or "tree_billboard" (2D).
+Matlib paths use $(LIBROOTPATH) (the root) and $(RENDERER); other relative paths are relative to the
+index.xml folder. A library-level <select setmacro="X"> defines $(X) for its items (Autumn Leaves:
+$(PRESET_STATE) in <object> and <material>); it is expanded to its default option.
 """
 from __future__ import annotations
 
@@ -26,8 +28,11 @@ ROOT_SCAN_BUDGET_S = 10.0
 SCAN_CACHE_S = 300.0
 TIMEOUT_CACHE_S = 60.0
 MAX_INDEX_BYTES = 16_000_000
-KINDS = ("presets", "3d", "2d", "all")
-_KIND_ORDER = {"presets": 0, "3d": 1, "2d": 2, "other": 3}
+KINDS = ("all", "presets", "3d", "2d", "ivy", "other")
+_KIND_ORDER = {"presets": 0, "3d": 1, "other": 2, "2d": 3, "ivy": 4}
+# Macros a <select setmacro> can't define here: the renderer stays for matlib_renderers, the paths are fixed.
+_FIXED_MACROS = frozenset({"RENDERER", "SELECTEDRENDERER", "LIBROOTPATH", "LIBFULLPATH"})
+_MACRO = re.compile(r"\$\((\w+)\)")
 
 _scan_cache: dict[str, tuple[float, list[str], str | None]] = {}
 _parse_cache: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
@@ -170,12 +175,47 @@ def _english_name(element: ET.Element) -> str:
     return ""
 
 
-def _kind(parts: list[str], item_class: str) -> str:
+def _kind(parts: list[str], item_class: str, maxfile: str | None) -> str:
+    """presets, 3d or 2d from the folder names; ivy for a Forest Ivy .fp item; other for anything else."""
+    if maxfile and ntpath.splitext(maxfile)[1].lower() == ".fp":
+        return "ivy"
     lowered = [p.lower() for p in parts]
     for kind in ("presets", "3d", "2d"):
         if kind in lowered:
             return kind
     return "2d" if item_class == "tree_billboard" else "other"
+
+
+def is_placeable(item: dict[str, Any]) -> bool:
+    """Whether forest_from_library can place the item: an object merged from a .max file, not a 2D billboard."""
+    return (item["class"] != "tree_billboard" and bool(item["object"]) and bool(item["maxfile"])
+            and ntpath.splitext(item["maxfile"])[1].lower() == ".max")
+
+
+def select_macros(library: ET.Element) -> dict[str, str]:
+    """Default values of the library's <select setmacro="X"> lists: the option marked default="1", else the first.
+
+    Renderer and path macros are left out, and so is an option whose value is a script call (it starts with @).
+    """
+    macros: dict[str, str] = {}
+    for select in library.findall("select"):
+        name = (select.get("setmacro") or "").strip().upper()
+        options = select.findall("option")
+        if not name or name in _FIXED_MACROS or not options:
+            continue
+        chosen = next((o for o in options if (o.get("default") or "").strip().lower() in ("1", "true")), options[0])
+        value = chosen.get("value")
+        value = (value if value is not None else chosen.text or "").strip()
+        if value and not value.startswith("@"):
+            macros[name] = value
+    return macros
+
+
+def expand_macros(text: str, macros: dict[str, str]) -> str:
+    """text with each $(X) that macros defines replaced (names are case-insensitive); others stay."""
+    if not text or not macros:
+        return text
+    return _MACRO.sub(lambda m: macros.get(m.group(1).upper(), m.group(0)), text)
 
 
 def resolve_path(template: str, index_dir: str, root: str, renderer: str | None = None) -> str | None:
@@ -229,12 +269,16 @@ def parse_index(path: str, root: dict[str, str]) -> list[dict[str, Any]]:
     index_dir = os.path.dirname(path)
     rel = os.path.relpath(index_dir, root["path"])
     parts = [] if rel in (".", "") else re.split(r"[\\/]+", rel)
+    macros = select_macros(tree)
     items: list[dict[str, Any]] = []
     for element in tree.iter("item"):
         item_class = element.get("class") or ""
-        maxfile_rel = _text(element, "maxfile")
+        raw = {tag: _text(element, tag) for tag in ("maxfile", "object", "material", "matlib", "library")}
+        used = {k: v for k, v in macros.items() if any(f"$({k})" in t.upper() for t in raw.values())}
+        maxfile_rel = expand_macros(raw["maxfile"], used)
         maxfile = resolve_path(maxfile_rel, index_dir, root["path"]) if maxfile_rel else None
-        template = _text(element, "matlib") or _text(element, "library")
+        template = expand_macros(raw["matlib"] or raw["library"], used)
+        obj = expand_macros(raw["object"], used)
         bitmap = _text(element, "bitmap")
         thumbnail = None
         if bitmap:
@@ -242,23 +286,23 @@ def parse_index(path: str, root: dict[str, str]) -> list[dict[str, Any]]:
                 if os.path.isfile(candidate):
                     thumbnail = candidate
                     break
-        name = _english_name(element) or _text(element, "object")
+        name = _english_name(element) or obj
         description = " ".join(_text(element, "description").split())
         record = {
             "name": name,
-            "kind": _kind(parts, item_class),
+            "kind": _kind(parts, item_class, maxfile),
             "library": parts[0] if parts else "",
             "category": parts[-1] if parts else os.path.basename(index_dir),
             "family": _text(element, "family"),
             "available": _text(element, "available"),
             "uuid": _text(element, "uuid"),
             "class": item_class,
-            "object": _text(element, "object"),
+            "object": obj,
             "maxfile": maxfile,
             "maxfile_exists": bool(maxfile and os.path.isfile(maxfile)),
             "matlib": resolve_path(template, index_dir, root["path"]) if template else None,
             "matlib_renderers": matlib_renderers(template, index_dir, root["path"]),
-            "material": _text(element, "material"),
+            "material": expand_macros(raw["material"], used),
             "thumbnail": thumbnail,
             "description": description[:200],
             "root": root["label"],
@@ -266,6 +310,11 @@ def parse_index(path: str, root: dict[str, str]) -> list[dict[str, Any]]:
             "_root_path": root["path"],
             "_matlib_template": template,
         }
+        record["placeable"] = is_placeable(record)
+        if used:
+            record["macros"] = used
+            if obj != raw["object"]:
+                record["object_template"] = raw["object"]
         record["_hay"] = " ".join(str(record[k]) for k in (
             "name", "object", "family", "category", "library", "uuid", "description", "kind")).lower()
         items.append(record)
@@ -321,25 +370,56 @@ def search(query: str, kind: str, limit: int) -> dict[str, Any]:
     q = " ".join(query.lower().split())
     tokens = q.split()
     matched = [it for it in items if (kind == "all" or it["kind"] == kind) and all(t in it["_hay"] for t in tokens)]
-    matched.sort(key=lambda it: (_score(it, q), _KIND_ORDER.get(it["kind"], 9), it["library"].lower(),
-                                 it["category"].lower(), it["name"].lower()))
+    matched.sort(key=lambda it: (_score(it, q), not it["placeable"], _KIND_ORDER.get(it["kind"], 9),
+                                 it["library"].lower(), it["category"].lower(), it["name"].lower()))
     return {"query": query, "kind": kind, "total": len(matched), "returned": min(limit, len(matched)),
             "items": [public(it) for it in matched[:limit]], "roots": roots, "warnings": warnings}
 
 
-def find_item(item: str) -> dict[str, Any]:
-    """One library item by uuid, object name or English name (case-insensitive)."""
-    items, roots, _ = catalogue()
-    key = item.strip().lower()
+def _identity(item: dict[str, Any]) -> tuple[str, str]:
+    return (item["maxfile"] or "").lower(), item["object"].lower()
+
+
+def _lookup(items: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    """Items whose uuid is key; failing that, whose object (or its template) or English name is key."""
     hits = [it for it in items if it["uuid"].lower() == key]
     if not hits:
-        hits = [it for it in items if key in (it["object"].lower(), it["name"].lower())]
-    unique = {((it["maxfile"] or "").lower(), it["object"].lower()): it for it in hits}
+        hits = [it for it in items
+                if key in (it["object"].lower(), it["name"].lower(), it.get("object_template", "").lower())]
+    return hits
+
+
+def _unique_key(items: list[dict[str, Any]], item: dict[str, Any]) -> str | None:
+    """A uuid, name or object that finds this placeable item and no other one, if there is one."""
+    for key in (item["uuid"], item["name"], item["object"]):
+        if key and {_identity(it) for it in _lookup(items, key.strip().lower()) if it["placeable"]} == {
+                _identity(item)}:
+            return key
+    return None
+
+
+def find_item(item: str) -> dict[str, Any]:
+    """One library item by uuid, object name or English name (case-insensitive).
+
+    Items forest_from_library can't place (2D billboards, Forest Ivy .fp items) only match when nothing
+    placeable does, so they never make a name ambiguous.
+    """
+    items, roots, _ = catalogue()
+    key = item.strip().lower()
+    hits = _lookup(items, key)
+    unique = {_identity(it): it for it in hits if it["placeable"]}
     if len(unique) == 1:
         return next(iter(unique.values()))
     if len(unique) > 1:
-        options = "; ".join(f"{it['uuid']} ({it['name']}, {it['library']}/{it['category']})" for it in hits[:8])
-        raise ForestError("AMBIGUOUS", f"{len(unique)} library items match '{item}'; pass a uuid: {options}")
+        options = []
+        for it in list(unique.values())[:8]:
+            found_by = _unique_key(items, it)
+            use = f"pass '{found_by}'" if found_by else "no uuid, name or object finds it alone"
+            options.append(f"{use}: {it['name']} (object '{it['object']}' in {it['maxfile']}; "
+                           f"{it['library']}/{it['category']})")
+        raise ForestError("AMBIGUOUS", f"{len(unique)} library items match '{item}': " + "; ".join(options))
+    if hits:
+        return hits[0]  # only items that can't be placed match; forest_from_library says why
     names = sorted({it["name"] for it in items} | {it["object"] for it in items if it["object"]})
     close = difflib.get_close_matches(item, names, n=5, cutoff=0.5)
     where = ", ".join(r["path"] for r in roots) or "no library roots"

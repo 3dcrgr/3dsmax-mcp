@@ -648,15 +648,35 @@ def lib_raw(*, placed=48, extra=()):
     return "\n".join(rows + ["END"]) + "\n"
 
 
+def roots_raw(roots):
+    """The roots report of the read-only registry script, as 3ds Max would send it."""
+    rows = ["RCROOTS"] + ["R|%s|%s" % (b64(r["name"]), b64(r["path"])) for r in roots]
+    return "\n".join(rows + ["END"]) + "\n"
+
+
 class FromLibraryTests(LibraryFixture):
     ROUTE1 = "\\Railclone Library\\Architecture\\Exterior\\Fences\\Metal\\Metal Fence 1"
     ROUTE_RAIL = "\\Railclone Library\\Architecture\\Interior\\Baseboards\\Baseboard 002"
 
-    def call(self, raw, **kw):
+    def call(self, raw, max_roots=None, **kw):
         kw.setdefault("allow_undo_flush", True)
-        with patch.object(rc, "client", client_with(raw)) as client:
+        roots = self.roots if max_roots is None else max_roots
+        with patch.object(rc, "client", client_with(roots_raw(roots), raw)) as client:
             out = rc.railclone_from_library(**kw)
-        return out, scripts(client)[0]
+        sent = scripts(client)
+        self.assertEqual(len(sent), 2)
+        self.assert_roots_read(sent[0])
+        return out, sent[1]
+
+    def assert_roots_read(self, script):
+        """The first call only reads 3ds Max's RailClone LibraryDir key."""
+        self.assertIn(rclib.LIBRARY_KEY, decoded_strings(script))
+        body = mxs_body(script)
+        self.assertIn('(dotNetClass "").CurrentUser.OpenSubKey keyPath', body)
+        self.assertIn("rk.GetValue nm", body)
+        for word in ("SetValue", "CreateSubKey", "DeleteValue", "DeleteSubKey", "RailClone_Pro", "mergeMAXFile",
+                     "loadLibraryItemByPath", "theHold", "undo", "delete", "select"):
+            self.assertNotIn(word, body)
 
     def test_max_item_needs_undo_flush_consent(self):
         for item in ("Metal Fence 1", "Saepes"):  # .max by merge, .max by route (.pmat matlib)
@@ -664,8 +684,70 @@ class FromLibraryTests(LibraryFixture):
             self.assertIn("clears 3ds Max's undo history", str(exc))
             self.assertIn("allow_undo_flush=true", str(exc))
             self.assertIn("remove_with", str(exc))
+            self.assertIn("Nothing was loaded; only the library roots were read", str(exc))
         exc = self.refused(ValueError, item=self.ROUTE1, method="route")
         self.assertIn("allow_undo_flush=true", str(exc))
+
+    def test_max_roots_are_the_authority(self):
+        # The server's registry view can be a stale private copy (Claude Desktop's package keeps one). Here
+        # it points the root at an old folder: the route is resolved against 3ds Max's roots instead.
+        stale = [{"name": "Railclone Library", "path": os.path.join(self.tmp, "old")},
+                 {"name": "CRGR 2", "path": os.path.join(self.tmp, "gone")}]
+        with patch.object(rclib, "library_roots", return_value=(stale, [])):
+            out, script = self.call(lib_raw(), item=self.ROUTE1, splines=["Path600"])
+        self.assertIn(os.path.join(self.fences, "objects", "fencing_metal1.max"), decoded_strings(script))
+        differ = [w for w in out["warnings"] if w.startswith("ROOTS_DIFFER")]
+        self.assertEqual(len(differ), 1)
+        for text in ("'CRGR' is only in 3ds Max", "'CRGR 2' is not in 3ds Max",
+                     f"'Railclone Library' is {self.root} in 3ds Max"):
+            self.assertIn(text, differ[0])
+        # the same roots on both sides: no warning
+        out, _ = self.call(lib_raw(), item=self.ROUTE1, splines=["Path600"])
+        self.assertFalse(any(w.startswith("ROOTS") for w in out["warnings"]))
+
+    def test_root_unknown_to_max_is_refused_before_anything_is_created(self):
+        # A route RailClone doesn't know opens a modal dialog: it never reaches loadLibraryItemByPath
+        crgr_only = [r for r in self.roots if r["name"] == "CRGR"]
+        exc = self.refused(rclib.RailCloneError, max_roots=crgr_only, item=self.ROUTE_RAIL)
+        self.assertEqual(exc.code, "ROUTE_INVALID")
+        self.assertIn("'Railclone Library' is not registered", str(exc))
+        exc = self.refused(rclib.RailCloneError, max_roots=crgr_only, item="Metal Fence 1")
+        self.assertEqual(exc.code, "ITEM_NOT_FOUND")
+        with patch.object(rc, "client", client_with("RCROOTS\nX|missing\nEND\n")) as client:
+            with self.assertRaises(rclib.RailCloneError) as ctx:
+                rc.railclone_from_library(item=self.ROUTE_RAIL)
+        self.assertEqual(ctx.exception.code, "NO_LIBRARY_ROOTS")
+        self.assertEqual(client.send_command.call_count, 1)
+
+    def test_unreadable_max_roots_fall_back_to_the_server_view(self):
+        with patch.object(rc, "client", client_with("RCERROR|-- Runtime error: dotNet failed", lib_raw())) as client:
+            out = rc.railclone_from_library(item=self.ROUTE_RAIL, splines=["Path600"])
+        self.assertEqual(client.send_command.call_count, 2)
+        self.assertTrue(any(w.startswith("ROOTS_NOT_CHECKED") for w in out["warnings"]))
+
+    def test_dialog_blocking_the_roots_read_is_retryable(self):
+        import json
+        from maxmcp.helpers.precheck import PrecheckBlocked
+        from maxmcp.max_client import DialogBlocked
+        client = MagicMock()
+        client.send_command.side_effect = DialogBlocked("r1", "maxscript", [{"title": "Missing External Files"}])
+        with patch.object(rc, "client", client):
+            with self.assertRaises(PrecheckBlocked) as ctx:
+                rc.railclone_from_library(item=self.ROUTE_RAIL)
+        self.assertEqual(client.send_command.call_count, 1)  # never the load
+        payload = json.loads(ctx.exception.bridge_message)
+        self.assertEqual((payload["code"], payload["retryable"]), ("BLOCKED_BY_DIALOG", True))
+        self.assertIn("Nothing was loaded", payload["message"])
+        self.assertFalse(payload["details"]["changed"])
+
+    def test_root_differences(self):
+        server = [{"name": "A", "path": "C:\\lib\\a\\"}, {"name": "B", "path": "C:\\lib\\b"}]
+        same = [{"name": "A", "path": "c:/LIB/a"}, {"name": "B", "path": "C:\\lib\\b"}]
+        self.assertEqual(rclib.root_differences(server, same), [])
+        moved = [{"name": "A", "path": "D:\\lib\\a"}, {"name": "C", "path": "C:\\lib\\c"}]
+        self.assertEqual(rclib.root_differences(server, moved),
+                         ["'C' is only in 3ds Max (C:\\lib\\c)", "'B' is not in 3ds Max (this server sees C:\\lib\\b)",
+                          "'A' is D:\\lib\\a in 3ds Max, C:\\lib\\a\\ here"])
 
     def assert_undo_off_load(self, script, load_call):
         """The whole load runs with undo off: no undo step, no copy, nothing deleted unless it fails."""
@@ -745,18 +827,25 @@ class FromLibraryTests(LibraryFixture):
         self.assertLess(body.index("getStyleDesc()"), body.index("rcRebuild rcBase"))
         self.assertLess(body.index("rcRebuild rcBase"), body.index(".getXMLOutput()"))
 
-    def refused(self, exc_type, **kw):
-        with patch.object(rc, "client", client_with()) as client:
+    def refused(self, exc_type, reads_roots=True, max_roots=None, **kw):
+        """The call fails before anything is created: at most 3ds Max's library roots were read."""
+        responses = [roots_raw(self.roots if max_roots is None else max_roots)] if reads_roots else []
+        with patch.object(rc, "client", client_with(*responses)) as client:
             with self.assertRaises(exc_type) as ctx:
                 rc.railclone_from_library(**kw)
-        client.send_command.assert_not_called()
+        sent = scripts(client)
+        self.assertEqual(len(sent), len(responses))
+        for script in sent:
+            self.assert_roots_read(script)
         return ctx.exception
 
     def test_merge_by_name(self):
         out, script = self.call(lib_raw(), item="Metal Fence 1", splines=["Path600"], name="Fence A")
         self.assertIn('local methodName = "merge"', script)
-        self.assertIn("mergeMAXFile maxFile #(objName) #autoRenameDups #useMergedMtlDups #neverReparent quiet:true",
+        # #useSceneMtlDups: the merge never replaces a scene material of the same name (one tuned for Vantage)
+        self.assertIn("mergeMAXFile maxFile #(objName) #autoRenameDups #useSceneMtlDups #neverReparent quiet:true",
                       script)
+        self.assertNotIn("#useMergedMtlDups", mxs_body(script))
         strings = decoded_strings(script)
         self.assertIn(os.path.join(self.fences, "objects", "fencing_metal1.max"), strings)
         self.assertIn("_RC_fencing_allum_1", strings)
@@ -829,13 +918,26 @@ class FromLibraryTests(LibraryFixture):
 
     def test_param_refusals(self):
         self.refused(ValueError, item=self.ROUTE_RAIL, method="merge")
-        self.refused(ValueError, item=self.ROUTE1, method="copy")
-        self.refused(ValueError, item=self.ROUTE1, splines=["A", "A"])
-        self.refused(ValueError, item=self.ROUTE1, splines="Path600")
-        self.refused(ValueError, item="")
+        # refused in Python before 3ds Max is asked for anything
+        self.refused(ValueError, reads_roots=False, item=self.ROUTE1, method="copy")
+        self.refused(ValueError, reads_roots=False, item=self.ROUTE1, splines=["A", "A"])
+        self.refused(ValueError, reads_roots=False, item=self.ROUTE1, splines=42)
+        self.refused(ValueError, reads_roots=False, item="")
         os.remove(os.path.join(self.fences, "objects", "fencing_metal1.max"))
         exc = self.refused(rclib.RailCloneError, item=self.ROUTE1)
         self.assertEqual(exc.code, "FILE_MISSING")
+
+    def test_splines_accept_one_name_or_a_comma_list(self):
+        # Small models send a single name; FastMCP validates arguments against the signature (StrList)
+        from mcp.server.fastmcp.utilities.func_metadata import func_metadata
+        meta = func_metadata(rc.railclone_from_library)
+        for given, expected in (("Line001", ["Line001"]), ("Line001, Line002", ["Line001", "Line002"]),
+                                ('["Line001"]', ["Line001"]), (["Line001"], ["Line001"])):
+            with self.subTest(given=given):
+                args = meta.arg_model.model_validate(meta.pre_parse_json({"item": "x", "splines": given}))
+                self.assertEqual(args.model_dump_one_level()["splines"], expected)
+        args = meta.arg_model.model_validate({"item": "x"})
+        self.assertIsNone(args.model_dump_one_level()["splines"])
 
     def test_empty_output_not_verified(self):
         out, _ = self.call(lib_raw(placed=0), item=self.ROUTE1, splines=["Path600"])
@@ -844,7 +946,7 @@ class FromLibraryTests(LibraryFixture):
 
     def test_load_failure_code(self):
         raw = "RCERROR|-- Runtime error: LOAD_FAILED: loadLibraryItemByPath returned 1 for x"
-        with patch.object(rc, "client", client_with(raw)):
+        with patch.object(rc, "client", client_with(roots_raw(self.roots), raw)):
             with self.assertRaises(rclib.RailCloneError) as ctx:
                 rc.railclone_from_library(item=self.ROUTE_RAIL)
         self.assertEqual(ctx.exception.code, "LOAD_FAILED")
@@ -903,6 +1005,9 @@ def generated_scripts():
     for method, step in (("merge", False), ("route", False), ("route", True)):
         out[f"from_library_{method}_{step}"] = rc._from_library_body(
             entry, method, ["Path600"], "Name", "RC_Item", "C:\\m.mat", "C:\\maps\\", undo_step=step)
+    with patch.object(rc, "client", client_with("RCERROR|-- stop")) as client:
+        rc._max_library_roots()
+    out["library_roots"] = scripts(client)[0]
     return out
 
 
@@ -915,7 +1020,7 @@ class MaxScriptLintTests(unittest.TestCase):
 
     def test_scripts_were_generated(self):
         self.assertTrue({"get_style#0", "set_style#0", "output#0", "inspect#0", "set_param#0", "set_param#1",
-                         "from_library_route_True"} <= set(self.scripts))
+                         "from_library_route_True", "library_roots"} <= set(self.scripts))
 
     def test_no_for_collect_in_call_arguments(self):
         # Live: a for-collect in a call's arguments that reads the caller's locals failed with
