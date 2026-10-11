@@ -84,7 +84,7 @@ After updating, start a new client session. MCP clients cache the tool list, so 
 
 **The native bridge:** `install.py` copies the prebuilt bridges from `native/bin/`.
 - `mcp_bridge_2026.gup` is the fork's build from `ec903a5` (sha256 `d5cd6ba5f7f35b83…`): upstream 1.7.5 plus every native fix on this branch. No native source has changed since, and later commits generate the same tool registry.
-- `mcp_bridge_2027.gup` is the fork's build from `18611d7` with the 3ds Max 2027 SDK (sha256 `48c186df3720f643…`), committed in `d90d6db` in place of upstream's stock 1.7.5 build (`2d5304d4…`). The production machine has run it since 2026-10-11. No native source changed between `18611d7` and this branch's tip, so it has every native fix here.
+- `mcp_bridge_2027.gup` is the fork's build from `6397f1f` with the 3ds Max 2027 SDK (sha256 `ca5e16dd43fc8183…`), deployed to the production machine on 2026-10-11 13:39. It has every native fix here, including the V-Ray GPU preview (#18). It replaces the first fork build (`48c186df…`, from `18611d7`, committed in `d90d6db`), which itself replaced upstream's stock 1.7.5 build (`2d5304d4…`).
 - The 2023, 2024 and 2025 bridges are upstream's 1.7.5 builds. To get the native fixes on those, build the bridge yourself (below).
 - With a stock bridge, the Python-side fixes work, but the native ones are missing: `health`, the executor shutdown drain, Autodesk Bitmap paths and the duplicate VRayBitmap row fix, `MAXSCRIPT_INTERRUPTED`, `replace_material`'s sub-material matching and source search, the agent viewport reclaim (#11), the #12 quiet-mode check, the dialog monitor's rules for Cosmos, Material Editor and other-thread windows, and the native half of the 1.7.5 dialog fixes (publishing errors before the call resumes, withdrawn presses, quiet mode on the main thread only, `main_thread_pumping`, the Qt error-box retry, the agent viewport's render cleanup after an error box). Without the #12 check, a script that mentions a reset, open, fetch or quit command runs in quiet mode, where a save prompt takes its default answer; pass `quiet=False` for such scripts.
 
@@ -153,7 +153,7 @@ ctest --test-dir native/build-tests -C Release --output-on-failure
 | `feat/railclone-tools`, `feat/forest-tools` | Where the RailClone and Forest Pack tools started, on the 1.7.3-based line. Both are merged, with every later fix. |
 | `fork/integration` | Staging for fixes under review, fast-forwarded into `fix/fork-fixes` after review. Last updated on 2026-10-01. |
 
-Since 2026-10-11 the production machine (3ds Max 2027.2) runs this branch's Python straight from a checkout, with the fork's 2027 bridge built from `18611d7` (sha256 `48c186df…`, the one in `native/bin/`). Until 2026-10-08 it ran Max 2026 with the 1.7.3-based fork: Python from `fix/fork-fixes` (up to `555c19a`) and a 2026 bridge built from `8330c2c` (sha256 `1cf0f9d8…`). In between, it ran upstream's stock 1.7.5.
+Since 2026-10-11 the production machine (3ds Max 2027.2) runs this branch's Python straight from a checkout, with the fork's 2027 bridge: built from `18611d7` (sha256 `48c186df…`) at first, and since 13:39 the same day from `6397f1f` (sha256 `ca5e16dd…`, the one in `native/bin/`). Until 2026-10-08 it ran Max 2026 with the 1.7.3-based fork: Python from `fix/fork-fixes` (up to `555c19a`) and a 2026 bridge built from `8330c2c` (sha256 `1cf0f9d8…`). In between, it ran upstream's stock 1.7.5.
 
 Pull requests to upstream will be cut from upstream's `master`, one per fix, so each can be reviewed on its own.
 
