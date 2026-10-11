@@ -186,7 +186,8 @@ location. Do not reset the user's scene or render unless asked.
 
 - **`fullMeshProxy`** (`HKCU\Software\Itoo Software\RailClone Pro`, RailClone 7.1.4+; 1 is the default):
   - With 1, V-Ray Proxy segments are converted to full mesh.
-  - It's allowed, but **warn before suggesting to turn it on**, whoever proposes it. On RailClone 7+ it's not needed for V-Ray GPU or Chaos Vantage any more, and it costs memory and translation time.
+  - It's allowed, but **warn before suggesting to turn it on**, whoever proposes it. On RailClone 7+ it's not needed for V-Ray GPU or Chaos Vantage any more, and it costs memory and translation time. In one live test it also turned native instancing off for a whole RailClone: 0 of 176 items instanced, against 169 with 0.
+  - RailClone reads it only when 3ds Max starts. Change it with every Max closed, or in RailClone's settings, then restart Max.
   - Never write it from a tool. `itoo_vantage_check` reports it (`FULL_MESH_PROXY_ON`) after reading it inside 3ds Max, because the MCP process may not see iToo's registry keys.
 - **`libUpdateStyles`** (same key, 1 on the production machine):
   - Loading a library style may update every scene RailClone that uses the same style. Before `railclone_from_library` loads a style the scene already uses, say that existing objects may change.
