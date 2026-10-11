@@ -35,8 +35,8 @@ Python (`material_roles`):
 ## Which bridge has it
 
 Everything under "Native" above runs in the bridge:
-- In `native/bin/`, only `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) is a fork build with this fix. The 2023, 2024, 2025 and 2027 files are upstream's 1.7.5 builds.
-- On the production machine, Max 2027 runs a fork bridge (sha256 `48c186df…`) built from `18611d7` with the Max 2027 SDK, deployed on 2026-10-11. It isn't committed yet, so a fresh install from the fork on Max 2027 still gets upstream's bridge.
+- In `native/bin/`, `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) and `mcp_bridge_2027.gup` (sha256 `48c186df…`, built from `18611d7` with the Max 2027 SDK) are fork builds with this fix. The 2023, 2024 and 2025 files are upstream's 1.7.5 builds.
+- The 2027 one has run on the production machine since 2026-10-11.
 
 The Python checks work with any bridge. With an upstream bridge:
 - Autodesk Bitmap paths still read as empty, but each such map gives `FILE_PATH_UNREADABLE` and `complete: false`, so the audit no longer looks clean.

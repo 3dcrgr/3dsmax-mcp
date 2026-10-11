@@ -436,4 +436,4 @@ for i = 1 to 1000 while found do
 - **`at time` is read-only without `animate on`.** Setting properties inside `at time` without `animate on` sets the value at the current time, not at the specified time.
 - **Assemblies cannot be unloaded** once loaded via `dotNet.loadAssembly`.
 - **Callbacks registered with functions cannot be persisted.** Only string-based callbacks support `persistent:true`.
-- **Always use `#noPrompt` with `resetMaxFile`** in batch scripts to avoid blocking save dialogs.
+- **`resetMaxFile #noPrompt` discards the open scene's unsaved changes.** Use it only in a batch the user asked for, after the `getSaveRequired()` check in the batch example above. Otherwise leave it out: the save prompt then comes back as `BLOCKED_BY_DIALOG` (see SKILL.md).

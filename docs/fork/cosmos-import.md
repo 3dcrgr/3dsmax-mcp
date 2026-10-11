@@ -162,7 +162,7 @@ With upstream's bridges, the client applies the same titles: replies don't list 
 
 **Status.** Unit tested in `native/tests/dialog_watch_tests.cpp`, which counts every message the monitor sends these windows, and on the client side in `tests/test_hang_diagnosis.py` and `tests/test_cosmos_import.py`.
 - It's in the fork's 2026 bridge in `native/bin` (`d5cd6ba5…`), which was never deployed.
-- It's also in the fork's 2027 bridge, built from `18611d7` and deployed on 2026-10-11 (`48c186df…`). That build isn't committed: `native/bin/mcp_bridge_2027.gup` is still upstream's stock 1.7.5 build (`2d5304d4…`), so a fresh install on Max 2027 gets only the client-side filtering.
+- It's also in the fork's 2027 bridge in `native/bin` (`48c186df…`, built from `18611d7`), deployed on 2026-10-11. With upstream's bridges (2023–2025), only the client-side filtering applies.
 - Not tested live with these windows. The 2026-10-11 checks on Max 2027 only showed that `max_dialogs` runs the fork's monitor.
 
 ## How it was verified

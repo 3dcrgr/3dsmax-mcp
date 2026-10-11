@@ -113,9 +113,9 @@ Two live test sessions on 2026-10-06 (3ds Max 2026.3, RailClone Pro 7.1.1, V-Ray
   6. `railclone_from_library`: Metal Fence 1 (merge, with consent): 106 items, `_RC_fencing`, selection unchanged, one undo removes it, nothing left over. Baseboard 002 (`.rail`, route): 5 items, the browser's material, 29 maps fixed, selection restored, undo history kept, one undo removes it. Glass Railing 03 (`.rail`): 86 placed, 9 maps fixed. A wrong-case root is refused in Python, with no dialog.
 - Commits: `5dd82d6` (fixes and tools), `5ae0338` (fixes from the live test), `fe36c3a` (undo rework), merged into `merge-1.7.5` at `42963c1`; review fixes after the merge in `9435851`.
 - The undo behaviour is safe by construction and was not run live: agents never run `max undo` or `max redo` through MCP (a redo crashed Max 2027). Only a person can check it with Ctrl+Z.
-- Next live run (Max 2027, scratch scene; the user does any Ctrl+Z):
-  1. `railclone_from_library("Metal Fence 1", ["<spline>"], allow_undo_flush=true)`: about 106 items, `undoable: false`, `remove_with` = the RailClone only, no `*_mcp_merged` node; deleting `remove_with` leaves nothing behind.
-  2. The same item with `method="route"`: the undo-off route load of a `.max` item; output > 0, `remove_with` lists the RailClone.
-  3. The same item with one spline more than it has spline bases: `TOO_MANY_SPLINES`, no new node, selection unchanged (this runs the error cleanup and `clearUndoBuffer()`).
-  4. Baseboard 002 (`.rail`): `undoable: true`, maps fixed; one Ctrl+Z by the user removes it.
-  5. `railclone_inspect`, then `get_railclone_output(rebuild=false)`: the output isn't empty.
+- The live checklist for the undo rework, run on Max 2027 (RailClone 7.3.5) on 2026-10-11 in a scratch scene:
+  1. Done. `railclone_from_library("Metal Fence 1", ["<spline>"], allow_undo_flush=true)`: about 106 items, `undoable: false`, `remove_with` = the RailClone only, no `*_mcp_merged` node.
+  2. Done. The same item with `method="route"` (the undo-off route load of a `.max` item): 106 items, `remove_with` = the node, no dialog.
+  3. Done. One spline more than the item has spline bases: `TOO_MANY_SPLINES`, no new node, selection unchanged.
+  4. Still for a person: Baseboard 002 (`.rail`) loads with `undoable: true`; one Ctrl+Z by the user should remove it.
+  5. Done. `railclone_inspect`, then `get_railclone_output(rebuild=false)`: the output isn't empty.

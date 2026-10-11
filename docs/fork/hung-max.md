@@ -3,8 +3,8 @@
 Fork issues #4 and #6, and the executor shutdown fix. Commits `adcfd93`, `a9d2a0d`, `ed1fb1c`, `2ce5928`, `011e547`, `f7dbb87`, `03f4d64`, `4ba8059` and `b4dd573`. Since the 1.7.5 merge (`a07ef93`), all of this is built to work alongside upstream's dialog handling; see [the last section](#upstream-175s-dialog-handling-fixed-on-the-merge).
 
 **Which bridge.** The client side, the Python half of the dialog fixes, `capture_hang_diagnostics` and the orphaned-server watchdog are Python, and work with upstream's bridges too. `health`, the shutdown drain and the native half of the dialog fixes need the fork's bridge:
-- In `native/bin/`, only `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) is a fork build. The 2023, 2024, 2025 and 2027 files are upstream's 1.7.5 builds.
-- On the production machine, Max 2027 runs a fork bridge built from `18611d7` with the Max 2027 SDK (sha256 `48c186df…`), deployed on 2026-10-11. Its native code is the same as the 2026 build's. It isn't committed yet, so a fresh install from the fork on Max 2027 still gets upstream's bridge.
+- In `native/bin/`, `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) and `mcp_bridge_2027.gup` (sha256 `48c186df…`, built from `18611d7` with the Max 2027 SDK) are fork builds, with the same native code. The 2023, 2024 and 2025 files are upstream's 1.7.5 builds.
+- The 2027 one has run on the production machine since 2026-10-11.
 
 ## What happened
 
