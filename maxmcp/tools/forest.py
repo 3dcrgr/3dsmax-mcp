@@ -451,6 +451,10 @@ def _edit_plan(edits: Any) -> dict[str, Any]:
         elif op == "set_height":
             mods.append(f"#(#height, {index}, {fh.mxs_float(size['height'])})")
         elif op == "set_rotation":
+            # the final angle is computed from the item's current transform, so a second rotation of the
+            # same item in one call would start from a stale angle
+            if "set_rotation" in touched_ops.get(index, set()):
+                raise ValueError(f"{label}: index {index} has two set_rotation edits; send one")
             mods.append(f"#(#rotation, {index}, {rotation:.9f})")
         elif op == "set_seed":
             mods.append(f"#(#seed, {index}, {seed})")

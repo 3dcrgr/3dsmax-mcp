@@ -484,7 +484,8 @@ class ForestEditTests(unittest.TestCase):
                [{"op": "set_width", "index": 0, "width": 0}], [{"op": "set_width", "index": 0, "width": float("nan")}],
                [{"op": "move", "index": 0, "position": [1]}], [{"op": "create", "position": [1, 2], "index": 3}],
                [{"op": "set_geom", "index": 0, "geom_id": 0}], [{"op": "set_seed", "index": 0, "seed": 2**31}],
-               ["move"], [{"op": "create", "position": [1, 2], "width": -1}]]
+               ["move"], [{"op": "create", "position": [1, 2], "width": -1}],
+               [{"op": "set_rotation", "index": 2, "rotation_z": 10}, {"op": "set_rotation", "index": 2, "rotation_z": 20}]]
         for edits in bad:
             with self.subTest(edits=edits), self.assertRaises(ValueError):
                 self.run_edit(edits)
