@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "tool_count": 178,
+  "tool_count": 194,
   "starter_tools": [
     "query_scene",
     "get_session_context",
@@ -14,11 +14,12 @@
     {
       "name": "Setup",
       "hint": "Bridge status, session context",
-      "tool_count": 7,
+      "tool_count": 8,
       "categories": [
         {
           "name": "Connection",
           "tools": [
+            "capture_hang_diagnostics",
             "get_bridge_status",
             "get_plugin_capabilities",
             "get_selected_max_instance",
@@ -55,15 +56,17 @@
     {
       "name": "Objects",
       "hint": "Create, transform, modifiers, layers",
-      "tool_count": 26,
+      "tool_count": 28,
       "categories": [
         {
           "name": "Modeling",
           "tools": [
             "contact_check",
             "curve_model",
+            "drop_to_surface",
             "edit_curve",
-            "inspect_curve"
+            "inspect_curve",
+            "resting_check"
           ]
         },
         {
@@ -220,7 +223,7 @@
     {
       "name": "Viewport & Render",
       "hint": "Captures and rendering",
-      "tool_count": 10,
+      "tool_count": 13,
       "categories": [
         {
           "name": "Lighting",
@@ -234,7 +237,10 @@
         {
           "name": "Render",
           "tools": [
-            "render_scene"
+            "render_scene",
+            "vantage_get_image",
+            "vantage_live_link",
+            "vantage_status"
           ]
         },
         {
@@ -268,7 +274,7 @@
     {
       "name": "Specialty",
       "hint": "MCG, Data Channel, tyFlow, RailClone, etc.",
-      "tool_count": 46,
+      "tool_count": 56,
       "categories": [
         {
           "name": "Data Channel",
@@ -316,12 +322,22 @@
           "tools": [
             "get_railclone_output",
             "get_railclone_style",
+            "railclone_from_library",
+            "railclone_inspect",
+            "railclone_library",
+            "railclone_set_param",
             "set_railclone_style"
           ]
         },
         {
           "name": "Scattering",
           "tools": [
+            "forest_edit_items",
+            "forest_from_library",
+            "forest_items",
+            "forest_library",
+            "forest_set_mode",
+            "forest_validate",
             "scatter_forest_pack"
           ]
         },
@@ -516,6 +532,9 @@
             "type": "string"
           },
           "quiet": {
+            "type": "boolean"
+          },
+          "allow_discard": {
             "type": "boolean"
           }
         }
@@ -1648,7 +1667,7 @@
     },
     {
       "name": "cosmos_import",
-      "description": "Download if needed and import one Cosmos asset into the selected Max instance. Returns imported nodes, materials or maps and their file checks. Materials/maps use the renderer's normal importer; selection is preserved. A pending download makes no scene edit. Repeating a completed model import create",
+      "description": "Download if needed and import one Cosmos asset into the selected Max instance. Returns imported nodes, materials or maps and their file checks; selection is preserved. New materials/maps are found by handle whatever their name (created means new since the import started): materials list those tied t",
       "category": "Cosmos",
       "group": "Materials",
       "module": "cosmos",
@@ -1668,6 +1687,18 @@
               "vray"
             ],
             "type": "string"
+          },
+          "settle_seconds": {
+            "type": "integer"
+          },
+          "restore_medit_renderer": {
+            "type": "boolean"
+          },
+          "swap_medit_renderer": {
+            "type": "boolean"
+          },
+          "minimize_browser": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -1683,7 +1714,7 @@
     },
     {
       "name": "cosmos_search",
-      "description": "Find compatible Cosmos assets for the selected Max instance. Returns asset IDs, kinds, thumbnails, sizes and download states. Filter models, materials or HDRIs with kind. Renderer defaults to the current scene renderer. Use cosmos_download to cache an asset or cosmos_import to download and import it",
+      "description": "Find compatible Cosmos assets for the selected Max instance. Returns asset IDs, kinds, thumbnails, sizes and download states. Filter models, materials or HDRIs with kind. Renderer defaults to the Max's only Cosmos importer (else its current scene renderer); usually no Max round-trip is needed. Use c",
       "category": "Cosmos",
       "group": "Materials",
       "module": "cosmos",
@@ -1967,7 +1998,7 @@
     },
     {
       "name": "batch_replace_materials",
-      "description": "Replace multiple materials in a single operation.",
+      "description": "Run several replace_material swaps in order: replacements=[{\"source\": apply, \"target\": remove}, ...].",
       "category": "Materials",
       "group": "Materials",
       "module": "material_replace",
@@ -1985,6 +2016,12 @@
           },
           "dry_run": {
             "type": "boolean"
+          },
+          "include_sub_materials": {
+            "type": "boolean"
+          },
+          "source_from": {
+            "type": "string"
           }
         },
         "required": [
@@ -2263,7 +2300,7 @@
     },
     {
       "name": "replace_material",
-      "description": "Replace one material with another across all objects that use it.",
+      "description": "Put source_material wherever target_material is used: on objects, and with include_sub_materials also in Multi/Sub (or other) sub-material slots.",
       "category": "Materials",
       "group": "Materials",
       "module": "material_replace",
@@ -2278,6 +2315,12 @@
           },
           "preview": {
             "type": "boolean"
+          },
+          "include_sub_materials": {
+            "type": "boolean"
+          },
+          "source_from": {
+            "type": "string"
           }
         },
         "required": [
@@ -2545,6 +2588,12 @@
           },
           "max_faces": {
             "type": "integer"
+          },
+          "work_budget": {
+            "type": "integer"
+          },
+          "time_budget_s": {
+            "type": "number"
           }
         }
       },
@@ -2588,6 +2637,76 @@
       "example": {},
       "risk": "changes_scene",
       "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "drop_to_surface",
+      "description": "Drop floating items straight down onto the surface below them (props onto a table, plates onto placemats).",
+      "category": "Modeling",
+      "group": "Objects",
+      "module": "resting",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "group_mode": {
+            "type": "string"
+          },
+          "supports": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "exclude_supports": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "clearance_mm": {
+            "type": "number"
+          },
+          "tolerance_mm": {
+            "type": "number"
+          },
+          "max_drop_mm": {
+            "type": "number"
+          },
+          "max_sink_mm": {
+            "type": "number"
+          },
+          "lift_penetrating": {
+            "type": "boolean"
+          },
+          "samples": {
+            "type": "integer"
+          },
+          "max_item_verts": {
+            "type": "integer"
+          },
+          "max_support_faces": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "time_budget_s": {
+            "type": "number"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "maxscript",
       "starter": false
     },
     {
@@ -2678,6 +2797,70 @@
       "example": {},
       "risk": "safe",
       "routing": "native:agent_viewport",
+      "starter": false
+    },
+    {
+      "name": "resting_check",
+      "description": "Find items floating above, or sunk into, the surface below them (props on tables, cloth on cloth).",
+      "category": "Modeling",
+      "group": "Objects",
+      "module": "resting",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "supports": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "exclude_supports": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "group_mode": {
+            "type": "string"
+          },
+          "tolerance_mm": {
+            "type": "number"
+          },
+          "max_drop_mm": {
+            "type": "number"
+          },
+          "max_sink_mm": {
+            "type": "number"
+          },
+          "samples": {
+            "type": "integer"
+          },
+          "max_item_verts": {
+            "type": "integer"
+          },
+          "max_support_faces": {
+            "type": "integer"
+          },
+          "include_resting": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "time_budget_s": {
+            "type": "number"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
       "starter": false
     },
     {
@@ -2980,6 +3163,9 @@
           },
           "count": {
             "type": "integer"
+          },
+          "clone_whole_group": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -4288,6 +4474,12 @@
           },
           "far_origin_threshold": {
             "type": "number"
+          },
+          "check_duplicate_groups": {
+            "type": "boolean"
+          },
+          "group_position_tolerance": {
+            "type": "number"
           }
         }
       },
@@ -4295,7 +4487,7 @@
         "max_issues": 20
       },
       "risk": "read",
-      "routing": "maxscript",
+      "routing": "native:scene_qa_fix",
       "starter": false
     },
     {
@@ -4855,6 +5047,34 @@
       "example": {},
       "risk": "read",
       "routing": "native:undo_last",
+      "starter": false
+    },
+    {
+      "name": "capture_hang_diagnostics",
+      "description": "Explain a hung 3ds Max from native thread stacks (what blocks the main thread).",
+      "category": "Connection",
+      "group": "Setup",
+      "module": "diagnostics",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "pid": {
+            "type": "integer"
+          },
+          "all_threads": {
+            "type": "boolean"
+          },
+          "depth": {
+            "type": "integer"
+          },
+          "save": {
+            "type": "boolean"
+          }
+        }
+      },
+      "example": {},
+      "risk": "read",
+      "routing": "python",
       "starter": false
     },
     {
@@ -5895,6 +6115,9 @@
           },
           "include_xml": {
             "type": "boolean"
+          },
+          "rebuild": {
+            "type": "boolean"
           }
         }
       },
@@ -5921,6 +6144,129 @@
         }
       },
       "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "railclone_from_library",
+      "description": "Create a RailClone from a library item (route or exact name), assign splines and verify its output.",
+      "category": "RailClone",
+      "group": "Specialty",
+      "module": "railclone",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "item": {
+            "type": "string"
+          },
+          "splines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "fix_maps": {
+            "type": "boolean"
+          },
+          "allow_undo_flush": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "item"
+        ]
+      },
+      "example": {
+        "item": ""
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "railclone_inspect",
+      "description": "Read one RailClone: settings, bases, exposed parameters, segments, graph summary and output counts.",
+      "category": "RailClone",
+      "group": "Specialty",
+      "module": "railclone",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "integer"
+          },
+          "include_graph": {
+            "type": "boolean"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "railclone_library",
+      "description": "Search the RailClone library browser (registry roots and their index.xml files); no 3ds Max call.",
+      "category": "RailClone",
+      "group": "Specialty",
+      "module": "railclone",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "root": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "railclone_set_param",
+      "description": "Set RailClone exposed parameters by exact name or id, in one undo step, and report the output change.",
+      "category": "RailClone",
+      "group": "Specialty",
+      "module": "railclone",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "params": {},
+          "name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "params"
+        ]
+      },
+      "example": {
+        "params": {}
+      },
       "risk": "advanced",
       "routing": "python",
       "starter": false
@@ -5961,8 +6307,226 @@
       "starter": false
     },
     {
+      "name": "forest_edit_items",
+      "description": "Edit Forest Pack items: move, delete, create, set size/width/height/rotation/seed/item type.",
+      "category": "Scattering",
+      "group": "Specialty",
+      "module": "forest",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "edits": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "allow_custom_edit": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "edits"
+        ]
+      },
+      "example": {
+        "name": "$first_object",
+        "edits": []
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "forest_from_library",
+      "description": "Place a Forest Pack library preset or 3D item on surfaces; returns the forest, item count and sources.",
+      "category": "Scattering",
+      "group": "Specialty",
+      "module": "forest",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "item": {
+            "type": "string"
+          },
+          "surfaces": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "include_splines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "exclude_splines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "matlib_renderer": {
+            "type": "string"
+          },
+          "hide_sources": {
+            "type": "boolean"
+          },
+          "items_per_m2": {
+            "type": "number"
+          },
+          "allow_undo_flush": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "item",
+          "surfaces"
+        ]
+      },
+      "example": {
+        "item": "",
+        "surfaces": []
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "forest_items",
+      "description": "Read a Forest Pack object's items, paged: pivot position, instance-ready transform, item type, size.",
+      "category": "Scattering",
+      "group": "Specialty",
+      "module": "forest",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "space": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "refresh_surfaces": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "example": {
+        "name": "$first_object"
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "forest_library",
+      "description": "Search the Forest Pack library: presets, 3D items and 2D billboards from every index.xml. Python only.",
+      "category": "Scattering",
+      "group": "Specialty",
+      "module": "forest",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "forest_set_mode",
+      "description": "Switch a Forest Pack object between procedural and custom edit mode (where item edits apply).",
+      "category": "Scattering",
+      "group": "Specialty",
+      "module": "forest",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "confirm_discard": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "example": {
+        "name": "$first_object"
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "forest_validate",
+      "description": "Check a Forest Pack object's item and area lists, then build it and report the item count.",
+      "category": "Scattering",
+      "group": "Specialty",
+      "module": "forest",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "fix": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "example": {
+        "name": "$first_object"
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
       "name": "scatter_forest_pack",
-      "description": "Create a Forest Pack scatter object and wire surfaces + source geometry.",
+      "description": "Create a Forest Pack scatter of source objects over surfaces; returns the real item count.",
       "category": "Scattering",
       "group": "Specialty",
       "module": "scattering",
@@ -6031,6 +6595,9 @@
           },
           "render_mode": {
             "type": "integer"
+          },
+          "items_per_m2": {
+            "type": "number"
           }
         },
         "required": [
@@ -6715,6 +7282,80 @@
       "example": {},
       "risk": "advanced",
       "routing": "native:render_scene",
+      "starter": false
+    },
+    {
+      "name": "vantage_get_image",
+      "description": "Save the frame Chaos Vantage is showing as a PNG, without touching 3ds Max.",
+      "category": "Render",
+      "group": "Viewport & Render",
+      "module": "vantage",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "max_width": {
+            "type": "integer"
+          },
+          "minimum_samples": {
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "type": "integer"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "vantage_live_link",
+      "description": "Start or stop V-Ray GPU Live Link from this 3ds Max to a running Chaos Vantage; only on request.",
+      "category": "Render",
+      "group": "Viewport & Render",
+      "module": "vantage",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "enum": [
+              "start",
+              "stop"
+            ],
+            "type": "string"
+          },
+          "wait_seconds": {
+            "type": "integer"
+          },
+          "force": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "example": {
+        "action": "info"
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "vantage_status",
+      "description": "Read Chaos Vantage's state over its local command port, without touching 3ds Max.",
+      "category": "Render",
+      "group": "Viewport & Render",
+      "module": "vantage",
+      "schema": {
+        "type": "object",
+        "properties": {}
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
       "starter": false
     },
     {

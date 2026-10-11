@@ -66,6 +66,7 @@ MODULE_CATEGORY = {
     "effects": "Effects",
     "railclone": "RailClone",
     "render": "Render",
+    "vantage": "Render",
     "scattering": "Scattering",
     "forest": "Scattering",
     "state_sets": "State Sets",
