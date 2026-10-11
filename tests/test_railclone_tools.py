@@ -81,6 +81,8 @@ STYLE_DUP = (
     f'\t\t<connector id="_exp_distance_0" name="Evenly Distance" parameter="distance" target_id="{POSTS}" '
     'target_name="Posts Distance"/>\n'
     '\t\t<connector id="in_0" name="Segment" target_id="2"/>\n'
+    '\t\t<connector id="spline" name="Spline" target_id="{B16C}" target_name="Path"/>\n'
+    '\t\t<connector id="base_surface" name="Surface" target_id="{890f}" target_name="Surface"/>\n'
     '\t</node>\n'
     '</scene>\n'
 )
@@ -166,8 +168,8 @@ class StyleTests(unittest.TestCase):
         self.assertNotIn("7.3.5", rc._FUNCTIONS)
 
 
-def out_raw(xml=OUTPUT, tm="1,0,0,0,1,0,0,0,1,100,-200,0", shared="", rebuilt="1"):
-    return "RCOUT|602061|%s|%s|%s|%s|%s" % (b64("RC_Fence"), tm, shared, rebuilt, b64(xml))
+def out_raw(xml=OUTPUT, tm="1,0,0,0,1,0,0,0,1,100,-200,0", shared="", rebuilt="1", auto_off="0"):
+    return "RCOUT|602061|%s|%s|%s|%s|%s|%s" % (b64("RC_Fence"), tm, shared, rebuilt, auto_off, b64(xml))
 
 
 class OutputTests(unittest.TestCase):
@@ -175,11 +177,15 @@ class OutputTests(unittest.TestCase):
         with patch.object(rc, "client", client_with(out_raw())) as client:
             out = rc.get_railclone_output(name="RC_Fence", limit=2)
         script = scripts(client)[0]
-        self.assertIn("rcRebuild base\nrebuilt = true", script)
-        self.assertIn("segmentsUpdate 1 n", script)
-        self.assertIn("base.seed = base.seed", script)
+        # Live (RC 7.3.5): seed = seed rebuilds without touching the segments; segmentsUpdate renames linked
+        # segments to their source node, so a read never runs it unless reload_segments asks for it
+        self.assertIn("xml = rcRebuildOutput base false\nrebuilt = true", script)
+        self.assertNotIn("segmentsUpdate", script.replace(rc._FUNCTIONS, ""))
+        self.assertIn("if reloadSegs then (", rc._FUNCTIONS)
+        self.assertIn(") else (base.seed = base.seed)", rc._FUNCTIONS)
         code = "\n".join(line for line in script.splitlines() if not line.strip().startswith("--"))
         self.assertNotIn("notifyDependents", code)
+        self.assertEqual((out["segments_reloaded"], out["auto_update"]), (False, True))
         # backward-compatible fields
         self.assertEqual((out["total"], out["offset"], out["truncated"], out["next_offset"]), (3, 0, True, 2))
         self.assertEqual(out["items"][0]["source_segment"], "post")
@@ -204,11 +210,43 @@ class OutputTests(unittest.TestCase):
         raw = out_raw(shared=b64("RC_Fence001"), rebuilt="0")
         with patch.object(rc, "client", client_with(raw)) as client:
             out = rc.get_railclone_output(name="RC_Fence", rebuild=False, include_xml=True)
-        self.assertNotIn("rcRebuild base\nrebuilt = true", scripts(client)[0])
+        body = scripts(client)[0].replace(rc._FUNCTIONS, "")
+        self.assertNotIn("rcRebuildOutput", body)
+        self.assertIn("xml = api.getXMLOutput()", body)
         self.assertFalse(out["rebuilt"])
         self.assertEqual(out["shared_base_with"], ["RC_Fence001"])
         self.assertTrue(any(w.startswith("SHARED_BASE") for w in out["warnings"]))
         self.assertEqual(out["xml"], OUTPUT)
+
+    def test_reload_segments_is_opt_in(self):
+        with patch.object(rc, "client", client_with(out_raw())) as client:
+            out = rc.get_railclone_output(name="RC_Fence", reload_segments=True)
+        self.assertIn("xml = rcRebuildOutput base true", scripts(client)[0])
+        self.assertTrue(out["segments_reloaded"])
+        self.assertTrue(any(w.startswith("SEGMENTS_RELOADED") and "renamed every linked segment" in w
+                            for w in out["warnings"]))
+        with patch.object(rc, "client", client_with()) as client:
+            with self.assertRaises(ValueError):
+                rc.get_railclone_output(name="RC_Fence", rebuild=False, reload_segments=True)
+            with self.assertRaises(ValueError):
+                rc.get_railclone_output(name="RC_Fence", reload_segments="yes")
+        client.send_command.assert_not_called()
+
+    def test_auto_update_off(self):
+        # Live: with autoUpdate off no scripted call rebuilds; it is pulsed on around the read
+        self.assertIn("if wasOff do base.autoUpdate = true", rc._FUNCTIONS)
+        functions = rc._FUNCTIONS
+        pulse = functions.index("if wasOff do base.autoUpdate = true")
+        self.assertLess(pulse, functions.index("xml = api.getXMLOutput()"))
+        self.assertLess(functions.index("xml = api.getXMLOutput()"),
+                        functions.index("if wasOff do base.autoUpdate = false", pulse))
+        with patch.object(rc, "client", client_with(out_raw(auto_off="1"))):
+            out = rc.get_railclone_output(name="RC_Fence")
+        self.assertFalse(out["auto_update"])
+        self.assertTrue(any(w.startswith("AUTO_UPDATE_OFF") for w in out["warnings"]))
+        with patch.object(rc, "client", client_with(out_raw(auto_off="1", rebuilt="0"))):
+            out = rc.get_railclone_output(name="RC_Fence", rebuild=False)
+        self.assertTrue(any(w.startswith("NOT_REBUILT") and "autoUpdate is off" in w for w in out["warnings"]))
 
     def test_empty_output(self):
         with patch.object(rc, "client", client_with(out_raw('<RailClone version="1"/>'))):
@@ -287,12 +325,31 @@ class InspectTests(unittest.TestCase):
         for needle in ("#paid", "#paselector", "#banode", "#sobjref", "getXMLStyle", "getXMLOutput",
                        "getStyleDesc", "units.decodeValue \"1mm\"", "objectTransform"):
             self.assertIn(needle, self.script)
-        for forbidden in ("theHold.Begin", "segmentsUpdate 1", "setXMLStyle"):
+        for forbidden in ("theHold.Begin", "segmentsUpdate", "setXMLStyle"):
             self.assertNotIn(forbidden, self.script.replace(rc._FUNCTIONS, ""))
         body = self.script.replace(rc._FUNCTIONS, "")
-        # getStyleDesc empties the output export until the next rebuild (live): read it, rebuild, read output
-        self.assertLess(body.index("getStyleDesc"), body.index("rcRebuild base"))
-        self.assertLess(body.index("rcRebuild base"), body.index("api.getXMLOutput()"))
+        # getStyleDesc empties the output export until the next rebuild (live): read it, then rebuild and read
+        # the output (seed = seed: the segments are never reloaded by a read)
+        self.assertLess(body.index("getStyleDesc"), body.index("local ox = rcRebuildOutput base false"))
+
+    def test_reload_segments(self):
+        with patch.object(rc, "client", client_with(inspect_raw())) as client:
+            out = rc.railclone_inspect(name="RC_Fence", reload_segments=True)
+        self.assertIn("local ox = rcRebuildOutput base true", scripts(client)[0])
+        self.assertTrue(out["output"]["segments_reloaded"])
+        self.assertFalse(self.out["output"]["segments_reloaded"])
+        self.assertTrue(any(w.startswith("SEGMENTS_RELOADED") for w in out["warnings"]))
+        self.assertFalse(any(w.startswith("SEGMENTS_RELOADED") for w in self.out["warnings"]))
+        with self.assertRaises(ValueError):
+            rc.railclone_inspect(name="RC_Fence", reload_segments=1)
+
+    def test_auto_update_off_note(self):
+        raw = inspect_raw().replace("K|seed|", "K|autoUpdate|b0\nK|seed|")
+        with patch.object(rc, "client", client_with(raw)):
+            out = rc.railclone_inspect(name="RC_Fence")
+        self.assertIs(out["node"]["settings"]["autoUpdate"], False)
+        self.assertTrue(any(w.startswith("AUTO_UPDATE_OFF") for w in out["warnings"]))
+        self.assertFalse(any(w.startswith("AUTO_UPDATE_OFF") for w in self.out["warnings"]))
 
     def test_node(self):
         node = self.out["node"]
@@ -309,7 +366,12 @@ class InspectTests(unittest.TestCase):
         bases = self.out["bases"]
         self.assertEqual(bases[0]["node"], {"name": "Path600", "handle": 555})
         self.assertEqual((bases[0]["type_name"], bases[1]["type_name"]), ("spline", "surface"))
+        self.assertEqual((bases[0]["role"], bases[1]["role"]), ("path", "surface"))  # from the graph
         self.assertIsNone(bases[1]["node"])
+        no_style = inspect_raw().replace("X|" + b64(STYLE_DUP) + "\n", "")
+        with patch.object(rc, "client", client_with(no_style)):
+            out = rc.railclone_inspect(name="RC_Fence", include_graph=False)
+        self.assertEqual([b["role"] for b in out["bases"]], [None, None])
 
     def test_params_typed(self):
         p = {x["name"]: x for x in self.out["params"]}
@@ -328,7 +390,8 @@ class InspectTests(unittest.TestCase):
         self.assertNotIn("value", p["--Settings--"])
         self.assertTrue(p["Repetitions"]["out_of_limits"])
         self.assertEqual((p["Mirror"]["type_name"], p["Mirror"]["value"]), ("bool", True))
-        self.assertEqual((p["Z Rotation"]["type_name"], p["Z Rotation"]["value"]), ("angle", 45.0))
+        # patype 1 is a plain float (live survey: angles in stock styles, any float in macro parameters)
+        self.assertEqual((p["Z Rotation"]["type_name"], p["Z Rotation"]["value"]), ("float", 45.0))
 
     def test_segments_graph_output(self):
         seg = self.out["segments"]
@@ -344,7 +407,8 @@ class InspectTests(unittest.TestCase):
         self.assertEqual({(e["connector"], e["param_index"]) for e in graph["exposed"]},
                          {("_exp_10_0", 2), ("_exp_distance_0", 1)})
         self.assertEqual(self.out["output"], {"total": 3, "placed": 2, "placeholders": 1,
-                                              "by_segment": {"post": 1, "rail": 1}, "rebuilt": True})
+                                              "by_segment": {"post": 1, "rail": 1}, "rebuilt": True,
+                                              "segments_reloaded": False})
         codes = {w.split(":")[0] for w in self.out["warnings"]}
         self.assertIn("SHARED_BASE", codes)
         self.assertIn("PARAM_OUT_OF_LIMITS", codes)
@@ -365,7 +429,7 @@ class InspectTests(unittest.TestCase):
     def test_no_graph(self):
         with patch.object(rc, "client", client_with(inspect_raw())) as client:
             rc.railclone_inspect(name="RC_Fence", include_graph=False)
-        self.assertNotIn("api.getXMLStyle()", scripts(client)[0])
+        self.assertNotIn("api.getXMLStyle()", scripts(client)[0].replace(rc._FUNCTIONS, ""))
 
 
 def setp_raw(values, before="5:%s:48" % b64("picket"), after="5:%s:24" % b64("picket")):
@@ -409,7 +473,9 @@ class SetParamTests(unittest.TestCase):
         self.assertIn("(rcAt ptype 2) != 3", script)
         self.assertIn('theHold.Accept "MCP RailClone params"', script)
         self.assertLess(script.index("theHold.Begin()"), script.index("base.paunitval[2]"))
-        self.assertEqual(script.replace(rc._FUNCTIONS, "").count("rcRebuild base"), 2)
+        body = script.replace(rc._FUNCTIONS, "")
+        self.assertEqual(body.count("rcRebuildOutput base false"), 2)  # before and after, never segmentsUpdate
+        self.assertNotIn("segmentsUpdate", body)
         self.assertIn("getAnimByHandle 602061", script)
         change = out["changes"][0]
         self.assertEqual((change["index"], change["array"], change["before"], change["after"]),
@@ -465,6 +531,23 @@ class SetParamTests(unittest.TestCase):
         self.assertIn("needs true or false", self.refused({"Mirror": "yes"}))
         self.assertIn("same parameter", self.refused({"Posts Distance": 1.0, POSTS: 2.0}))
         self.assertIn("outside the parameter limits", self.refused({"Posts Distance": -5}))
+
+    def test_string_parameters_are_read_only(self):
+        # patype 6 is String (pastrval) per the docs; no stock style uses it, so it is read but never written
+        rows = PARAM_ROWS + ["|".join(["P", "8"] + [V(v) for v in (
+            "{c8}", "Label Text", 6, 0, 0.0, 0.0, False, "Hello", "", False, 0, 0, 0.0, 0.0, 0.0, 0.0, "")])]
+        raw = "\n".join(["RCINSPECT"] + head_rows() + rows + ["END"]) + "\n"
+        with patch.object(rc, "client", client_with(raw)) as client:
+            with self.assertRaises(ValueError) as ctx:
+                rc.railclone_set_param({"Label Text": "x"}, name="RC_Fence")
+        self.assertEqual(client.send_command.call_count, 1)
+        self.assertIn("string parameter (type 6)", str(ctx.exception))
+        view = rclib.param_view(dict(zip(rclib.PARAM_FIELDS, ["{c8}", "Label Text", 6, 0, 0.0, 0.0, False, "Hello",
+                                                              "", False, 0, 0, 0.0, 0.0, 0.0, 0.0, ""])), 8, 0.1)
+        self.assertEqual((view["type_name"], view["array"], view["value"], view["read_only"]),
+                         ("string", "pastrval", "Hello", True))
+        self.assertNotIn("raw", view)
+        self.assertNotIn("pastrval", rclib.WRITABLE_ARRAYS)
 
     def test_ambiguous_name(self):
         rows = PARAM_ROWS + [param_row(8, "{c8}", "Mirror", 4)]
@@ -523,7 +606,7 @@ INDEX_FENCES = """<?xml version="1.0" encoding="utf-8"?>
     <name lang="english">Metal Fence 1</name>
     <family>Fences</family>
     <description>Parametric metal fence</description>
-    <bitmap>thumbs\\metal1.jpg</bitmap>
+    <bitmap>metal1.jpg</bitmap>
     <maxfile>objects\\fencing_metal1.max</maxfile>
     <object>_RC_fencing_allum_1</object>
     <matlib>$(LIBROOTPATH)\\..\\..\\matlib\\$(RENDERER)_v2.mat</matlib>
@@ -602,7 +685,8 @@ class LibraryTests(LibraryFixture):
         self.assertEqual(first["matlib"], os.path.normpath(os.path.join(self.root, "..", "..", "matlib",
                                                                         "$(RENDERER)_v2.mat")))
         self.assertEqual(first["matlib_macros"], ["RENDERER"])
-        self.assertEqual(first["thumbnail"], os.path.join(self.fences, "thumbs", "metal1.jpg"))
+        # live: a bare <bitmap> file name is in the index folder's thumbnails\ (683 of 683 stock thumbnails)
+        self.assertEqual(first["thumbnail"], os.path.join(self.fences, "thumbnails", "metal1.jpg"))
         self.assertEqual((first["object"], first["material"], first["uuid"]),
                          ("_RC_fencing_allum_1", "_RC_fencing", "{1111}"))
         self.assertEqual(first["load_method"], "merge")
@@ -635,6 +719,30 @@ class LibraryTests(LibraryFixture):
         out = rc.railclone_library()
         self.assertEqual(out["total"], 2)
         self.assertTrue(any(w.startswith("INDEX_UNREADABLE") for w in out["warnings"]))
+
+    def test_leading_backslash_paths_are_index_relative(self):
+        # The docs' template writes "\objects\x.max"; live, index.xml paths are relative to the index folder
+        # (686 of 687 stock maxfiles), and a naive join put such a path on the drive or share root
+        folder = os.path.join(self.root, "Lead")
+        os.makedirs(os.path.join(folder, "thumbnails"))
+        Path(folder, "thumbnails", "lead.jpg").write_bytes(b"x")
+        Path(folder, "index.xml").write_text(
+            '<library><item><name>Lead</name><bitmap>\\thumbnails\\lead.jpg</bitmap>'
+            '<maxfile>\\objects\\lead.max</maxfile><object>o</object>'
+            '<matlib>/matlibs/lead.mat</matlib><material>m</material></item>'
+            '<item><name>Abs</name><bitmap>\\\\srv\\share\\t.jpg</bitmap><maxfile>\\\\srv\\share\\a.max</maxfile>'
+            '<object>o</object><matlib>D:\\lib\\a.mat</matlib></item></library>', encoding="utf-8")
+        lead, absolute = rclib.parse_index(os.path.join(folder, "index.xml"), "Railclone Library", self.root)
+        self.assertEqual(lead["maxfile"], os.path.join(folder, "objects", "lead.max"))
+        self.assertEqual(lead["matlib"], os.path.join(folder, "matlibs", "lead.mat"))
+        self.assertEqual(lead["thumbnail"], os.path.join(folder, "thumbnails", "lead.jpg"))
+        self.assertEqual(absolute["maxfile"], "\\\\srv\\share\\a.max")  # UNC and drive paths stay absolute
+        self.assertEqual(absolute["matlib"], "D:\\lib\\a.mat")
+        self.assertEqual(absolute["thumbnail"], "\\\\srv\\share\\t.jpg")
+        for text, rel in (("\\objects\\x.max", "objects\\x.max"), ("/objects/x.max", "objects/x.max"),
+                          ("objects\\x.max", "objects\\x.max"), ("..\\x.max", "..\\x.max"),
+                          ("\\\\srv\\share\\x.max", None), ("C:\\x.max", None), ("C:x.max", None)):
+            self.assertEqual(rclib.library_relative(text), rel, text)
 
 
 def lib_raw(*, placed=48, extra=()):
@@ -760,7 +868,7 @@ class FromLibraryTests(LibraryFixture):
         end = body.index("\n)\n", catch)
         load = body.index(load_call)
         self.assertLess(start, load)
-        for step in ("base.banode[spIdx[k]] = splines[k]", "o.pos = splines[1].pos",
+        for step in ("base.banode[pathIdx[k]] = splines[k]", "o.pos = splines[1].pos",
                      "setProperty pair[1] pair[2] cand"):
             self.assertLess(load, body.index(step))
             self.assertLess(body.index(step), catch)
@@ -800,7 +908,7 @@ class FromLibraryTests(LibraryFixture):
         body = mxs_body(script)
         begin = body.index("theHold.Begin()")
         accept = body.index('theHold.Accept ""')
-        for step in ("o = RailClone_Pro()", "api.loadLibraryItemByPath routeArg", "base.banode[spIdx[k]] = splines[k]",
+        for step in ("o = RailClone_Pro()", "api.loadLibraryItemByPath routeArg", "base.banode[pathIdx[k]] = splines[k]",
                      "setProperty pair[1] pair[2] cand"):
             self.assertTrue(begin < body.index(step) < accept, step)
         # nothing is deleted with undo off: the cancel removes the node, leftovers go in a recorded step
@@ -824,8 +932,8 @@ class FromLibraryTests(LibraryFixture):
         _, script = self.call(lib_raw(), item=self.ROUTE_RAIL, allow_undo_flush=False)
         body = script.replace(rc._FUNCTIONS, "")
         # getStyleDesc empties the output export until the next rebuild (live)
-        self.assertLess(body.index("getStyleDesc()"), body.index("rcRebuild rcBase"))
-        self.assertLess(body.index("rcRebuild rcBase"), body.index(".getXMLOutput()"))
+        self.assertLess(body.index("getStyleDesc()"), body.index("rcOutStats (rcRebuildOutput rcBase false)"))
+        self.assertNotIn(".getXMLOutput()", body)  # read inside rcRebuildOutput, after its rebuild
 
     def refused(self, exc_type, reads_roots=True, max_roots=None, **kw):
         """The call fails before anything is created: at most 3ds Max's library roots were read."""
@@ -857,7 +965,7 @@ class FromLibraryTests(LibraryFixture):
         self.assertFalse(any(s.endswith(".pmat") for s in strings))
         self.assertIn("loadTempMaterialLibrary matPath", script)
         self.assertNotIn("theHold.Accept", script)  # a merge clears the undo history: no undo step
-        self.assertIn("rcRebuild rcBase", script)
+        self.assertIn("rcRebuildOutput rcBase false", script)
         self.assertEqual((out["method"], out["route"], out["handle"]), ("merge", self.ROUTE1, 900))
         self.assertTrue(out["verified"])
         self.assertEqual(out["output"]["placed"], 48)
@@ -951,6 +1059,52 @@ class FromLibraryTests(LibraryFixture):
                 rc.railclone_from_library(item=self.ROUTE_RAIL)
         self.assertEqual(ctx.exception.code, "LOAD_FAILED")
 
+    def test_splines_go_by_base_role(self):
+        # Live: batype is 0 for a path and a clipping area alike, so by order the second spline of a window
+        # (X Spline + Clipping area) became its clipping area. Bases now get splines by their graph role.
+        raw = lib_raw().replace(
+            "B|1|" + "|".join(V(v) for v in ("{b16c}", "Path", 0, {"name": "Path600", "handle": 555})),
+            "B|1|" + "|".join(V(v) for v in ("{b16c}", "X Spline", 0, {"name": "Path600", "handle": 555}, "path"))
+            + "\nB|3|" + "|".join(V(v) for v in ("{c1ce}", "Clipping area", 0, {"name": "Outline", "handle": 556},
+                                                 "clip")))
+        out, script = self.call(raw, item=self.ROUTE_RAIL, splines=["Path600"], clipping_splines=["Outline"],
+                                allow_undo_flush=False)
+        self.assertEqual(decoded_strings(script).count("Outline"), 1)
+        self.assertIn("local clipNames = #(rcDecode", script)
+        body = mxs_body(script)
+        roles = body.index("baseRoles = rcBaseRoles base")
+        for step in ("base.banode[pathIdx[k]] = splines[k]", "base.banode[clipIdx[k]] = clipSplines[k]"):
+            self.assertLess(roles, body.index(step))
+        self.assertIn('(rcAt baseRoles i) == "path" collect i', script)
+        self.assertIn('(rcAt baseRoles i) == "clip" collect i', script)
+        self.assertNotIn("spIdx", body)
+        self.assertEqual([(b["index"], b["name"], b["role"]) for b in out["bases"]],
+                         [(1, "X Spline", "path"), (3, "Clipping area", "clip"), (2, "Surface", None)])
+        self.assertEqual(out["bases"][1]["node"], {"name": "Outline", "handle": 556})
+        self.assertFalse(any(w.startswith("NO_SPLINES") for w in out["warnings"]))
+        # without splines the warning names the bases by role
+        out, _ = self.call(raw, item=self.ROUTE_RAIL, allow_undo_flush=False)
+        warning = next(w for w in out["warnings"] if w.startswith("NO_SPLINES"))
+        self.assertIn("path base(s) ['X Spline'] (splines)", warning)
+        self.assertIn("clipping-area base(s) ['Clipping area'] (clipping_splines)", warning)
+
+    def test_role_errors_remove_the_load(self):
+        for code in ("ROLE_UNKNOWN", "TOO_MANY_SPLINES", "TOO_MANY_CLIPPING_SPLINES"):
+            raw = f"RCERROR|-- Runtime error: {code}: 2 spline(s) for 1 path base(s)"
+            with self.subTest(code=code), patch.object(rc, "client", client_with(roots_raw(self.roots), raw)):
+                with self.assertRaises(rclib.RailCloneError) as ctx:
+                    rc.railclone_from_library(item=self.ROUTE_RAIL, splines=["A", "B"])
+                self.assertEqual(ctx.exception.code, code)
+        for script in (rc._from_library_body({"route": self.ROUTE_RAIL, "maxfile": "x.rail"}, "route", ["A"], "",
+                                             "RC_x", "", "", undo_step=True, clipping_splines=["B"]),):
+            body = script.replace(rc._FUNCTIONS, "")
+            # the refusals are thrown inside the load's try, so the cancel/cleanup path removes the new node
+            setup = body.index("baseRoles = rcBaseRoles base")
+            self.assertTrue(body.index("theHold.Begin()") < setup < body.index('throw ("ROLE_UNKNOWN: ')
+                            < body.index('theHold.Accept "'))
+        self.refused(ValueError, reads_roots=False, item=self.ROUTE1, splines=["A"], clipping_splines=["A"])
+        self.refused(ValueError, reads_roots=False, item=self.ROUTE1, clipping_splines=[""])
+
 
 MXS_KEYWORDS = frozenset("""about and animate as at by case catch collect continue coordsys do dontcollect else exit
     fn for from function global if in local macroscript mapped max not of off on or parameters persistent plugin
@@ -1004,7 +1158,8 @@ def generated_scripts():
     entry = {"route": "\\L\\Cat\\Item", "maxfile": "C:\\lib\\item.max", "object": "rc_item", "material": "mtl"}
     for method, step in (("merge", False), ("route", False), ("route", True)):
         out[f"from_library_{method}_{step}"] = rc._from_library_body(
-            entry, method, ["Path600"], "Name", "RC_Item", "C:\\m.mat", "C:\\maps\\", undo_step=step)
+            entry, method, ["Path600"], "Name", "RC_Item", "C:\\m.mat", "C:\\maps\\", undo_step=step,
+            clipping_splines=["Outline"])
     with patch.object(rc, "client", client_with("RCERROR|-- stop")) as client:
         rc._max_library_roots()
     out["library_roots"] = scripts(client)[0]
@@ -1066,6 +1221,17 @@ class MaxScriptLintTests(unittest.TestCase):
                     self.assertLess(after.index("rcRebuild"), after.index("getXMLOutput()"), label)
         self.assertGreaterEqual(seen, 4)  # inspect, and the three from-library scripts
 
+    def test_no_script_reloads_segments_by_default(self):
+        # Live (RC 7.3.5): segmentsUpdate renames every linked segment to its source node; only an explicit
+        # reload_segments=true may run it, never a read, a parameter write or a library load
+        for label, script in self.scripts.items():
+            if label == "functions":
+                continue
+            body = script.replace(rc._FUNCTIONS, "")
+            self.assertNotIn("segmentsUpdate", body, label)
+            self.assertNotIn("rcRebuildOutput base true", body, label)
+            self.assertNotIn("rcRebuildOutput rcBase true", body, label)
+
     def test_undo_records_never_outlive_their_nodes(self):
         # Live: an undo record that refers to a node deleted with undo off crashed a later undo
         holds = 0
@@ -1079,6 +1245,87 @@ class MaxScriptLintTests(unittest.TestCase):
                     self.assertIn('undo "', line, f"{label}: a script with an undo step deletes without undo: "
                                                   f"{line.strip()}")
         self.assertGreaterEqual(holds, 3)  # set_style, set_param, from-library .rail
+
+
+ROLE_STYLE = """<scene version="400">
+  <node id="{P}" baseClass="Object" class="Spline" name="Path"/>
+  <node id="{C}" baseClass="Object" class="Spline" name="Boundary Spline"/>
+  <node id="{X}" baseClass="Object" class="Spline" name="X Spline"/>
+  <node id="{W}" baseClass="Object" class="Spline" name="Clipping area"/>
+  <node id="{N}" baseClass="Object" class="Spline" name="Clipping area 2"/>
+  <node id="{O}" baseClass="Object" class="Spline" name="Offset path"/>
+  <node id="{S}" baseClass="Object" class="Surface" name="Surface"/>
+  <node id="{U}" baseClass="Object" class="Spline" name="Unused"/>
+  <node id="{M}" baseClass="Object" class="Spline" name="Both"/>
+  <node id="{G}" baseClass="Object" class="Spline" name="Odd"/>
+  <node id="op1" baseClass="Operator" class="Offset" name="Offset">
+    <connector id="node" name="Spline" target_id="{O}"/>
+  </node>
+  <node id="g1" baseClass="Generator" class="Linear1S" name="L1S">
+    <connector id="spline" target_id="{p}"/>
+    <connector id="base_surface" target_id="{S}"/>
+    <connector id="_exp_x_0" target_id="{P}"/>
+  </node>
+  <node id="g2" baseClass="Generator" class="Array2S" name="A2S">
+    <connector id="clipping_area" target_id="{C}"/>
+    <connector id="spline" target_id="op1"/>
+    <connector id="spline_x" target_id="{M}"/>
+    <connector id="clipping_area" target_id="{M}"/>
+    <connector id="default" target_id="{G}"/>
+  </node>
+  <node id="{mac}" baseClass="Macro" class="Macro" name="Window">
+    <macro>
+      <node id="{im_x}" baseClass="InputMacro" class="InputMacro" name="X Spline">
+        <parameter id="type" value="1"/>
+      </node>
+      <node id="{im_w}" baseClass="InputMacro" class="InputMacro" name="Clipping area">
+        <parameter id="type" value="3"/>
+      </node>
+      <node id="{im_n}" baseClass="InputMacro" class="InputMacro" name="Clipping area">
+        <parameter id="type" value="1"/>
+      </node>
+      <node id="g3" baseClass="Generator" class="Array2S" name="Inner">
+        <connector id="spline_x" target_id="{im_x}"/>
+        <connector id="clipping_area" target_id="{im_n}"/>
+      </node>
+    </macro>
+    <connector id="{mac}{im_x}" name="X Spline" target_id="{X}"/>
+    <connector id="{mac}{im_w}" name="Clipping area" target_id="{W}"/>
+    <connector id="{mac}{im_n}" name="Clipping area" target_id="{N}"/>
+  </node>
+</scene>"""
+
+
+class BaseRoleTests(unittest.TestCase):
+    """The role of each base from the style graph (live probes p12/p13 on RailClone 7.3.5)."""
+
+    def test_roles(self):
+        ids = ["{P}", "{C}", "{X}", "{W}", "{N}", "{O}", "{S}", "{U}", "{M}", "{G}"]
+        roles = dict(zip(ids, rclib.base_roles(ET.fromstring(ROLE_STYLE), ids)))
+        self.assertEqual(roles, {
+            "{P}": "path",      # L1S spline input (ids match case-insensitively; _exp_ connectors are parameters)
+            "{C}": "clip",      # A2S clipping area
+            "{X}": "path",      # macro input of type 1, followed to the inner A2S's spline_x
+            "{W}": "clip",      # macro input of type 3
+            "{N}": "clip",      # a type-1 InputMacro named "Clipping area" that feeds clipping_area inside
+            "{O}": "path",      # through an operator to a spline input
+            "{S}": "surface",
+            "{U}": "unused",
+            "{M}": "mixed",
+            "{G}": "unknown",   # a generator input that is no path, clipping area or surface
+        })
+        self.assertEqual(rclib.combine_roles({"path", "unknown"}), "path")
+        self.assertEqual(rclib.combine_roles({"segment", "unknown"}), "unknown")
+
+    def test_maxscript_walk_matches(self):
+        # rcBaseRoles is the same walk in MAXScript; compared live on all 233 stock items in the scratch Max
+        for cid, role in rclib.GENERATOR_INPUTS.items():
+            self.assertIn(f'cid == "{cid}"', rc._FUNCTIONS)
+            self.assertIn(f'appendIfUnique found "{role}"', rc._FUNCTIONS)
+        for kind, role in rclib.INPUT_MACRO_ROLES.items():
+            self.assertIn(f'if mt == {kind} then appendIfUnique found "{role}"', rc._FUNCTIONS)
+        self.assertIn('else if cKinds[k] == "Operator" then append queue cOwners[k]', rc._FUNCTIONS)
+        self.assertIn(f"steps < {rclib.ROLE_STEPS}", rc._FUNCTIONS)
 
 
 class DecodeTests(unittest.TestCase):

@@ -28,10 +28,19 @@ MS_ERROR = "__MCP_MS_ERR__:"
 UNDO_PARAMS = "MCP RailClone params"
 UNDO_LIBRARY = "MCP RailClone from library"
 UNDO_CLEANUP = "MCP RailClone cleanup"
+_AUTO_UPDATE_NOTE = ("AUTO_UPDATE_OFF: autoUpdate is off, so no scripted call rebuilds this RailClone; it was "
+                     "switched on for the read and back off (undo off), and the rebuilt output is kept")
+_RELOAD_NOTE = ("SEGMENTS_RELOADED: segmentsUpdate ran (reload_segments). On RailClone 7.3.5 it changed no "
+                "geometry, but it renamed every linked segment (sname) to its source node's name, so sname can "
+                "differ from the segment's name in the style XML; it isn't undoable")
 
 
 def _b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _mxs_bool(value: bool) -> str:
+    return "true" if value else "false"
 
 
 def _parse_xml(text: str, root: str) -> tuple[ET.Element, int, int]:
@@ -121,13 +130,134 @@ fn rcRestoreSel prevSel = (
     local keep = for n in prevSel where isValidNode n collect n
     if keep.count == 0 then clearSelection() else select keep
 )
-fn rcRebuild base = (
-    -- Moves and copies do not re-evaluate a RailClone; notifyDependents does not either.
+-- Rebuild, then return the output export. Moves and copies do not re-evaluate a RailClone, and neither
+-- do notifyDependents or reading .mesh. Live (RailClone 7.3): seed = seed rebuilds without touching the
+-- segments. segmentsUpdate changes no geometry there, but renames every linked segment (sname) to
+-- its source node's name, so it runs only when reloadSegs is true. With autoUpdate off no scripted
+-- call rebuilds and the build is lazy: autoUpdate goes on, the export is read, then it goes back
+-- off (the rebuilt output is kept). All with undo off.
+fn rcRebuildOutput base reloadSegs = (
+    local api = rcApi base #getXMLOutput
+    local xml = undefined
+    local wasOff = (isProperty base #autoUpdate) and base.autoUpdate == false
     with undo off (
-        local n = (rcArr base #sid).count
-        if n > 0 then ((rcApi base #segmentsUpdate).segmentsUpdate 1 n) else (base.seed = base.seed)
+        if wasOff do base.autoUpdate = true
+        try (
+            if reloadSegs then (
+                local n = (rcArr base #sid).count
+                if n > 0 then ((rcApi base #segmentsUpdate).segmentsUpdate 1 n) else (base.seed = base.seed)
+            ) else (base.seed = base.seed)
+            xml = api.getXMLOutput()
+        ) catch (
+            if wasOff do base.autoUpdate = false
+            throw()
+        )
+        if wasOff do base.autoUpdate = false
     )
-    true
+    xml
+)
+-- The role of each base (baid order) from the style XML (live, RailClone 7.3): the connectors whose
+-- target_id is the base id. A generator input names it (spline, spline_x, spline_y: path;
+-- clipping_area: clip; base_surface: surface). A macro input "{macro}{input}" takes its InputMacro's
+-- type (0 segment, 2 surface, 3 clipping area; 1 spline is followed inside the macro), and an
+-- operator is followed to what uses it. batype is 0 for paths and clipping areas alike, and names
+-- are no guide. railclone_lib.base_roles is the same walk in Python.
+fn rcRoleOf found = (
+    local hasPath = (findItem found "path") > 0
+    local hasClip = (findItem found "clip") > 0
+    if found.count == 0 then "unused"
+    else if hasPath and hasClip then "mixed"
+    else if hasPath then "path"
+    else if hasClip then "clip"
+    else if (findItem found "surface") > 0 then "surface"
+    else if found.count == 1 and found[1] == "segment" then "segment"
+    else "unknown"
+)
+fn rcBaseRoles base = (
+    local ids = for v in (rcArr base #baid) collect (toLower (v as string))
+    local roles = for v in ids collect "unknown"
+    local api = getInterface base #railclone
+    local doc = undefined
+    if api != undefined and isProperty api #getXMLStyle do (
+        doc = dotNetObject "System.Xml.XmlDocument"
+        doc.XmlResolver = undefined
+        try (doc.LoadXml (rcSanitize (api.getXMLStyle()))) catch (doc = undefined)
+    )
+    if doc != undefined do (
+        local cIds = #(), cTargets = #(), cOwners = #(), cKinds = #()
+        local conns = doc.GetElementsByTagName "connector"
+        for i = 0 to conns.Count - 1 do (
+            local c = conns.Item i
+            local own = c.ParentNode
+            local t = toLower (c.GetAttribute "target_id")
+            if t != "" and own != undefined and own.Name == "node" do (
+                append cIds (toLower (c.GetAttribute "id"))
+                append cTargets t
+                append cOwners (toLower (own.GetAttribute "id"))
+                append cKinds (own.GetAttribute "baseClass")
+            )
+        )
+        local mIds = #(), mTypes = #()
+        local nodes = doc.GetElementsByTagName "node"
+        for i = 0 to nodes.Count - 1 do (
+            local nd = nodes.Item i
+            if (nd.GetAttribute "class") == "InputMacro" do (
+                local ty = -1
+                local kids = nd.ChildNodes
+                for j = 0 to kids.Count - 1 do (
+                    local ch = kids.Item j
+                    if ch.Name == "parameter" and (ch.GetAttribute "id") == "type" do (
+                        local tv = (ch.GetAttribute "value") as integer
+                        ty = if tv == undefined then -1 else tv
+                    )
+                )
+                append mIds (toLower (nd.GetAttribute "id"))
+                append mTypes ty
+            )
+        )
+        for b = 1 to ids.count do (
+            local found = #()
+            local queue = #(ids[b])
+            local seen = #()
+            local steps = 0
+            while queue.count > 0 and steps < 500 do (
+                steps += 1
+                local tgt = queue[queue.count]
+                deleteItem queue queue.count
+                if (findItem seen tgt) == 0 do (
+                    append seen tgt
+                    for k = 1 to cTargets.count where cTargets[k] == tgt do (
+                        local cid = cIds[k]
+                        if cid == "spline" or cid == "spline_x" or cid == "spline_y" then appendIfUnique found "path"
+                        else if cid == "clipping_area" then appendIfUnique found "clip"
+                        else if cid == "base_surface" then appendIfUnique found "surface"
+                        else (
+                            if not (matchPattern cid pattern:"_exp_*") do (
+                                local cut = findString cid "}{"
+                                local m = 0
+                                local inner = ""
+                                if cut != undefined and cid[1] == "{" do (
+                                    inner = substring cid (cut + 1) -1
+                                    m = findItem mIds inner
+                                )
+                                if m > 0 then (
+                                    local mt = mTypes[m]
+                                    if mt == 3 then appendIfUnique found "clip"
+                                    else if mt == 2 then appendIfUnique found "surface"
+                                    else if mt == 0 then appendIfUnique found "segment"
+                                    else append queue inner
+                                )
+                                else if cKinds[k] == "Operator" then append queue cOwners[k]
+                                else appendIfUnique found "unknown"
+                            )
+                        )
+                    )
+                )
+            )
+            roles[b] = rcRoleOf found
+        )
+    )
+    roles
 )
 fn rcOutStats xml = (
     local rx = dotNetClass "System.Text.RegularExpressions.Regex"
@@ -387,43 +517,55 @@ def get_railclone_output(
     limit: int = 100,
     include_xml: bool = False,
     rebuild: bool = True,
+    reload_segments: bool = False,
 ) -> dict[str, Any]:
     """Inspect RailClone getXMLOutput at the current frame, without rendering.
 
-    rebuild (default) re-evaluates first with segmentsUpdate: moving or copying a
-    RailClone does not, so cached output goes stale. Items keep RailClone's
-    attributes verbatim (index, source_segment, instanced, tm, box, tags) plus
-    placeholder=true for empty slots (no source_segment, inverted sentinel box).
-    tm and box are in the RailClone object's local space; node_tm and bounds_world
-    give world placement. total/placed/placeholders/by_segment/bounds cover every
-    item, not only the page. offset is a zero-based row offset. include_xml adds
-    the full XML. Each call re-evaluates; pages are not a snapshot. Max 4M chars.
+    rebuild (default) re-evaluates first with seed = seed, undo off: moving or
+    copying a RailClone does not, so cached output goes stale. It doesn't touch the
+    segments. With autoUpdate off it is switched on for the read and back off.
+    reload_segments=true also runs segmentsUpdate: on RailClone 7.3.5 that changed
+    no geometry but renamed each linked segment to its source node. Items keep
+    RailClone's attributes verbatim (index, source_segment, instanced, tm, box,
+    tags) plus placeholder=true for empty slots (no source_segment, inverted
+    sentinel box). tm and box are in the RailClone object's local space; node_tm
+    and bounds_world give world placement. total/placed/placeholders/by_segment/
+    bounds cover every item, not only the page. offset is a zero-based row offset.
+    include_xml adds the full XML. Each call re-evaluates; pages are not a
+    snapshot. Max 4M chars.
     """
     integer(offset, "offset", low=0, high=2**31 - 1)
     integer(limit, "limit", high=10000)
     if type(include_xml) is not bool:
         raise ValueError("include_xml must be boolean")
-    if type(rebuild) is not bool:
-        raise ValueError("rebuild must be boolean")
-    rebuild_code = "rcRebuild base\nrebuilt = true\n" if rebuild else ""
+    if type(rebuild) is not bool or type(reload_segments) is not bool:
+        raise ValueError("rebuild and reload_segments must be boolean")
+    if reload_segments and not rebuild:
+        raise ValueError("reload_segments rebuilds the RailClone; it can't be combined with rebuild=false")
+    if rebuild:
+        read_code = f"xml = rcRebuildOutput base {_mxs_bool(reload_segments)}\nrebuilt = true\n"
+    else:
+        read_code = "xml = api.getXMLOutput()\n"
     raw = _send(_target(name, handle) + f'''
 local base = obj.baseObject
 local api = rcApi base #getXMLOutput
 local rebuilt = false
-{rebuild_code}local xml = api.getXMLOutput()
-if xml.count > {MAX_XML_CHARS} do throw "XML_TOO_LARGE: output exceeds the XML response limit"
+local autoOff = (isProperty base #autoUpdate) and base.autoUpdate == false
+local xml = undefined
+{read_code}if xml.count > {MAX_XML_CHARS} do throw "XML_TOO_LARGE: output exceeds the XML response limit"
 local shared = for n in (rcShared obj) collect (rcEncode n.name)
-"RCOUT|" + (rcH obj) + "|" + (rcEncode obj.name) + "|" + (rcTm obj.objectTransform) + "|" + (rcJoin shared ",") + "|" + (if rebuilt then "1" else "0") + "|" + (rcEncode xml)
+"RCOUT|" + (rcH obj) + "|" + (rcEncode obj.name) + "|" + (rcTm obj.objectTransform) + "|" + (rcJoin shared ",") + "|" + (if rebuilt then "1" else "0") + "|" + (if autoOff then "1" else "0") + "|" + (rcEncode xml)
 ''')
-    parts = raw.split("|", 6)
-    if len(parts) != 7 or parts[0] != "RCOUT":
+    parts = raw.split("|", 7)
+    if len(parts) != 8 or parts[0] != "RCOUT":
         raise RailCloneError("INVALID_READBACK", f"RailClone returned no output readback: {raw[:250]}")
     try:
-        xml = _unb64(parts[6])
+        xml = _unb64(parts[7])
         result: dict[str, Any] = {"handle": int(parts[1]), "name": _unb64(parts[2])}
         shared = [_unb64(s) for s in parts[4].split(",") if s]
     except (ValueError, UnicodeError) as exc:
         raise RailCloneError("INVALID_READBACK", "Incomplete output response; inspect before retrying") from exc
+    auto_off = parts[6] == "1"
     node_rows = rclib.parse_matrix(parts[3])
     root = _xml(xml, "RailClone")
     items = [dict(item.attrib) for item in root.findall("item")]
@@ -437,13 +579,19 @@ local shared = for n in (rcShared obj) collect (rcEncode n.name)
                         "its output to one node only, so positions may belong to another instance")
     if not rebuild:
         warnings.append("NOT_REBUILT: this is RailClone's last export; it can be stale after moves and copies, "
-                        "and empty after a script calls getStyleDesc() (it clears the export until a rebuild)")
+                        "and empty after a script calls getStyleDesc() (it clears the export until a rebuild)"
+                        + ("; autoUpdate is off, so it is stale until a rebuild" if auto_off else ""))
+    elif auto_off:
+        warnings.append(_AUTO_UPDATE_NOTE)
+    if reload_segments:
+        warnings.append(_RELOAD_NOTE)
     if summary["placed"] == 0:
         warnings.append("EMPTY_OUTPUT: no placed items (no spline assigned, or the style produces nothing)")
     result.update(
         schema=dict(root.attrib), total=len(items), offset=offset, items=items[offset:end],
         truncated=end < len(items), next_offset=end if end < len(items) else None,
-        rebuilt=parts[5] == "1", space="object", node_tm=node_rows,
+        rebuilt=parts[5] == "1", segments_reloaded=reload_segments, auto_update=not auto_off,
+        space="object", node_tm=node_rows,
         placed=summary["placed"], placeholders=summary["placeholders"], by_segment=summary["by_segment"],
         bounds_object=summary["bounds_object"], bounds_world=summary["bounds_world"],
         shared_base_with=shared, warnings=warnings,
@@ -467,7 +615,7 @@ def _rows(tag: str, fields: tuple[str, ...]) -> str:
             ')\n')
 
 
-def _inspect_body(*, graph: bool, output: bool, bases: bool, segments: bool) -> str:
+def _inspect_body(*, graph: bool, output: bool, bases: bool, segments: bool, reload: bool = False) -> str:
     body = '''
 local base = obj.baseObject
 local api = getInterface base #railclone
@@ -508,8 +656,7 @@ for n in (rcShared obj) do rcRow ss #("D", rcV n)
         # before the rebuild; the export is full again afterwards. Without the output it isn't read at all.
         body += 'rcRow ss #("K", "style_desc", rcV (try (api.getStyleDesc()) catch undefined))\n'
         body += f'''if isProperty api #getXMLOutput then (
-    rcRebuild base
-    local ox = api.getXMLOutput()
+    local ox = rcRebuildOutput base {_mxs_bool(reload)}
     if ox.count > {MAX_XML_CHARS} then rcRow ss #("W", rcEncode "XML_TOO_LARGE: output XML over the limit; output skipped") else rcRow ss #("O", rcEncode ox)
 ) else rcRow ss #("W", rcEncode "XML_API_UNAVAILABLE: no getXMLOutput; output skipped")
 '''
@@ -552,20 +699,24 @@ def _node_ref(value: Any) -> dict[str, Any] | None:
 
 
 @mcp.tool()
-def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = True) -> dict[str, Any]:
+def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = True,
+                      reload_segments: bool = False) -> dict[str, Any]:
     """Read one RailClone: settings, bases, exposed parameters, segments, graph summary and output counts.
 
     Read only, one call. Parameters report the value from the array their type
-    uses (0 int, 1 angle, 2 percent, 3 distance in scene units plus value_mm,
-    4 bool, 5 selector with options, 7 separator), their limits (RailClone does
-    not enforce them) and, with include_graph, which graph inputs use them. The
-    output counts come after a rebuild (undo off); use get_railclone_output for
-    positions.
+    uses (0 int, 1 float, 2 percent, 3 distance in scene units plus value_mm,
+    4 bool, 5 selector with options, 6 string (read only), 7 separator), their
+    limits (RailClone does not enforce them) and, with include_graph, which graph
+    inputs use them and each base's role (path, clip, surface) from the graph.
+    The output counts come after a rebuild with seed = seed (undo off), which
+    doesn't touch the segments; reload_segments=true runs segmentsUpdate instead
+    (on RailClone 7.3.5 it renamed linked segments to their source nodes). Use
+    get_railclone_output for positions.
     """
-    if type(include_graph) is not bool:
-        raise ValueError("include_graph must be boolean")
+    if type(include_graph) is not bool or type(reload_segments) is not bool:
+        raise ValueError("include_graph and reload_segments must be boolean")
     raw = _send(_target(name, handle) + _inspect_body(graph=include_graph, output=True, bases=True,
-                                                       segments=True))
+                                                       segments=True, reload=reload_segments))
     data = _parse_inspect(raw)
     info, warnings = data["info"], list(data["warnings"])
     upm = info.get("upm") if isinstance(info.get("upm"), float) and info.get("upm") > 0 else None
@@ -594,7 +745,7 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
     bases = []
     for i, b in enumerate(data["bases"], 1):
         bases.append({"index": i, "id": b["baid"], "name": b["baname"], "type": b["batype"],
-                      "type_name": {0: "spline", 1: "surface"}.get(b["batype"], "unknown"),
+                      "type_name": {0: "spline", 1: "surface"}.get(b["batype"], "unknown"), "role": None,
                       "node": _node_ref(b["banode"]), "start": b["bastart"], "length": b["balength"],
                       "full": b["bafull"], "description": b["badesc"] or None})
     params = [rclib.param_view(p, i, upm) for i, p in enumerate(data["params"], 1)]
@@ -604,6 +755,8 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
             root, removed, conflicts = _parse_xml(data["style"], "scene")
             graph = rclib.graph_summary(root, [p["paid"] for p in data["params"]])
             graph["duplicate_attributes_removed"] = removed
+            for base, role in zip(bases, rclib.base_roles(root, [b["id"] for b in bases])):
+                base["role"] = role
             if conflicts:
                 warnings.append(f"DUPLICATE_ATTRIBUTE_CONFLICT: {conflicts} repeated style attributes differed")
             for exposed in graph["exposed"]:
@@ -619,8 +772,13 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
             summary = rclib.summarize_items(items)
             output = {k: summary[k] for k in ("total", "placed", "placeholders", "by_segment")}
             output["rebuilt"] = True
+            output["segments_reloaded"] = reload_segments
         except ValueError as exc:
             warnings.append(f"OUTPUT_UNREADABLE: {exc}")
+    if data["output"] is not None and info.get("autoUpdate") is False:
+        warnings.append(_AUTO_UPDATE_NOTE)
+    if reload_segments:
+        warnings.append(_RELOAD_NOTE)
     segments = []
     for i, s in enumerate(data["segments"], 1):
         ref, mtl = s["sobjref"], s["sobjmtl"]
@@ -670,8 +828,7 @@ local ptype = rcArr base #patype
 {chr(10).join(checks)}
 local ss = stringStream ""
 format "RCSETP\\n" to:ss
-rcRebuild base
-rcRow ss (join #("O", "before") (rcOutStats (api.getXMLOutput())))
+rcRow ss (join #("O", "before") (rcOutStats (rcRebuildOutput base false)))
 {chr(10).join(before)}
 local ownsHold = false
 try (
@@ -684,9 +841,9 @@ try (
     if ownsHold do theHold.Cancel()
     throw()
 )
-rcRebuild base
+local outAfter = rcRebuildOutput base false
 {chr(10).join(after)}
-rcRow ss (join #("O", "after") (rcOutStats (api.getXMLOutput())))
+rcRow ss (join #("O", "after") (rcOutStats outAfter))
 format "END\\n" to:ss
 ss as string
 '''
@@ -704,11 +861,12 @@ def _same(a: Any, b: Any) -> bool:
 def railclone_set_param(params: dict[str, Any], name: str = "", handle: int = 0) -> dict[str, Any]:
     """Set RailClone exposed parameters by exact name or id, in one undo step, and report the output change.
 
-    params maps an exact parameter name (or its id) to a value: int, angle,
+    params maps an exact parameter name (or its id) to a value: int, float,
     percent, distance (scene units, or a string such as "60cm"), bool, or a
     selector option label/value. Values outside the parameter limits are refused,
-    since RailClone does not clamp them; separators are refused. The RailClone is
-    rebuilt; before/after values and output item counts are returned.
+    since RailClone does not clamp them; separators and string parameters (type 6,
+    never seen in a stock style) are refused. The RailClone is rebuilt with
+    seed = seed; before/after values and output item counts are returned.
     """
     if not isinstance(params, dict) or not params:
         raise ValueError("params must be a non-empty object of parameter name or id -> value")
@@ -867,17 +1025,21 @@ local matTpl = rcDecode "@@MATLIB@@"
 local matName = rcDecode "@@MATERIAL@@"
 local mapsDir = rcDecode "@@MAPS@@"
 local splineNames = #(@@SPLINES@@)
+local clipNames = #(@@CLIPS@@)
 if not (isKindOf RailClone_Pro MAXClass) do throw "NOT_INSTALLED: RailClone Pro is not loaded in this 3ds Max"
 if theHold.Holding() or theHold.IsSuspended() or theHold.SuperLevel() != 0 do throw "USER_BUSY: an undo operation is active"
 if wantName != "" and (getNodeByName wantName exact:true all:true).count > 0 do throw ("NAME_IN_USE: a node is already named " + wantName)
-local splines = #()
-for nm in splineNames do (
+local shapes = #()
+for nm in (splineNames + clipNames) do (
     local found = getNodeByName nm exact:true all:true
     if found.count == 0 do throw ("SPLINE_NOT_FOUND: no node is named " + nm)
     if found.count > 1 do throw ("AMBIGUOUS: several nodes are named " + nm)
     if (superClassOf found[1]) != Shape do throw ("NOT_A_SPLINE: " + nm + " is not a shape")
-    append splines found[1]
+    append shapes found[1]
 )
+local splines = for k = 1 to splineNames.count collect shapes[k]
+local clipSplines = for k = 1 to clipNames.count collect shapes[splineNames.count + k]
+local baseRoles = #()
 local warnings = #()
 local renderer = try (RC_getRenderer() as string) catch ""
 local matPath = ""
@@ -941,10 +1103,25 @@ if code != 0 do throw ("LOAD_FAILED: loadLibraryItemByPath returned " + (code as
 _SETUP = r'''
 local base = o.baseObject
 local types = rcArr base #batype
-local spIdx = for i = 1 to types.count where types[i] == 0 collect i
-if splines.count > spIdx.count do throw ("TOO_MANY_SPLINES: the item has " + (spIdx.count as string) + " spline base(s)")
-for k = 1 to splines.count do base.banode[spIdx[k]] = splines[k]
-if splines.count > 0 do o.pos = splines[1].pos
+local bnames = rcArr base #baname
+-- Splines go by the role each base has in the style graph, never by order: batype is 0 for a path and
+-- a clipping area alike (live), so the second spline of a path + clipping item became its clipping area.
+baseRoles = rcBaseRoles base
+local pathIdx = for i = 1 to types.count where types[i] == 0 and (rcAt baseRoles i) == "path" collect i
+local clipIdx = for i = 1 to types.count where types[i] == 0 and (rcAt baseRoles i) == "clip" collect i
+local otherIdx = for i = 1 to types.count where types[i] == 0 and (findItem #("path", "clip", "unused") (rcAt baseRoles i)) == 0 collect i
+if splines.count > pathIdx.count or clipSplines.count > clipIdx.count do (
+    local pathNames = for i in pathIdx collect ((rcAt bnames i) as string)
+    local clipBaseNames = for i in clipIdx collect ((rcAt bnames i) as string)
+    local otherNames = for i in otherIdx collect (((rcAt bnames i) as string) + " (" + (rcAt baseRoles i) + ")")
+    local why = "path bases [" + (rcJoin pathNames ", ") + "], clipping-area bases [" + (rcJoin clipBaseNames ", ") + "], bases of unknown role [" + (rcJoin otherNames ", ") + "]"
+    if splines.count > pathIdx.count and otherIdx.count > 0 do throw ("ROLE_UNKNOWN: the item's style graph doesn't show which spline bases are paths; nothing is assigned to a base of unknown role. It has " + why)
+    if splines.count > pathIdx.count do throw ("TOO_MANY_SPLINES: " + (splines.count as string) + " spline(s) for " + (pathIdx.count as string) + " path base(s); a clipping area takes clipping_splines. The item has " + why)
+    throw ("TOO_MANY_CLIPPING_SPLINES: " + (clipSplines.count as string) + " clipping spline(s) for " + (clipIdx.count as string) + " clipping-area base(s). The item has " + why)
+)
+for k = 1 to splines.count do base.banode[pathIdx[k]] = splines[k]
+for k = 1 to clipSplines.count do base.banode[clipIdx[k]] = clipSplines[k]
+if splines.count > 0 then o.pos = splines[1].pos else (if clipSplines.count > 0 do o.pos = clipSplines[1].pos)
 if o.material != undefined do (
     local maps = for b in (getClassInstances BitmapTexture target:o.material) collect #(b, #filename)
     if isKindOf VRayBitmap MAXClass do (for b in (getClassInstances VRayBitmap target:o.material) do append maps #(b, #HDRIMapName))
@@ -1014,8 +1191,7 @@ local rcBase = o.baseObject
 local styleDesc = try ((getInterface rcBase #railclone).getStyleDesc()) catch undefined
 -- The node is committed now; report a failed rebuild/readback as a warning, not an error.
 local stats = try (
-    rcRebuild rcBase
-    rcOutStats ((rcApi rcBase #getXMLOutput).getXMLOutput())
+    rcOutStats (rcRebuildOutput rcBase false)
 ) catch (
     append warnings ("REBUILD_FAILED: " + (getCurrentException() as string))
     #("0", "0", "")
@@ -1036,6 +1212,7 @@ for n in extras do rcRow ss #("N", rcV n)
     for k = 1 to fa[1].count do (
         local row = #("B", (k as string))
         for a in fa do append row (rcV (rcAt a k))
+        append row (rcV (rcAt baseRoles k))
         rcRow ss row
     )
 )
@@ -1052,7 +1229,7 @@ def _indent(block: str, depth: int) -> str:
 
 
 def _from_library_body(entry: dict[str, Any], method: str, splines: list[str], name: str, default_name: str,
-                       matlib: str, maps_dir: str, *, undo_step: bool) -> str:
+                       matlib: str, maps_dir: str, *, undo_step: bool, clipping_splines: list[str] = ()) -> str:
     """The from-library script: an undo step for a .rail route load, otherwise the whole load with undo off."""
     if method == "merge" and undo_step:
         raise ValueError("internal: a merge clears the undo history; it never runs in an undo step")
@@ -1072,6 +1249,7 @@ def _from_library_body(entry: dict[str, Any], method: str, splines: list[str], n
         "@@MATERIAL@@": _b64(entry.get("material") or ""),
         "@@MAPS@@": _b64(maps_dir),
         "@@SPLINES@@": ", ".join(f'rcDecode "{_b64(s)}"' for s in splines),
+        "@@CLIPS@@": ", ".join(f'rcDecode "{_b64(s)}"' for s in clipping_splines),
         "@@UNDO@@": UNDO_LIBRARY,
         "@@CLEANUP@@": UNDO_CLEANUP,
     }
@@ -1088,6 +1266,7 @@ def railclone_from_library(
     method: str = "auto",
     fix_maps: bool = True,
     allow_undo_flush: bool = False,
+    clipping_splines: StrList | None = None,
 ) -> dict[str, Any]:
     """Create a RailClone from a library item (route or exact name), assign splines and verify its output.
 
@@ -1098,9 +1277,12 @@ def railclone_from_library(
     library roots 3ds Max lists: a wrong route opens a modal dialog. method: auto
     (route for .rail files, .pmat matlibs and items without an object; merge for
     every other .max item), merge or route. A merged item without a .mat matlib
-    keeps the materials from its file (NO_MATERIAL warning). splines go to the
-    spline bases in order. Returns the node, method, material, output counts,
-    remove_with and warnings.
+    keeps the materials from its file (NO_MATERIAL warning). Bases get splines by
+    their role in the style graph: splines go to the path bases in order,
+    clipping_splines to the clipping-area bases (a paving boundary, a window
+    outline); a base whose role can't be told gets none (ROLE_UNKNOWN). Returns
+    the node, method, material, bases with roles, output counts, remove_with and
+    warnings.
     """
     if method not in ("auto", "merge", "route"):
         raise ValueError("method must be 'auto', 'merge' or 'route'")
@@ -1110,11 +1292,14 @@ def railclone_from_library(
         raise ValueError("name must be a string of at most 255 characters")
     if splines is None:
         splines = []
-    if not isinstance(splines, list) or len(splines) > 64 or any(
-            not isinstance(s, str) or not s or "\x00" in s for s in splines):
-        raise ValueError("splines must be a list of at most 64 node names")
-    if len(set(splines)) != len(splines):
-        raise ValueError("splines lists a node twice")
+    if clipping_splines is None:
+        clipping_splines = []
+    for label, value in (("splines", splines), ("clipping_splines", clipping_splines)):
+        if not isinstance(value, list) or len(value) > 64 or any(
+                not isinstance(s, str) or not s or "\x00" in s for s in value):
+            raise ValueError(f"{label} must be a list of at most 64 node names")
+    if len(set(splines) | set(clipping_splines)) != len(splines) + len(clipping_splines):
+        raise ValueError("splines and clipping_splines list a node twice")
     if not isinstance(item, str) or not item.strip() or "\x00" in item:
         raise ValueError("item must be a library route or an exact item name")
     # One read-only call: 3ds Max's own roots are the authority for the route and the item's folder.
@@ -1153,7 +1338,7 @@ def railclone_from_library(
     maps_dir = maps_dir + "\\" if fix_maps and os.path.isdir(maps_dir) else ""
     default_name = "RC_" + (re.sub(r"\W+", "_", entry["name"]).strip("_") or "RailClone")
     raw = _send(_from_library_body(entry, chosen, splines, name, default_name, matlib, maps_dir,
-                                   undo_step=undo_step))
+                                   undo_step=undo_step, clipping_splines=clipping_splines))
     info: dict[str, Any] = {}
     extra, bases, missing, stats = [], [], [], None
     try:
@@ -1167,7 +1352,7 @@ def railclone_from_library(
                 bid, bname, btype, bnode = (_dv(f) for f in row[2:6])
                 bases.append({"index": int(row[1]), "id": bid, "name": bname, "type": btype,
                               "type_name": {0: "spline", 1: "surface"}.get(btype, "unknown"),
-                              "node": _node_ref(bnode)})
+                              "role": _dv(row[6]) if len(row) > 6 else None, "node": _node_ref(bnode)})
             elif tag == "O":
                 stats = _stats(row)
             elif tag == "M":
@@ -1179,11 +1364,15 @@ def railclone_from_library(
     if stats is None or "handle" not in info:
         raise RailCloneError("INVALID_READBACK", "library report is incomplete; inspect the scene before retrying")
     verified = stats["placed"] > 0
-    if splines and not verified:
+    if (splines or clipping_splines) and not verified:
         warnings.append("EMPTY_OUTPUT: the RailClone places no items with the given splines")
-    if not splines:
-        names = [b["name"] for b in bases if b["type"] == 0]
-        warnings.append(f"NO_SPLINES: assign a spline to the spline base(s) {names} for output")
+    if not splines and not clipping_splines:
+        paths = [b["name"] for b in bases if b["type"] == 0 and b.get("role") == "path"]
+        clips = [b["name"] for b in bases if b["type"] == 0 and b.get("role") == "clip"]
+        other = [b["name"] for b in bases if b["type"] == 0 and b.get("role") not in ("path", "clip", "unused")]
+        warnings.append(f"NO_SPLINES: assign a spline to the path base(s) {paths} (splines) or the clipping-area "
+                        f"base(s) {clips} (clipping_splines) for output"
+                        + (f"; the role of {other} couldn't be told" if other else ""))
     if chosen == "route" and info.get("style") != entry["route"]:
         warnings.append(f"STYLE_ROUTE_MISMATCH: style reads {info.get('style')!r}")
     if missing:

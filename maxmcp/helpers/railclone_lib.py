@@ -9,6 +9,7 @@ from __future__ import annotations
 import difflib
 import itertools
 import math
+import ntpath
 import os
 import re
 import threading
@@ -82,6 +83,86 @@ def graph_summary(root: ET.Element, param_ids: Iterable[Any] = ()) -> dict[str, 
         "by_type": dict(sorted(by_type.items())),
         "exposed": exposed,
     }
+
+
+# ---------------------------------------------------------------- base roles
+
+# What a base feeds, read from the style XML (live on RailClone 7.3.5, probes p12/p13/p19): the connectors
+# whose target_id is the base id. batype can't tell a path from a clipping area (it is 0 for every spline base),
+# and base names are no guide: 12 stock InputMacros named "Clipping area" are spline inputs.
+GENERATOR_INPUTS = {"spline": "path", "spline_x": "path", "spline_y": "path", "clipping_area": "clip",
+                    "base_surface": "surface"}
+# A macro input's connector id is "{macroId}{inputMacroId}"; the InputMacro's <parameter id="type"> is
+# 0 segment, 1 spline (followed inside the macro), 2 surface, 3 clipping area.
+INPUT_MACRO_ROLES = {0: "segment", 2: "surface", 3: "clip"}
+ROLE_STEPS = 500
+# tools/railclone.py has the same walk in MAXScript (rcBaseRoles) for railclone_from_library; keep them alike.
+
+
+def combine_roles(found: set[str]) -> str:
+    """One role from everything a base feeds: path, clip, surface, segment, mixed, unused or unknown."""
+    if not found:
+        return "unused"
+    if "path" in found and "clip" in found:
+        return "mixed"
+    for role in ("path", "clip", "surface"):
+        if role in found:
+            return role
+    return "segment" if found == {"segment"} else "unknown"
+
+
+def base_roles(root: ET.Element, base_ids: Iterable[Any]) -> list[str]:
+    """The role of each base (in base_ids order), following operators and macro inputs to a generator input."""
+    connectors = []
+    macros: dict[str, int] = {}
+    for node in root.iter("node"):
+        owner = (node.get("id") or "").lower()
+        owner_class = node.get("baseClass") or ""
+        for conn in node.findall("connector"):
+            target = (conn.get("target_id") or "").lower()
+            if target:
+                connectors.append(((conn.get("id") or "").lower(), target, owner, owner_class))
+        if node.get("class") == "InputMacro":
+            kind = -1
+            for param in node.findall("parameter"):
+                if param.get("id") == "type":
+                    try:
+                        kind = int(param.get("value") or "")
+                    except ValueError:
+                        kind = -1
+            macros[owner] = kind
+    roles = []
+    for base_id in base_ids:
+        found: set[str] = set()
+        queue, seen, steps = [str(base_id).lower()], set(), 0
+        while queue and steps < ROLE_STEPS:
+            steps += 1
+            target = queue.pop()
+            if target in seen:
+                continue
+            seen.add(target)
+            for cid, tgt, owner, owner_class in connectors:
+                if tgt != target:
+                    continue
+                if cid in GENERATOR_INPUTS:
+                    found.add(GENERATOR_INPUTS[cid])
+                    continue
+                if cid.startswith("_exp_"):
+                    continue
+                cut = cid.find("}{")
+                inner = cid[cut + 1:] if cut >= 0 and cid.startswith("{") else ""
+                if inner and inner in macros:
+                    kind = macros[inner]
+                    if kind in INPUT_MACRO_ROLES:
+                        found.add(INPUT_MACRO_ROLES[kind])
+                    else:
+                        queue.append(inner)
+                elif owner_class == "Operator":
+                    queue.append(owner)
+                else:
+                    found.add("unknown")
+        roles.append(combine_roles(found))
+    return roles
 
 
 # ---------------------------------------------------------------- output XML
@@ -185,14 +266,18 @@ def summarize_items(items: list[dict[str, Any]], node_rows: list[list[float]] | 
 
 # ---------------------------------------------------------------- exposed parameters
 
-# patype -> meaning and the array the engine reads (verified by output changes).
+# patype -> meaning and the array the engine reads (verified by output changes). 1 is a plain float: stock
+# styles use it for angles only, but macro parameters with the same enum use it for any float (RC 7.3.5 survey
+# of 226 .max and 179 .rail styles). 6 is String (pastrval) per the docs; no stock style uses it, so its value is
+# read but never written.
 PARAM_TYPES: dict[int, dict[str, Any]] = {
     0: {"name": "int", "array": "paintval", "limits": ("paintmin", "paintmax")},
-    1: {"name": "angle", "array": "pafloatval", "limits": ("pafloatmin", "pafloatmax")},
+    1: {"name": "float", "array": "pafloatval", "limits": ("pafloatmin", "pafloatmax")},
     2: {"name": "percent", "array": "pafloatval", "limits": ("pafloatmin", "pafloatmax")},
     3: {"name": "distance", "array": "paunitval", "limits": ("paunitmin", "paunitmax")},
     4: {"name": "bool", "array": "paboolval", "limits": None},
     5: {"name": "selector", "array": "pafloatval", "limits": None},
+    6: {"name": "string", "array": "pastrval", "limits": None, "read_only": True},
     7: {"name": "separator", "array": None, "limits": None},
 }
 PARAM_FIELDS = ("paid", "paname", "patype", "paintval", "pafloatval", "paunitval", "paboolval", "pastrval",
@@ -265,6 +350,8 @@ def param_view(raw: dict[str, Any], index: int, upm: float | None) -> dict[str, 
         match = [o for o in options if _number(o["value"]) is not None and current is not None
                  and abs(float(o["value"]) - current) < 1e-6]
         view["selected"] = {"label": match[0]["label"], "index": match[0]["index"]} if match else None
+    if spec and spec.get("read_only"):
+        view["read_only"] = True
     if ptype not in PARAM_TYPES:
         view["raw"] = {k: raw.get(k) for k in ("paintval", "pafloatval", "paunitval", "paboolval", "pastrval")}
     if raw.get("padesc"):
@@ -293,6 +380,9 @@ def coerce_param_value(raw: dict[str, Any], value: Any, upm: float | None, label
         raise ValueError(f"{label}: parameter type {ptype!r} is not supported (verified types: 0-5, 7)")
     if ptype == 7:
         raise ValueError(f"{label}: is a separator/label row and has no value")
+    if spec.get("read_only"):
+        raise ValueError(f"{label}: is a {spec['name']} parameter (type {ptype}); the docs say it is stored in "
+                         f"{spec['array']}, but no stock style uses this type, so writing it is untested and refused")
     if ptype == 4:
         if isinstance(value, bool):
             flag = value
@@ -476,13 +566,42 @@ def _expand(text: str, macros: dict[str, str]) -> str:
     return _MACRO.sub(lambda m: macros.get(m.group(1).upper(), "$(" + m.group(1).upper() + ")"), text)
 
 
+def library_relative(path: str) -> str | None:
+    """The index-folder-relative part of a library path, or None for an absolute path.
+
+    index.xml paths are relative to the folder that holds the index.xml (live: 686 of 687 stock RailClone and
+    all 511 Forest Pack maxfiles). The docs' template writes them with a leading backslash
+    (\\objects\\x.max), which Windows reads as the drive root, so one leading slash is dropped. A UNC path
+    (\\\\server\\share) or a drive path stays absolute.
+    """
+    if path[:2] in ("\\\\", "//") or ntpath.splitdrive(path)[0]:
+        return None
+    return path.lstrip("\\/")
+
+
 def _resolve(text: str, macros: dict[str, str], cat_dir: str) -> str:
     if not text:
         return ""
     path = _expand(text.strip(), macros).replace("/", "\\")
-    if not os.path.isabs(path) and not path.startswith("$("):
-        path = os.path.join(cat_dir, path)
-    return os.path.normpath(path)
+    if path.startswith("$("):
+        return os.path.normpath(path)
+    rel = library_relative(path)
+    return os.path.normpath(path if rel is None else os.path.join(cat_dir, rel))
+
+
+def _thumbnail(text: str, macros: dict[str, str], cat_dir: str) -> str:
+    """<bitmap>: a bare file name is in the index folder's thumbnails\\ (live: 683 of 683 stock thumbnails)."""
+    if not text:
+        return ""
+    path = _expand(text.strip(), macros).replace("/", "\\")
+    rel = library_relative(path)
+    if rel is None or path.startswith("$("):
+        return os.path.normpath(path)
+    candidates = [os.path.join(cat_dir, rel)]
+    if not rel.lower().startswith("thumbnails\\"):
+        candidates.insert(0, os.path.join(cat_dir, "thumbnails", rel))
+    found = next((c for c in candidates if os.path.isfile(c)), candidates[0])
+    return os.path.normpath(found)
 
 
 def _ext(path: str) -> str:
@@ -528,7 +647,7 @@ def parse_index(path: str, root_name: str, root_dir: str) -> list[dict[str, Any]
         name = english[0] if english else names[0][1]
         maxfile = _resolve(fields.get("maxfile", ""), macros, cat_dir)
         matlib = _resolve(fields.get("matlib", ""), macros, cat_dir)
-        thumb = _resolve(fields.get("bitmap", ""), macros, cat_dir)
+        thumb = _thumbnail(fields.get("bitmap", ""), macros, cat_dir)
         route = "\\" + root_name + ("\\" + category if category else "") + "\\" + name
         item = {
             "route": route,

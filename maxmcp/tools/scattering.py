@@ -10,7 +10,10 @@ from ..helpers import forest as fh
 from ..helpers.forest import ForestError
 from ..server import client, mcp
 
-_FACING = {0: 0, 1: 100, "normal": 0, "up": 100}  # Forest Pack direction: 0 = surface normal ... 100 = world up
+# Forest Pack direction (live): -100 = world down, 0 = surface normal, 100 = world up; not clamped by MAXScript
+_FACING = {0: 0, 1: 100, "normal": 0, "up": 100}
+_FACING_NAMES = {0: "normal", 100: "up", -100: "down"}
+_STOCK_MAP = "dense.bmp"
 
 _SCATTER_BODY = r'''
 if fpBusy() do throw "USER_BUSY: an undo operation is open in 3ds Max; finish it first"
@@ -49,7 +52,8 @@ undo "MCP Forest scatter" on (
     fp.problist = @@PROBS@@
     fp.widthlist = ws
     fp.heightlist = hs
-    -- Density is the tile size: about 1437 items per units_x * units_y tile (the max density setting does nothing).
+    -- Density is the tile size: about 1437 items per units_x * units_y tile with the stock map. The
+    -- maxdensity setting is a cap on candidate cells (millions), not a density: it is never written.
     fp.units_x = units.decodeValue "@@UNITS_X@@cm"
     fp.units_y = units.decodeValue "@@UNITS_Y@@cm"
     fp.seed = @@SEED@@
@@ -77,6 +81,10 @@ local ss = stringStream ""
 format "FPOK\n" to:ss
 format "F|%|%|%|%|%|%\n" (fpEnc fp.name) n (fpF area) (fpF (units.decodeValue "1m")) (fpF fp.units_x) (fpF fp.units_y) to:ss
 for k = 1 to geos.count do format "G|%|%|%\n" (fpEnc geos[k].name) (fpF ws[k]) (fpF hs[k]) to:ss
+-- Read back what this call doesn't set: a saved default preset could change new forests, and "Scale to fit
+-- sloped areas" forces direction to 0 (live). The caps say whether trees.count() is the full scatter.
+format "D|%|%|%|%|%|%|%\n" (fpPropV fp #direction) (fpPropV fp #scalelope) (fpPropV fp #distmode) (fpEnc (fp.mapname as string)) (fpHasDistMap fp) (fpPropV fp #densityMap) (fpPropV fp #lock_ratio) to:ss
+format "Q|%|%|%|%|%\n" (fpPropV fp #vmaxitems) (fpPropV fp #rmaxitems) (fpPropV fp #maxdensity) (fpPropV fp #pixels_x) (fpPropV fp #pixels_y) to:ss
 ss as string
 '''
 
@@ -109,17 +117,20 @@ def scatter_forest_pack(
     viewport_mode: int = 2,
     render_mode: int = 0,
     items_per_m2: float | None = None,
+    direction: int | None = None,
 ) -> dict[str, Any]:
     """Create a Forest Pack scatter of source objects over surfaces; returns the real item count.
 
     Density is Forest Pack's tile size (units_x/units_y): about 1437 items per tile with the default density
-    map, so count ~ 1437 * surface area / (units_x * units_y). items_per_m2 sets both units to
-    100 * sqrt(1437 / items_per_m2) cm. Otherwise density is a percentage of density_units_x/y_cm: 100 keeps
-    them, 200 gives twice the items (units / sqrt(2)). Very small tiles saturate (100 cm on 100 m2 gave 35800,
-    not 143700). facing_mode 0/'normal' aligns items to the surface normal, 1/'up' to world up (Forest Pack
-    direction 0 and 100). Width/height per item come from each source's bounding box (source_width_cm and
-    source_height_cm when it is flat). Fails with ZERO_ITEMS when the scatter has no items (the object stays).
-    Hide the source objects afterwards.
+    map, so the full scatter is ~ 1437 * surface area / (units_x * units_y) (estimated_count). items_per_m2 sets
+    both units to 100 * sqrt(1437 / items_per_m2) cm. Otherwise density is a percentage of density_units_x/y_cm:
+    100 keeps them, 200 gives twice the items (units / sqrt(2)). count is trees.count(), the viewport build:
+    over Max items Viewport (vmaxitems, 50000) Forest Pack thins it (100 cm tiles on 100 m2: 35800 shown,
+    143700 rendered), reported as VIEWPORT_LIMIT. Over maxdensity (millions of candidate cells) it scatters 0.
+    facing_mode 0/'normal' aligns items to the surface normal, 1/'up' to world up (direction 0 and 100);
+    direction (-100 world down .. 0 normal .. 100 up) overrides it. Width/height per item come from each source's
+    bounding box (source_width_cm and source_height_cm when it is flat). Fails with ZERO_ITEMS when the scatter
+    has no items (the object stays). Hide the source objects afterwards.
     """
     surface_names = fh.name_list(surfaces, "surfaces")
     geometry_names = fh.name_list(geometry, "geometry")
@@ -150,7 +161,10 @@ def scatter_forest_pack(
     icon_cm = fh.finite(icon_size_cm, "icon_size_cm", 0.0, 1e6, low_open=True)
     base_x = fh.finite(density_units_x_cm, "density_units_x_cm", 1.0, 1e7)
     base_y = fh.finite(density_units_y_cm, "density_units_y_cm", 1.0, 1e7)
-    direction = _facing(facing_mode)
+    facing = _facing(facing_mode)
+    if direction is not None:
+        facing = fh.integer(direction, "direction", -100, 100)
+    direction = facing
     vmesh = fh.integer(viewport_mode, "viewport_mode", 0, 5)
     rmesh = fh.integer(render_mode, "render_mode", 0, 5)
     if not isinstance(name, str) or not name.strip() or "\x00" in name or len(name) > 1024:
@@ -176,7 +190,39 @@ def scatter_forest_pack(
         raise ForestError("INVALID_READBACK", "scatter_forest_pack got no result line")
     count, area, upm = int(head[2]), float(head[3]), float(head[4])
     area_m2 = area / (upm * upm) if upm > 0 else 0.0
-    estimate = fh.estimate_count(area_m2, units_x / 100.0, units_y / 100.0)
+    back = next((line.split("|") for line in report if line.startswith("D|")), None)
+    caps = next((line.split("|") for line in report if line.startswith("Q|")), None)
+    warnings: list[str] = []
+    settings: dict[str, Any] = {}
+    if back is not None and len(back) >= 8:
+        settings = {"direction": fh.num(back[1]), "scale_to_slope": back[2] == "1", "distmode": fh.num(back[3]),
+                    "mapname": fh.unb64(back[4]), "distmap": back[5] == "1", "density_map": back[6] == "1",
+                    "lock_ratio": back[7] == "1"}
+    stock_map = not settings or (settings["mapname"].lower() == _STOCK_MAP and not settings["distmap"]
+                                 and not settings["density_map"] and settings["distmode"] in (0, None))
+    if settings and not stock_map:
+        warnings.append(f"NON_DEFAULT_DISTRIBUTION: the new forest doesn't use the stock distribution map "
+                        f"(mapname {settings['mapname']!r}, custom map {settings['distmap']}, density map "
+                        f"{settings['density_map']}, distmode {settings['distmode']}); a default preset saved in "
+                        "Forest Pack can change new forests. The item estimate assumes the stock map, so it is "
+                        "left out")
+    if settings and settings["direction"] is not None and settings["direction"] != direction:
+        warnings.append(f"DIRECTION_NOT_APPLIED: direction reads {settings['direction']:g}, not {direction}"
+                        + ("; 'Scale to fit sloped areas' is on, which forces it to 0" if settings["scale_to_slope"]
+                           else ""))
+    lock = bool(settings.get("lock_ratio"))
+    estimate = fh.estimate_count(area_m2, units_x / 100.0, units_y / 100.0, lock_ratio=lock) if stock_map else None
+    limits: dict[str, Any] = {}
+    if caps is not None and len(caps) >= 6:
+        values = [fh.num(v) for v in caps[1:6]]
+        limits = dict(zip(("viewport_max_items", "render_max_items", "maxdensity_millions", "pixels_x",
+                           "pixels_y"), [None if v is None else int(v) if v.is_integer() else v for v in values]))
+    pixels = (limits.get("pixels_x") or fh.DEFAULT_PIXELS) * (limits.get("pixels_y") or fh.DEFAULT_PIXELS)
+    candidates = fh.candidate_cells(area_m2, units_x / 100.0, units_y / 100.0, lock_ratio=lock, pixels=pixels)
+    checks = fh.count_checks(estimate, count, viewport_max=limits.get("viewport_max_items"),
+                             maxdensity=limits.get("maxdensity_millions"), candidates=candidates,
+                             render_max=limits.get("render_max_items"))
+    warnings += [f"{code}: {detail}" for code, detail in checks["warnings"] + checks["notes"]]
     result: dict[str, Any] = {
         "name": fh.unb64(head[1]),
         "count": count,
@@ -188,17 +234,23 @@ def scatter_forest_pack(
         "units_x_cm": round(units_x, 3),
         "units_y_cm": round(units_y, 3),
         "items_per_m2_estimate": round(fh.ITEMS_PER_TILE / ((units_x / 100.0) * (units_y / 100.0)), 3),
-        "facing": "normal" if direction == 0 else "up",
+        "facing": _FACING_NAMES.get(direction, "custom"),
         "direction": direction,
         "seed": seed,
-        "warnings": [],
+        "count_is_viewport_build": True,
+        "viewport_thinned": checks["viewport_thinned"],
+        "estimated_viewport_count": checks["estimated_viewport_count"],
+        "limits": limits,
+        "warnings": warnings,
     }
-    if estimate is not None and count > 0 and estimate > 2 * count:
-        result["warnings"].append("far fewer items than estimated: very small density tiles saturate, or the "
-                                  "surfaces face down")
+    if (estimate is not None and count > 0 and estimate > 2 * count and not checks["viewport_thinned"]):
+        warnings.append("far fewer items than estimated: check that the surfaces face up")
     if count == 0:
+        cap = next((d for c, d in checks["warnings"] if c == "MAXDENSITY_CAP"), None)
+        advice = (f"MAXDENSITY_CAP: {cap}" if cap else "Lower the density units or raise items_per_m2, and check "
+                  "that the surfaces face up")
         raise ForestError("ZERO_ITEMS", f"'{result['name']}' was created but scatters 0 items (about "
                           f"{0 if estimate is None else round(estimate, 2)} expected for {result['surface_area_m2']} "
-                          "m2 of surface). Lower the density units or raise items_per_m2, check that the surfaces "
-                          "face up, or delete it", details=result)
+                          f"m2 of surface). {advice}. The object stays in the scene; delete it if unwanted",
+                          details=result)
     return result
