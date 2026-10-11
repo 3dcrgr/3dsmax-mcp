@@ -81,6 +81,7 @@ _READ_ONLY_TOOLS = {
     "mcg_search_operators",
     "railclone_inspect",
     "railclone_library",
+    "itoo_vantage_check",
 }
 
 _DESTRUCTIVE_TOOLS = {
@@ -144,6 +145,7 @@ _IDEMPOTENT_TOOLS = {
     "mcg_search_operators",
     "railclone_inspect",
     "railclone_library",
+    "itoo_vantage_check",
 }
 
 
@@ -293,6 +295,7 @@ SPECIALTY_TOOL_MODULES = (
     "render",
     "render_automations",
     "vantage",
+    "itoo_vantage",
     "scattering",
     "state_sets",
     "tyflow",

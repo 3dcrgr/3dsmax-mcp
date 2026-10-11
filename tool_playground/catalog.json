@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "tool_count": 194,
+  "tool_count": 195,
   "starter_tools": [
     "query_scene",
     "get_session_context",
@@ -223,7 +223,7 @@
     {
       "name": "Viewport & Render",
       "hint": "Captures and rendering",
-      "tool_count": 13,
+      "tool_count": 14,
       "categories": [
         {
           "name": "Lighting",
@@ -237,6 +237,7 @@
         {
           "name": "Render",
           "tools": [
+            "itoo_vantage_check",
             "render_scene",
             "vantage_get_image",
             "vantage_live_link",
@@ -7272,6 +7273,37 @@
       "example": {},
       "risk": "read",
       "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "itoo_vantage_check",
+      "description": "Read-only check of how ready Forest Pack and RailClone objects are for Chaos Vantage.",
+      "category": "Render",
+      "group": "Viewport & Render",
+      "module": "itoo_vantage",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "time_budget_s": {
+            "type": "number"
+          },
+          "max_paths": {
+            "type": "integer"
+          },
+          "details": {
+            "type": "boolean"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "maxscript",
       "starter": false
     },
     {
