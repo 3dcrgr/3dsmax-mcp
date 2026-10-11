@@ -90,12 +90,28 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
         "markers": ["forestpro", "forestlite", "forest"],
         "capability_key": "forestPack",
         "entry_classes": ["Forest_Pro", "Forest_Lite"],
+        "workflow_tools": [
+            "scatter_forest_pack",
+            "forest_library",
+            "forest_from_library",
+            "forest_items",
+            "forest_edit_items",
+            "forest_set_mode",
+            "forest_validate",
+        ],
         "recipes": [
-            "Inspect existing scatter objects before changing sources or surfaces.",
-            "Verify distribution surfaces and geometry references after edits.",
+            "Create with scatter_forest_pack or forest_from_library; both return the real item count.",
+            "Run forest_validate when a forest shows 0 items; read items with forest_items.",
+            "Edit items with forest_edit_items; it needs custom edit mode (allow_custom_edit or forest_set_mode).",
         ],
         "gotchas": [
-            "Some scatter setup is more stable through dedicated adapters than generic property writes.",
+            "Density is units_x/units_y (about 1437 items per tile with the default map); maxdensity does nothing.",
+            "Never set geomlist to 3: it crashed Max. namelist is the master length of the item lists.",
+            "Stock presets ship their Surface Area inactive (pf_aractivelist); retargeted they give 0 items until it is activated.",
+            "Item edits apply only in custom edit mode; switching back to procedural discards them irreversibly.",
+            "Item edits aren't recorded in undo: forest_edit_items returns revert, an edit list that puts them back.",
+            "forest_from_library clears Max's undo history (needs allow_undo_flush=true) and isn't undoable; "
+            "delete its remove_with nodes to take it out.",
         ],
     },
     "railclone": {
