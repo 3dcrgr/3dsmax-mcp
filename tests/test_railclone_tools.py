@@ -168,8 +168,8 @@ class StyleTests(unittest.TestCase):
         self.assertNotIn("7.3.5", rc._FUNCTIONS)
 
 
-def out_raw(xml=OUTPUT, tm="1,0,0,0,1,0,0,0,1,100,-200,0", shared="", rebuilt="1", auto_off="0"):
-    return "RCOUT|602061|%s|%s|%s|%s|%s|%s" % (b64("RC_Fence"), tm, shared, rebuilt, auto_off, b64(xml))
+def out_raw(xml=OUTPUT, tm="1,0,0,0,1,0,0,0,1,100,-200,0", shared="", rebuilt="1", auto_off="0", proxy="0"):
+    return "RCOUT|602061|%s|%s|%s|%s|%s|%s|%s" % (b64("RC_Fence"), tm, shared, rebuilt, auto_off, proxy, b64(xml))
 
 
 class OutputTests(unittest.TestCase):
@@ -316,7 +316,8 @@ def head_rows(handle=602061, base_handle="602062"):
 
 def inspect_raw(extra_params=(), rebuilt=True):
     rows = ["RCINSPECT"] + head_rows() + [
-        "K|plugin_version|" + V(400), "K|rebuilt|" + V(rebuilt)] + (
+        "K|api_version|" + V(400), "K|rc_runtime|" + V(735), "K|createdversion|" + V(0), "K|proxymode|" + V(0),
+        "K|rebuilt|" + V(rebuilt)] + (
         ["K|style_desc|" + V("Parametric fence")] if rebuilt else []) + [
         "K|style|" + V(""), "K|savedversion|" + V("2.4.2b Pro"), "K|disabled|" + V(False),
         "K|seed|" + V(123456), "K|gscale|" + V(100.0), "K|vmesh|" + V(2), "K|rmesh|" + V(0),
@@ -429,7 +430,11 @@ class InspectTests(unittest.TestCase):
         node = self.out["node"]
         self.assertEqual((self.out["handle"], self.out["name"]), (602061, "RC_Fence"))
         self.assertEqual(node["style_desc"], "Parametric fence")
-        self.assertEqual(node["plugin_version"], 400)
+        # RailClone_Pro.version() is an API number (400 on 7.1.1 and 7.3.5 alike), relabelled from plugin_version
+        self.assertEqual(node["api_version"], 400)
+        self.assertNotIn("plugin_version", node)
+        self.assertEqual((node["rc_version"], node["rc_version_int"]), ("7.3.5", 735))
+        self.assertEqual((node["createdversion"], node["savedversion"], node["proxymode"]), (0, "2.4.2b Pro", 0))
         self.assertEqual(node["material"], {"class": "Multimaterial", "name": "_RC_fencing", "ids": [1, 2]})
         self.assertEqual((node["display_mode"], node["render_mode"]), (2, 0))
         self.assertEqual(node["settings"]["seed"], 123456)
@@ -482,7 +487,7 @@ class InspectTests(unittest.TestCase):
                          {("_exp_10_0", 2), ("_exp_distance_0", 1)})
         self.assertEqual(self.out["output"], {"total": 3, "placed": 2, "placeholders": 1,
                                               "by_segment": {"post": 1, "rail": 1}, "rebuilt": True,
-                                              "segments_reloaded": False})
+                                              "segments_reloaded": False, "proxy_cache": False})
         codes = {w.split(":")[0] for w in self.out["warnings"]}
         self.assertIn("SHARED_BASE", codes)
         self.assertIn("PARAM_OUT_OF_LIMITS", codes)
@@ -1178,6 +1183,211 @@ class FromLibraryTests(LibraryFixture):
                             < body.index('theHold.Accept "'))
         self.refused(ValueError, reads_roots=False, item=self.ROUTE1, splines=["A"], clipping_splines=["A"])
         self.refused(ValueError, reads_roots=False, item=self.ROUTE1, clipping_splines=[""])
+
+
+PROXY_OUTPUT = (
+    # Live (RailClone 7.3.5, probe p19/p22): under Proxy Cache getXMLOutput lists every item without source_segment
+    '<RailClone version="1">'
+    '<item index="0" instanced="1" tm="[1,0,0][0,1,0][0,0,1][0,0,0]" box="[-2.55,-2.55,119.93][2.55,2.55,127.07]" '
+    'tags=""/>'
+    '<item index="1" instanced="1" tm="[1,0,0][0,1,0][0,0,1][10,0,0]" box="[-2.55,-2.55,0][2.55,2.55,120]" tags=""/>'
+    '<item index="2" instanced="0" tm="[1,0,0][0,1,0][0,0,1][20,0,0]" '
+    'box="[2.14748e+09,2.14748e+09,2.14748e+09][-2.14748e+09,-2.14748e+09,-2.14748e+09]" tags=""/>'
+    '</RailClone>'
+)
+
+
+class VersionTests(unittest.TestCase):
+    """Issue #26: RailClone versions, library-load bugs, selectors and Proxy Cache (live probes p02-p22)."""
+
+    def inspect(self, raw, **kw):
+        with patch.object(rc, "client", client_with(raw)) as client:
+            out = rc.railclone_inspect(name="RC_Fence", **kw)
+        return out, scripts(client)[0]
+
+    def test_version_text_and_saved_version(self):
+        self.assertEqual(rclib.version_text(735), "7.3.5")
+        self.assertEqual(rclib.version_text(613), "6.1.3")
+        for value in (0, -1, None, True, 7.35, "735"):
+            self.assertIsNone(rclib.version_text(value), value)
+        self.assertEqual(rclib.version_text(1004), "1004")
+        self.assertEqual(rclib.saved_version("7.0.8 Pro"), 708)
+        self.assertEqual(rclib.saved_version("2.4.2b Pro"), 242)
+        self.assertEqual(rclib.saved_version("7.3.5 Pro"), 735)
+        for text in ("n/a", "", None, "7.10.1 Pro"):
+            self.assertIsNone(rclib.saved_version(text), text)
+
+    def test_runtime_version_is_read_from_a_new_instance(self):
+        # RailClone_Pro.version() is 400 on 7.1.1 and 7.3.5 alike: an API number. A new instance's createdversion
+        # is the running version (735 on 7.3.5, railclonepro.dlo 7.3.5.687), and creating it adds no node.
+        self.assertIn("fn rcRuntime = (try ((createInstance RailClone_Pro).createdversion) catch undefined)",
+                      rc._FUNCTIONS)
+        _, script = self.inspect(inspect_raw())
+        body = script.replace(rc._FUNCTIONS, "")
+        self.assertIn('rcRow ss #("K", "rc_runtime", rcV (rcRuntime()))', body)
+        self.assertIn('rcRow ss #("K", "api_version", rcV (try (RailClone_Pro.version()) catch undefined))', body)
+        self.assertIn("#savedversion, #createdversion, #proxymode,", body)
+        self.assertNotIn("plugin_version", body)
+        out, _ = self.inspect(inspect_raw().replace("K|rc_runtime|" + V(735), "K|rc_runtime|u"))
+        self.assertEqual((out["node"]["rc_version"], out["node"]["rc_version_int"]), (None, None))
+
+    def test_selector_index_mismatch(self):
+        # paintval is the index the panel shows, pafloatval the value the engine builds with (live, p07)
+        swapped = param_row(8, "{c8}", "Top Window", 5, ival=0, fval=2.0, sel="No Top|1;Top|2")
+        outside = param_row(9, "{c9}", "Frames", 5, ival=7, fval=10.0, sel="Wood|1;PVC|10")
+        out, _ = self.inspect(inspect_raw(extra_params=[swapped, outside]))
+        mismatch = [w for w in out["warnings"] if w.startswith("SELECTOR_INDEX_MISMATCH")]
+        self.assertEqual(len(mismatch), 2)
+        self.assertIn("'Top Window': the option index (paintval) 0 is 'No Top' = 1, but the value (pafloatval) is "
+                      "2, option 'Top'", mismatch[0])
+        self.assertIn("outside its 2 options", mismatch[1])
+        params = {p["name"]: p for p in out["params"]}
+        self.assertTrue(params["Top Window"]["index_mismatch"])
+        self.assertNotIn("index_mismatch", params["Spandrel Type"])  # index 1 = Solid = 2.0: they agree
+        self.assertFalse(any(w.startswith("SELECTOR_INDEX_MISMATCH") for w in
+                             self.inspect(inspect_raw())[0]["warnings"]))
+        # stale paselector text on a non-selector (seen live on distance parameters) is never checked
+        self.assertIsNone(rclib.selector_mismatch(dict(zip(rclib.PARAM_FIELDS, [
+            "{p}", "Height", 3, 1, 0.0, 200.0, True, "", "X Spline|0;Closed Spline|1", False, 0, 0, 0.0, 0.0, 0.0,
+            0.0, ""]))))
+
+    def test_selector_bug_version(self):
+        old = inspect_raw().replace("K|rc_runtime|" + V(735), "K|rc_runtime|" + V(711))
+        out, _ = self.inspect(old)
+        bug = [w for w in out["warnings"] if w.startswith("RC_SELECTOR_BUG_VERSION")]
+        self.assertEqual(len(bug), 1)
+        self.assertIn("RailClone 7.1.1 is older than 7.3.1", bug[0])
+        self.assertIn("1 selector parameter(s)", bug[0])
+        self.assertEqual(out["node"]["rc_version"], "7.1.1")
+        self.assertFalse(any(w.startswith("RC_SELECTOR_BUG_VERSION") for w in
+                             self.inspect(inspect_raw())[0]["warnings"]))  # 7.3.5
+        self.assertIsNone(rclib.selector_bug_warning(711, 0))  # no selector in the style
+        self.assertIsNone(rclib.selector_bug_warning(731, 3))
+        self.assertIsNone(rclib.selector_bug_warning(None, 3))
+
+    def test_style_may_predate_mapping_fix(self):
+        route = "\\Railclone Library\\Architecture\\Exterior\\Windows\\Window 1 - PVC"
+        routed = inspect_raw().replace("K|style|" + V(""), "K|style|" + V(route))
+        for created, saved, fires in ((711, "n/a", True), (735, "7.0.8 Pro", True), (735, "7.3.5 Pro", False),
+                                      (0, "n/a", False), (713, "7.1.3 Pro", False)):
+            raw = routed.replace("K|createdversion|" + V(0), "K|createdversion|" + V(created)).replace(
+                "K|savedversion|" + V("2.4.2b Pro"), "K|savedversion|" + V(saved))
+            with self.subTest(created=created, saved=saved):
+                out, _ = self.inspect(raw)
+                found = [w for w in out["warnings"] if w.startswith("STYLE_MAY_PREDATE_MAPPING_FIX")]
+                self.assertEqual(len(found), int(fires))
+                if fires:
+                    self.assertIn(route, found[0])
+                    self.assertIn("may have been loaded before that fix", found[0])
+                    self.assertIn("railclone_from_library", found[0])
+        # a merged library object has no style route: createdversion 0 and savedversion "2.4.2b Pro" (Metal Fence 1)
+        out, _ = self.inspect(inspect_raw())
+        self.assertFalse(any(w.startswith("STYLE_MAY_PREDATE") for w in out["warnings"]))
+        self.assertIn("created by RailClone 6.1.3 and last saved by RailClone 7.0.8 Pro",
+                      rclib.mapping_predate_warning("\\L\\x", 613, "7.0.8 Pro"))
+
+    def test_inspect_under_proxy_cache(self):
+        # Live: Proxy Cache lists 176 items with no source_segment; the inspect said 176 placeholders, EMPTY_OUTPUT
+        raw = inspect_raw().replace("K|proxymode|" + V(0), "K|proxymode|" + V(1)).replace(
+            "O|" + b64(OUTPUT), "O|" + b64(PROXY_OUTPUT))
+        out, _ = self.inspect(raw)
+        self.assertEqual(out["node"]["proxymode"], 1)
+        self.assertEqual(out["output"], {"total": 3, "placed": 2, "placeholders": 1, "by_segment": {},
+                                         "rebuilt": True, "segments_reloaded": False, "proxy_cache": True})
+        self.assertEqual([s["items"] for s in out["segments"]], [None, None])
+        codes = [w.split(":")[0] for w in out["warnings"]]
+        self.assertIn("PROXY_CACHE", codes)
+        self.assertNotIn("EMPTY_OUTPUT", codes)
+        # without Proxy Cache the same items are placeholders: no source_segment
+        plain = inspect_raw().replace("O|" + b64(OUTPUT), "O|" + b64(PROXY_OUTPUT))
+        out, _ = self.inspect(plain)
+        self.assertEqual((out["output"]["placed"], out["output"]["placeholders"]), (0, 3))
+        self.assertIn("EMPTY_OUTPUT", [w.split(":")[0] for w in out["warnings"]])
+        self.assertNotIn("PROXY_CACHE", [w.split(":")[0] for w in out["warnings"]])
+        self.assertFalse(rclib.is_placeholder({"box": "[0,0,0][1,1,1]"}, proxy=True))
+        self.assertTrue(rclib.is_placeholder({"box": "[2,0,0][1,1,1]"}, proxy=True))
+
+    def test_output_under_proxy_cache(self):
+        with patch.object(rc, "client", client_with(out_raw(PROXY_OUTPUT, proxy="1"))) as client:
+            out = rc.get_railclone_output(name="RC_Fence")
+        self.assertIn("local proxy = if isProperty base #proxymode then base.proxymode else 0", scripts(client)[0])
+        self.assertEqual((out["proxymode"], out["proxy_cache"]), (1, True))
+        self.assertEqual((out["placed"], out["placeholders"], out["by_segment"]), (2, 1, {}))
+        self.assertEqual([i["placeholder"] for i in out["items"]], [False, False, True])
+        codes = [w.split(":")[0] for w in out["warnings"]]
+        self.assertIn("PROXY_CACHE", codes)
+        self.assertNotIn("EMPTY_OUTPUT", codes)
+        with patch.object(rc, "client", client_with(out_raw())):
+            out = rc.get_railclone_output(name="RC_Fence")
+        self.assertEqual((out["proxymode"], out["proxy_cache"]), (0, False))
+        self.assertFalse(any(w.startswith("PROXY_CACHE") for w in out["warnings"]))
+
+    def test_set_param_under_proxy_cache(self):
+        read = read_raw().replace("RCINSPECT\n", "RCINSPECT\nK|proxymode|" + V(1) + "\n")
+        write = setp_raw({("before", 1, "paunitval"): 10.0, ("after", 1, "paunitval"): 20.0},
+                         before="0:", after="0:")
+        with patch.object(rc, "client", client_with(read, write)):
+            out = rc.railclone_set_param({"Pickets Distance": 20}, name="RC_Fence")
+        self.assertTrue(out["output"]["proxy_cache"])
+        self.assertEqual((out["output"]["after"]["placed"], out["output"]["after"]["total"]), (None, 40))
+        codes = [w.split(":")[0] for w in out["warnings"]]
+        self.assertIn("PROXY_CACHE", codes)
+        self.assertNotIn("EMPTY_OUTPUT", codes)
+        # live: a 20 cm picket distance left a Proxy Cache fence at 176 items: the output is the cached build
+        proxy = next(w for w in out["warnings"] if w.startswith("PROXY_CACHE"))
+        self.assertIn("placed and placeholders are left out", proxy)
+        self.assertIn("the geometry can stay as cached", proxy)
+
+    def test_reload_segments_docs(self):
+        # Two live tests on RailClone 7.3.5: segmentsUpdate never changed geometry; it renamed linked segments
+        for fn in (rc.railclone_inspect, rc.get_railclone_output):
+            doc = re.sub(r"\s+", " ", fn.__doc__)
+            with self.subTest(fn=fn.__name__):
+                self.assertIn("renames linked segments after their sources, with no geometry effect on RailClone "
+                              "7.3.5; use force_rebuild to pick up source edits", doc)
+        self.assertIn("renamed every linked segment (sname) after its source node", rc._RELOAD_NOTE)
+        self.assertIn("use force_rebuild to pick up source edits", rc._RELOAD_NOTE)
+
+
+class FromLibraryVersionTests(LibraryFixture):
+    ROUTE_RAIL = FromLibraryTests.ROUTE_RAIL
+
+    def call(self, raw, **kw):
+        with patch.object(rc, "client", client_with(roots_raw(self.roots), raw)) as client:
+            out = rc.railclone_from_library(item=self.ROUTE_RAIL, splines=["Path600"], **kw)
+        return out, scripts(client)[1]
+
+    def test_versions_reported(self):
+        raw = lib_raw(extra=["K|api_version|" + V(400), "K|rc_runtime|" + V(735), "K|createdversion|" + V(735),
+                             "K|savedversion|" + V("n/a"), "K|proxymode|" + V(0), "K|selectors|" + V(2)])
+        out, script = self.call(raw)
+        tail = script[script.index('format "RCLIB'):]
+        self.assertIn('rcRow ss #("K", "rc_runtime", rcV (rcRuntime()))', tail)
+        self.assertIn("for p in #(#createdversion, #savedversion, #proxymode) do", tail)
+        self.assertIn("for t in (rcArr rcBase #patype) where t == 5 do nSel += 1", tail)
+        self.assertEqual((out["rc_version"], out["rc_version_int"], out["api_version"]), ("7.3.5", 735, 400))
+        self.assertEqual((out["createdversion"], out["savedversion"], out["proxymode"]), (735, "n/a", 0))
+        self.assertFalse(any(w.startswith("RC_") for w in out["warnings"]))
+
+    def test_old_runtime_warns(self):
+        raw = lib_raw(extra=["K|rc_runtime|" + V(711), "K|selectors|" + V(2)])
+        out, _ = self.call(raw)
+        codes = [w.split(":")[0] for w in out["warnings"]]
+        self.assertIn("RC_LIBRARY_MAPPING_BUG_VERSION", codes)
+        self.assertIn("RC_SELECTOR_BUG_VERSION", codes)
+        out, _ = self.call(lib_raw(extra=["K|rc_runtime|" + V(720), "K|selectors|" + V(0)]))
+        self.assertEqual([w.split(":")[0] for w in out["warnings"] if w.startswith("RC_")], [])
+        out, _ = self.call(lib_raw(extra=["K|rc_runtime|" + V(720), "K|selectors|" + V(1)]))
+        self.assertEqual([w.split(":")[0] for w in out["warnings"] if w.startswith("RC_")],
+                         ["RC_SELECTOR_BUG_VERSION"])
+
+    def test_proxy_cache_load(self):
+        out, _ = self.call(lib_raw(placed=0, extra=["K|proxymode|" + V(1)]))
+        self.assertTrue(out["verified"])  # 3 items listed, none naming its segment
+        self.assertEqual((out["item_count"], out["output"]["placed"]), (3, None))
+        codes = [w.split(":")[0] for w in out["warnings"]]
+        self.assertIn("PROXY_CACHE", codes)
+        self.assertNotIn("EMPTY_OUTPUT", codes)
 
 
 MXS_KEYWORDS = frozenset("""about and animate as at by case catch collect continue coordsys do dontcollect else exit

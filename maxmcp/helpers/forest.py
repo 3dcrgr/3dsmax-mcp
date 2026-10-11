@@ -7,9 +7,12 @@ send the scripts themselves, so tests can patch their ``client``.
 from __future__ import annotations
 
 import base64
+import html
 import math
 import re
 from typing import Any, Iterable
+
+from .railclone_lib import FOREST_LINK, version_text
 
 # Items per units_x * units_y tile with the stock distribution map: dense.bmp's white pixels (live: 1437 on a
 # 10 m plane at 1000 cm units, 16023 at 300 cm, 22992 = 16 x 1437 at 250 cm). threshold and mapname writes don't
@@ -26,6 +29,18 @@ DEFAULT_VIEWPORT_MAX_ITEMS = 50000
 DEFAULT_RENDER_MAX_ITEMS = 1_000_000
 
 MODE_NAMES = {0: "procedural", 1: "custom_edit"}
+
+# distmode 2 is Reference: one item per reference node (distrefnodes), or with Use RailClone Items
+# (distrefusercitems, Forest Pack 9.4.1 or later) one per item a RailClone exports. It needs no surface or area
+# (live, Forest Pack 9.4.3 and RailClone 7.3.5, probes p14-p21 in livetests-2027\runs-1011\probe-26-27).
+REFERENCE_MODE = 2
+# Export to Forest on an operator (a Transform) is a style XML parameter, <parameter id="export_forest"
+# name="Export to Forest" value="1"/>; on a Segment it is only the per-segment array sexportforest (live, p12-p16).
+EXPORT_FOREST_PATTERN = r'<parameter\b(?=[^>]*\bid="export_forest")(?=[^>]*\bvalue="1")[^>]*>'
+# A Tags operator's tags reach the output items as tags="..." (live: tags="fpgeom=P27_cyl"), one tag per line
+TAGS_PATTERN = r'\btags="([^"]*)"'
+MAX_REF_NODES = 500
+MAX_REF_TAGS = 50
 
 # namelist is the master: Forest Pack pads every other item list to namelist.count on a rebuild.
 ITEM_LISTS_CORE = ("cobjlist", "geomlist", "problist", "widthlist", "heightlist")
@@ -86,6 +101,56 @@ fn fpVal v = (
 fn fpState v = (if v == undefined then "u" else if isValidNode v then "n" else "x")
 -- A property's number or flag, "u" when this Forest Pack build lacks it
 fn fpPropV nd p = (if isProperty nd p then fpVal (getProperty nd p) else "u")
+fn fpH n = formattedPrint ((getHandleByAnim n) as integer64) format:"d"
+-- The running RailClone version as a number (major, minor, patch digits): a new instance's createdversion, no
+-- node created (live). RailClone_Pro.version() is an API number, not the product version.
+fn fpRcVer = (
+    local v = try ((createInstance RailClone_Pro).createdversion) catch undefined
+    if isKindOf v Number then (fpF v) else "u"
+)
+-- Reference mode (distmode 2), read only: one E row per reference node, then the D row with the forest's
+-- reference settings. A RailClone's row says what it exports to Forest Pack, without a rebuild: its Segment flags
+-- (sexportforest), the Export to Forest parameters in getXMLStyle (Transforms), and the item count and tags of its
+-- last getXMLOutput. Never getStyleDesc: it empties the output export until the next rebuild (live).
+fn fpRefRows nd ss = (
+    local rn = if isProperty nd #distrefnodes then (nd.distrefnodes as array) else #()
+    local rx = dotNetClass "System.Text.RegularExpressions.Regex"
+    local expPat = fpDec "@@EXPORT_PAT@@"
+    local tagPat = fpDec "@@TAGS_PAT@@"
+    local anyRc = false
+    for i = 1 to (amin rn.count @@MAX_REF_NODES@@) do (
+        local r = rn[i]
+        local api = if isValidNode r then (getInterface r.baseObject #railclone) else undefined
+        if not (isValidNode r) then (format "E|%|x\n" i to:ss)
+        else if api == undefined then (format "E|%|n|%|%\n" i (fpEnc r.name) (fpH r) to:ss)
+        else (
+            anyRc = true
+            local b = r.baseObject
+            local sx = if isProperty b #sexportforest then (b.sexportforest as array) else #()
+            local nExp = 0
+            for v in sx where v == true do nExp += 1
+            local st = if isProperty api #getXMLStyle then (try (api.getXMLStyle()) catch undefined) else undefined
+            local tExp = if isKindOf st String then ((rx.Matches st expPat).Count) else -1
+            local ox = if isProperty api #getXMLOutput then (try (api.getXMLOutput()) catch undefined) else undefined
+            local nOut = -1
+            local tagText = ""
+            if isKindOf ox String do (
+                nOut = (rx.Matches ox "<item[ />]").Count
+                local seen = #()
+                local hits = rx.Matches ox tagPat
+                for k = 0 to hits.Count - 1 while seen.count < @@MAX_REF_TAGS@@ do (
+                    local tv = (hits.Item k).Groups.Item[1].Value
+                    if tv != "" and (findItem seen tv) == 0 do (
+                        append seen tv
+                        tagText += (if seen.count > 1 then "," else "") + (fpEnc tv)
+                    )
+                )
+            )
+            format "E|%|r|%|%|%|%|%|%|%|%|%|%|%\n" i (fpEnc r.name) (fpH r) (fpPropV b #disabled) (fpPropV b #proxymode) (fpPropV b #autoUpdate) nExp sx.count tExp nOut (fpPropV b #createdversion) tagText to:ss
+        )
+    )
+    format "D|%|%|%|%|%\n" (fpPropV nd #distrefusercitems) (fpPropV nd #distrefmatchname) (fpPropV nd #distrefmode) rn.count (if anyRc then (fpRcVer()) else "u") to:ss
+)
 fn fpHasDistMap nd = (if isProperty nd #distmap and (getProperty nd #distmap) != undefined then "1" else "0")
 -- The source object's object-offset (pivot offset) TM. getFullTransform maps the source's
 -- object-space vertices, so inverse(fpOffTM src) * itemTM places the source's pivot.
@@ -169,7 +234,13 @@ fn fpAppendArea nd shp atype incexc isOn = (
         setProperty nd d[1] v
     )
 )
-'''.replace("@@AR_LISTS@@", _AR_LISTS_MXS).replace("@@AR_DEFAULTS@@", _AR_DEFAULTS_MXS)
+'''
+for _key, _value in (("AR_LISTS", _AR_LISTS_MXS), ("AR_DEFAULTS", _AR_DEFAULTS_MXS),
+                     ("EXPORT_PAT", base64.b64encode(EXPORT_FOREST_PATTERN.encode()).decode("ascii")),
+                     ("TAGS_PAT", base64.b64encode(TAGS_PATTERN.encode()).decode("ascii")),
+                     ("MAX_REF_NODES", str(MAX_REF_NODES)), ("MAX_REF_TAGS", str(MAX_REF_TAGS))):
+    MXS_LIB = MXS_LIB.replace(f"@@{_key}@@", _value)
+del _key, _value
 
 _PLACEHOLDER = re.compile(r"@@([A-Z0-9_]+)@@")
 
@@ -454,8 +525,11 @@ fn fpCollect nd ss doBuild = (
     )
     local bad = fpGeomBad nd
     if bad > 0 then (format "C|-1|0|%\n" bad to:ss) else if doBuild then (nd.trees.update(); format "C|%|1|0\n" (nd.trees.count()) to:ss) else (format "C|-1|0|0\n" to:ss)
+    -- after the build, so a linked RailClone's output is the one the forest just read
+    if nd.distmode == @@REFERENCE@@ do fpRefRows nd ss
 )
-'''.replace("@@ITEM_LISTS@@", "#(" + ", ".join(f'"{n}"' for n in ITEM_LISTS) + ")").replace("@@AR_LISTS@@", _AR_LISTS_MXS)
+'''.replace("@@ITEM_LISTS@@", "#(" + ", ".join(f'"{n}"' for n in ITEM_LISTS) + ")").replace(
+    "@@AR_LISTS@@", _AR_LISTS_MXS).replace("@@REFERENCE@@", str(REFERENCE_MODE))
 
 
 def parse_state(report: list[str]) -> dict[str, Any]:
@@ -498,7 +572,182 @@ def parse_state(report: list[str]) -> dict[str, Any]:
         elif tag == "C":
             count = int(f[1])
             state.update(count=None if count < 0 else count, built=f[2] == "1", crash_index=int(f[3]))
+    state["reference"] = parse_reference(report)
     return state
+
+
+def _flag(text: str) -> bool | None:
+    """A fpPropV flag: True, False, or None when this Forest Pack or RailClone build lacks the property."""
+    value = num(text)
+    return None if value is None else value != 0
+
+
+def _int(text: str) -> int | None:
+    value = num(text)
+    return None if value is None else int(value)
+
+
+def _ref_node(f: list[str]) -> dict[str, Any]:
+    """One E row of fpRefRows: x (deleted entry), n (any other node) or r (a RailClone)."""
+    index = int(f[1])
+    if f[2] == "x":
+        return {"index": index, "valid": False, "name": None, "handle": None, "railclone": False}
+    node: dict[str, Any] = {"index": index, "valid": True, "name": unb64(f[3]), "handle": int(f[4]),
+                            "railclone": f[2] == "r"}
+    if f[2] == "r":
+        node.update(disabled=_flag(f[5]), proxymode=_int(f[6]), auto_update=_flag(f[7]),
+                    exported_segments=int(f[8]), segments=int(f[9]),
+                    transform_exports=None if int(f[10]) < 0 else int(f[10]),
+                    output_items=None if int(f[11]) < 0 else int(f[11]), createdversion=_int(f[12]),
+                    tags=[unb64(t) for t in f[13].split(",") if t] if len(f) > 13 else [])
+    return node
+
+
+def parse_reference(report: list[str]) -> dict[str, Any] | None:
+    """The fpRefRows rows (D and E) as a dict; None when the script wrote none (the forest isn't in Reference mode)."""
+    head = None
+    nodes: list[dict[str, Any]] = []
+    for line in report:
+        f = line.split("|")
+        if f[0] == "D" and len(f) >= 6:
+            head = f
+        elif f[0] == "E" and len(f) >= 3:
+            nodes.append(_ref_node(f))
+    if head is None:
+        return None
+    return {"use_railclone_items": _flag(head[1]), "match_by_name": _flag(head[2]), "ref_mode": _int(head[3]),
+            "node_count": int(head[4]), "rc_runtime": _int(head[5]), "nodes": nodes}
+
+
+def fpgeom_names(tags: Iterable[str]) -> list[str]:
+    """The fpgeom=<name> values in RailClone item tags (XML-escaped, one tag per line), sorted and unique."""
+    names = set()
+    for raw in tags:
+        for line in re.split(r"[\r\n]+", html.unescape(raw)):
+            key, sep, value = line.partition("=")
+            if sep and key.strip().lower() == "fpgeom" and value.strip():
+                names.add(value.strip())
+    return sorted(names)
+
+
+def reference_view(ref: dict[str, Any] | None, detail: bool = False) -> dict[str, Any] | None:
+    """A Reference-mode forest's reference settings and nodes as JSON (detail adds versions, items and tags)."""
+    if ref is None:
+        return None
+    nodes = []
+    for n in ref["nodes"]:
+        if not n["valid"]:
+            nodes.append({"name": None, "handle": None, "railclone": False, "missing": True})
+            continue
+        row: dict[str, Any] = {"name": n["name"], "handle": n["handle"], "railclone": n["railclone"]}
+        if n["railclone"]:
+            row.update(exported_segments=n["exported_segments"], transform_exports=n["transform_exports"],
+                       proxy_cache=n["proxymode"] not in (None, 0), disabled=n["disabled"],
+                       auto_update=n["auto_update"])
+            if detail:
+                row.update(segments=n["segments"], proxymode=n["proxymode"], output_items=n["output_items"],
+                           createdversion=n["createdversion"], fpgeom=fpgeom_names(n["tags"]))
+        nodes.append(row)
+    view: dict[str, Any] = {"use_railclone_items": ref["use_railclone_items"], "match_by_name": ref["match_by_name"],
+                            "nodes": nodes}
+    if detail:
+        view.update(ref_mode=ref["ref_mode"], node_count=ref["node_count"],
+                    rc_version=version_text(ref["rc_runtime"]))
+    if ref["node_count"] > len(ref["nodes"]):
+        view["nodes_truncated"] = True
+    return view
+
+
+def reference_issues(state: dict[str, Any]) -> tuple[list, list, list, list[str]]:
+    """Errors, warnings, notes and the NO_ITEMS causes of a Reference-mode forest's links (distmode 2).
+
+    Every failure of a RailClone link is silent in Forest Pack (live): no Export to Forest, Proxy Cache or a
+    disabled RailClone give 0 items, autoUpdate off keeps the last build, and Use RailClone Items off makes the
+    RailClone one marker at its pivot. A link that gives no items is an error when the forest builds 0 items and
+    a warning next to items from other nodes.
+    """
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    notes: list[dict[str, Any]] = []
+    causes: list[str] = []
+    ref = state.get("reference") or {"nodes": [], "use_railclone_items": None, "match_by_name": None,
+                                     "rc_runtime": None}
+    empty = bool(state.get("built")) and state.get("count") == 0
+
+    def problem(code: str, detail: str, **extra: Any) -> None:
+        (errors if empty else warnings).append(_issue(code, detail, **extra))
+        causes.append(code)
+
+    nodes = ref["nodes"]
+    valid = [n for n in nodes if n["valid"]]
+    missing = [n["index"] for n in nodes if not n["valid"]]
+    if not valid:
+        errors.append(_issue("REF_NO_NODES", "Reference mode (distmode 2) places items at its reference nodes "
+                             "(distrefnodes), and the list has no valid node"
+                             + (f": entries {missing} are deleted" if missing else "")))
+        causes.append("REF_NO_NODES")
+    elif missing:
+        notes.append(_issue("REF_NODE_MISSING", f"distrefnodes entries {missing} are undefined or deleted; they "
+                            "place nothing"))
+    rcs = [n for n in valid if n["railclone"]]
+    if not rcs:
+        return errors, warnings, notes, causes
+    names = [n["name"] for n in rcs]
+    use = ref.get("use_railclone_items")
+    if use is None:
+        problem("RC_LINK_UNSUPPORTED", "this Forest Pack has no Use RailClone Items (distrefusercitems, Forest Pack "
+                f"9.4.1 or later), so each RailClone in distrefnodes {names} is one marker at its pivot, not its items")
+        return errors, warnings, notes, causes
+    if use is False:
+        # one marker per node: never the cause of 0 items
+        warnings.append(_issue("RC_LINK_OFF", f"Use RailClone Items (distrefusercitems) is off, so each RailClone "
+                               f"in distrefnodes {names} is one marker at its pivot, not the items it exports; "
+                               "turn it on to place items on the RailClone's exported items"))
+        return errors, warnings, notes, causes
+    runtime = ref.get("rc_runtime")
+    if runtime is not None and runtime < FOREST_LINK:
+        problem("RC_LINK_UNSUPPORTED", f"RailClone {version_text(runtime)} is older than 7.3.2, which added Export "
+                "to Forest; Use RailClone Items needs RailClone 7.3.2 and Forest Pack 9.4.1 or later")
+    n_types = state["lengths"].get("namelist", 0)
+    labels = {it["label"] for it in state["items"] if it["label"] and it["index"] <= n_types}
+    for rc in rcs:
+        label = f"RailClone '{rc['name']}'"
+        if rc["disabled"]:
+            problem("RC_LINK_DISABLED", f"{label} is disabled, so it builds and exports nothing", node=rc["name"])
+        if rc["proxymode"] not in (None, 0):
+            problem("RC_LINK_PROXY_CACHE", f"{label} uses Proxy Cache (proxymode {rc['proxymode']}), and Use "
+                    "RailClone Items gets no items from a RailClone in Proxy Cache; turn Proxy Cache off",
+                    node=rc["name"])
+        if rc["exported_segments"] == 0 and rc["transform_exports"] == 0:
+            problem("RC_LINK_NO_EXPORT", f"{label} exports nothing to Forest Pack: none of its {rc['segments']} "
+                    "segments has Export to Forest (sexportforest) and no Transform in its style has it "
+                    "(export_forest); turn it on for the segments, or a Transform above them, whose items the "
+                    "forest should take", node=rc["name"])
+        if rc["output_items"] == 0 and not rc["disabled"]:
+            problem("RC_LINK_EMPTY", f"the last build of {label} has no items (no spline, a style that places "
+                    "nothing, or an export emptied by a getStyleDesc() call until the next rebuild)",
+                    node=rc["name"])
+        if rc["auto_update"] is False:
+            warnings.append(_issue("RC_LINK_STALE", f"{label} has autoUpdate off, so the forest takes the items of "
+                                   "its last build: changes made since, Export to Forest included, reach the "
+                                   "forest only once autoUpdate is on", node=rc["name"]))
+            if empty:
+                causes.append("RC_LINK_STALE")
+        tags = fpgeom_names(rc["tags"])
+        if tags and not ref.get("match_by_name"):
+            warnings.append(_issue("FPGEOM_IGNORED", f"the items of {label} carry fpgeom tags {tags}, but Match by "
+                                   "name (distrefmatchname) is off, so the forest picks item types by probability; "
+                                   "turn it on to match the tags to the Geometry List names", node=rc["name"]))
+        elif tags:
+            # Live: a tag matches the Geometry List name whatever its case (fpgeom=P27_cyl matched "p27_CYL")
+            folded = {name.lower() for name in labels}
+            unmatched = [t for t in tags if t.lower() not in folded]
+            if unmatched:
+                warnings.append(_issue("FPGEOM_UNMATCHED", f"the fpgeom tags {unmatched} of {label} match no "
+                                       f"Geometry List name (namelist: {sorted(labels)}); a tag matches the Geometry "
+                                       "List name (case doesn't matter), not the source object's name, and live an "
+                                       "unmatched item got item type 1", node=rc["name"]))
+    return errors, warnings, notes, causes
 
 
 def _issue(code: str, detail: str, **extra: Any) -> dict[str, Any]:
@@ -578,23 +827,28 @@ def analyze(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = froz
             f"{k}={v}" for k, v in sorted(area_lengths.items(), key=lambda kv: (-kv[1], kv[0]))
             if v != max(area_lengths.values()))))
     areas = state["areas"]
+    reference = state.get("distmode") == REFERENCE_MODE
+    # The area checks: in Reference mode the positions come from the reference nodes, and no surface or area is
+    # needed (live: a forest with an inactive Surface Area and no surface built 88 items), so they are notes there
+    area_errors: list[dict[str, Any]] = []
+    area_warnings: list[dict[str, Any]] = []
     surface_areas = [a for a in areas if a["type"] == 3]
     if not surface_areas:
-        warnings.append(_issue("SURFACE_AREA_MISSING", "no Surface Area entry; Forest Pack appends an inactive one "
-                               "on the next rebuild"))
+        area_warnings.append(_issue("SURFACE_AREA_MISSING", "no Surface Area entry; Forest Pack appends an inactive "
+                                    "one on the next rebuild"))
     elif len(surface_areas) > 1:
         errors.append(_issue("SURFACE_AREA_COUNT", f"{len(surface_areas)} Surface Area entries (type 3); expected 1"))
     active = [a for a in areas if a["active"]]
     if not active:
-        errors.append(_issue("NO_ACTIVE_AREA", "no area is active (stock presets ship their Surface Area inactive); "
-                             "set pf_aractivelist for the Surface Area or a spline area"))
+        area_errors.append(_issue("NO_ACTIVE_AREA", "no area is active (stock presets ship their Surface Area "
+                                  "inactive); set pf_aractivelist for the Surface Area or a spline area"))
     for a in active:
         if a["type"] == 0 and a["node"] != "n":
-            errors.append(_issue("AREA_NODE_MISSING", f"active spline area {a['index']} ('{a['name']}') has no "
-                                 "spline", index=a["index"]))
+            area_errors.append(_issue("AREA_NODE_MISSING", f"active spline area {a['index']} ('{a['name']}') has no "
+                                      "spline", index=a["index"]))
         if a["type"] == 3 and not state["surfaces"]:
-            errors.append(_issue("SURFACE_LIST_EMPTY", "the Surface Area is active but surflist is empty",
-                                 index=a["index"]))
+            area_errors.append(_issue("SURFACE_LIST_EMPTY", "the Surface Area is active but surflist is empty",
+                                      index=a["index"]))
     # Live: a spline exclude cuts only the include splines listed before it (a lower list index); the Surface
     # Area is cut by an exclude anywhere in the list. So an exclude listed before an include leaves it uncut.
     for exc in active:
@@ -602,10 +856,16 @@ def analyze(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = froz
             continue
         uncut = [a for a in active if a["type"] == 0 and a["incexc"] == 0 and a["index"] > exc["index"]]
         for inc in uncut:
-            warnings.append(_issue("EXCLUDE_BEFORE_INCLUDE", f"exclude area {exc['index']} ('{exc['name']}') is "
-                                   f"listed before include area {inc['index']} ('{inc['name']}'), so it cuts no hole "
-                                   "in it: an exclude only cuts include splines listed before it",
-                                   index=exc["index"], include_index=inc["index"]))
+            area_warnings.append(_issue("EXCLUDE_BEFORE_INCLUDE", f"exclude area {exc['index']} ('{exc['name']}') "
+                                        f"is listed before include area {inc['index']} ('{inc['name']}'), so it cuts "
+                                        "no hole in it: an exclude only cuts include splines listed before it",
+                                        index=exc["index"], include_index=inc["index"]))
+    if reference:
+        notes += [dict(issue, detail="Reference mode (distmode 2) takes its positions from the reference nodes "
+                       "and needs no area: " + issue["detail"]) for issue in area_errors + area_warnings]
+    else:
+        errors += area_errors
+        warnings += area_warnings
     for s in state["surfaces"]:
         if s["state"] != "n":
             errors.append(_issue("SURFACE_MISSING", f"surflist entry {s['index']} is undefined or deleted",
@@ -620,6 +880,12 @@ def analyze(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = froz
         warnings.append(_issue("DISABLED", "the forest is disabled"))
     if state.get("manual_update"):
         warnings.append(_issue("MANUAL_UPDATE", "manual update is on; the viewport may show stale items"))
+    causes: list[str] = []
+    if reference:
+        ref_errors, ref_warnings, ref_notes, causes = reference_issues(state)
+        errors += ref_errors
+        warnings += ref_warnings
+        notes += ref_notes
 
     estimate = None
     estimate_note = None
@@ -632,12 +898,15 @@ def analyze(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = froz
     lock = bool(state.get("lock_ratio"))
     surface_active = any(a["active"] and a["type"] == 3 for a in areas)
     area_m2 = None
-    if surface_active and upm > 0:
+    if surface_active and upm > 0 and not reference:
         area_m2 = sum(s["xy_area"] for s in state["surfaces"] if s["state"] == "n") / (upm * upm)
         pixels = (state.get("pixels_x") or DEFAULT_PIXELS) * (state.get("pixels_y") or DEFAULT_PIXELS)
         candidates = candidate_cells(area_m2, state["units_x"] / upm, state["units_y"] / upm, lock_ratio=lock,
                                      pixels=pixels)
-    if not default_map:
+    if reference:
+        estimate_note = ("not estimated: in Reference mode the forest places one item per reference node, or, with "
+                         "Use RailClone Items, one per item each linked RailClone exports")
+    elif not default_map:
         estimate_note = ("not estimated: the forest doesn't use the stock distribution map (dense.bmp, no custom "
                          "distribution or density map)")
     elif not surface_active:
@@ -662,7 +931,15 @@ def analyze(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = froz
         errors.append(_issue("NOT_REBUILT", "the forest was not rebuilt because geomlist holds an unsafe value"))
     elif state.get("built") and state.get("count") == 0:
         cap = next((d for c, d in caps["warnings"] if c == "MAXDENSITY_CAP"), None)
-        errors.append(_issue("NO_ITEMS", "the forest builds 0 items" + (f": {cap}" if cap else "")))
+        detail = "the forest builds 0 items" + (f": {cap}" if cap else "")
+        extra: dict[str, Any] = {}
+        if reference:
+            # Forest Pack reports none of these itself (live): the causes found among the reference checks
+            unique = list(dict.fromkeys(causes))
+            detail += (f" in Reference mode; causes: {', '.join(unique)}" if unique else
+                       " in Reference mode, and the reference checks found no cause")
+            extra["causes"] = unique
+        errors.append(_issue("NO_ITEMS", detail, **extra))
     return {"errors": errors, "warnings": warnings, "notes": notes, "estimated_count": estimate,
             "estimate_note": estimate_note, "viewport_thinned": caps["viewport_thinned"],
             "estimated_viewport_count": caps["estimated_viewport_count"],

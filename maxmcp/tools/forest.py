@@ -100,6 +100,7 @@ for g = 1 to nT do (
     local src = if g <= cl.count then cl[g] else undefined
     format "G|%|%|%|%|%|%|%\n" g hist[g] (if g <= gl.count then fpVal gl[g] else "-") (fpB srcOk[g]) (fpEnc (nl[g] as string)) (if g <= cn.count then fpEnc (cn[g] as string) else "") (if isValidNode src then fpEnc src.name else "") to:ss
 )
+if nd.distmode == @@REFERENCE@@ do fpRefRows nd ss
 local objTM = nd.objectTransform
 local i0 = @@OFFSET@@
 local i1 = amin (n - 1) (i0 + @@LIMIT@@ - 1)
@@ -176,6 +177,11 @@ def forest_items(
     surfaces, so items keep the old Z after a surface moves until then. limit is at most 5000 (~100 bytes each).
     The items are the viewport build: over Max items Viewport (vmaxitems) Forest Pack thins it, so count can be
     lower than what renders (VIEWPORT_LIMIT_POSSIBLE).
+
+    A forest in Reference mode (distmode 2) also returns reference, read only: use_railclone_items
+    (distrefusercitems), match_by_name (distrefmatchname) and nodes, each with name, handle and railclone; a
+    RailClone adds exported_segments (segments with Export to Forest), transform_exports (Transforms with it in
+    the style), proxy_cache, disabled and auto_update. forest_validate says why such a forest has no items.
     """
     fh.node_name(name, "name")
     offset = fh.integer(offset, "offset", 0, 2**31 - 2)
@@ -186,7 +192,7 @@ def forest_items(
     refresh = _bool(refresh_surfaces, "refresh_surfaces")
     flags = {f"F_{f.upper()}": _mxs_bool(f in wanted) for f in _MAX_FIELDS}
     report = _send(fh.fill(_ITEMS_BODY, NAME=fh.b64(name), REFRESH=_mxs_bool(refresh), OFFSET=offset, LIMIT=limit,
-                           WORLD=_mxs_bool(space == "world"), **flags))
+                           WORLD=_mxs_bool(space == "world"), REFERENCE=fh.REFERENCE_MODE, **flags))
     head = next((line.split("|") for line in report if line.startswith("H|")), None)
     if head is None:
         raise ForestError("INVALID_READBACK", "forest_items got no header line")
@@ -237,7 +243,7 @@ def forest_items(
         warnings.append("procedural mode: indices are valid until the forest rebuilds")
         warnings += [f"{code}: {detail}" for code, detail in
                      _viewport_notes(count, fh.num(head[7]) if len(head) > 7 else None)]
-    return {
+    result = {
         "name": fh.unb64(head[1]),
         "mode": fh.mode_name(mode),
         "count": count,
@@ -251,6 +257,10 @@ def forest_items(
         "items": items,
         "warnings": warnings,
     }
+    reference = fh.reference_view(fh.parse_reference(report))
+    if reference is not None:
+        result["reference"] = reference
+    return result
 
 
 # --------------------------------------------------------------------------------------------
@@ -1131,6 +1141,9 @@ def _validation(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = 
     }
     if analysis["estimate_note"]:
         out["estimate_note"] = analysis["estimate_note"]
+    if state.get("distmode") == fh.REFERENCE_MODE:
+        out["distribution"] = "reference"
+        out["reference"] = fh.reference_view(state.get("reference"), detail=True)
     if state.get("vmesh") in (3, 4):
         out["viewport_note"] = f"vmesh={state['vmesh']} shows no item meshes in the viewport; that isn't an error"
     return out
@@ -1151,6 +1164,16 @@ def forest_validate(name: str, fix: bool = False) -> dict[str, Any]:
     a unique matching name, pads area lists, in one undo step, then checks again. An item type it had to pad with
     geomlist 0 (no source found) is an error after the fix, SOURCE_UNRESOLVED, not a gap note. It never
     truncates lists or writes geomlist 3.
+
+    Reference mode (distmode 2) needs no surface or area, so the area checks are notes there. It returns
+    reference (the settings and each reference node; a RailClone's exports, Proxy Cache, state, last item count
+    and fpgeom tags, read without a rebuild) and checks the RailClone links, whose failures Forest Pack never
+    reports: REF_NO_NODES, RC_LINK_NO_EXPORT, RC_LINK_PROXY_CACHE, RC_LINK_DISABLED, RC_LINK_EMPTY and
+    RC_LINK_UNSUPPORTED (RailClone before 7.3.2 or Forest Pack without Use RailClone Items) are errors when the
+    forest builds 0 items, else warnings, and NO_ITEMS lists them as causes. Warnings: RC_LINK_STALE (autoUpdate
+    off: the last build is used), RC_LINK_OFF (a RailClone with Use RailClone Items off is one marker),
+    FPGEOM_IGNORED (fpgeom tags with Match by name off) and FPGEOM_UNMATCHED (a tag that names no Geometry List
+    item).
     """
     fh.node_name(name, "name")
     do_fix = _bool(fix, "fix")
