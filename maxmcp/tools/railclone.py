@@ -36,11 +36,20 @@ _AUTO_UPDATE_KEPT = ("AUTO_UPDATE_OFF: autoUpdate is off (manual mode), so the R
                      "getStyleDesc(). force_rebuild=true builds it (autoUpdate on for the read and back off, undo "
                      "off); the new geometry is kept, can't be undone, and a heavy RailClone blocks Max while it "
                      "builds")
-_RELOAD_NOTE = ("SEGMENTS_RELOADED: segmentsUpdate ran (reload_segments). On RailClone 7.3.5 it changed no "
-                "geometry, but it renamed every linked segment (sname) to its source node's name, so sname can "
-                "differ from the segment's name in the style XML; it isn't undoable")
+_RELOAD_NOTE = ("SEGMENTS_RELOADED: segmentsUpdate ran (reload_segments). It renamed every linked segment (sname) "
+                "after its source node, so sname can differ from the segment's name in the style XML, and it "
+                "isn't undoable. It has no geometry effect on RailClone 7.3.5: use force_rebuild to pick up "
+                "source edits made while autoUpdate was off")
 _RELOAD_SKIPPED = ("RELOAD_SKIPPED: nothing was rebuilt (autoUpdate is off), so segmentsUpdate didn't run; "
                    "force_rebuild=true runs it")
+
+
+def _proxy_note(proxymode: Any, by_box: bool = True) -> str:
+    placed = ("an item counts as placed unless its box marks an empty slot" if by_box else
+              "placed and placeholders are left out")
+    return (f"PROXY_CACHE: Proxy Cache is on (proxymode {proxymode}). Its output lists the items without "
+            f"source_segment, so item counts by segment are unknown (by_segment is empty; {placed}), and a Forest "
+            "Pack object that uses this RailClone's items (Use RailClone Items) gets none")
 
 
 def _b64(text: str) -> str:
@@ -121,6 +130,10 @@ fn rcV v = (
 )
 fn rcArr base prop = if isProperty base prop then (getProperty base prop) else #()
 fn rcAt arr i = if arr != undefined and i <= arr.count then arr[i] else undefined
+-- The running RailClone version as a number (major, minor and patch digits): a new instance's
+-- createdversion; no node is created (live).
+-- RailClone_Pro.version() is an API number (400), not the product version.
+fn rcRuntime = (try ((createInstance RailClone_Pro).createdversion) catch undefined)
 -- A `for ... collect` written straight into a call's arguments must not read the caller's
 -- locals: MAXScript then fails with "Bad free thunk local member index" or reads the wrong
 -- variable (both seen live). Collect into a local first, then pass it.
@@ -540,15 +553,17 @@ def get_railclone_output(
     last build returned (AUTO_UPDATE_OFF), unless force_rebuild=true: that switches
     autoUpdate on for the read and back off, and keeps the new geometry (not
     undoable; a heavy RailClone blocks Max while it builds).
-    reload_segments=true also runs segmentsUpdate: on RailClone 7.3.5 that changed
-    no geometry but renamed each linked segment to its source node. Items keep
+    reload_segments=true also runs segmentsUpdate: it renames linked segments
+    after their sources, with no geometry effect on RailClone 7.3.5; use
+    force_rebuild to pick up source edits made while autoUpdate was off. Items keep
     RailClone's attributes verbatim (index, source_segment, instanced, tm, box,
     tags) plus placeholder=true for empty slots (no source_segment, inverted
-    sentinel box). tm and box are in the RailClone object's local space; node_tm
-    and bounds_world give world placement. total/placed/placeholders/by_segment/
-    bounds cover every item, not only the page. offset is a zero-based row offset.
-    include_xml adds the full XML. Each call re-evaluates; pages are not a
-    snapshot. Max 4M chars.
+    sentinel box). Under Proxy Cache (proxymode != 0) no item has a source_segment:
+    the box alone marks placeholders, by_segment is empty, and PROXY_CACHE says so.
+    tm and box are in the RailClone object's local space; node_tm and bounds_world
+    give world placement. total/placed/placeholders/by_segment/bounds cover every
+    item, not only the page. offset is a zero-based row offset. include_xml adds
+    the full XML. Each call re-evaluates; pages are not a snapshot. Max 4M chars.
     """
     integer(offset, "offset", low=0, high=2**31 - 1)
     integer(limit, "limit", high=10000)
@@ -574,26 +589,29 @@ local autoOff = (isProperty base #autoUpdate) and base.autoUpdate == false
 local xml = undefined
 {read_code}if xml.count > {MAX_XML_CHARS} do throw "XML_TOO_LARGE: output exceeds the XML response limit"
 local shared = for n in (rcShared obj) collect (rcEncode n.name)
-"RCOUT|" + (rcH obj) + "|" + (rcEncode obj.name) + "|" + (rcTm obj.objectTransform) + "|" + (rcJoin shared ",") + "|" + (if rebuilt then "1" else "0") + "|" + (if autoOff then "1" else "0") + "|" + (rcEncode xml)
+local proxy = if isProperty base #proxymode then base.proxymode else 0
+"RCOUT|" + (rcH obj) + "|" + (rcEncode obj.name) + "|" + (rcTm obj.objectTransform) + "|" + (rcJoin shared ",") + "|" + (if rebuilt then "1" else "0") + "|" + (if autoOff then "1" else "0") + "|" + (proxy as string) + "|" + (rcEncode xml)
 ''')
-    parts = raw.split("|", 7)
-    if len(parts) != 8 or parts[0] != "RCOUT":
+    parts = raw.split("|", 8)
+    if len(parts) != 9 or parts[0] != "RCOUT":
         raise RailCloneError("INVALID_READBACK", f"RailClone returned no output readback: {raw[:250]}")
     try:
-        xml = _unb64(parts[7])
+        xml = _unb64(parts[8])
         result: dict[str, Any] = {"handle": int(parts[1]), "name": _unb64(parts[2])}
         shared = [_unb64(s) for s in parts[4].split(",") if s]
+        proxymode = int(parts[7])
     except (ValueError, UnicodeError) as exc:
         raise RailCloneError("INVALID_READBACK", "Incomplete output response; inspect before retrying") from exc
     auto_off = parts[6] == "1"
     rebuilt = parts[5] == "1"
     reloaded = reload_segments and rebuilt
+    proxy = proxymode != 0
     node_rows = rclib.parse_matrix(parts[3])
     root = _xml(xml, "RailClone")
     items = [dict(item.attrib) for item in root.findall("item")]
     for item in items:
-        item["placeholder"] = rclib.is_placeholder(item)
-    summary = rclib.summarize_items(items, node_rows)
+        item["placeholder"] = rclib.is_placeholder(item, proxy)
+    summary = rclib.summarize_items(items, node_rows, proxy)
     end = min(offset + limit, len(items))
     warnings = []
     if shared:
@@ -609,13 +627,15 @@ local shared = for n in (rcShared obj) collect (rcEncode n.name)
         warnings.append(_RELOAD_NOTE)
     elif reload_segments:
         warnings.append(_RELOAD_SKIPPED)
+    if proxy:
+        warnings.append(_proxy_note(proxymode))
     if summary["placed"] == 0:
         warnings.append("EMPTY_OUTPUT: no placed items (no spline assigned, or the style produces nothing)")
     result.update(
         schema=dict(root.attrib), total=len(items), offset=offset, items=items[offset:end],
         truncated=end < len(items), next_offset=end if end < len(items) else None,
-        rebuilt=rebuilt, segments_reloaded=reloaded, auto_update=not auto_off,
-        space="object", node_tm=node_rows,
+        rebuilt=rebuilt, segments_reloaded=reloaded, auto_update=not auto_off, proxymode=proxymode,
+        proxy_cache=proxy, space="object", node_tm=node_rows,
         placed=summary["placed"], placeholders=summary["placeholders"], by_segment=summary["by_segment"],
         bounds_object=summary["bounds_object"], bounds_world=summary["bounds_world"],
         shared_base_with=shared, warnings=warnings,
@@ -653,8 +673,9 @@ rcRow ss #("K", "class", rcV ((classOf base) as string))
 rcRow ss #("K", "base_handle", rcV (rcH base))
 rcRow ss #("K", "upm", rcV (units.decodeValue "1mm"))
 rcRow ss #("K", "units", rcV (units.SystemType as string))
-rcRow ss #("K", "plugin_version", rcV (try (RailClone_Pro.version()) catch undefined))
-for p in #(#style, #savedversion, #disabled, #seed, #gscale, #vmesh, #rmesh, #rendermode, #autoUpdate, #nodemat, #stylelink, #maxseg, #maxfaces, #maxtime) do rcRow ss #("K", (p as string), rcV (if isProperty base p then (getProperty base p) else undefined))
+rcRow ss #("K", "api_version", rcV (try (RailClone_Pro.version()) catch undefined))
+rcRow ss #("K", "rc_runtime", rcV (rcRuntime()))
+for p in #(#style, #savedversion, #createdversion, #proxymode, #disabled, #seed, #gscale, #vmesh, #rmesh, #rendermode, #autoUpdate, #nodemat, #stylelink, #maxseg, #maxfaces, #maxtime) do rcRow ss #("K", (p as string), rcV (if isProperty base p then (getProperty base p) else undefined))
 rcRow ss #("K", "node_tm", rcV (rcTm obj.objectTransform))
 rcRow ss #("K", "layer", rcV obj.layer.name)
 local mtl = obj.material
@@ -730,6 +751,11 @@ def _node_ref(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) and "handle" in value else None
 
 
+def _version_int(value: Any) -> int | None:
+    """A version number read from Max (735), or None when RailClone didn't give one."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
 @mcp.tool()
 def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = True,
                       reload_segments: bool = False, rebuild: bool = True,
@@ -742,13 +768,25 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
     limits (RailClone does not enforce them) and, with include_graph, which graph
     inputs use them and each base's role (path, clip, surface) from the graph.
     The output counts come after a rebuild with seed = seed (undo off), which
-    doesn't touch the segments; reload_segments=true runs segmentsUpdate instead
-    (on RailClone 7.3.5 it renamed linked segments to their source nodes).
-    rebuild=false reads the last export (no style_desc then: reading it empties
-    the export until a rebuild). A RailClone with autoUpdate off (manual mode) is
-    never rebuilt unless force_rebuild=true, which switches autoUpdate on for the
-    read and back off and keeps the new geometry (not undoable; a heavy RailClone
-    blocks Max while it builds). Use get_railclone_output for positions.
+    doesn't touch the segments. reload_segments=true runs segmentsUpdate instead:
+    it renames linked segments after their sources, with no geometry effect on
+    RailClone 7.3.5; use force_rebuild to pick up source edits made while
+    autoUpdate was off. rebuild=false reads the last export (no style_desc then:
+    reading it empties the export until a rebuild). A RailClone with autoUpdate
+    off (manual mode) is never rebuilt unless force_rebuild=true, which switches
+    autoUpdate on for the read and back off and keeps the new geometry (not
+    undoable; a heavy RailClone blocks Max while it builds). Use
+    get_railclone_output for positions.
+
+    node gives rc_version, the running RailClone ("7.3.5", and rc_version_int
+    735), api_version (RailClone_Pro.version(), 400 on 7.1.1 and 7.3.5 alike: an
+    API number, not the product version), the object's createdversion and
+    savedversion, and proxymode. Warnings: SELECTOR_INDEX_MISMATCH (a selector's
+    option index and value disagree; the engine builds with the value),
+    RC_SELECTOR_BUG_VERSION (RailClone older than 7.3.1 and selectors in the
+    style), STYLE_MAY_PREDATE_MAPPING_FIX (a library style on an object created or
+    saved before 7.1.3) and PROXY_CACHE (Proxy Cache on: the output has no
+    source_segment, so counts per segment are unknown).
     """
     for label, value in (("include_graph", include_graph), ("reload_segments", reload_segments),
                          ("rebuild", rebuild), ("force_rebuild", force_rebuild)):
@@ -766,12 +804,19 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
     material = info.get("material")
     if isinstance(material, dict) and info.get("material_ids"):
         material = dict(material, ids=[int(v) for v in info["material_ids"].split(",") if v])
+    runtime = _version_int(info.get("rc_runtime"))
+    proxymode = info.get("proxymode")
+    proxy = isinstance(proxymode, int) and proxymode != 0
     node = {
         "class": info.get("class"),
         "style": info.get("style") or "",
         "style_desc": info.get("style_desc"),
+        "rc_version": rclib.version_text(runtime),
+        "rc_version_int": runtime,
+        "api_version": info.get("api_version"),
+        "createdversion": info.get("createdversion"),
         "savedversion": info.get("savedversion"),
-        "plugin_version": info.get("plugin_version"),
+        "proxymode": proxymode,
         "material": material,
         "layer": info.get("layer"),
         "units": info.get("units"),
@@ -813,10 +858,11 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
     if data["output"] is not None:
         try:
             items = [dict(it.attrib) for it in _xml(data["output"], "RailClone").findall("item")]
-            summary = rclib.summarize_items(items)
+            summary = rclib.summarize_items(items, proxy=proxy)
             output = {k: summary[k] for k in ("total", "placed", "placeholders", "by_segment")}
             output["rebuilt"] = rebuilt
             output["segments_reloaded"] = reload_segments and rebuilt
+            output["proxy_cache"] = proxy
         except ValueError as exc:
             warnings.append(f"OUTPUT_UNREADABLE: {exc}")
     if data["output"] is not None:
@@ -839,7 +885,8 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
             "source_class": ref.get("class") if isinstance(ref, dict) else None,
             "source_material": mtl.get("name") if isinstance(mtl, dict) else None,
             "instance": s["sinstance"], "slice": s["sslice"], "bend": s["sbend"], "renderable": s["srenderable"],
-            "items": (output or {}).get("by_segment", {}).get(s["sname"], 0) if output else None,
+            # under Proxy Cache the output names no segment, so a per-segment count is unknown, not 0
+            "items": output["by_segment"].get(s["sname"], 0) if output and not proxy else None,
         })
     empty = [b["name"] for b in bases if b["type"] == 0 and b["node"] is None]
     if empty and len(empty) == sum(1 for b in bases if b["type"] == 0):
@@ -849,6 +896,17 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
     for p in params:
         if p.get("out_of_limits"):
             warnings.append(f"PARAM_OUT_OF_LIMITS: {p['name']!r} = {p.get('value')} is outside its limits")
+    for raw_param, p in zip(data["params"], params):
+        why = rclib.selector_mismatch(raw_param)
+        if why:
+            warnings.append(f"SELECTOR_INDEX_MISMATCH: {p['name']!r}: {why}. RailClone builds with the value, so "
+                            "the panel shows another option than the one built; railclone_set_param with an "
+                            "option label writes both")
+    warnings += [w for w in (
+        rclib.selector_bug_warning(runtime, sum(1 for p in params if p["type"] == 5)),
+        rclib.mapping_predate_warning(node["style"], node["createdversion"], node["savedversion"])) if w]
+    if proxy:
+        warnings.append(_proxy_note(proxymode))
     if output is not None and output["placed"] == 0:
         warnings.append("EMPTY_OUTPUT: the RailClone places no items")
     return {"handle": info.get("handle"), "name": info.get("name"), "node": node, "bases": bases,
@@ -964,8 +1022,20 @@ def railclone_set_param(params: dict[str, Any], name: str = "", handle: int = 0)
                             f"{expected!r}")
         changes.append(change)
     before, after = stats.get("before"), stats.get("after")
+    proxymode = info.get("proxymode")
+    proxy = isinstance(proxymode, int) and proxymode != 0
+    if proxy:
+        # Under Proxy Cache no output item names its segment (live), so the counts by segment are unknown
+        for counts in (before, after):
+            if counts:
+                counts.update(placed=None, placeholders=None)
+        # Live (RailClone 7.3.5): "Pickets Distance" 10 -> 20 cm left a Proxy Cache fence at 176 items and 2098
+        # faces; without Proxy Cache the pickets halve
+        warnings.append(_proxy_note(proxymode, by_box=False) + ". The output is the cached build: the parameter "
+                        "is written, but the geometry can stay as cached until the cache is rebuilt or Proxy Cache "
+                        "is off")
     delta = {}
-    if before and after:
+    if before and after and not proxy:
         for seg in sorted(set(before["by_segment"]) | set(after["by_segment"])):
             diff = after["by_segment"].get(seg, 0) - before["by_segment"].get(seg, 0)
             if diff:
@@ -973,7 +1043,7 @@ def railclone_set_param(params: dict[str, Any], name: str = "", handle: int = 0)
         if after["placed"] == 0:
             warnings.append("EMPTY_OUTPUT: the RailClone places no items after the change")
     return {"handle": node_handle, "name": info.get("name"), "changes": changes,
-            "output": {"before": before, "after": after, "by_segment_delta": delta},
+            "output": {"before": before, "after": after, "by_segment_delta": delta, "proxy_cache": proxy},
             "rebuilt": True, "undoable": True, "undo": UNDO_PARAMS, "warnings": warnings}
 
 
@@ -1257,6 +1327,14 @@ rcRow ss #("K", "material", rcV o.material)
 rcRow ss #("K", "renderer", rcV renderer)
 rcRow ss #("K", "matlib", rcV matPath)
 rcRow ss #("K", "fixed_maps", rcV fixed)
+rcRow ss #("K", "api_version", rcV (try (RailClone_Pro.version()) catch undefined))
+rcRow ss #("K", "rc_runtime", rcV (rcRuntime()))
+for p in #(#createdversion, #savedversion, #proxymode) do rcRow ss #("K", (p as string), rcV (if isProperty rcBase p then (getProperty rcBase p) else undefined))
+(
+    local nSel = 0
+    for t in (rcArr rcBase #patype) where t == 5 do nSel += 1
+    rcRow ss #("K", "selectors", rcV nSel)
+)
 for n in extras do rcRow ss #("N", rcV n)
 (
     local fa = for f in #(#baid, #baname, #batype, #banode) collect (rcArr rcBase f)
@@ -1333,7 +1411,11 @@ def railclone_from_library(
     clipping_splines to the clipping-area bases (a paving boundary, a window
     outline); a base whose role can't be told gets none (ROLE_UNKNOWN). Returns
     the node, method, material, bases with roles, output counts, remove_with and
-    warnings.
+    warnings, and rc_version (the running RailClone, e.g. "7.3.5"), api_version,
+    createdversion, savedversion and proxymode. RailClone older than 7.1.3 warns
+    RC_LIBRARY_MAPPING_BUG_VERSION (library presets get wrong texture mapping), and
+    older than 7.3.1 RC_SELECTOR_BUG_VERSION when the style has selectors (they
+    can get wrong values on a library load).
     """
     if method not in ("auto", "merge", "route"):
         raise ValueError("method must be 'auto', 'merge' or 'route'")
@@ -1414,7 +1496,16 @@ def railclone_from_library(
         raise RailCloneError("INVALID_READBACK", f"malformed library report: {exc}") from exc
     if stats is None or "handle" not in info:
         raise RailCloneError("INVALID_READBACK", "library report is incomplete; inspect the scene before retrying")
-    verified = stats["placed"] > 0
+    runtime = _version_int(info.get("rc_runtime"))
+    proxymode = info.get("proxymode")
+    proxy = isinstance(proxymode, int) and proxymode != 0
+    if proxy:
+        # Under Proxy Cache no output item names its segment (live), so only the item total tells
+        stats.update(placed=None, placeholders=None)
+        warnings.append(_proxy_note(proxymode, by_box=False))
+    verified = stats["total"] > 0 if proxy else stats["placed"] > 0
+    warnings += [w for w in (rclib.mapping_bug_warning(runtime),
+                             rclib.selector_bug_warning(runtime, info.get("selectors") or 0)) if w]
     if (splines or clipping_splines) and not verified:
         warnings.append("EMPTY_OUTPUT: the RailClone places no items with the given splines")
     if not splines and not clipping_splines:
@@ -1434,8 +1525,12 @@ def railclone_from_library(
     return {
         "handle": info["handle"], "name": info.get("name"), "method": chosen, "route": entry["route"],
         "item": item_out, "style": info.get("style") or "", "style_desc": info.get("style_desc"),
+        "rc_version": rclib.version_text(runtime), "rc_version_int": runtime,
+        "api_version": info.get("api_version"), "createdversion": info.get("createdversion"),
+        "savedversion": info.get("savedversion"), "proxymode": proxymode,
         "material": info.get("material"), "renderer": info.get("renderer"), "matlib": info.get("matlib") or None,
-        "bases": bases, "item_count": stats["placed"], "output": stats, "verified": verified,
+        "bases": bases, "item_count": stats["total"] if proxy else stats["placed"], "output": stats,
+        "verified": verified,
         "maps": {"fixed": info.get("fixed_maps") or 0, "missing": missing},
         "extra_nodes": [e["name"] for e in extra_nodes],
         "undoable": undo_step, "undo": UNDO_LIBRARY if undo_step else None,

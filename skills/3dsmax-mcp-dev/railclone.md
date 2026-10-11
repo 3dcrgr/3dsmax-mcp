@@ -138,7 +138,10 @@ Inspect existing IDs and slots before extending these arrays. Preserve all other
 segment settings and source bindings. A segment linked through `sobjnode` follows its
 source at once (live, RailClone 7.3.5); rebuild with `n.seed = n.seed` and verify the
 output. Don't call `segmentsUpdate` for that: on 7.3.5 it ignores its arguments, changes
-no geometry, and renames every linked segment to its source node's name.
+no geometry, and renames every linked segment to its source node's name. The tools'
+`reload_segments` runs it: it renames linked segments after their sources, with no
+geometry effect on 7.3.5; use `force_rebuild` to pick up source edits made while
+`autoUpdate` was off.
 
 **`sinstance` is Force Instance.** It is not a harmless performance preference.
 For geometry that must be clipped or deformed, use `sinstance=false` and
@@ -188,6 +191,8 @@ location. Do not reset the user's scene or render unless asked.
   - With 1, V-Ray Proxy segments are converted to full mesh.
   - It's allowed, but **warn before suggesting to turn it on**, whoever proposes it. On RailClone 7+ it's not needed for V-Ray GPU or Chaos Vantage any more, and it costs memory and translation time.
   - Never write it from a tool. `itoo_vantage_check` reports it (`FULL_MESH_PROXY_ON`) after reading it inside 3ds Max, because the MCP process may not see iToo's registry keys.
+- **Proxy Cache** (`proxymode` 1): `getXMLOutput` lists the items without `source_segment`, so counts by segment are unknown (`PROXY_CACHE`), a parameter change can leave the cached geometry as it was, and a Forest Pack object using the RailClone's items gets none. Turn it off before relying on the output or linking a Forest.
+- **Versions:** `RailClone_Pro.version()` is an API number (400 on 7.1.1 and 7.3.5). `railclone_inspect` reports the running version as `rc_version`. Before 7.3.1 library loads could give selectors wrong values, and before 7.1.3 library presets got wrong texture mapping that an update doesn't repair; the tools warn about both.
 - **`libUpdateStyles`** (same key, 1 on the production machine):
   - Loading a library style may update every scene RailClone that uses the same style. Before `railclone_from_library` loads a style the scene already uses, say that existing objects may change.
   - Verification on 7.3.5 is pending (MCP_ISSUES).

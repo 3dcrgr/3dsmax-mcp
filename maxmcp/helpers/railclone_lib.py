@@ -1,8 +1,9 @@
 """RailClone helpers: XML sanitising, output geometry, exposed parameters, library index.
 
 Pure Python; nothing here talks to 3ds Max. The facts behind it come from live
-tests on RailClone Pro 7.1.1 (``RailClone_Pro.version()`` = 400) in 3ds Max 2026;
-see docs/fork/railclone.md.
+tests on RailClone Pro 7.1.1 in 3ds Max 2026 and RailClone Pro 7.3.5 in 3ds Max
+2027; see docs/fork/railclone.md. ``RailClone_Pro.version()`` returns 400 on
+both: it is an API number, not the product version (see ``version_text``).
 """
 from __future__ import annotations
 
@@ -213,9 +214,13 @@ def transform_point(p: list[float], rows: list[list[float]]) -> list[float]:
     return [p[0] * rows[0][k] + p[1] * rows[1][k] + p[2] * rows[2][k] + rows[3][k] for k in range(3)]
 
 
-def is_placeholder(item: dict[str, Any]) -> bool:
-    """No source_segment, or an inverted/sentinel box: a slot that places nothing."""
-    if not item.get("source_segment"):
+def is_placeholder(item: dict[str, Any], proxy: bool = False) -> bool:
+    """No source_segment, or an inverted/sentinel box: a slot that places nothing.
+
+    proxy: the RailClone uses Proxy Cache (proxymode != 0). Its getXMLOutput lists every item without
+    source_segment (live, RailClone 7.3.5), so only the box can tell a placeholder then.
+    """
+    if not proxy and not item.get("source_segment"):
         return True
     box = parse_box(item.get("box"))
     if box is None:
@@ -239,16 +244,18 @@ def _bounds_out(bounds: list[list[float]] | None) -> dict[str, list[float]] | No
     return {"min": [round(v, 6) for v in bounds[0]], "max": [round(v, 6) for v in bounds[1]]}
 
 
-def summarize_items(items: list[dict[str, Any]], node_rows: list[list[float]] | None = None) -> dict[str, Any]:
-    """Counts by source segment and object/world bounds of the placed items."""
+def summarize_items(items: list[dict[str, Any]], node_rows: list[list[float]] | None = None,
+                    proxy: bool = False) -> dict[str, Any]:
+    """Counts by source segment and object/world bounds of the placed items (proxy: see is_placeholder)."""
     placed = 0
     by_segment: Counter = Counter()
     local = world = None
     for item in items:
-        if is_placeholder(item):
+        if is_placeholder(item, proxy):
             continue
         placed += 1
-        by_segment[item.get("source_segment")] += 1
+        if item.get("source_segment"):
+            by_segment[item["source_segment"]] += 1
         box = parse_box(item.get("box"))
         if box is None:
             continue
@@ -265,6 +272,81 @@ def summarize_items(items: list[dict[str, Any]], node_rows: list[list[float]] | 
         "bounds_object": _bounds_out(local),
         "bounds_world": _bounds_out(world),
     }
+
+
+# ---------------------------------------------------------------- versions
+
+# RailClone_Pro.version() is an API number, not the product version: it is 400 on RailClone 7.1.1 and on 7.3.5.
+# The running version is the createdversion of a new instance: (createInstance RailClone_Pro).createdversion is 735
+# on 7.3.5, where railclonepro.dlo is 7.3.5.687. A node's createdversion is the version that created the object: a
+# library route load keeps it, and a merged library object brings its file's value (613 for Window 1 - PVC, 0 for
+# Metal Fence 1). savedversion ("7.0.8 Pro") is rewritten whenever the object is saved. No property records when a
+# style was loaded. Live on RailClone 7.3.5, probes p02, p08, p09 and p46 (livetests-2027\runs-1011\probe-26-27).
+# The fixes, from iToo's release notes on the forum:
+SELECTOR_FIX = 731  # 7.3.1: Selector parameters got wrong values when a style was loaded from the library
+MAPPING_FIX = 713   # 7.1.3: library presets got wrong texture mapping; styles already in a scene keep it
+FOREST_LINK = 732   # 7.3.2: Export to Forest, read by Forest Pack 9.4.1's Reference > Use RailClone Items
+_SAVED_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def version_text(value: Any) -> str | None:
+    """A RailClone version number as text (735 -> "7.3.5"); None for 0, undefined or a non-integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    if 100 <= value <= 999:
+        return f"{value // 100}.{value // 10 % 10}.{value % 10}"
+    return str(value)
+
+
+def saved_version(text: Any) -> int | None:
+    """savedversion text as a version number ("7.0.8 Pro" -> 708, "2.4.2b Pro" -> 242); None for "n/a"."""
+    match = _SAVED_VERSION.search(text) if isinstance(text, str) else None
+    if not match:
+        return None
+    major, minor, patch = (int(g) for g in match.groups())
+    if minor > 9 or patch > 9:
+        return None
+    return major * 100 + minor * 10 + patch
+
+
+def selector_bug_warning(runtime: Any, selectors: int) -> str | None:
+    """RC_SELECTOR_BUG_VERSION when the running RailClone predates 7.3.1 and the style has selector parameters."""
+    if not isinstance(runtime, int) or runtime <= 0 or runtime >= SELECTOR_FIX or selectors <= 0:
+        return None
+    return (f"RC_SELECTOR_BUG_VERSION: RailClone {version_text(runtime)} is older than 7.3.1, which fixed Selector "
+            f"parameters getting wrong values when a style is loaded from the library (iToo release notes); this "
+            f"style has {selectors} selector parameter(s). railclone_inspect flags a selector whose option index "
+            "and value disagree (SELECTOR_INDEX_MISMATCH); compare the others with the library item")
+
+
+def mapping_bug_warning(runtime: Any) -> str | None:
+    """RC_LIBRARY_MAPPING_BUG_VERSION when the running RailClone predates 7.1.3."""
+    if not isinstance(runtime, int) or runtime <= 0 or runtime >= MAPPING_FIX:
+        return None
+    return (f"RC_LIBRARY_MAPPING_BUG_VERSION: RailClone {version_text(runtime)} is older than 7.1.3, which fixed "
+            "library presets getting wrong texture mapping (iToo release notes). After updating RailClone, load "
+            "the item again: the update doesn't repair styles already in a scene")
+
+
+def mapping_predate_warning(style: Any, created: Any, saved: Any) -> str | None:
+    """STYLE_MAY_PREDATE_MAPPING_FIX for a library style on an object created or last saved before 7.1.3."""
+    if not isinstance(style, str) or not style:
+        return None
+    created_old = isinstance(created, int) and not isinstance(created, bool) and 0 < created < MAPPING_FIX
+    saved_number = saved_version(saved)
+    saved_old = saved_number is not None and saved_number < MAPPING_FIX
+    if not (created_old or saved_old):
+        return None
+    why = []
+    if created_old:
+        why.append(f"created by RailClone {version_text(created)}")
+    if saved_old:
+        why.append(f"last saved by RailClone {saved}")
+    return (f"STYLE_MAY_PREDATE_MAPPING_FIX: this object uses the library style '{style}' and was "
+            f"{' and '.join(why)}, older than 7.1.3, which fixed library presets' texture mapping. The style may "
+            "have been loaded before that fix, and updating RailClone doesn't repair a style already in a scene. "
+            "No property records when a style was loaded, so this is only a possibility: if its texture mapping "
+            "looks wrong, load it again from the library (railclone_from_library)")
 
 
 # ---------------------------------------------------------------- exposed parameters
@@ -353,6 +435,8 @@ def param_view(raw: dict[str, Any], index: int, upm: float | None) -> dict[str, 
         match = [o for o in options if _number(o["value"]) is not None and current is not None
                  and abs(float(o["value"]) - current) < 1e-6]
         view["selected"] = {"label": match[0]["label"], "index": match[0]["index"]} if match else None
+        if selector_mismatch(raw):
+            view["index_mismatch"] = True
     if spec and spec.get("read_only"):
         view["read_only"] = True
     if ptype not in PARAM_TYPES:
@@ -360,6 +444,32 @@ def param_view(raw: dict[str, Any], index: int, upm: float | None) -> dict[str, 
     if raw.get("padesc"):
         view["description"] = raw.get("padesc")
     return view
+
+
+def selector_mismatch(raw: dict[str, Any]) -> str | None:
+    """For a selector (patype 5) whose option at the paintval index isn't its pafloatval value: what differs.
+
+    paintval is the 0-based option index the panel shows and pafloatval the option value the engine builds with
+    (live, RailClone 7.3.5); railclone_set_param writes both. Before RailClone 7.3.1 a library load could set
+    wrong selector values, so a disagreement shows that bug or a script that wrote one array only.
+    """
+    if raw.get("patype") != 5:
+        return None
+    options = parse_selector(raw.get("paselector"))
+    index, value = raw.get("paintval"), _number(raw.get("pafloatval"))
+    if not options or isinstance(index, bool) or not isinstance(index, int) or value is None:
+        return None
+    by_value = [o for o in options if _number(o["value"]) is not None and abs(float(o["value"]) - value) < 1e-6]
+    builds = f"option {by_value[0]['label']!r}" if by_value else "no option"
+    if not 0 <= index < len(options):
+        return (f"the option index (paintval) is {index}, outside its {len(options)} options, and its value "
+                f"(pafloatval) is {value:g}, {builds}")
+    shown = options[index]
+    shown_value = _number(shown["value"])
+    if shown_value is not None and abs(shown_value - value) < 1e-6:
+        return None
+    return (f"the option index (paintval) {index} is {shown['label']!r} = {shown['value']}, but the value "
+            f"(pafloatval) is {value:g}, {builds}")
 
 
 def _mxs_float(value: float) -> str:
