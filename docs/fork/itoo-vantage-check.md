@@ -10,7 +10,7 @@ The checks come from the iToo documentation (the knowledge pack's digests A §3.
 itoo_vantage_check(names=None, time_budget_s=30, max_paths=5, details=False)
 ```
 
-- `names`: exact node names. Without them, every node whose base object is `Forest_Pro`, `RailClone_Pro` or `ForestIvy` is checked. Names that match nothing go to `not_found`; other classes go to `not_itoo`.
+- `names`: exact node names (Max compares node names case-insensitively, so `l25_ivy` finds `L25_ivy` [live]; spaces, quotes, backslashes and non-ASCII characters match as typed). Without them (or with an empty list), every node whose base object is `Forest_Pro`, `RailClone_Pro` or `ForestIvy` is checked. Names that match nothing go to `not_found`; other classes go to `not_itoo`.
 - `time_budget_s` (1–300): one MAXScript call does the whole check. Between objects, and while walking materials, it stops at the budget; objects it didn't reach are listed in `not_checked` and `complete` is false. The scratch scene's 263 iToo objects took 1.1 s.
 - `max_paths`: example paths kept per finding (`where`); `where_truncated` says when there were more.
 - `details`: adds the segment, item, area and modifier lists to each object's `state`.
@@ -32,7 +32,7 @@ Checked live on 2026-10-11:
 - A moved RailClone stays stale: the check doesn't rebuild it. A Forest with a pending `units_x` change kept its old `trees.count()`.
 - One whole-scene run, the first right after the fixtures were created, logged change events on two unnamed nodes. That logger didn't record node names, and the later runs with names logged none. Another session was also using the scratch Max (its objects appeared during the test), so the cause is unknown.
 - Getting a RailClone's export can complete a build RailClone already has pending (the probes saw `autoUpdate = true` followed by a read rebuild it), as a viewport redraw would. The check never starts one.
-- `save_required_before` and `save_required_after` report `getSaveRequired()` around the check. If it goes from false to true, the result warns `SCENE_MARKED_DIRTY`. The scratch scene was already unsaved, so this couldn't be checked live.
+- `save_required_before` and `save_required_after` report `getSaveRequired()` around the check. If it goes from false to true, the result warns `SCENE_MARKED_DIRTY`. Live (L25 run, flag cleared first): the check left it false. But the flag is a weak sensor: property writes sent through the bridge, with undo on or off, didn't set it either, while `maxOps.cloneNodes` did. So the warning catches only operations Max itself marks dirty; the read-only proof is the script lint plus the event and fingerprint checks below.
 
 ## Report
 
@@ -153,6 +153,7 @@ Checked live on 2026-10-11:
   - `RC_PROXY_CACHE_FILE` (info): `proxymode` 2. `RC_PROXY_FILE_MISSING` (error) when `doesFileExist proxyfile` is false.
   - `proxyfile` stays set after mode 0 [live], so only `proxymode` counts.
 - **V-Ray proxy segments:** `RC_PROXY_MESH_REVERTABLE` (info) when a segment's `sobjref` or linked `sobjnode` base object is `VRayProxy`, instancing is off, and the RailClone plugin is 7 or later.
+  - Live: after a proxy was linked as a segment (`sobjnode[k]`), `sobjref[k]` read `Editable_mesh`, not `VRayProxy`, so the linked node is what identifies it. A proxy segment with no linked node left would read as a mesh, with its preview faces.
   - Since RailClone 7, proxies no longer need full mesh mode for GPU/Vantage.
   - The version is the file version of the loaded `railclone*.dlo` module. It's read only when needed, because enumerating the modules takes about a second.
 - **Segment materials:** `RC_SOBJMTL_NOT_ONE_SLOT_MULTI` (warn) for `sobjmtl` entries that aren't one-slot Multimaterials (`getNumSubMtls` 1).
@@ -165,11 +166,12 @@ Checked live on 2026-10-11:
   - Over `maxseg` or `maxFaces`, RailClone generates nothing (0 items), and `disabled` empties the export too [live].
   - So an empty export of an enabled object is `RC_EXPORT_EMPTY` (warn), and the caps go to unknown as "no current export".
   - `RC_AUTOUPDATE_OFF` (info) notes that with `autoUpdate` off the export may be older than the last change.
-- **RailClone: segments.** `RC_MAXSEG_NEAR` (warn) at 80% or more of `maxseg`. `RC_MAXSEG_EXCEEDED` (error) means the export predates the cap. 0 gives `RC_MAXSEG_UNLIMITED`.
+- **RailClone: segments.** `RC_MAXSEG_NEAR` (warn) at 80% or more of `maxseg`. `RC_MAXSEG_EXCEEDED` (error) means the export predates the cap. 0 gives `RC_MAXSEG_UNLIMITED` (live: `maxseg` 0 with `maxFaces` 0 kept all 131 items of a fence).
 - **RailClone: faces.** The estimate is items per segment × each segment's faces.
   - The faces come from `sobjref[k].mesh.numfaces`, or else from the linked source node's evaluated mesh (so a linked source with modifiers is counted: its `sobjref` turns into a DummyClass [live], and the node's mesh is what RailClone uses). V-Ray proxy segments are unknown, and so is an embedded segment whose `sobjref` is a DummyClass with no linked node to fall back on.
   - It is compared with `maxFaces` (in millions) as `RC_MAXFACES_NEAR` (warn) or `RC_MAXFACES_EXCEEDED` (error); 0 gives `RC_MAXFACES_UNLIMITED`. Instanced items count too [live].
   - Live, the estimate for a 176-item fence was 12,112 faces. `maxFaces` 0.0122 kept the output and 0.0121 emptied it, so the estimate was exact there.
+  - Live (L25 run), on the stock Pantile roof (a clipping area, 12 segments, Material operators, 430 items): the estimate was 517,878 faces, and RailClone's own cutoff was exactly there (0.517878 kept the output, 0.517877 emptied it), although the built mesh had 509,708 faces after clipping. So the estimate follows RailClone's cap arithmetic (items × segment faces), not the final mesh.
   - Sliced or bent segments can add faces, so treat it as an estimate.
   - A proxy-cached RailClone exports items without `source_segment`, so its faces are unknown.
 - **Forest: viewport thinning.** `trees.count()` is read as it is. The viewport Max Items limit (`vmaxitems`, default 50,000) thins it [live]: with a full count N over the limit, Forest keeps every k-th grid cell, k = ceil(sqrt(N / vmaxitems)). Live: 143,700 items gave a count of 35,800.
@@ -224,10 +226,11 @@ All of these change the scene, so ask the user first. Never export a `.vrscene`:
 
 ## Not tested live
 
-- V-Ray proxy segments: no `.vrmesh` was linked into a RailClone in the shared scratch Max. That covers `RC_PROXY_MESH_REVERTABLE` and the version read. `EDGE_MODE_ON_PROXIES` wasn't run live either. A Forest with a V-Ray proxy item (V-Ray's armadillo sample) was checked: its item type goes to the `faces` unknown.
+- A RailClone *built* with a V-Ray proxy segment: the L25 run linked the armadillo proxy with `autoUpdate` off, so RailClone never generated with it (see below).
+- A missing external proxy cache file (`RC_PROXY_FILE_MISSING`): an existing one was tested; removing the file under a mode-2 RailClone might open a dialog in the shared Max.
 - MultiTexture's `rnd_by` values, and whether Vantage renders BerconTile's random by material ID.
-- An external proxy cache file (`proxymode` 2).
-- ForestIvy with surfaces, and `FOREST_RENDER_DISPLAY`.
+- ForestIvy with surfaces.
+- Forest's Max Faces / Max Items (render) cutoffs ('F' icon): render-time only. `snapshotAsMesh renderMesh:true` returned the viewport display mesh, so it can't show them.
 - Every Vantage-side claim: what Vantage renders for slot 1, Opacity Maps, Use Segment Material, the Material operator, segment mapping, Edge mode. The tool says which ones are documented and which are unverified; nothing was rendered.
 
 ## Live test (2026-10-11, scratch Max 2027.2, PID 35448)
@@ -246,3 +249,14 @@ All of these change the scene, so ask the user first. Never export a `.vrscene`:
   - Item 2's material holds a `VRayMultiSubTex` (from_id 12, By face MtlID), a `BerconTile` (randByMat) and a `MultiTexture`. Both forests reported the first two as `ID_MAP_IN_FOREST` and the MultiTexture as the `id_map` unknown.
   - The proxy forest's estimate dropped from 17,244 faces (1,437 × the 12-face preview) to 0, marked partial, with the proxy under `faces`.
   - Whole scene, 290 objects in 1.2 s: 10 objects name a fallback and 5 are errors (all colour maps). In the earlier whole-scene run, 236 objects were errors with a fallback, and 229 of them were only disabled stock RailClones.
+
+### L25 live test (2026-10-11, later, under `runs-1011\live-vcheck\`)
+
+- **Fixtures** (prefix `L25_`, left in the scratch Max at x ≈ 450,000):
+  - RailClones from the stock Metal Fence 1 (merged with its path, undo off) and the stock Pantile roof (merged, given a clipping rectangle): a plain control, a UVW modifier on in renders, a Bend off in renders with caps 0, render flags with segment materials and mapping and `autoUpdate` off with a pending change, embedded and file proxy caches, caps near and over, disabled, moved without a rebuild, and a fence with the armadillo `VRayProxy` linked as segment 3 (instancing and `autoUpdate` off).
+  - RailClone Color maps with a bitmap, a `VRayColor`, an empty slot 1, and a nested Forest Color.
+  - Forests: one scatter with Forest Colors (bitmap, flat with tint from map, empty), bitmap and Noise opacity, a `VRayMultiSubTex` by face ID in a Multi/Sub, a Forest Material and a billboard; Meshes mode over Max Faces with `rmesh` 1 and `rskip`; thinned; a proxy item with Edge mode; unconsolidated with its own material; a replaced node material; disabled; no surface; billboard with fake shadows off; and the stock "fallen leaves oak" preset merged with its sources. Plus a ForestIvy and an XShadow Omni.
+  - The `.rail` item (Baseboard 002) was skipped: a `.rail` is iToo's own chunked format, loadable only through `loadLibraryItemByPath`.
+- **Read-only:** a fingerprint of all 562 nodes (transform, parent, hidden/frozen, material, modifiers), every property of the 356 iToo objects, each RailClone's export (items and hash) and style hash, `trees.count()`, and every property of the 1,462 materials and maps they use, plus the selection and the dirty flag. Two fingerprints with nothing in between matched; a changed seed and a changed `units_x` showed up. The whole-scene run (356 objects, 2.4 s), the 24-name run, a 1 s budget run and an awkward-names run changed nothing and fired no node events.
+- **Findings:** every planted condition was reported with the expected code, severity and count, and nothing else; the names run matched the whole-scene run object for object. Newly live: `EDGE_MODE_ON_PROXIES`, `RC_PROXY_MESH_REVERTABLE` with the version read (`7,3,5,687`), `RC_PROXY_CACHE_FILE`, `FOREST_RENDER_DISPLAY`, `FOREST_MAX_FACES_EXCEEDED`, `RC_MAXSEG_NEAR`/`RC_MAXFACES_NEAR`, the unlimited caps and the nested colour map.
+- **Through FastMCP:** the tool is registered with the four parameters, and `names` passed as a JSON string, a list or one string all work.
