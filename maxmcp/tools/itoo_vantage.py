@@ -739,9 +739,12 @@ CODES: dict[str, tuple[str, str, str, str | None]] = {
         "warn", "doc",
         "RailClone fullMeshProxy is on (HKCU\\Software\\Itoo Software\\RailClone Pro): V-Ray Proxy segments are "
         "converted to full mesh. Not recommended on RailClone 7+: no longer needed for V-Ray GPU/Vantage, and it costs "
-        "memory and translation time. Allowed: change it only in RailClone's settings if wanted.",
-        "Leave it, or set fullMeshProxy to 0 in RailClone's settings. Don't suggest turning it on for V-Ray GPU or "
-        "Vantage on RailClone 7+."),
+        "memory and translation time. In one live test (RC 7.3.5, a proxy in the pickets of a 176-item fence) it "
+        "also turned native instancing off for the whole RailClone: 0/176 items instanced, against 169/176 with 0. "
+        "Allowed: change it only in RailClone's settings if wanted. RailClone reads it when 3ds Max starts, so this "
+        "registry value may differ from what a running Max uses.",
+        "Leave it, or set fullMeshProxy to 0 in RailClone's settings (or in the registry with every 3ds Max closed) "
+        "and restart Max. Don't suggest turning it on for V-Ray GPU or Vantage on RailClone 7+."),
     "RC_PROXY_FULL_MESH": (
         "info", "doc",
         "This RailClone has V-Ray Proxy segments, and fullMeshProxy is on, so they are rendered as full mesh "

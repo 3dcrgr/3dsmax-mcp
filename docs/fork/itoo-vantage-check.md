@@ -160,7 +160,12 @@ Checked live on 2026-10-11:
   - The check reads it inside 3ds Max with the .NET registry, read-only, once per call and only when a RailClone is checked. A Max started from inside an MSIX-packaged app (such as Claude Desktop) sees a private registry where iToo's keys can be hidden; then the value is unknown, never assumed fine.
   - `FULL_MESH_PROXY_ON` (warn, scene finding, once): the value is 1, or not set (the default applies), on RailClone 7 or later.
   - `RC_PROXY_FULL_MESH` (info) on each RailClone that actually has V-Ray Proxy segments while it's on.
-  - **Policy (user, 2026-10-11):** the setting is allowed, but any suggestion to turn it ON, from the user or an agent, gets a warning first. It's not recommended on RailClone 7+: no longer needed for V-Ray GPU/Vantage, and it costs memory and translation time. Change it only in RailClone's settings; this tool never writes the registry.
+  - **Policy (user, 2026-10-11):** the setting is allowed, but any suggestion to turn it ON, from the user or an agent, gets a warning first. It's not recommended on RailClone 7+: no longer needed for V-Ray GPU/Vantage, and it costs memory and translation time. Change it only in RailClone's settings, or in the registry with every 3ds Max closed; this tool never writes the registry.
+  - **Live (2026-10-11, RC 7.3.5):**
+    - RailClone reads the value once, when 3ds Max starts. A registry change while Max runs has no effect on that session, so the value this check reads may differ from what a running Max uses.
+    - With 1, a 4,032-face proxy segment was built as full mesh (17,752 faces for 44 items). With 0, it used the proxy's display mesh (1,672 faces).
+    - The docs session's test found more: with 1, one proxy segment in the pickets of a 176-item fence turned native instancing off for the whole RailClone (0/176 instanced, against 169/176 with 0). The fix session's 44-item test, with the proxy in the posts, showed no instancing change.
+    - Whether a Max writes its loaded value back on exit was seen once by the docs session, but not after a `quitMax #noPrompt`.
 - **Segment materials:** `RC_SOBJMTL_NOT_ONE_SLOT_MULTI` (warn) for `sobjmtl` entries that aren't one-slot Multimaterials (`getNumSubMtls` 1).
   - Vantage 3.4 logged "Unsupported nested MtlSingleBRDF" for them, and the one-slot wrap fixed it [memory].
   - Writing `sobjmtl` changed no face IDs in the viewport [live].
