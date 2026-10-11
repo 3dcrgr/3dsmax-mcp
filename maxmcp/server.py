@@ -179,6 +179,11 @@ def _raw_tool_decorator(raw_tool, decorator_args, decorator_kwargs, annotations:
     return raw_tool(*decorator_args, **decorator_kwargs)
 
 
+def _pid_guarded(fn) -> bool:
+    """Every tool takes expected_pid (#19) except the routing tools, which pick the target."""
+    return not fn.__module__.endswith(".routing")
+
+
 def _install_structured_tool_results() -> None:
     """Register MCP tools with stable JSON envelopes while keeping raw callables."""
     raw_tool = mcp.tool
@@ -197,6 +202,7 @@ def _install_structured_tool_results() -> None:
                 fn,
                 before_call=client.clear_last_response,
                 transport_provider=client.get_last_transport,
+                pid_guard=_pid_guarded(fn),
             )
             _register_raw_tool(registration_tool(fn), wrapped, annotations)
             return fn
@@ -213,6 +219,7 @@ def _install_structured_tool_results() -> None:
                 fn,
                 before_call=client.clear_last_response,
                 transport_provider=client.get_last_transport,
+                pid_guard=_pid_guarded(fn),
             )
             raw_decorator(wrapped)
             return fn

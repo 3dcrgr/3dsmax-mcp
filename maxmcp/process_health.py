@@ -153,6 +153,37 @@ def process_start_time(pid: int) -> int | None:
                 pass
 
 
+def process_gone(pid: int, started: int | None = None) -> bool:
+    """True only when `pid` has certainly exited, or now names a process created after `started`.
+
+    False when it is alive (busy or hung included) or when that can't be told (e.g. access denied).
+    """
+    if not _IS_WINDOWS or not _valid_pid(pid):
+        return False
+    handle = None
+    try:
+        handle, err = _open_process(pid)
+        if handle is None:
+            return err == _ERROR_INVALID_PARAMETER  # no such process
+        alive, _code = _exit_status(handle)
+        if alive is False:
+            return True
+        if alive is None or started is None:
+            return False
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not _kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return False
+        return ((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime) != started
+    except Exception:
+        return False
+    finally:
+        if handle is not None:
+            try:
+                _kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+
 def _top_level_windows(pid: int) -> list[int]:
     """Visible, unowned top-level windows of a process."""
     found: list[int] = []
