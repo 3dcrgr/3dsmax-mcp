@@ -19,7 +19,7 @@ Automate everything!
 - **Native Bridge** — only 2023-2027 versions.
 - **Introspection** — discover arbitrary Max classes for all kinds of automation and scripting purposes. 
 - **Bundled agent skill** — There is a bundled maxscript documentation if you want to create your own tools.
-- **FStorm materials and lights** — `FStorm`/`FStormPBR` texture import, palette laydown and smart import; create and edit plane/disc/sphere lights and suns with native solar controls. See [support and validation](docs/FSTORM.md).
+- **FStorm materials and lights** — `FStorm`/`FStormPBR` texture import, palette laydown and smart import; create and edit plane/disc/sphere lights and suns with native solar controls.
 
 ## Requirements
 
