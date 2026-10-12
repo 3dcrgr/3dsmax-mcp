@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .process_health import describe as describe_process
 from .process_health import diagnose_process, process_gone, process_start_time, quick_hung_check, window_hung
+from .process_health import list_processes
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -38,6 +39,30 @@ class RequestOutcomeUnknown(Exception):
 
 # Wording shared by every report of a request whose reply was lost after it was sent.
 OUTCOME_UNKNOWN_ADVICE = "The request may have committed; inspect before retrying."
+
+
+class MaxBridgeUnavailableError(ConnectionError):
+    """Auto transport found neither a ready native bridge nor a TCP listener."""
+
+    code = "BRIDGE_DOWN"
+    retryable = True
+
+    def __init__(self, native_error: str, tcp_error: str, host: str, port: int) -> None:
+        candidates = [p["pid"] for p in list_processes()]
+        self.details = {
+            "requested_transport": "auto", "preferred_transport": "namedpipe",
+            "attempted_transports": ["namedpipe", "tcp"], "running_max_pids": candidates,
+            "native_state": "unavailable", "native_error": native_error, "tcp_error": tcp_error,
+            "tcp_endpoint": f"{host}:{port}", "request_sent": False,
+        }
+        if candidates:
+            message = (f"No native MCP bridge is ready/reachable; running Max candidate PIDs: {candidates}. "
+                       "Max may still be starting, or its MCP Bridge plugin may be missing/stopped. "
+                       "Wait and recheck list_max_instances; if startup is complete, check the native plugin. ")
+        else:
+            message = "No native MCP bridge is ready/reachable and no running Max process was found. Start Max and recheck. "
+        super().__init__(message + f"Requested auto transport (namedpipe preferred); TCP fallback at {host}:{port} "
+                         f"refused the connection. Native error: {native_error}.")
 
 
 ALWAYS_ASK = ("Always ask the user before Save, Don't Save or any other discard, overwrite, Fetch or Reset "
@@ -954,7 +979,12 @@ class MaxClient:
                 fallback_error = str(exc)
                 transport_used = "tcp"
                 self._refuse_unverifiable_pid()
-                response_data = self._send_via_tcp(request, effective_timeout)
+                try:
+                    response_data = self._send_via_tcp(request, effective_timeout)
+                except ConnectionRefusedError as tcp_exc:
+                    unavailable = MaxBridgeUnavailableError(fallback_error, str(tcp_exc), self.host, self.port)
+                    self._local.last_error = {"transport": "tcp", **unavailable.details, "error": str(unavailable)}
+                    raise unavailable from tcp_exc
 
         try:
             response = self._parse_response(response_data, request_id, started_at)
@@ -1377,7 +1407,7 @@ class MaxClient:
                 "Is the MCP TCP listener running in 3ds Max?"
             )
         except ConnectionRefusedError:
-            raise ConnectionError(
+            raise ConnectionRefusedError(
                 f"Could not connect to 3ds Max on {self.host}:{self.port}. "
                 "Is the MCP TCP listener running in 3ds Max?"
             )

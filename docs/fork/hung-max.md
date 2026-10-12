@@ -8,6 +8,12 @@ Fork issues #4 and #6, and the executor shutdown fix. Commits `adcfd93`, `a9d2a0
 
 ## What happened
 
+### Shutdown and startup diagnostics (2026-10-12, issues #29 and #30)
+
+Connected pipe clients now use cancellable overlapped reads and writes. `PipeServer::Stop` signals shutdown before joining workers; each pending operation is cancelled and drained while its buffer and event remain alive. This covers idle clients, partial requests, and clients that stop reading responses. The executor still closes its submission gate and drains queued work first; started SDK work retains its existing lifetime guarantees.
+
+If auto transport finds neither a native bridge nor a TCP listener, `BRIDGE_DOWN` now includes running Max candidate PIDs, the preferred and attempted transports, and both failures. A candidate may still be starting or may lack the bridge; its presence is not evidence of readiness. Explicit TCP mode keeps its legacy listener advice. These changes do not make `MAXSCRIPT_INTERRUPTED` proof that the Max process has exited: restart workflows must still wait for the exact PID to disappear.
+
 When Max's main thread hung, every tool returned the MCP client's generic "Request timed out", `get_bridge_status` included. The agent then had to work out from the outside whether Max was busy, hung or gone. Usually it guessed "permanent deadlock", and Max was killed with unsaved work, even though some of those stalls would have cleared on their own after a few minutes.
 
 ## Why

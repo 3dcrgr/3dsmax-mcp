@@ -5,6 +5,7 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
+#include <memory>
 
 class MCPBridgeGUP;
 
@@ -23,6 +24,7 @@ private:
     void HandleClient(HANDLE pipe);
     std::string ReadRequest(HANDLE pipe);
     bool WriteResponse(HANDLE pipe, const std::string& response);
+    bool Transfer(HANDLE pipe, void* buffer, DWORD size, DWORD& transferred, bool write);
     void CleanupFinishedThreads();
 
     MCPBridgeGUP* gup_;
