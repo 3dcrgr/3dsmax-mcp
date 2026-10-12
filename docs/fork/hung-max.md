@@ -8,6 +8,10 @@ Fork issues #4 and #6, and the executor shutdown fix. Commits `adcfd93`, `a9d2a0
 
 ## What happened
 
+### Stale instance registry records (#31)
+
+Instance discovery opportunistically removes unchanged `instances/pid-N.json` registrations only when the PID is certainly exited, its pipe is unavailable, and the filename, recorded PID, instance ID and native pipe agree. It rechecks file identity, pipe availability and process state before unlinking. Records with live/unknown owners, answering/busy/access-denied pipes, custom identities or concurrent refreshes are retained. Cleanup failures do not break routing, and `active_instance.json` is untouched. The native GUP already unregisters its own record on clean exit; this handles leftovers after crashes/interrupted teardown.
+
 ### Shutdown and startup diagnostics (2026-10-12, issues #29 and #30)
 
 Connected pipe clients now use cancellable overlapped reads and writes. `PipeServer::Stop` signals shutdown before joining workers; each pending operation is cancelled and drained while its buffer and event remain alive. This covers idle clients, partial requests, and clients that stop reading responses. The executor still closes its submission gate and drains queued work first; started SDK work retains its existing lifetime guarantees.

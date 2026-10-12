@@ -492,7 +492,35 @@ class MaxClient:
                 continue
             if data and self._probe_pipe_available(data["pipe"]):
                 live.append({**data, "updated": updated})
+            elif data:
+                self._prune_exited_instance(path, data, updated)
         return sorted(live, key=lambda item: item["updated"], reverse=True)
+
+    def _prune_exited_instance(self, path: Path, data: dict[str, Any], updated: int) -> None:
+        """Remove only an unchanged native PID record with a certainly exited owner.
+
+        Missing pipe alone is not proof: startup, shutdown, a hung process and
+        access failures must retain their registration. Never prune claims or
+        custom records; the native bridge removes its own records on clean exit.
+        """
+        pid = data.get("pid")
+        if type(pid) is not int or pid <= 0:
+            return
+        if (path.name != f"pid-{pid}.json" or data.get("instance_id") != f"pid-{pid}"
+                or data["pipe"].casefold() != rf"\\.\pipe\3dsmax-mcp-pid-{pid}".casefold()):
+            return
+        if not process_gone(pid):
+            return
+        try:
+            # Another bridge/client may have refreshed or removed it since the
+            # scan. Recheck both identity and liveness immediately before unlink.
+            if path.stat().st_mtime_ns != updated or self._load_instance(path) != data:
+                return
+            if self._probe_pipe_available(data["pipe"]) or not process_gone(pid):
+                return
+            path.unlink()
+        except OSError:
+            pass  # best effort: racing cleanup or read-only registry never breaks routing
 
     def _default_target(self) -> dict[str, Any]:
         live = self._live_instances()
