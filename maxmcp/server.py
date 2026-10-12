@@ -280,6 +280,7 @@ SPECIALTY_TOOL_MODULES = (
     "tyflow_manifest",
     "tyflow_census",
     "wire_params",
+    "core_reload",  # Development: native core hot reload; full/progressive only.
 )
 
 

@@ -89,6 +89,22 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 - Classify raw structured errors by `error`, `code` or `status=error|failed`, never by `message` alone.
 - `USER_BUSY`: Max has an open undo operation and the write was rejected before any change. Continue read-only and retry after it finishes; never bypass it with MAXScript.
 
+## Native Core Development
+
+Only when changing the bridge's native C++ handlers; ordinary sessions never need it. `reload_native_core` (full and progressive profiles) swaps a rebuilt core into the running Max.
+
+- `reload_native_core(action="status")` tells you whether reload applies: `layout="hot"` reloads. `static`, the shipped layout, cannot; a native change there applies only after the rebuilt plugin is installed and Max restarts.
+- After rebuilding the core, call `reload_native_core(action="reload")`, check that `build` changed (a warning flags an unchanged one), then verify the changed behavior through its real tool, not just the status.
+- On any error the previous core keeps serving, unless the message says no core is loaded:
+  - `CORE_STATIC`: static layout. Do not retry.
+  - `CORE_BUSY` (retryable; with `wait_ms` up to 20000 the tool already retried): native calls were still running (including one waiting on a dialog), Max's main thread was busy (a render), or another reload was running. Let long calls finish or answer the dialog with `max_dialogs`, then reload, or raise `wait_ms` (up to 600000).
+  - `CORE_LOAD_FAILED`: the DLL is missing, is not a core build, or would not load or initialize. Fix the cause and rebuild; never retry unchanged.
+  - `CORE_VERSION_MISMATCH`: the core does not match the running shell's interface, SDK, compiler or build configuration. Rebuild Release from the same tree; a change to the shell itself cannot be reloaded.
+  - A lost reload response: never resend it; compare `build`, `reloads` and `last_error` from status.
+- A reload stops `watch_scene` and drops its events; start it again if needed. `query_scene(action="delta")` positions, dialogs, the agent viewport, armed render jobs and undo history survive. Calls that arrive mid-swap get a retryable `CORE_BUSY`.
+- A reload cannot apply shell changes: the named pipe, main-thread executor, dialog monitoring (Win32 and Qt), scene journal, agent viewport, render job notifications, undo records, the core loader, and the shell/core interface. Those need the rebuilt plugin installed and a Max restart.
+- Python tool changes need a fresh MCP server process; a reload does not apply them.
+
 ## execute_maxscript
 
 - Use it only when no dedicated tool exists: unsupported controller operations, render or environment settings, one-off scripted operations.

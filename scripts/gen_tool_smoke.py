@@ -32,6 +32,7 @@ FLAG_EXPECT_ERROR = 2
 # Skipped unless run_tool_smoke(include_skipped=True) / native includeSkipped
 SKIP_DEFAULT = {
     "max_dialogs",
+    "reload_native_core",  # Development control of the bridge shell, never a smoke probe.
     "script_controller",
     "cosmos_search",
     "cosmos_download",
@@ -101,6 +102,7 @@ SKIP_DEFAULT = {
 
 # Explicit inputs — ${SMOKE_TARGET} / ${SMOKE_SPAWN} replaced at runtime.
 CUSTOM: dict[str, dict] = {
+    "reload_native_core": {"action": "status"},  # Never reload by default.
     "execute_maxscript": {"code": "42"},
     "execute_python": {"code": "result = 42"},
     "manage_scene": {"action": "info"},

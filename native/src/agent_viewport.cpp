@@ -2,6 +2,7 @@
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/spatial_snapshot.h"
 #include "mcp_bridge/scene_journal.h"
+#include "mcp_bridge/dialog_watch.h"
 #include <IViewPanel.h>
 #include <IViewPanelManager.h>
 #include <Graphics/IViewportViewSetting.h>
@@ -24,6 +25,11 @@ using json = nlohmann::json;
 using namespace HandlerHelpers;
 namespace AgentViewport {
 namespace {
+// Shell code: RunMAXScript's default dialog check is the core's host binding.
+std::string RunMAXScript(const std::string& script) {
+    return HandlerHelpers::RunMAXScript(script, &DialogWatch::ThrowIfDismissed);
+}
+
 constexpr wchar_t kTitle[] = L"AGENT VIEWPORT";
 constexpr wchar_t kWindowTitle[] = L"AGENT VIEWPORT (do not close or minimize while agent is working)";
 constexpr wchar_t kOwner[] = L"3dsmax-mcp.AgentViewport";

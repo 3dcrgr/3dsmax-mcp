@@ -1,7 +1,7 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/node_ref.h"
-#include "mcp_bridge/scene_journal.h"
+#include "mcp_bridge/core_bridge.h"
 
 #include <max.h>
 #include <units.h>
@@ -573,8 +573,8 @@ std::string SceneQAImpl(const std::string& params, bool allowMutation) {
         checks.insert(fixes.begin(), fixes.end());
     }
 
-    SceneJournal::FlushPending();
-    const unsigned long long seqBefore = SceneJournal::CurrentMutationSeq();
+    McpHost::SceneJournal::FlushPending();
+    const unsigned long long seqBefore = McpHost::SceneJournal::CurrentMutationSeq();
     auto expectedIt = payload.find("expected_scene_seq");
     if (requestedFix && !dryRun && expectedIt != payload.end() && !expectedIt->is_null()) {
         const unsigned long long expected = expectedIt->get<unsigned long long>();
@@ -614,8 +614,8 @@ std::string SceneQAImpl(const std::string& params, bool allowMutation) {
     }
 
     json applied = ApplyRepairs(nodes, fixes);
-    SceneJournal::FlushPending();
-    const unsigned long long seqAfter = SceneJournal::CurrentMutationSeq();
+    McpHost::SceneJournal::FlushPending();
+    const unsigned long long seqAfter = McpHost::SceneJournal::CurrentMutationSeq();
     json after = ScanSceneGraph(
         nodes, checks, maxIssues, transformEpsilon, farOriginThreshold, seqAfter);
     after["scope"] = payload.value("scope", "scene");

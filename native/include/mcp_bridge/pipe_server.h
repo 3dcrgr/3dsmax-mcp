@@ -6,11 +6,10 @@
 #include <vector>
 #include <mutex>
 
-class MCPBridgeGUP;
-
+// Serves the pipe; every request goes to the core through CoreHost.
 class PipeServer {
 public:
-    explicit PipeServer(MCPBridgeGUP* gup, std::wstring pipe_name);
+    explicit PipeServer(std::wstring pipe_name);
     ~PipeServer();
 
     void Start();
@@ -25,7 +24,6 @@ private:
     bool WriteResponse(HANDLE pipe, const std::string& response);
     void CleanupFinishedThreads();
 
-    MCPBridgeGUP* gup_;
     std::wstring pipe_name_;
     std::thread accept_thread_;
     std::atomic<bool> running_{false};

@@ -21,9 +21,13 @@
 #include <maxscript/maxwrapper/mxsobjects.h>
 #include <CoreFunctions.h>
 #include "mcp_bridge/color_value.h"
-#include "mcp_bridge/dialog_watch.h"
 
 class MCPBridgeGUP;
+
+// Fails the current bridge operation when Max showed an error dialog during
+// it. Core code reaches the shell's DialogWatch through the host API
+// (core_bridge.cpp); shell code passes DialogWatch::ThrowIfDismissed itself.
+namespace McpHost::DialogWatch { void ThrowIfDismissed(); }
 
 namespace HandlerHelpers {
 
@@ -309,7 +313,9 @@ inline std::wstring WrapForErrorCapture(const std::wstring& wcmd) {
 }
 
 // ── MAXScript execution (for hybrid handlers) ───────────────────
-inline std::string RunMAXScript(const std::string& script) {
+inline std::string RunMAXScript(
+    const std::string& script,
+    void (*throwIfDialogDismissed)() = &McpHost::DialogWatch::ThrowIfDismissed) {
     // Tool scripts are batch work: prompts take their defaults.
     TempQuietMode quiet;
     std::wstring wcmd = WrapForErrorCapture(Utf8ToWide(script));
@@ -333,7 +339,7 @@ inline std::string RunMAXScript(const std::string& script) {
         throw std::runtime_error("MAXScript execution failed: " + detail);
     }
 
-    DialogWatch::ThrowIfDismissed();
+    throwIfDialogDismissed();
     // Convert FPValue to string
     if (fpv.type == TYPE_STRING || fpv.type == TYPE_FILENAME) {
         return WideToUtf8(fpv.s);

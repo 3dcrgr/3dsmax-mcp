@@ -1,10 +1,9 @@
 #include "mcp_bridge/pipe_server.h"
-#include "mcp_bridge/bridge_gup.h"
-#include "mcp_bridge/command_dispatcher.h"
-#include "mcp_bridge/native_handlers.h"
+#include "mcp_bridge/core_api.h"
+#include "mcp_bridge/core_host.h"
 
-PipeServer::PipeServer(MCPBridgeGUP* gup, std::wstring pipe_name)
-    : gup_(gup), pipe_name_(std::move(pipe_name)) {
+PipeServer::PipeServer(std::wstring pipe_name)
+    : pipe_name_(std::move(pipe_name)) {
     shutdown_event_ = CreateEvent(nullptr, TRUE, FALSE, nullptr);
 }
 
@@ -132,17 +131,9 @@ void PipeServer::HandleClient(HANDLE pipe) {
 
         std::string response;
         try {
-            response = CommandDispatcher::Dispatch(request, gup_, client_id);
+            response = CoreHost::Dispatch(request, client_id);
         } catch (const std::exception& e) {
-            response = "{\"success\":false,\"error\":\"Internal bridge error: ";
-            std::string msg = e.what();
-            for (auto& c : msg) {
-                if (c == '"') response += "\\\"";
-                else if (c == '\\') response += "\\\\";
-                else if (c == '\n') response += "\\n";
-                else response += c;
-            }
-            response += "\",\"meta\":{\"transport\":\"namedpipe\"}}";
+            response = McpInternalErrorResponse(e.what());
         }
 
         if (!WriteResponse(pipe, response)) {
@@ -150,7 +141,7 @@ void PipeServer::HandleClient(HANDLE pipe) {
         }
     }
 
-    NativeHandlers::ReleaseSceneDeltaSession(client_id);
+    CoreHost::ReleaseSession(client_id);
 }
 
 std::string PipeServer::ReadRequest(HANDLE pipe) {

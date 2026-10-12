@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "tool_count": 178,
+  "tool_count": 179,
   "starter_tools": [
     "query_scene",
     "get_session_context",
@@ -14,7 +14,7 @@
     {
       "name": "Setup",
       "hint": "Bridge status, session context",
-      "tool_count": 7,
+      "tool_count": 8,
       "categories": [
         {
           "name": "Connection",
@@ -24,6 +24,7 @@
             "get_selected_max_instance",
             "list_max_instances",
             "release_max_instance",
+            "reload_native_core",
             "select_max_instance"
           ]
         },
@@ -4929,6 +4930,33 @@
       },
       "example": {},
       "risk": "read",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "reload_native_core",
+      "description": "Report the native core's state, or reload a rebuilt core DLL into the running 3ds Max.",
+      "category": "Connection",
+      "group": "Setup",
+      "module": "core_reload",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "wait_ms": {
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "example": {
+        "action": "status"
+      },
+      "risk": "advanced",
       "routing": "python",
       "starter": false
     },

@@ -165,13 +165,26 @@ def _err(message: str, **extra: Any) -> dict[str, Any]:
     return out
 
 
+_MAXSCRIPT_ERROR = "__MCP_MS_ERR__:"
+
+
 def _run(script: str) -> str:
-    return str(client.send_command(script).get("result", ""))
+    raw = str(client.send_command(script).get("result", ""))
+    # The bridge returns uncaught script exceptions as a sentinel string; report
+    # them as script errors, not as an unexpected (transport-looking) reply.
+    if raw.startswith(_MAXSCRIPT_ERROR):
+        return "__ERROR__|MAXScript error: " + raw[len(_MAXSCRIPT_ERROR):].strip()
+    return raw
 
 
 def _base_guard(safe: str) -> str:
-    """Shared script prologue: resolve base node into `obj` or emit __ERROR__."""
-    return f'local obj = getNodeByName "{safe}"\nif obj == undefined then "__ERROR__|base object not found: {safe}" else '
+    """Modifier-route prologue: require BooleanMod, resolve base node into `obj`, or emit __ERROR__."""
+    return (
+        f'local obj = getNodeByName "{safe}"\n'
+        'if not isKindOf BooleanMod MAXClass then "__ERROR__|BooleanMod requires 3ds Max 2024 or newer; '
+        'use backend=auto or backend=proboolean on this version"\n'
+        f'else if obj == undefined then "__ERROR__|base object not found: {safe}" else '
+    )
 
 
 def _find_boolmod() -> str:

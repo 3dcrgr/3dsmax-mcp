@@ -134,4 +134,5 @@ Result Client(HWND window) {
     if(!Equal(before,ClientBounds(window))) throw std::runtime_error("Window changed during capture; retry");
     return result;
 }
+void ReleaseFactories() noexcept { winrt::clear_factory_cache(); }
 }

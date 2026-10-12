@@ -19,6 +19,15 @@ MCP_PIPE_ENV = "MCP_MAX_PIPE"
 DIALOG_CHECK_AFTER = 1.0
 DIALOG_POLL_INTERVAL = 1.0
 MAX_BLOCKED_CALLS = 16
+# native:core control (hot-reloadable core). Only CORE_BUSY is retried: the
+# shell kept the old core and changed nothing. Waits above CORE_RETRY_MAX_WAIT_MS
+# get one attempt, so a long drain is never repeated.
+CORE_RELOAD_ATTEMPTS = 3
+CORE_RETRY_MAX_WAIT_MS = 20_000
+CORE_DEFAULT_WAIT_MS = 5_000  # the shell's default when wait_ms is omitted
+CORE_BUSY_BACKOFF = 0.5  # seconds before the first retry; doubles after each
+CORE_MAX_WAIT_MS = 600_000  # kMcpCoreMaxWaitMs, native/include/mcp_bridge/shell_control.h
+CORE_STATUS_TIMEOUT = 5.0
 
 
 class RequestOutcomeUnknown(Exception):
@@ -118,6 +127,15 @@ class MaxBridgeError(Exception):
         self.bridge_message = message
         self.bridge_response = response
         super().__init__(f"MAXScript error: {message}")
+
+
+def _bridge_error_code(exc: MaxBridgeError) -> str:
+    """Return the structured NativeError code carried by a bridge error, if any."""
+    try:
+        payload = json.loads(exc.bridge_message)
+    except (TypeError, ValueError):
+        return ""
+    return str(payload.get("code") or "") if isinstance(payload, dict) else ""
 
 
 class _PipeReader:
@@ -470,7 +488,8 @@ class MaxClient:
 
         request_fields adds handler options beside the command, e.g. quiet.
         """
-        if (cmd_type in {"native:render_cancel", "native:render_cancel_capture", "native:capture_screen", "native:max_dialogs"}
+        if (cmd_type in {"native:render_cancel", "native:render_cancel_capture", "native:capture_screen", "native:max_dialogs",
+                         "native:core"}
                 and self.transport != "tcp" and not self._control_channel):
             return self._send_control_command(command, cmd_type, timeout)
         effective_timeout = timeout or self.timeout
@@ -614,6 +633,62 @@ class MaxClient:
             return result if isinstance(result, dict) else {}
         finally:
             self._local.last_response, self._local.last_error = saved
+
+    def core_control(
+        self,
+        action: str = "status",
+        *,
+        wait_ms: int | None = None,
+        path: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Report or reload the hot-reloadable native core through the bridge shell.
+
+        Uses the control channel, so it runs beside an in-flight request and never
+        falls back to TCP. reload retries CORE_BUSY up to CORE_RELOAD_ATTEMPTS
+        times with backoff when wait_ms (default 5000) is at most
+        CORE_RETRY_MAX_WAIT_MS (20000); a longer wait gets a single attempt and
+        CORE_BUSY is raised directly. Any other error, and a lost response, is
+        raised at once. A raised MaxBridgeError records the attempts made in .attempts.
+        """
+        if action not in {"status", "reload"}:
+            raise ValueError("action must be status or reload")
+        if self.transport == "tcp":
+            raise ValueError("native core control requires the native bridge control channel")
+        if action == "status" and (wait_ms is not None or path is not None):
+            raise ValueError("wait_ms and path apply to reload only")
+        request: dict[str, Any] = {"action": action}
+        if wait_ms is not None:
+            if isinstance(wait_ms, bool) or not isinstance(wait_ms, int) or not 0 <= wait_ms <= CORE_MAX_WAIT_MS:
+                raise ValueError(f"wait_ms must be an integer from 0 to {CORE_MAX_WAIT_MS}")
+            request["wait_ms"] = wait_ms
+        if path is not None:
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError("path must be a non-empty core DLL path")
+            request["path"] = path
+        wait = CORE_DEFAULT_WAIT_MS if wait_ms is None else wait_ms
+        if timeout is None:
+            timeout = CORE_STATUS_TIMEOUT if action == "status" else wait / 1000.0 + 30.0
+        command = json.dumps(request)
+        retry = action == "reload" and wait <= CORE_RETRY_MAX_WAIT_MS
+        attempts = CORE_RELOAD_ATTEMPTS if retry else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._send_control_command(command, "native:core", timeout)
+                break
+            except MaxBridgeError as exc:
+                exc.attempts = attempt
+                if attempt == attempts or _bridge_error_code(exc) != "CORE_BUSY":
+                    raise
+                time.sleep(CORE_BUSY_BACKOFF * 2 ** (attempt - 1))
+        raw = response.get("result")
+        try:
+            result = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            result = None
+        if not isinstance(result, dict):
+            raise RuntimeError(f"native:core {action} returned no status object")
+        return result
 
     def _dialogs_blocking(self, request_id: str) -> list[dict[str, Any]]:
         """Main-thread dialogs holding this request: its own, or any while it is queued."""

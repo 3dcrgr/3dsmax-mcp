@@ -12,6 +12,10 @@ MainThreadExecutor::~MainThreadExecutor() {
     Shutdown();
 }
 
+void MainThreadExecutor::EnableDirectMode() { tl_direct_mode_ = true; }
+void MainThreadExecutor::DisableDirectMode() { tl_direct_mode_ = false; }
+bool MainThreadExecutor::IsDirectMode() { return tl_direct_mode_; }
+
 void MainThreadExecutor::Initialize() {
     // Initialize() is called from GUP::Start on the Max main thread, so this is
     // the thread that owns hwnd_ and pumps WM_MCP_EXECUTE. ExecuteSync uses it
@@ -107,7 +111,11 @@ std::string MainThreadExecutor::ExecuteSync(
         if (!item->started) {
             // A timed-out queued mutation must never execute later, after the
             // caller has left (its lambda may also capture stack references).
+            // Drop the closure now, while its request is still in flight: the
+            // item itself may wait in the queue or s_deferred_ much longer,
+            // past a core reload, and must not keep anything of the core.
             item->cancelled = true;
+            item->work = nullptr;
             throw std::runtime_error("Main thread execution timed out before starting; queued work cancelled");
         }
         // Running SDK work is not safely interruptible. Keep its caller and
@@ -169,20 +177,26 @@ LRESULT CALLBACK MainThreadExecutor::WndProc(
 }
 
 void MainThreadExecutor::RunWorkItem(const std::shared_ptr<WorkItem>& item) {
+    std::function<std::string()> work;
     {
         std::lock_guard<std::mutex> lock(item->mutex);
-        if (item->cancelled) return;
+        if (item->cancelled) return;  // its caller already dropped the closure
         item->started = true;
+        work = std::move(item->work);
+        item->work = nullptr;
     }
     std::string result, error;
     try {
         DialogWatch::Guard guard(item->request_id, item->command_type);
-        result = guard.Execute(item->work);
+        result = guard.Execute(work);
     } catch (const std::exception& e) {
         error = e.what();
     } catch (...) {
         error = "Unknown exception on main thread";
     }
+    // Destroy the closure before its caller resumes, so nothing it captured
+    // outlives the request that created it.
+    work = nullptr;
     {
         std::lock_guard<std::mutex> lock(item->mutex);
         item->result = std::move(result);

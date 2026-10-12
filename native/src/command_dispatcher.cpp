@@ -1,10 +1,9 @@
 #include "mcp_bridge/command_dispatcher.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 #include "mcp_bridge/native_handlers.h"
-#include "mcp_bridge/main_thread_executor.h"
 #include "mcp_bridge/handler_helpers.h"
+#include "mcp_bridge/response_envelope.h"
 #include "mcp_bridge/transaction_policy.h"
-#include "mcp_bridge/dialog_watch.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
@@ -27,23 +26,9 @@ using json = nlohmann::json;
 static bool g_safeMode = true;
 static bool g_safeModeLoaded = false;
 
-static bool LoadSafeModeSetting() {
-    char localAppData[MAX_PATH];
-    if (FAILED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData)))
-        return true;  // default: safe
-
-    std::string iniPath = std::string(localAppData) + "\\3dsmax-mcp\\mcp_config.ini";
-
-    char buf[16] = {};
-    GetPrivateProfileStringA("mcp", "safe_mode", "true", buf, 16, iniPath.c_str());
-
-    std::string val(buf);
-    return !(val == "false" || val == "0" || val == "off");
-}
-
 static bool IsSafeModeEnabled() {
     if (!g_safeModeLoaded) {
-        g_safeMode = LoadSafeModeSetting();
+        g_safeMode = McpEnvelope::ReadSafeModeSetting();
         g_safeModeLoaded = true;
     }
     return g_safeMode;
@@ -55,9 +40,11 @@ static bool IsSafeModeEnabled() {
 // benefit: scene reads, plugin introspection, reference walking.
 // Mutation handlers (create/delete/transform/assign) and MAXScript
 // execution always marshal to the main thread.
+// ping and native:max_dialogs never reach the core: the shell answers them
+// (core_control.cpp). watch_scene's reads run direct; the handler marshals its
+// start and stop, which register with Max, to the main thread itself.
 static bool IsDirectHandler(const std::string& cmd_type) {
     static const std::unordered_set<std::string> kDirect = {
-        "native:max_dialogs",
         // Scene reads
         "native:scene_info",
         "native:selection",
@@ -193,46 +180,9 @@ static bool ResultLooksLikeError(const std::string& result) {
     return status == "error" || status == "failed";
 }
 
-static std::string NativeErrorCodeForMessage(const std::string& message) {
-    std::string lower = message;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower.find("user_busy") != std::string::npos) return "USER_BUSY";
-    if (lower.find("stale_view") != std::string::npos) return "STALE_VIEW";
-    if (lower.find("safe mode") != std::string::npos) return "SAFE_MODE";
-    if (lower.find("main thread execution timed out") != std::string::npos ||
-        lower.find("named pipe") != std::string::npos ||
-        (lower.find("bridge") != std::string::npos && lower.find("not found") != std::string::npos))
-        return "BRIDGE_DOWN";
-    if (lower.find("render busy") != std::string::npos ||
-        lower.find("already rendering") != std::string::npos)
-        return "RENDER_BUSY";
-    if (lower.find("ambiguous") != std::string::npos) return "AMBIGUOUS";
-    if (lower.find("unknown object class") != std::string::npos ||
-        lower.find("unknown modifier class") != std::string::npos ||
-        lower.find("unknown material class") != std::string::npos ||
-        lower.find("unknown class") != std::string::npos ||
-        (lower.find("plugin") != std::string::npos && lower.find("missing") != std::string::npos))
-        return "PLUGIN_MISSING";
-    if (lower.find("not found") != std::string::npos ||
-        lower.find("no material assigned") != std::string::npos ||
-        lower.find("no modifiers on") != std::string::npos)
-        return "NOT_FOUND";
-    return "BAD_PARAM";
-}
-
+// Shared with the shell's own answers (response_envelope.h).
 static std::string NormalizeNativeError(const std::string& message) {
-    json structured = json::parse(message, nullptr, false);
-    if (!structured.is_discarded() && structured.is_object() &&
-        (structured.contains("code") || structured.contains("message"))) {
-        return structured.dump();
-    }
-    const std::string code = NativeErrorCodeForMessage(message);
-    json payload;
-    payload["type"] = "NativeError";
-    payload["message"] = message;
-    payload["code"] = code;
-    payload["retryable"] = (code == "BRIDGE_DOWN" || code == "RENDER_BUSY" || code == "USER_BUSY");
-    return payload.dump();
+    return McpEnvelope::NormalizeError(message);
 }
 
 class NativeUndoTransaction {
@@ -282,10 +232,10 @@ private:
 struct DirectModeGuard {
     bool active;
     DirectModeGuard(bool enable) : active(enable) {
-        if (active) MainThreadExecutor::EnableDirectMode();
+        if (active) HostExecutor::EnableDirectMode();
     }
     ~DirectModeGuard() {
-        if (active) MainThreadExecutor::DisableDirectMode();
+        if (active) HostExecutor::DisableDirectMode();
     }
 };
 
@@ -314,24 +264,11 @@ static std::string BuildResponse(
     const std::string& request_id,
     const std::string& cmd_type,
     int duration_ms) {
-
-    json resp;
-    resp["success"] = success;
-    resp["requestId"] = request_id;
-    resp["result"] = result;
-    resp["error"] = error;
-    resp["meta"] = {
-        {"protocolVersion", 2},
-        {"cmdType", cmd_type},
-        {"safeMode", IsSafeModeEnabled()},
-        {"durationMs", duration_ms},
-        {"transport", "namedpipe"},
-        {"threadMode", MainThreadExecutor::IsDirectMode() ? "direct" : "mainThread"}
-    };
-    // Every response reports dialogs blocking Max, whoever opened them.
-    json dialogs = DialogWatch::OpenDialogs();
-    if (!dialogs.empty()) resp["meta"]["openDialogs"] = std::move(dialogs);
-    return resp.dump();
+    // Same envelope as the shell's own answers (response_envelope.h).
+    const bool safe_mode = IsSafeModeEnabled();
+    const bool direct = HostExecutor::IsDirectMode();
+    return McpEnvelope::Build(success, result, error, request_id, cmd_type, duration_ms, safe_mode, direct,
+                              McpHost::DialogWatch::OpenDialogs());
 }
 
 // ── Safe mode filter ────────────────────────────────────────────
@@ -394,7 +331,7 @@ static std::string HandleMaxScript(
             const std::string detail = fpv.type == TYPE_TSTR && fpv.tstr ? WideToUtf8(fpv.tstr->data()) : "";
             throw std::runtime_error("MAXScript execution failed: " + detail);
         }
-        DialogWatch::ThrowIfDismissed();
+        McpHost::DialogWatch::ThrowIfDismissed();
 
         // Convert FPValue to string
         if (fpv.type == TYPE_STRING || fpv.type == TYPE_FILENAME) {
@@ -425,21 +362,6 @@ static std::string HandleMaxScript(
     });
 }
 
-// ── Ping handler ────────────────────────────────────────────────
-static std::string HandlePing(MCPBridgeGUP* gup) {
-    return gup->GetExecutor().ExecuteSync([]() -> std::string {
-        Interface* ip = GetCOREInterface();
-        json result;
-        result["pong"] = true;
-        result["server"] = "3dsmax-mcp-native";
-        result["protocolVersion"] = 2;
-        result["transport"] = "namedpipe";
-        DWORD v = Get3DSMAXVersion();
-        result["maxVersion"] = 1998 + (HIWORD(v) / 1000);
-        return result.dump();
-    });
-}
-
 // ── Dispatcher ──────────────────────────────────────────────────
 std::string CommandDispatcher::Dispatch(
     const std::string& json_request,
@@ -459,7 +381,7 @@ std::string CommandDispatcher::Dispatch(
     std::string command = req.value("command", "");
     std::string cmd_type = req.value("type", "maxscript");
     std::string request_id = req.value("requestId", "");
-    DialogWatch::RequestContext request_context(request_id, cmd_type);
+    McpHost::DialogWatch::RequestContext request_context(request_id, cmd_type);
 
     // Route to handler — read-only handlers run directly on pipe thread
     // _forceMainThread flag allows benchmarking the same handler both ways
@@ -471,12 +393,7 @@ std::string CommandDispatcher::Dispatch(
         auto invoke = [&]() -> std::string {
         std::string result;
 
-        if (cmd_type == "native:max_dialogs") {
-            // No ExecuteSync, SDK calls, undo hold, or blocked command's pipe.
-            result = DialogWatch::Control(command);
-        } else if (cmd_type == "ping") {
-            result = HandlePing(gup);
-        } else if (cmd_type == "native:plugin_inspect") {
+        if (cmd_type == "native:plugin_inspect") {
             result = NativeHandlers::PluginInspect(command, gup);
         } else if (cmd_type == "native:plugin_patch") {
             result = NativeHandlers::PluginPatch(command, gup);
@@ -739,7 +656,7 @@ std::string CommandDispatcher::Dispatch(
             result = gup->GetExecutor().ExecuteSync([&]() -> std::string {
                 NativeUndoTransaction tx(cmd_type);
                 std::string inner = invoke();
-                DialogWatch::ThrowIfDismissed();
+                McpHost::DialogWatch::ThrowIfDismissed();
                 if (ResultLooksLikeError(inner)) {
                     tx.Cancel();
                 } else {
