@@ -17,7 +17,7 @@ Everything here is being offered back to upstream as small, separate pull reques
 
 ## At a glance
 
-- **196 tools:** all 179 of upstream's, plus 17 new ones (marked ★ in the [catalog](#tools)).
+- **207 tools:** all 179 of upstream's, plus 28 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
   - 3ds Max 2027.2, and 3ds Max 2026 before that;
   - V-Ray 7 (GPU as the production renderer);
@@ -103,6 +103,7 @@ Everything here is being offered back to upstream as small, separate pull reques
 | Chaos Vantage | `vantage_status`, `vantage_get_image`, `vantage_live_link` | Read Vantage's state over its local command port, save the frame it shows as a PNG, start or stop V-Ray GPU Live Link. Vantage's command port isn't documented by Chaos |
 | RailClone | `railclone_inspect`, `railclone_set_param`, `railclone_library`, `railclone_from_library` | Inspect bases, exposed parameters, segments and output; set parameters by name within their limits; search the library; create items by route or name, with splines assigned by role. They report the running RailClone version, warn about version-specific library bugs, and handle Proxy Cache |
 | Forest Pack | `forest_items`, `forest_edit_items`, `forest_set_mode`, `forest_library`, `forest_from_library`, `forest_validate` | Read items with instance-ready transforms; edit items in custom edit mode with a revert list (Forest doesn't undo item edits); search the library and place presets or 3D items; validate item and area lists, including Reference-mode forests fed by a RailClone, and name why a forest is empty |
+| iToo API extensions | `itoo_api_inventory`, `itoo_catalog`, `railclone_slots`, `railclone_metadata`, `railclone_proxy`, `railclone_instances`, `railclone_settings`, `forest_inspect`, `forest_effects`, `forest_settings`, `forest_effect_library` | [Coverage and remaining gaps](docs/fork/itoo-api-coverage.md): live API signatures, guarded source/segment/settings edits, metadata, cache/instance controls and tested Forest Effects editing and library reads |
 | iToo → Vantage | `itoo_vantage_check` | Read-only check of how ready Forest Pack, RailClone and ForestIvy objects are for Chaos Vantage: colour-map slot 1, opacity maps, CPU-only features, ID-driven maps, render settings, caps and the `fullMeshProxy` setting. A fallback is suggested for objects with errors |
 
 New options on existing tools:

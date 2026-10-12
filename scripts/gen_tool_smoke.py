@@ -31,6 +31,9 @@ FLAG_EXPECT_ERROR = 2
 
 # Skipped unless run_tool_smoke(include_skipped=True) / native includeSkipped
 SKIP_DEFAULT = {
+    "railclone_settings", "forest_settings", "forest_effect_library",
+    "itoo_api_inventory", "itoo_catalog", "forest_inspect", "forest_effects",
+    "railclone_slots", "railclone_metadata", "railclone_proxy", "railclone_instances",
     "max_dialogs",
     "vantage_status",
     "vantage_get_image",
@@ -212,6 +215,8 @@ CUSTOM: dict[str, dict] = {
 }
 
 MUTATE_TOOLS = {
+    "railclone_settings", "forest_settings",
+    "railclone_slots", "railclone_metadata", "railclone_proxy", "railclone_instances", "forest_effects",
     "script_controller",
     "drop_to_surface",
     "scatter_forest_pack",

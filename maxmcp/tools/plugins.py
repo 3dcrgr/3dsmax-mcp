@@ -98,6 +98,8 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "forest_edit_items",
             "forest_set_mode",
             "forest_validate",
+            "forest_inspect", "forest_effects", "forest_settings", "forest_effect_library",
+            "itoo_api_inventory", "itoo_catalog",
             "itoo_vantage_check",
         ],
         "recipes": [
@@ -131,6 +133,9 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "get_railclone_style",
             "set_railclone_style",
             "get_railclone_output",
+            "railclone_slots", "railclone_metadata", "railclone_proxy", "railclone_instances",
+            "railclone_settings",
+            "itoo_api_inventory", "itoo_catalog",
             "itoo_vantage_check",
         ],
         "recipes": [

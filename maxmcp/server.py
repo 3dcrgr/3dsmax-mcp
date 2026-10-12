@@ -82,9 +82,12 @@ _READ_ONLY_TOOLS = {
     "railclone_inspect",
     "railclone_library",
     "itoo_vantage_check",
+    "itoo_api_inventory", "itoo_catalog", "forest_inspect", "forest_effect_library",
 }
 
 _DESTRUCTIVE_TOOLS = {
+    "railclone_slots", "railclone_metadata", "railclone_proxy", "railclone_instances", "forest_effects",
+    "railclone_settings", "forest_settings",
     "mesh_edit",
     "drop_to_surface",
     "forest_edit_items",
@@ -296,6 +299,7 @@ SPECIALTY_TOOL_MODULES = (
     "render_automations",
     "vantage",
     "itoo_vantage",
+    "itoo_api",
     "scattering",
     "state_sets",
     "tyflow",

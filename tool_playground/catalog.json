@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "tool_count": 195,
+  "tool_count": 206,
   "starter_tools": [
     "query_scene",
     "get_session_context",
@@ -275,7 +275,7 @@
     {
       "name": "Specialty",
       "hint": "MCG, Data Channel, tyFlow, RailClone, etc.",
-      "tool_count": 56,
+      "tool_count": 67,
       "categories": [
         {
           "name": "Data Channel",
@@ -347,6 +347,22 @@
           "tools": [
             "get_camera_sequence",
             "get_state_sets"
+          ]
+        },
+        {
+          "name": "iToo APIs",
+          "tools": [
+            "forest_effect_library",
+            "forest_effects",
+            "forest_inspect",
+            "forest_settings",
+            "itoo_api_inventory",
+            "itoo_catalog",
+            "railclone_instances",
+            "railclone_metadata",
+            "railclone_proxy",
+            "railclone_settings",
+            "railclone_slots"
           ]
         },
         {
@@ -5110,7 +5126,7 @@
     },
     {
       "name": "get_selected_max_instance",
-      "description": "Read this MCP process's selected target and availability without switching it.",
+      "description": "Read this MCP server process's selected target and availability without switching it.",
       "category": "Connection",
       "group": "Setup",
       "module": "routing",
@@ -5140,7 +5156,7 @@
     },
     {
       "name": "release_max_instance",
-      "description": "Release this MCP process's target, including startup pinning; next connection uses the default.",
+      "description": "Release this MCP server process's target, including startup pinning; next connection uses the default.",
       "category": "Connection",
       "group": "Setup",
       "module": "routing",
@@ -5155,7 +5171,7 @@
     },
     {
       "name": "select_max_instance",
-      "description": "Bind this MCP process to a live Max PID until explicitly changed or released.",
+      "description": "Bind this MCP server process to a live Max PID until explicitly changed or released.",
       "category": "Connection",
       "group": "Setup",
       "module": "routing",
@@ -6122,6 +6138,9 @@
           },
           "reload_segments": {
             "type": "boolean"
+          },
+          "force_rebuild": {
+            "type": "boolean"
           }
         }
       },
@@ -6219,6 +6238,12 @@
             "type": "boolean"
           },
           "reload_segments": {
+            "type": "boolean"
+          },
+          "rebuild": {
+            "type": "boolean"
+          },
+          "force_rebuild": {
             "type": "boolean"
           }
         }
@@ -6657,6 +6682,373 @@
       "example": {},
       "risk": "safe",
       "routing": "native:get_state_sets",
+      "starter": false
+    },
+    {
+      "name": "forest_effect_library",
+      "description": "Search/read installed or user Forest Effects .eff files, without contacting or editing Max.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "include_code": {
+            "type": "boolean"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "forest_effects",
+      "description": "Read, add, replace code, toggle or remove Forest Pack effects with guarded staged undo.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "effect": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "effect_name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "expected_effects": {
+            "type": "string"
+          },
+          "confirm_delete": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "example": {
+        "name": "$first_object"
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "forest_inspect",
+      "description": "Read Forest Pack settings and parallel arrays without building or editing items.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "max_entries": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "example": {
+        "name": "$first_object"
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "forest_settings",
+      "description": "Inspect/edit Forest distribution, update, cap, transform and effect-display settings.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "settings": {},
+          "expected_settings": {
+            "type": "string"
+          },
+          "confirm_rebuild": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "example": {
+        "name": "$first_object"
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "itoo_api_inventory",
+      "description": "List the installed iToo methods, signatures and dedicated MCP coverage, without creating scene nodes.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "plugin": {
+            "type": "string"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "itoo_catalog",
+      "description": "Read iToo's Library Browser catalog metadata and stored macro text without opening it.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "plugin": {
+            "type": "string"
+          },
+          "macro": {
+            "type": "string"
+          },
+          "item_property": {
+            "type": "string"
+          },
+          "custom_property": {
+            "type": "string"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "railclone_instances",
+      "description": "Create standalone RailClone instances, enable source, or delete prior vendor-generated instances.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "integer"
+          },
+          "action": {
+            "type": "string"
+          },
+          "layer": {
+            "type": "string"
+          },
+          "max_items": {
+            "type": "integer"
+          },
+          "separated_meshes": {
+            "type": "boolean"
+          },
+          "disable_source": {
+            "type": "boolean"
+          },
+          "confirm_delete": {
+            "type": "boolean"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "railclone_metadata",
+      "description": "Set a RailClone description or explicitly upgrade style compatibility, with staged undo.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "integer"
+          },
+          "description": {
+            "type": "string"
+          },
+          "reset_compatibility": {
+            "type": "boolean"
+          },
+          "confirm_change": {
+            "type": "boolean"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "railclone_proxy",
+      "description": "Inspect or set RailClone Proxy Cache (disabled, embedded, external).",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "integer"
+          },
+          "action": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "confirm_change": {
+            "type": "boolean"
+          },
+          "overwrite": {
+            "type": "boolean"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "railclone_settings",
+      "description": "Inspect/edit RailClone global, display and instancing settings with a state token and one undo hold.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "settings": {},
+          "expected_settings": {
+            "type": "string"
+          },
+          "confirm_rebuild": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "example": {
+        "name": "$first_object"
+      },
+      "risk": "advanced",
+      "routing": "python",
+      "starter": false
+    },
+    {
+      "name": "railclone_slots",
+      "description": "Inspect or edit RailClone base/segment slots by exact GUID or unique slot name.",
+      "category": "iToo APIs",
+      "group": "Specialty",
+      "module": "itoo_api",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "slot": {
+            "type": "string"
+          },
+          "values": {},
+          "expected_slots": {
+            "type": "string"
+          }
+        }
+      },
+      "example": {},
+      "risk": "advanced",
+      "routing": "python",
       "starter": false
     },
     {

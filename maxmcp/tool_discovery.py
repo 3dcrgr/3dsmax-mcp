@@ -128,6 +128,11 @@ TOOLSET_SPECS = (
         ("tyflow", "tyflow_graph", "tyflow_patch", "tyflow_manifest", "tyflow_census"),
     ),
     ToolsetSpec(
+        "itoo_api",
+        "Live RailClone/Forest Pack API coverage, guarded sources/settings, metadata, Proxy Cache, instances and Forest Effects/library.",
+        ("itoo_api",),
+    ),
+    ToolsetSpec(
         "railclone",
         "RailClone inspection, exposed parameters, library search and loading, XML style read/write and generated output (RailClone 7.x).",
         ("railclone",),
