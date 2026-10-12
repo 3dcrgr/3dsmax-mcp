@@ -14,6 +14,8 @@ Connected pipe clients now use cancellable overlapped reads and writes. `PipeSer
 
 If auto transport finds neither a native bridge nor a TCP listener, `BRIDGE_DOWN` now includes running Max candidate PIDs, the preferred and attempted transports, and both failures. A candidate may still be starting or may lack the bridge; its presence is not evidence of readiness. Explicit TCP mode keeps its legacy listener advice. These changes do not make `MAXSCRIPT_INTERRUPTED` proof that the Max process has exited: restart workflows must still wait for the exact PID to disappear.
 
+The auto diagnostic covers TCP connection refusal and a timeout before TCP connects. `tcp_failure` distinguishes `connection_refused` from `connect_timeout`; both set `request_sent:false`. A timeout after connection or dispatch retains its existing error behavior and is never reported as an unsent startup failure. The connect phase is tracked in the TCP transport itself rather than inferred from a generic timeout exception.
+
 When Max's main thread hung, every tool returned the MCP client's generic "Request timed out", `get_bridge_status` included. The agent then had to work out from the outside whether Max was busy, hung or gone. Usually it guessed "permanent deadlock", and Max was killed with unsaved work, even though some of those stalls would have cleared on their own after a few minutes.
 
 ## Why

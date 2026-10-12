@@ -41,19 +41,25 @@ class RequestOutcomeUnknown(Exception):
 OUTCOME_UNKNOWN_ADVICE = "The request may have committed; inspect before retrying."
 
 
+class MaxTcpConnectTimeoutError(TimeoutError):
+    """TCP connect timed out before sendall; no request reached the listener."""
+
+
 class MaxBridgeUnavailableError(ConnectionError):
     """Auto transport found neither a ready native bridge nor a TCP listener."""
 
     code = "BRIDGE_DOWN"
     retryable = True
 
-    def __init__(self, native_error: str, tcp_error: str, host: str, port: int) -> None:
+    def __init__(self, native_error: str, tcp_error: str, host: str, port: int,
+                 tcp_failure: str = "connection_refused") -> None:
         candidates = [p["pid"] for p in list_processes()]
         self.details = {
             "requested_transport": "auto", "preferred_transport": "namedpipe",
             "attempted_transports": ["namedpipe", "tcp"], "running_max_pids": candidates,
             "native_state": "unavailable", "native_error": native_error, "tcp_error": tcp_error,
             "tcp_endpoint": f"{host}:{port}", "request_sent": False,
+            "tcp_failure": tcp_failure,
         }
         if candidates:
             message = (f"No native MCP bridge is ready/reachable; running Max candidate PIDs: {candidates}. "
@@ -61,8 +67,9 @@ class MaxBridgeUnavailableError(ConnectionError):
                        "Wait and recheck list_max_instances; if startup is complete, check the native plugin. ")
         else:
             message = "No native MCP bridge is ready/reachable and no running Max process was found. Start Max and recheck. "
+        failure = "timed out before connecting" if tcp_failure == "connect_timeout" else "refused the connection"
         super().__init__(message + f"Requested auto transport (namedpipe preferred); TCP fallback at {host}:{port} "
-                         f"refused the connection. Native error: {native_error}.")
+                         f"{failure}. Native error: {native_error}.")
 
 
 ALWAYS_ASK = ("Always ask the user before Save, Don't Save or any other discard, overwrite, Fetch or Reset "
@@ -981,8 +988,9 @@ class MaxClient:
                 self._refuse_unverifiable_pid()
                 try:
                     response_data = self._send_via_tcp(request, effective_timeout)
-                except ConnectionRefusedError as tcp_exc:
-                    unavailable = MaxBridgeUnavailableError(fallback_error, str(tcp_exc), self.host, self.port)
+                except (ConnectionRefusedError, MaxTcpConnectTimeoutError) as tcp_exc:
+                    failure = "connect_timeout" if isinstance(tcp_exc, MaxTcpConnectTimeoutError) else "connection_refused"
+                    unavailable = MaxBridgeUnavailableError(fallback_error, str(tcp_exc), self.host, self.port, failure)
                     self._local.last_error = {"transport": "tcp", **unavailable.details, "error": str(unavailable)}
                     raise unavailable from tcp_exc
 
@@ -1385,9 +1393,11 @@ class MaxClient:
     def _send_via_tcp(self, request: str, timeout: float) -> bytes:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
+        connected = False
 
         try:
             sock.connect((self.host, self.port))
+            connected = True
             sock.sendall((request + "\n").encode("utf-8"))
 
             response_data = b""
@@ -1402,6 +1412,11 @@ class MaxClient:
             return response_data
 
         except socket.timeout:
+            if not connected:
+                raise MaxTcpConnectTimeoutError(
+                    f"TCP connection to 3ds Max on {self.host}:{self.port} timed out within {timeout}s. "
+                    "Is the MCP TCP listener running in 3ds Max?"
+                )
             raise TimeoutError(
                 f"3ds Max did not respond within {timeout}s. "
                 "Is the MCP TCP listener running in 3ds Max?"
