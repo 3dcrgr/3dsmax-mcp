@@ -735,6 +735,18 @@ CODES: dict[str, tuple[str, str, str, str | None]] = {
         "info", "doc",
         "V-Ray proxy segments with the instancing engine off: since RailClone 7, V-Ray proxies no longer need full "
         "mesh mode for V-Ray GPU and Vantage, so instancing can go back on.", None),
+    "RC_PROXY_PRE_637": (
+        "warn", "doc",
+        "This RailClone predates 6.3.7 and contains V-Ray Proxy segments. iToo documents that older versions need "
+        "full-mesh proxy display mode for V-Ray GPU and Vantage. The fullMeshProxy registry setting was introduced "
+        "in 7.1.4 and cannot establish the effective mode on this older version.",
+        "Upgrade RailClone or check the V-Ray Proxy's full-mesh display mode."),
+    "RC_732_RENDER_CRASH": (
+        "warn", "doc",
+        "RailClone 7.3.2 has documented render crashes with empty segments, Transforms without geometry, and Proxy "
+        "Cache containing empty segments. This read-only check cannot establish whether those exact conditions are "
+        "present in this style.",
+        "Upgrade to RailClone 7.3.3 or later before rendering, or inspect the style for those conditions."),
     "FULL_MESH_PROXY_ON": (
         "warn", "doc",
         "RailClone fullMeshProxy is on (HKCU\\Software\\Itoo Software\\RailClone Pro): V-Ray Proxy segments are "
@@ -1204,6 +1216,10 @@ def analyze_railclone(obj: dict[str, Any], max_paths: int, rc_version: list[int]
 
     # Segments: V-Ray proxies under Mesh mode, sobjmtl wrapping
     proxy_segs = [s for s in obj["segs"] if "VRayProxy" in (s["ref_class"], s["source_class"])]
+    if proxy_segs and rc_version is not None and tuple((rc_version + [0, 0, 0])[:3]) < (6, 3, 7):
+        rep.add("RC_PROXY_PRE_637", ", ".join(f"[{s['index']}] {s['name']}" for s in proxy_segs))
+    if rc_version is not None and tuple((rc_version + [0, 0, 0])[:3]) == (7, 3, 2):
+        rep.add("RC_732_RENDER_CRASH")
     if proxy_segs and instancing is False:
         if rc_version is None:
             rep.unknown_check("railclone_version", "the RailClone plugin version couldn't be read, so whether V-Ray "

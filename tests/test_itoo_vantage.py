@@ -862,6 +862,15 @@ class FullMeshProxyTests(unittest.TestCase):
 
 
 class SceneTests(unittest.TestCase):
+    def test_version_risks_have_fixed_version_boundaries(self):
+        proxy = FullMeshProxyTests.PROXY
+        for version, expected in (("6,3,6,0", True), ("6,3,7,0", False), ("7,3,5,0", False)):
+            r = run(*railclone(seg_overrides=proxy), scene={"railclone_version": version})
+            self.assertEqual("RC_PROXY_PRE_637" in codes(r), expected)
+        self.assertNotIn("RC_PROXY_PRE_637", codes(run(*railclone(), scene={"railclone_version": "6,3,6,0"})))
+        for version, expected in (("7,3,1,0", False), ("7,3,2,10543", True), ("7,3,3,0", False)):
+            self.assertEqual("RC_732_RENDER_CRASH" in codes(run(*railclone(), scene={"railclone_version": version})), expected)
+
     def test_scene_findings_and_lists(self):
         r = run(*forest(), xshadow=[(5, "Omni001")], missing=["Nope"], not_itoo=[("Box001", "Box")],
                 scene={"renderer": "Default_Scanline_Renderer"})

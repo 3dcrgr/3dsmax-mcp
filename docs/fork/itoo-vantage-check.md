@@ -6,6 +6,11 @@ The checks come from the iToo documentation (the knowledge pack's digests A §3.
 
 ## Calling it
 
+Version findings added on 2026-10-12:
+
+- `RC_PROXY_PRE_637`: V-Ray Proxy segments on RailClone older than 6.3.7 need full-mesh proxy display for GPU/Vantage. The registry switch introduced in 7.1.4 does not establish the effective mode on those older versions.
+- `RC_732_RENDER_CRASH`: RailClone 7.3.2 has documented render crashes with empty segments, Transforms without geometry and Proxy Cache with empty segments. This is a version warning; the read-only check does not claim those exact conditions are present.
+
 ```
 itoo_vantage_check(names=None, time_budget_s=30, max_paths=5, details=False)
 ```
