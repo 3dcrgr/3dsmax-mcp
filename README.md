@@ -17,6 +17,8 @@ Verified and deployed improvements are published on the fork's default branch, `
 
 ## At a glance
 
+Forest Effects supports guarded ordering and parameter-free `.eff` export/import. The deployed implementation passed 12 scratch-Max checks and the 1,064-test Python suite; parameterized effect files remain unsupported. See [iToo coverage](docs/fork/itoo-api-coverage.md).
+
 - **207 tools:** all 179 of upstream's, plus 28 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
   - 3ds Max 2027.2, and 3ds Max 2026 before that;

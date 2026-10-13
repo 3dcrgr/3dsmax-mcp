@@ -6,6 +6,8 @@ All notable changes to this project are documented here.
 
 ### Verified deployments, 2026-10-12–13
 
+- Forest Effects `move`, `load` and `export` (`416ef90`) are deployed. Fresh installed stdio enumeration reports 207 tools and the new actions; normalized source matches the installed module. Twelve scratch-Max checks passed, including effect ordering and parameter-free `.eff` roundtrip with exact-PID guards. Post-deployment Python suite: 1,064 passed. Overwrite refusal is unit-tested; parameterized files are unsupported and stored effect code is not compile-checked.
+
 - #29–#30: cancellable connected-pipe shutdown and native-aware startup failures, including unsent TCP connection timeouts. The reviewed 2027 bridge is SHA256 `3bd55e31d1088cbccac2ea90e6ca1a42b29d75f7c0e797b709240c94b5a8b6cf`, built from `205d467`. Native checks passed 6/6; scratch Max exited with connected clients retained (4.759 s and 4.092 s).
 - #31: conservative exited-PID registry cleanup. Live validation removed 14 confirmed dead registrations while retaining two live registrations; exact-PID pings and 8 cleanup tests passed.
 - #32–#34: reviewed bridge manifest, installer replacement guards, reliable scratch-driver error reporting and conservative teardown classification. Installed-package checks and 59 focused tests passed; saved-capture replay is offline evidence. The rebuilt Setup compiled successfully but has not been installed or published; older installers remain capable of replacing a bridge.
