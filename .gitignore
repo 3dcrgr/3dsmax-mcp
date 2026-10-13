@@ -5,7 +5,6 @@ __pycache__/
 *.egg-info/
 dist/
 /installer/
-/Tool Playground.bat
 build/
 .venv/
 *.egg
