@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.7.6] — 2026-10-14
+
+- 3ds Max now quits while an MCP client is connected. The bridge waited for every connected client to disconnect, so Max kept running in the background after its window closed. Requests still queued when Max exits now fail at once instead of waiting out their timeout.
+- After the selected 3ds Max exits or restarts, calls fail with `TARGET_UNAVAILABLE`, not retryable, and point to `list_max_instances`, `select_max_instance` and `release_max_instance`, instead of a retryable bridge error with a scene-search hint.
+- `get_state_sets`, `get_camera_sequence`, `get_wired_params` and `introspect_instance` run on Max's main thread. They ran MAXScript on a pipe thread.
+- `inspect_curve` and `edit_curve` accept Line objects, and `draw_spline` edits a Line in place instead of converting it, or collapsing its modifiers with `convert=true`.
+- `contact_check` no longer misreads a whole-number `tolerance` or `near_gap` as almost zero.
+- `clone_objects` refuses a member of a closed group and names the group, instead of cloning the whole group on top of the original. Clone the group, or open it to clone the member alone.
+- `replace_material` returns `no_objects` with a warning when no object uses the target material, instead of reporting success.
+- Agent viewport V-Ray previews (`vray_ipr`, `vray_vfb`) start on V-Ray GPU; they were refused.
+- `execute_maxscript` and the agent skill warn that quiet mode skips the save prompt: `checkForSave()` returns true and `resetMaxFile()` discards unsaved work.
+- Added Pulze Scene Manager tools: `pulze_inspect`, `pulze_preflight`, and guarded, undoable `pulze_set` edits with `pulze_restore` from a backup (#26).
+- A Boolean forced to the modifier backend on 3ds Max 2023, which has no Boolean modifier, now fails with a script error naming the working backends instead of a bridge error.
+- The native bridge is split into a permanent shell and a core. Installed bridges still ship as one plugin; development builds rebuild the core and reload it into a running Max with `reload_native_core`, and `scripts/mcpcall.py` runs a tool from current source without restarting the MCP server.
+- Removed the Tool Playground GUI (`Tool Playground.bat`, `scripts/tool_playground.py`) and its generated catalog.
+- Rebuilt bridges for Max 2023-2027.
+
 ## [1.7.5] — 2026-10-01
 
 - Agents can read and answer any dialog blocking 3ds Max, Win32 or Qt. A call that opens or waits behind a dialog now returns `BLOCKED_BY_DIALOG` with the title, text and buttons instead of hanging; `max_dialogs` presses a chosen button and returns the interrupted call's result. Other tool replies warn while a dialog is open. Agents ask the user before save, overwrite, discard, Fetch, Reset or licensing choices unless told to proceed.

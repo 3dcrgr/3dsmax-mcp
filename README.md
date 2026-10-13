@@ -11,7 +11,7 @@ Connect AI agents to Autodesk 3ds Max through the [Model Context Protocol](https
 
 Automate everything!
 
-**Current release: 1.7.5** — see [CHANGELOG.md](docs/CHANGELOG.md).
+**Current release: 1.7.6** — see [CHANGELOG.md](docs/CHANGELOG.md).
 
 ## Features
 
