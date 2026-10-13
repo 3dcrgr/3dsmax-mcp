@@ -1,4 +1,4 @@
-# iToo API coverage — Max 2027, 2026-10-12
+# iToo API coverage â€” Max 2027, 2026-10-12
 
 The API is larger than the dedicated MCP tool list. Inspect the installed
 surface using `itoo_api_inventory(plugin="railclone"|"forest")`: it reports
@@ -110,7 +110,7 @@ The shared MCP_SOLVED log records deployment, hashes and the final counts.
 Every launch used an interactive one-shot scheduled task outside the MSIX
 process, exact PID routing, and 4 Hz main-thread sampling. Launch-request to
 the same final log marker measured 41.77, 39.59 and 39.48 seconds before the
-Connecter timeout change. Sampler suspension overhead was 1.49–1.75 seconds;
+Connecter timeout change. Sampler suspension overhead was 1.49â€“1.75 seconds;
 these are sampled timings, not independent uninstrumented benchmarks.
 
 Connecter's absent-localhost connection cost about 2 seconds. The optional
@@ -119,7 +119,7 @@ Connecter's absent-localhost connection cost about 2 seconds. The optional
 Connecter available. Originals, hashes and rollback are retained separately;
 a vendor update can replace this patch. Arnold initialization and the MassFX
 debugger connection each cost about 2 seconds in these runs. No plugin was
-uninstalled and the user's fullMeshProxy=0 policy was preserved.
+uninstalled on 2026-10-12, and the user's fullMeshProxy=0 policy was preserved.
 
 A process observer recorded exits with Windows exit codes and confirmed their
 PIDs disappeared. The scratch fixture was saved to a new local test file before
@@ -147,3 +147,29 @@ parameter definitions are now included in library inspection.
 Live export/import preserved exact XML and actual Z=10 output. The full suite
 passed 1,051 tests; 42 iToo-specific tests pass. The lifecycle observer's stop
 signal now uses its configured output directory.
+
+## 2026-10-13: Arnold removal and measurement limits
+
+With explicit user approval, Windows Installer removed MAXtoA for 3ds Max 2027
+5.9.4.0 (product E5058F9F-F96F-4A7A-9EE2-A52A2124E718). Exit code 0, no reboot
+required; package registration and plugin files are gone. The final sampled
+warm launch took 35.490 seconds, including 1.531 seconds of sampler suspension.
+Module verification confirms Arnold is absent and Forest, RailClone and Phoenix
+are loaded. Read-only Python module inspection found 72 Connecter modules. The
+final unmodified scratch quit exited in 4.250 seconds, client retained.
+
+The first launch after today's boot took 96.368 seconds. About 44.55 seconds of
+sampled main-thread time was in file-open calls. A later Windows FileIO/Minifilter
+trace was highly intrusive (125 million events), so its 70.753-second launch is
+not a comparable performance benchmark. A compatible reader recovered 82,614
+create/completion pairs, about 2.53 seconds total across threads, which does not
+explain the first launch's delay. No antivirus or network cause is established.
+The first-launch bottleneck remains open and needs a bounded cold-start trace.
+
+The timing helper now recognizes zero-padded PIDs in Max.log; PID 4260 was
+logged as 04260 and its otherwise healthy run exhausted the old recorder timeout.
+The observer waits for actual PID disappearance and drains completed exits when
+stopped, rather than reporting a pre-exit process snapshot as a lingering process.
+Offline observer checks pass. The integrated wt-review suite passes 1,064 tests.
+Fresh installed MCP clients see the new effect actions; existing server processes
+need their MCP connection restarted to reload the deployed module.
