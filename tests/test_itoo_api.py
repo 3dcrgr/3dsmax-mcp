@@ -403,5 +403,44 @@ class NumericParameterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"PARAMETER_TYPE_UNSUPPORTED"):api.numeric_definitions(root)
 
 
+class ReferenceParameterTests(unittest.TestCase):
+    def state(self, kind="node"):
+        pid="{33333333-3333-3333-3333-333333333333}"
+        code, prop = next((c, p) for c, (k, p) in api.REFERENCE_KINDS.items() if k == kind)
+        xml=f'<effect><parameter id="{pid}" name="Source" type="{kind}"/></effect>'
+        arrays={"efpaid":[pid],"efpaeffid":["owner"],"efpatype":[code],"efpaname":["Source"],prop:[{"name":"Box", "handle":123}]}
+        return {"effects_token":TOKEN,"effects":[{"id":"owner","name":"Fixture","xml":xml}],"arrays":{k:{"values":v} for k,v in arrays.items()}}
+
+    def test_reference_rows(self):
+        for kind in ("node", "spline"):
+            row=api.parameter_rows(self.state(kind))[0]
+            self.assertEqual(row["kind"],kind)
+            self.assertEqual(row["value"],{"name":"Box","handle":123})
+            self.assertTrue(row["bound"] and row["writable"])
+
+    def test_reference_write_guards(self):
+        for kind in ("node", "spline"):
+            state=self.state(kind)
+            with patch.object(api,"forest_effects",return_value=state),patch.object(api.rc,"_send",return_value="PARAMETERS_WRITTEN") as send:
+                api.forest_effect_parameters("forest",action="set",values={"Source":{"name":"Box","handle":123}},expected_effects=TOKEN)
+            script=send.call_args.args[0]
+            for text in ("STALE_NODE_REFERENCE", "NODE_NOT_UNIQUE", "DEPENDENCY_CYCLE", "copy base", "theHold.Cancel()"):
+                self.assertIn(text,script)
+            self.assertIn("refs.dependencyLoopTest next_reference_1 obj",script)
+            self.assertIn("refs.dependencyLoopTest next_reference_1 base",script)
+            self.assertIn("NOT_SPLINE",script) if kind == "spline" else self.assertNotIn("NOT_SPLINE",script)
+
+    def test_reference_literal_validation(self):
+        self.assertEqual(api.reference_literal(None),"undefined")
+        for value in (True, 1, "", {"name":"Box"}, {"name":"Box","handle":True}, {"name":"Box","handle":-1}, {"name":"Box","handle":123,"extra":1}):
+            with self.subTest(value=value),self.assertRaises(ValueError):api.reference_literal(value)
+
+    def test_reference_schema_and_storage_mismatch(self):
+        state=self.state();state["effects"][0]["xml"]=state["effects"][0]["xml"].replace('type="node"','type="spline"')
+        with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
+        state=self.state();state["arrays"]["efpainode"]["values"]=["not a node"]
+        with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
+
+
 if __name__ == "__main__":
     unittest.main()

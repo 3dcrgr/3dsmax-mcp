@@ -207,3 +207,23 @@ The first scratch launch measured 37.407 s; the later vendor-preset launch
 measured 89.968 s, still with Arnold absent. File-open stacks account for about
 47.06 sampled seconds in that slower run; MassFX accounts for about 2 seconds.
 This variability is logged separately and is not attributed to the new tools.
+
+## Forest Effects object and spline bindings — 2026-10-13
+
+`forest_effect_parameters` now reads and edits existing object (`node`, native
+type 1, `efpainode`) and spline (`spline`, native type 5, `efpaspline`) bindings.
+Both mappings were measured against actual generated item positions through the
+API, with the Forest deselected. Values are canonical `{name, handle}` identities
+or null. Writes accept an exact unique name, a guarded identity, or null to clear.
+The handle is Max's animation handle, resolved through `getAnimByHandle`.
+
+XML/native type, ID and name must agree. Missing, ambiguous or stale sources,
+non-shape spline sources and dependency cycles are refused before adoption.
+All writes stage a copied base under the existing fresh-token, shared-base,
+custom-mode and busy-state guards, then adopt it in one undo hold. No UI or
+automatic build is needed. Use `forest_items(refresh_surfaces=true)` to verify
+actual output; storage readback alone does not certify compilation.
+
+Reference imports/exports remain refused pending explicit portable binding
+semantics. Controller, texture and curve parameter writes remain unsupported.
+This extends an existing command; the MCP tool count stays 208.

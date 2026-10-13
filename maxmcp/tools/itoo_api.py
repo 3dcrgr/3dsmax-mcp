@@ -307,6 +307,42 @@ def numeric_definitions(document: ET.Element) -> list[dict[str, Any]]:
     return rows
 
 
+REFERENCE_KINDS = {1: ("node", "efpainode"), 5: ("spline", "efpaspline")}
+
+
+def reference_literal(value: Any) -> str:
+    """Resolve an exact unique name or a guarded scene node identity."""
+    if value is None:
+        return "undefined"
+    handle = 0
+    if isinstance(value, dict):
+        if set(value) != {"name", "handle"}:
+            raise ValueError("reference identity requires name and handle only")
+        handle = value["handle"]
+        if isinstance(handle, bool) or not isinstance(handle, int) or not 0 < handle < 2**63:
+            raise ValueError("reference handle must be a positive integer")
+        value = value["name"]
+    if not isinstance(value, str) or not value or len(value) > 1024 or "\x00" in value:
+        raise ValueError("reference requires an exact node name, name/handle identity, or null")
+    return f'(iaEffectNode "{rc._b64(value)}" {handle})'
+
+
+_REFERENCE_LIB = '''
+fn iaEffectNode text handle = (
+    local wanted=rcDecode text
+    if handle!=0 then (
+        local n=getAnimByHandle handle
+        if not isValidNode n or n.name!=wanted do throw "STALE_NODE_REFERENCE: refresh node identity"
+        n
+    ) else (
+        local nodes=getNodeByName wanted exact:true all:true
+        if nodes==undefined or nodes.count!=1 do throw "NODE_NOT_UNIQUE: use a name/handle identity"
+        nodes[1]
+    )
+)
+'''
+
+
 def parameter_rows(state: dict[str, Any], effect: str = "") -> list[dict[str, Any]]:
     arrays = {p.lower(): a["values"] for p, a in state["arrays"].items()}
     effects = state["effects"]
@@ -346,6 +382,17 @@ def parameter_rows(state: dict[str, Any], effect: str = "") -> list[dict[str, An
             row.update(kind=kind, value=at(prefix+"val", i), min=at(prefix+"min", i),
                        max=at(prefix+"max", i), default=at(prefix+"def", i), limited=at("efpalimit", i),
                        writable=True)
+        elif row["native_type"] in REFERENCE_KINDS:
+            kind, prop = REFERENCE_KINDS[row["native_type"]]
+            definition = next((p for p in parse_effect_xml(by_id[owner]["xml"]).findall("parameter")
+                               if p.get("id", "").lower() == str(ident).lower()), None)
+            if definition is None or definition.get("name") != row["name"] or definition.get("type") != kind:
+                raise RailCloneError("PARAMETER_SCHEMA_MISMATCH", "XML and native reference definition differ")
+            value = at(prop, i)
+            if value is not None and (not isinstance(value, dict) or not isinstance(value.get("handle"), int)
+                                      or not isinstance(value.get("name"), str)):
+                raise RailCloneError("INVALID_REFERENCE", "native reference is not a scene node")
+            row.update(kind=kind, value=value, bound=value is not None, writable=True)
         rows.append(row)
     return rows
 
@@ -384,13 +431,15 @@ if next_{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"
 @mcp.tool()
 def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect",
                              values: dict[str, Any] | None = None, expected_effects: str = "") -> dict[str, Any]:
-    """Inspect Forest effect parameters or set existing numeric values in one staged undo step.
+    """Inspect Forest effect parameters or set existing numeric/reference values in one staged undo step.
 
     Select by exact parameter ID or unique name, optionally scoped to an effect ID.
     set requires effects_token from inspection. Integer, real, percentage and
     scene-unit values are supported; enabled native limits are enforced. Percentage
-    values use the effect's declared range, not an assumed 0..100 cap. Reference,
-    controller, texture and curve writes are refused. XML/native schema must agree.
+    values use the effect's declared range, not an assumed 0..100 cap. Object and
+    spline bindings accept exact unique node names, {name, handle} identities, or
+    null to clear. Spline bindings require shapes; cycles and stale identities are
+    refused. Controller, texture and curve writes are refused. XML/native schema must agree.
     Does not build or compile-check; verify using forest_items(refresh_surfaces=true).
     """
     if action not in ("inspect", "set"):
@@ -416,14 +465,24 @@ def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect
                 raise ValueError("duplicate parameter target")
             touched.add(row["index"])
             if not row["writable"]:
-                raise ValueError("PARAMETER_TYPE_UNSUPPORTED: reference writes are not yet supported")
+                raise ValueError("PARAMETER_TYPE_UNSUPPORTED: this parameter type is not supported")
+            if row["native_type"] in REFERENCE_KINDS:
+                kind, prop = REFERENCE_KINDS[row["native_type"]]
+                literal = reference_literal(value)
+                var = f'next_reference_{row["index"]}'
+                writes.append(f'local {var}={literal}')
+                writes.append(f'if {var}!=undefined and ({var}==obj or (refs.dependencyLoopTest {var} obj) or (refs.dependencyLoopTest {var} base)) do throw "DEPENDENCY_CYCLE: source depends on the target"')
+                if kind == "spline":
+                    writes.append(f'if {var}!=undefined and superClassOf {var}.baseObject!=Shape do throw "NOT_SPLINE: reference requires a shape"')
+                writes.append(f'staged.{prop}[{row["index"]}]={var}')
+                continue
             _, prefix, typ = NUMERIC_KINDS[row["kind"]]
             literal = _literal(value, typ)
             if row["limited"] and not row["min"] <= value <= row["max"]:
                 raise ValueError("parameter value is outside native limits")
             writes.append(f'staged.{prefix}val[{row["index"]}]={literal}')
         from ..helpers import forest as fh
-        body = fh.MXS_LIB + _EFFECT_LIB + f'\nlocal obj=fpForest "{rc._b64(name)}"\nlocal base=obj.baseObject\n'
+        body = fh.MXS_LIB + _EFFECT_LIB + _REFERENCE_LIB + f'\nlocal obj=fpForest "{rc._b64(name)}"\nlocal base=obj.baseObject\n'
         body += f'''if fpBusy() do throw "USER_BUSY: an undo operation is active"
 if (rcShared obj).count>0 do throw "SHARED_BASE: make the Forest base unique first"
 if base.mode!=0 do throw "CUSTOM_EDIT_UNSUPPORTED: requires procedural mode"
