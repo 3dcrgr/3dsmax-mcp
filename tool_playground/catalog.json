@@ -2264,7 +2264,7 @@
     },
     {
       "name": "replace_material",
-      "description": "Replace one material with another across all objects that use it.",
+      "description": "Assign source_material to every object whose material is target_material.",
       "category": "Materials",
       "group": "Materials",
       "module": "material_replace",

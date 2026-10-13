@@ -18,7 +18,11 @@ def replace_material(
     target_material: str,
     preview: bool = False,
 ) -> str:
-    """Replace one material with another across all objects that use it."""
+    """Assign source_material to every object whose material is target_material.
+
+    Materials are matched by name on the object's own material; sub-materials
+    are not matched. status "no_objects" means nothing was replaced.
+    """
     if client.native_available:
         payload = _json.dumps({"source_material": source_material, "target_material": target_material, "preview": preview})
         response = client.send_command(payload, cmd_type="native:replace_material")
@@ -81,12 +85,15 @@ def replace_material(
                     names += "\\"" + replaced[i] + "\\""
                 )
                 names += "]"
+                local status = if replaced.count > 0 then "\\"status\\":\\"success\\"" else (
+                    "\\"status\\":\\"no_objects\\",\\"warnings\\":[\\"No object uses '{safe_tgt}' " + \
+                    "as its material, so nothing was replaced. Sub-materials are not matched.\\"]")
                 "{{" + \
                     "\\"source_material\\":\\"" + "{safe_src}" + "\\"," + \
                     "\\"target_material\\":\\"" + "{safe_tgt}" + "\\"," + \
                     "\\"replaced_count\\":" + (replaced.count as string) + "," + \
                     "\\"replaced_objects\\":" + names + "," + \
-                    "\\"status\\":\\"success\\"" + \
+                    status + \
                 "}}"
             )
         )"""
@@ -101,7 +108,10 @@ def batch_replace_materials(
     preview: bool = False,
     dry_run: bool = False,
 ) -> str:
-    """Replace multiple materials in a single operation."""
+    """Replace multiple materials in a single operation.
+
+    Each entry assigns `source` to every object whose material is `target`.
+    """
     preview = preview or dry_run
     if client.native_available:
         payload = _json.dumps({"replacements": list(replacements), "preview": preview, "dry_run": dry_run})

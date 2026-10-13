@@ -660,7 +660,13 @@ std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridge
         result["target_material"] = targetName;
         result["replaced_count"] = (int)affectedNodes.size();
         result["replaced_objects"] = affectedList;
-        result["status"] = "replaced";
+        if (affectedNodes.empty()) {
+            result["status"] = "no_objects";
+            result["warnings"] = json::array({"No object uses '" + targetName +
+                "' as its material, so nothing was replaced. Sub-materials are not matched."});
+        } else {
+            result["status"] = "replaced";
+        }
         return result.dump();
     });
 }
