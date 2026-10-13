@@ -273,8 +273,8 @@ PARAM_DEFAULTS = {
 }
 
 
-def numeric_definitions(document: ET.Element) -> list[dict[str, Any]]:
-    """Validate the measured numeric subset of the native .eff schema."""
+def parameter_definitions(document: ET.Element, allow_references: bool = False) -> list[dict[str, Any]]:
+    """Validate measured numeric and optionally node/spline .eff definitions."""
     definitions = document.findall(".//parameter")
     if definitions != document.findall("parameter"):
         raise ValueError("EFFECT_FORMAT_UNSUPPORTED: parameters must be direct effect children")
@@ -283,14 +283,19 @@ def numeric_definitions(document: ET.Element) -> list[dict[str, Any]]:
     rows, names, ids = [], set(), set()
     for definition in definitions:
         kind, name = definition.get("numtype"), definition.get("name", "")
-        if definition.get("type") != "numerical" or kind not in NUMERIC_KINDS:
-            raise ValueError("PARAMETER_TYPE_UNSUPPORTED: only numeric parameters are supported")
+        reference = definition.get("type") in ("node", "spline")
+        if not ((reference and allow_references) or (definition.get("type") == "numerical" and kind in NUMERIC_KINDS)):
+            raise ValueError("PARAMETER_TYPE_UNSUPPORTED: only measured numeric/node/spline parameters are supported")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) or name.lower() in names:
             raise ValueError("parameter names must be unique identifiers")
         ident = "{" + str(uuid.UUID(definition.get("id", ""))) + "}"
         if ident in ids:
             raise ValueError("parameter IDs must be unique")
         names.add(name.lower()); ids.add(ident)
+        if reference:
+            rows.append({"id": ident, "name": name, "kind": definition.get("type"),
+                         "description": definition.get("description", "")})
+            continue
         values = {}
         for field in ("min", "max", "default"):
             value = float(definition.get(field, "0"))
@@ -305,6 +310,37 @@ def numeric_definitions(document: ET.Element) -> list[dict[str, Any]]:
         rows.append({"id": ident, "name": name, "kind": kind, "limited": limited == "1",
                      "description": definition.get("description", ""), **values})
     return rows
+
+
+def numeric_definitions(document: ET.Element) -> list[dict[str, Any]]:
+    return parameter_definitions(document)
+
+
+def bind_definitions(rows: list[dict[str, Any]], bindings: dict[str, Any] | None) -> None:
+    """Require an explicit binding, including explicit null, for every reference."""
+    refs = [r for r in rows if r["kind"] in ("node", "spline")]
+    if bindings is None:
+        bindings = {}
+    if not isinstance(bindings, dict):
+        raise ValueError("bindings must map exact parameter IDs or names to node references")
+    touched = set()
+    for key, value in bindings.items():
+        if not isinstance(key, str):
+            raise ValueError("binding keys must be parameter IDs or names")
+        try:
+            ident = "{" + str(uuid.UUID(key)) + "}"
+        except ValueError:
+            ident = key
+        matches = [r for r in refs if r["id"] == ident] or [r for r in refs if r["name"] == key]
+        if len(matches) != 1:
+            raise ValueError("binding must identify exactly one reference parameter ID or name")
+        row = matches[0]
+        if row["id"] in touched:
+            raise ValueError("duplicate reference binding")
+        touched.add(row["id"])
+        row["binding_literal"] = reference_literal(value)
+    if len(touched) != len(refs):
+        raise ValueError("REFERENCE_BINDINGS_REQUIRED: explicitly bind every node/spline parameter, or use null")
 
 
 REFERENCE_KINDS = {1: ("node", "efpainode"), 5: ("spline", "efpaspline")}
@@ -401,6 +437,13 @@ def append_numeric_parameters(rows: list[dict[str, Any]], owner: str) -> str:
     if not rows:
         return ""
     script = 'local pc=staged.efpaid.count\n'
+    for i, row in enumerate(rows):
+        if row["kind"] in ("node", "spline"):
+            var = f'import_reference_{i}'
+            script += f'local {var}={row["binding_literal"]}\n'
+            script += f'if {var}!=undefined and ({var}==obj or (refs.dependencyLoopTest {var} obj) or (refs.dependencyLoopTest {var} base)) do throw "DEPENDENCY_CYCLE: source depends on target"\n'
+            if row["kind"] == "spline":
+                script += f'if {var}!=undefined and superClassOf {var}.baseObject!=Shape do throw "NOT_SPLINE: binding requires a shape"\n'
     for prop in ("efpaeffid", "efpatype", "efpaname"):
         script += f'if staged.{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"\n'
     for prop, default in PARAM_DEFAULTS.items():
@@ -408,17 +451,22 @@ def append_numeric_parameters(rows: list[dict[str, Any]], owner: str) -> str:
 if next_{prop}.count==0 do next_{prop}=for j=1 to pc collect {default}
 if next_{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"
 '''
-        for row in rows:
-            subtype, prefix, typ = NUMERIC_KINDS[row["kind"]]
+        for i, row in enumerate(rows):
+            reference = row["kind"] in ("node", "spline")
+            subtype, prefix, typ = (0, "", "") if reference else NUMERIC_KINDS[row["kind"]]
             string_fields = {"efpaid": row["id"], "efpaeffid": owner,
                              "efpaname": row["name"], "efpadesc": row["description"]}
             if prop in string_fields:
                 value = f'(rcDecode "{rc._b64(string_fields[prop])}")'
+            elif reference and prop == "efpatype":
+                value = "1" if row["kind"] == "node" else "5"
+            elif reference and prop == ("efpainode" if row["kind"] == "node" else "efpaspline"):
+                value = f'import_reference_{i}'
             elif prop == "efpanumtype":
                 value = str(subtype)
             elif prop == "efpalimit":
-                value = rc._mxs_bool(row["limited"])
-            elif prop.startswith(prefix) and prop[len(prefix):] in ("val", "min", "max", "def"):
+                value = rc._mxs_bool(row.get("limited", False))
+            elif not reference and prop.startswith(prefix) and prop[len(prefix):] in ("val", "min", "max", "def"):
                 suffix = prop[len(prefix):]
                 value = _literal(row[{"val": "default", "def": "default"}.get(suffix, suffix)], typ)
             else:
@@ -509,7 +557,9 @@ catch (if owns do theHold.Cancel(); throw())
 def forest_effects(name: str, action: str = "list", effect: str = "", code: str = "",
                    effect_name: str = "", enabled: bool = True, expected_effects: str = "",
                    confirm_delete: bool = False, position: int = 0,
-                   path: str = "", expected_file_hash: str = "") -> dict[str, Any]:
+                   path: str = "", expected_file_hash: str = "",
+                   bindings: dict[str, Any] | None = None,
+                   export_reference_definitions: bool = False) -> dict[str, Any]:
     """Read, add, replace code, toggle or remove Forest Pack effects with guarded staged undo.
 
     action: list, get, add, load, export, move, set_code, toggle, remove. Read returns full effect XML,
@@ -526,9 +576,15 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     can return the cached distribution). Mutations return refresh_required=true.
 
     move uses a 1-based destination position and reorders all six effect rows,
-    preserving parameter associations by ID. load appends a parameter-free .eff
+    preserving parameter associations by ID. load appends a .eff
     definition, preserving metadata; expected_file_hash must match a library read.
-    Numeric parameters are initialized with fresh IDs; reference/curve/controller files are refused.
+    Numeric parameters and node/spline references are initialized with fresh IDs.
+    load requires bindings for every reference by exact parameter ID or name;
+    values accept exact unique names, {name, handle} identities or explicit null.
+    export of references requires export_reference_definitions=true: the file
+    contains definitions only, not scene bindings. required_bindings lists the
+    parameters that must be bound explicitly on the next load. Controller,
+    texture and curve files are refused. No source nodes are created or serialized.
     export writes an effect with current numeric values as defaults to a new absolute .eff path; existing
     files are never overwritten. Export does not edit Max and is not undoable.
     """
@@ -540,6 +596,12 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
         raise ValueError("move requires a positive 1-based position; other actions use position=0")
     if type(enabled) is not bool or type(confirm_delete) is not bool:
         raise ValueError("flags must be boolean")
+    if type(export_reference_definitions) is not bool:
+        raise ValueError("export_reference_definitions must be boolean")
+    if bindings is not None and action != "load":
+        raise ValueError("bindings are accepted only for load")
+    if export_reference_definitions and action != "export":
+        raise ValueError("export_reference_definitions is accepted only for export")
     if action not in ("list", "add", "load") and (not isinstance(effect, str) or not effect or "\x00" in effect):
         raise ValueError("effect must be an exact ID or unique name")
     if action == "remove" and not confirm_delete:
@@ -558,12 +620,15 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
                 raise ValueError("STALE_EFFECT_FILE: file changed; read the library again")
             if not info["parameter_free"]:
                 document = parse_effect_xml(info["xml"])
-                imported_parameters = numeric_definitions(document)
+                imported_parameters = parameter_definitions(document, allow_references=True)
+                bind_definitions(imported_parameters, bindings)
                 # Repeated imports must not share parameter identities.
                 for definition, row in zip(document.findall("parameter"), imported_parameters):
                     row["id"] = "{" + str(uuid.uuid4()) + "}"
                     definition.set("id", row["id"])
                 info["xml"] = ET.tostring(document, encoding="unicode")
+            else:
+                bind_definitions([], bindings)
             effect_name = effect_name or info["title"] or info["name"]
             effect_xml(info["code"], effect_name)
             imported_text, file_hash = info["xml"], info["sha256"]
@@ -571,7 +636,7 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
             raise ValueError("export parent directory must exist")
         elif Path(path).exists():
             raise ValueError("EFFECT_FILE_EXISTS: export never overwrites existing files")
-    body = fh.MXS_LIB + _EFFECT_LIB + f'\nlocal obj=fpForest "{rc._b64(name)}"\nlocal base=obj.baseObject\n'
+    body = fh.MXS_LIB + _EFFECT_LIB + _REFERENCE_LIB + f'\nlocal obj=fpForest "{rc._b64(name)}"\nlocal base=obj.baseObject\n'
     if action not in ("list", "get", "export"):
         if not isinstance(expected_effects, str) or rc.TOKEN.fullmatch(expected_effects) is None:
             raise ValueError("mutation requires effects_token as expected_effects")
@@ -702,7 +767,7 @@ base=obj.baseObject
         chosen = result["effect"]
         document = parse_effect_xml(chosen["xml"])
         if document.findall(".//parameter") or chosen["id"] in arrays.get("efpaeffid", []):
-            numeric_definitions(document)
+            parameter_definitions(document, allow_references=True)
             parameters = parameter_rows(result, chosen["id"])
             definitions = document.findall("parameter")
             if len(parameters) != len(definitions):
@@ -710,8 +775,13 @@ base=obj.baseObject
             for definition in definitions:
                 matches = [p for p in parameters if str(p["id"]).lower() == definition.get("id", "").lower()]
                 if len(matches) != 1 or not matches[0]["writable"]:
-                    raise ValueError("PARAMETER_TYPE_UNSUPPORTED: only numeric exports are supported")
+                    raise ValueError("PARAMETER_TYPE_UNSUPPORTED: parameter cannot be exported")
                 row = matches[0]
+                if row["kind"] in ("node", "spline"):
+                    if not export_reference_definitions:
+                        raise ValueError("REFERENCE_EXPORT_CONFIRMATION_REQUIRED: definitions omit scene bindings; set export_reference_definitions=true")
+                    result.setdefault("required_bindings", []).append({"id": row["id"], "name": row["name"], "kind": row["kind"]})
+                    continue
                 definition.set("default", str(row["value"]))
                 definition.set("min", str(row["min"])); definition.set("max", str(row["max"]))
                 definition.set("limits", "1" if row["limited"] else "0")
@@ -721,6 +791,8 @@ base=obj.baseObject
         with Path(path).open("xb") as output:
             output.write(payload)
         result.update(exported_path=path, exported_sha256=hashlib.sha256(payload).hexdigest())
+        if result.get("required_bindings"):
+            result["scene_bindings_exported"] = False
     return result
 
 

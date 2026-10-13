@@ -438,6 +438,73 @@ class ReferenceParameterTests(unittest.TestCase):
     def test_reference_schema_and_storage_mismatch(self):
         state=self.state();state["effects"][0]["xml"]=state["effects"][0]["xml"].replace('type="node"','type="spline"')
         with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
+
+    def test_reference_definitions_require_complete_explicit_bindings(self):
+        rows=api.parameter_definitions(api.parse_effect_xml(self.state()["effects"][0]["xml"]),allow_references=True)
+        for bindings in (None, {}, {"wrong":"Box"}, {"Source":"Box", rows[0]["id"]:None}):
+            with self.subTest(bindings=bindings),self.assertRaises(ValueError):api.bind_definitions(rows,bindings)
+        api.bind_definitions(rows,{"Source":None})
+        self.assertEqual(rows[0]["binding_literal"],"undefined")
+        api.bind_definitions(rows,{rows[0]["id"]:{"name":"Box","handle":123}})
+        api.bind_definitions(rows,{rows[0]["id"].strip('{}').upper():{"name":"Box","handle":123}})
+        script=api.append_numeric_parameters(rows,"owner")
+        self.assertIn("append next_efpatype 1",script)
+        self.assertIn("append next_efpainode import_reference_0",script)
+        self.assertIn("refs.dependencyLoopTest import_reference_0 obj",script)
+
+    def test_spline_import_guards_and_all_parallel_arrays(self):
+        rows=api.parameter_definitions(api.parse_effect_xml(self.state('spline')["effects"][0]["xml"]),allow_references=True)
+        api.bind_definitions(rows,{"Source":"Shape"})
+        script=api.append_numeric_parameters(rows,"owner")
+        self.assertIn("append next_efpatype 5",script)
+        self.assertIn("append next_efpaspline import_reference_0",script)
+        self.assertIn("NOT_SPLINE",script)
+        for p in api.PARAM_DEFAULTS:self.assertIn(f'staged.{p}=next_{p}',script)
+
+    def test_binding_arguments_restricted_to_load_and_export(self):
+        for args in ({"bindings":{}},{"export_reference_definitions":True},{"export_reference_definitions":1}):
+            with patch.object(api.rc,"_send") as send,self.assertRaises(ValueError):api.forest_effects("forest",**args)
+            send.assert_not_called()
+
+    def test_reference_import_initializes_before_xml(self):
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/"fixture.eff";p.write_text(self.state('spline')["effects"][0]["xml"].replace('<effect>','<effect><expression>fpItem.position.z = 1;</expression>'),encoding='utf-8')
+            file_hash=api.read_effect_file(p)['sha256']
+            with patch.object(api.rc,'_send',return_value=f'ITOOEFFECTS\nT|{TOKEN}\nEND\n') as send:
+                result=api.forest_effects('forest',action='load',path=str(p),expected_file_hash=file_hash,expected_effects=TOKEN,bindings={'Source':'Shape'})
+            script=send.call_args.args[0]
+            self.assertLess(script.index('staged.efpaspline=next_efpaspline'),script.index('staged.efxmllist=xmls'))
+            self.assertEqual(result['initialized_parameters'],1)
+            with patch.object(api.rc,'_send') as send,self.assertRaisesRegex(ValueError,'REFERENCE_BINDINGS_REQUIRED'):
+                api.forest_effects('forest',action='load',path=str(p),expected_file_hash=file_hash,expected_effects=TOKEN)
+            send.assert_not_called()
+
+    def test_reference_export_definitions_opt_in(self):
+        state=self.state();arrays={k:v['values'] for k,v in state['arrays'].items()}
+        arrays.update(efidlist=['owner'],efnamelist=['Fixture'],efxmllist=[state['effects'][0]['xml']],efenablelist=[True])
+        def encode(v):
+            if isinstance(v,dict):return f"n{v['handle']}:{api.rc._b64(v['name'])}"
+            if isinstance(v,bool):return 'b1' if v else 'b0'
+            if isinstance(v,int):return f'i{v}'
+            return 's'+api.rc._b64(v)
+        raw=f'ITOOEFFECTS\nT|{TOKEN}\n'
+        for k,values in arrays.items():
+            raw+=f'A|{k}|{len(values)}\n'
+            for i,v in enumerate(values,1):raw+=f'V|{k}|{i}|{encode(v)}\n'
+        raw+='END\n'
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/'reference.eff'
+            with patch.object(api.rc,'_send',return_value=raw),self.assertRaisesRegex(ValueError,'REFERENCE_EXPORT_CONFIRMATION_REQUIRED'):
+                api.forest_effects('forest',action='export',effect='owner',path=str(path))
+            self.assertFalse(path.exists())
+            with patch.object(api.rc,'_send',return_value=raw):
+                result=api.forest_effects('forest',action='export',effect='owner',path=str(path),export_reference_definitions=True)
+            self.assertEqual(result['required_bindings'][0]['name'],'Source')
+            self.assertFalse(result['scene_bindings_exported'])
+            self.assertNotIn('Box',path.read_text())
+            with patch.object(api.rc,'_send') as send,self.assertRaisesRegex(ValueError,'EFFECT_FILE_EXISTS'):
+                api.forest_effects('forest',action='export',effect='owner',path=str(path),export_reference_definitions=True)
+            send.assert_not_called()
         state=self.state();state["arrays"]["efpainode"]["values"]=["not a node"]
         with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
 
