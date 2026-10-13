@@ -61,6 +61,33 @@ class DialogBlocked(Exception):
         super().__init__(message)
 
 
+class TargetUnavailable(ConnectionError):
+    """The bound Max's pipe is gone, e.g. after a crash or restart.
+
+    Calls never move to another Max on their own; retrying cannot succeed
+    until the target is selected again or released.
+    """
+
+    code = "TARGET_UNAVAILABLE"
+    retryable = False
+
+    def __init__(self, target: dict[str, Any], reason: str) -> None:
+        message = (f"Selected 3ds Max target {target['target_pipe']} is unavailable. "
+                   f"Select another instance or release it explicitly. {reason}")
+        self.bridge_message = json.dumps({
+            "type": "TargetUnavailable", "code": self.code, "retryable": False, "message": message,
+            "hint": {
+                "message": ("The 3ds Max this server was bound to is gone (exited or restarted). Do not retry. Check "
+                            "list_max_instances, then select_max_instance(pid) or release_max_instance "
+                            "to use the default Max. Re-inspect the scene: handles from the old session "
+                            "are invalid."),
+                "suggested_tools": ["list_max_instances", "select_max_instance", "release_max_instance"],
+            },
+            "details": {"target_pid": target.get("target_pid"), "target_source": target.get("target_source")},
+        })
+        super().__init__(message)
+
+
 # Win32 constants for named pipe
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _GENERIC_READ = 0x80000000
@@ -523,6 +550,8 @@ class MaxClient:
                 if self._bound_target or self._startup_pipe or self._pinned_pipe_name:
                     target = self._bound_target or self._target(self._startup_pipe or self._pinned_pipe_name, self._startup_source)
                     self._local.last_error = {**target, "transport": "namedpipe", "error": str(exc)}
+                    if not self._probe_pipe_available(target["target_pipe"]):
+                        raise TargetUnavailable(target, str(exc)) from exc
                     raise ConnectionError(f"Selected 3ds Max target {target['target_pipe']} is unavailable. Select another instance or release it explicitly. {exc}") from exc
                 fallback_error = str(exc)
                 transport_used = "tcp"
