@@ -171,7 +171,7 @@ The timing helper now recognizes zero-padded PIDs in Max.log; PID 4260 was
 logged as 04260 and its otherwise healthy run exhausted the old recorder timeout.
 The observer waits for actual PID disappearance and drains completed exits when
 stopped, rather than reporting a pre-exit process snapshot as a lingering process.
-Offline observer checks pass. The integrated wt-review suite passes 1,064 tests.
+Offline observer checks pass. The integrated wt-review suite before numeric parameter support passed 1,064 tests; the numeric parameter integration passes 1,071.
 Fresh installed MCP clients see the new effect actions; existing server processes
 need their MCP connection restarted to reload the deployed module.
 
