@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import shutil
 import subprocess
@@ -62,7 +63,24 @@ def stage_runtime(base: Path, wheel: Path, dest: Path) -> None:
         zf.extractall(dest / site)
 
 
+def validate_wheel_bridges(wheel: Path) -> None:
+    """A cached wheel must carry this checkout's reviewed bridges, including its manifest."""
+    source = ROOT / "native" / "bin"
+    manifest = json.loads((source / "bridge_manifest.json").read_text(encoding="utf-8"))
+    with zipfile.ZipFile(wheel) as zf:
+        for path in [source / "bridge_manifest.json", *sorted(source.glob("*.gup"))]:
+            name = f"maxmcp/native/bin/{path.name}"
+            if zf.read(name) != path.read_bytes():
+                raise ValueError(f"Stale wheel bridge payload: {name}; rebuild the wheel instead of --skip-build")
+        for year, entry in manifest.items():
+            if hashlib.sha256((source / f"mcp_bridge_{year}.gup").read_bytes()).hexdigest() != entry["sha256"]:
+                raise ValueError(f"Source bridge {year} differs from reviewed manifest")
+
+
 def stage(base: Path, wheel: Path, stage_dir: Path) -> None:
+    validate_wheel_bridges(wheel) # fail before deleting/copying a staged release
+    if stage_dir.resolve().name != "stage" or not stage_dir.resolve().is_relative_to(ROOT.resolve()):
+        raise ValueError("Release staging must be a stage directory inside the repository")
     if stage_dir.exists():
         shutil.rmtree(stage_dir)
     app = stage_dir / "app"
@@ -85,6 +103,11 @@ def stage(base: Path, wheel: Path, stage_dir: Path) -> None:
 
 
 def check_runtime(stage_dir: Path, v: str) -> None:
+    for src in (ROOT / "native" / "bin").glob("*.gup"):
+        for target in (stage_dir / "app" / "runtime" / "Lib" / "site-packages" / "maxmcp" / "native" / "bin" / src.name,
+                       stage_dir / "bundle" / "Contents" / "bin" / src.name):
+            if target.read_bytes() != src.read_bytes():
+                raise ValueError(f"Staged bridge differs from reviewed source: {target}")
     python = stage_dir / "app" / "runtime" / "python.exe"
     out = subprocess.run([str(python), "-c",
                           "import importlib.metadata as m, maxmcp.server, maxmcp.opencode_config, tomlkit;"
@@ -96,7 +119,10 @@ def check_runtime(stage_dir: Path, v: str) -> None:
 
 
 def compile_setup(iscc: Path, stage_dir: Path, v: str) -> Path:
+    entry = json.loads((ROOT / "native" / "bin" / "bridge_manifest.json").read_text(encoding="utf-8"))["2027"]
     subprocess.run([str(iscc), f"/DAppVersion={display_version(v)}", f"/DStageDir={stage_dir}",
+                    f"/DBridge2027SHA256={entry['sha256']}",
+                    f"/DBridge2027Superseded={';'.join(entry.get('superseded_sha256', []))}",
                     str(HERE / "3dsmax-mcp.iss")], cwd=HERE, check=True)
     exe = HERE / "output" / f"3dsmax-mcp-{display_version(v)}-Setup.exe"
     digest = hashlib.sha256(exe.read_bytes()).hexdigest()

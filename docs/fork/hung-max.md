@@ -8,6 +8,14 @@ Fork issues #4 and #6, and the executor shutdown fix. Commits `adcfd93`, `a9d2a0
 
 ## What happened
 
+### Bridge packaging and shutdown classification (#32–#34, 2026-10-13)
+
+`native/bin/bridge_manifest.json` records the reviewed 2027 payload and the known superseded build. Wheel/Setup staging verifies native payloads against the checkout and that manifest; a cached stale wheel fails before staging changes. Both the Python installer and Setup refuse to replace an unrecognized installed 2027 bridge, which may be newer, while allowing the matching reviewed payload or known retired build. Review/update the manifest when shipping a different native build. Previously built/upstream installers cannot gain this protection retroactively; replace stale distributed artifacts with a newly reviewed build.
+
+Hang diagnosis reports a symbol-resolved bridge thread join beneath GUP as `mcp_shutdown_join`. Without join symbols, a bridge wait beneath GUP is `mcp_teardown_wait`, explicitly only consistent with teardown. An MCP module alone no longer claims an active request. No additional native capture or Max restart is required to reclassify a saved capture.
+
+The shared `livetests-2027/scratch_max.py` uses UTF-8 stdout/stderr, keeps PID mismatch exit 2, and returns exit 1 for native error markers or structured `ok:false`, `success:false`, `isError:true`, error payloads and failed/error statuses. Offline fake-client checks exercise these routes without touching Max.
+
 ### Stale instance registry records (#31)
 
 Instance discovery opportunistically removes unchanged `instances/pid-N.json` registrations only when the PID is certainly exited, its pipe is unavailable, and the filename, recorded PID, instance ID and native pipe agree. It rechecks file identity, pipe availability and process state before unlinking. Records with live/unknown owners, answering/busy/access-denied pipes, custom identities or concurrent refreshes are retained. Cleanup failures do not break routing, and `active_instance.json` is untouched. The native GUP already unregisters its own record on clean exit; this handles leftovers after crashes/interrupted teardown.

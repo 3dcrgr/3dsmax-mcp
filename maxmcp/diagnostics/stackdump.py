@@ -99,6 +99,14 @@ _MESSAGE_WAIT_RE = re.compile(
 # Regexes match module names case-insensitively, from the start. Message fields: tid, state,
 # module, top_modules, partner_tid, partner_module, window, count, tids, windows_note.
 RULES: tuple[dict[str, Any], ...] = (
+    {"kind": "mcp_shutdown_join", "thread": "main", "cause": True, "state": "kernel_wait",
+     "any_module": r"mcp_bridge", "below": r"gup$", "any_symbol": r"Thrd_join|thread::join|_Thrd_join",
+     "message": "The main thread is waiting for a bridge-owned thread join during GUP shutdown. "
+                "This is plugin teardown; native symbols are needed to identify the joined worker"},
+    {"kind": "mcp_teardown_wait", "thread": "main", "cause": True, "state": "kernel_wait",
+     "any_module": r"mcp_bridge", "below": r"gup$", "unless_kind": "mcp_shutdown_join",
+     "message": "The main thread waits in the MCP bridge with a GUP caller, consistent with plugin teardown. "
+                "Without resolved shutdown/join symbols this does not prove the lifecycle phase or joined worker"},
     {"kind": "medit_vray_render", "thread": "main", "cause": True,
      "first_module": r"vray|vrender", "below": r"mtl$",
      "message": "Material Editor sample-slot render (V-Ray) is blocking the main thread"},
@@ -113,7 +121,8 @@ RULES: tuple[dict[str, Any], ...] = (
     {"kind": "cosmos_importer", "thread": "any", "any_module": r"galaxyimporter",
      "message": "Chaos Cosmos importer ({module}) is on the stack of {count} thread(s): {tids}{windows_note}"},
     {"kind": "mcp_bridge_call", "thread": "main", "any_module": r"mcp_bridge",
-     "message": "The main thread is running an MCP bridge request: the stuck call came through the bridge"},
+     "unless_kind": ["mcp_shutdown_join", "mcp_teardown_wait"],
+     "message": "The MCP bridge is on the main-thread stack; module presence alone does not establish an active request"},
 )
 # Default (small) dumps also keep threads that an "any" rule looks for.
 _WATCHED_MODULES = tuple(r["any_module"] for r in RULES if r.get("thread") == "any" and r.get("any_module"))
@@ -342,6 +351,9 @@ def _match_thread(cond: dict[str, Any], thread: dict[str, Any]) -> dict[str, Any
         if hit is None:
             return None
         ctx.setdefault("module", hit)
+    if "any_symbol" in cond and not any(re.search(cond["any_symbol"], f.get("symbol") or "", re.IGNORECASE)
+                                         for f in frames):
+        return None
     if cond.get("owns_hung_window"):
         hung = [w for w in thread.get("windows") or [] if w.get("hung")]
         if not hung:
@@ -376,6 +388,11 @@ def summarize(capture: dict[str, Any], rules: Iterable[dict[str, Any]] = RULES) 
         explained = True
 
     for rule in rules:
+        excluded = rule.get("unless_kind") or []
+        if isinstance(excluded, str):
+            excluded = [excluded]
+        if any(f["kind"] in excluded for f in findings):
+            continue
         if rule.get("fallback") and explained:
             continue
         if rule.get("thread", "main") == "any":

@@ -8,6 +8,12 @@
 #ifndef StageDir
   #define StageDir "stage"
 #endif
+#ifndef Bridge2027SHA256
+  #error "Build with build_release.py: reviewed bridge hash is required"
+#endif
+#ifndef Bridge2027Superseded
+  #define Bridge2027Superseded ""
+#endif
 
 [Setup]
 AppId={{56A47E4C-9E1D-488E-AF71-45A379AC1386}
@@ -89,10 +95,30 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Paths: array[0..1] of String;
+  I: Integer;
+  Digest: String;
 begin
   Result := '';
   if MaxIsRunning() then
+  begin
     Result := '3ds Max is running. Close every 3ds Max window (its bridge is in use), then run Setup again.';
+    Exit;
+  end;
+  Paths[0] := ExpandConstant('{commonappdata}\Autodesk\ApplicationPlugins\3dsmax-mcp\Contents\bin\mcp_bridge_2027.gup');
+  Paths[1] := ExpandConstant('{app}\runtime\Lib\site-packages\maxmcp\native\bin\mcp_bridge_2027.gup');
+  for I := 0 to 1 do
+    if FileExists(Paths[I]) then
+    begin
+      Digest := Lowercase(GetSHA256OfFile(Paths[I]));
+      if (Digest <> '{#Bridge2027SHA256}') and
+         (Pos(';' + Digest + ';', ';{#Bridge2027Superseded};') = 0) then
+      begin
+        Result := 'Installed bridge differs from the reviewed bundled or superseded builds. Refusing to overwrite a potentially newer bridge: ' + Paths[I];
+        Exit;
+      end;
+    end;
 end;
 
 function InitializeUninstall(): Boolean;

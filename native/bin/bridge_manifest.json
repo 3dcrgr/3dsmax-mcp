@@ -1,0 +1,7 @@
+{
+  "2027": {
+    "sha256": "3bd55e31d1088cbccac2ea90e6ca1a42b29d75f7c0e797b709240c94b5a8b6cf",
+    "source_commit": "205d467",
+    "superseded_sha256": ["ca5e16dd43fc81837574b162d7c57c115762c86c47d4ed69381d2088e6c825ff"]
+  }
+}

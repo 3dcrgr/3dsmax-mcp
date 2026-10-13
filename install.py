@@ -12,6 +12,7 @@ import argparse
 import base64
 import csv
 import filecmp
+import hashlib
 import json
 import os
 import re
@@ -304,8 +305,33 @@ def package_contents_xml(app_version: str) -> str:
     raise FileNotFoundError(f"Missing bundle template: {PACKAGE_CONTENTS_TEMPLATE}")
 
 
+def bridge_manifest() -> dict:
+    return json.loads((ROOT / "native" / "bin" / "bridge_manifest.json").read_text(encoding="utf-8"))
+
+
+def validate_bridge_sources() -> None:
+    for year, entry in bridge_manifest().items():
+        src = GUP_SRCS.get(int(year))
+        if not src or not src.is_file():
+            raise ValueError(f"Missing reviewed bridge {year}; refusing an incomplete payload")
+        if hashlib.sha256(src.read_bytes()).hexdigest() != entry["sha256"]:
+            raise ValueError(f"Bridge {year} does not match its reviewed payload manifest; rebuild/review before packaging")
+
+
+def bridge_replacement_conflicts(dest: Path) -> list[str]:
+    conflicts = []
+    for year, entry in bridge_manifest().items():
+        target = dest / "Contents" / "bin" / f"mcp_bridge_{year}.gup"
+        if target.exists():
+            digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if digest not in [entry["sha256"], *entry.get("superseded_sha256", [])]:
+                conflicts.append(f"{target} ({digest})")
+    return conflicts
+
+
 def stage_bundle(dest: Path) -> tuple[list[int], list[int]]:
     """Stage ApplicationPlugins bundle. Returns (included years, missing years)."""
+    validate_bridge_sources()
     bin_dir = dest / "Contents" / "bin"
     scripts_dir = dest / "Contents" / "scripts"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -367,6 +393,11 @@ def deploy_application_package() -> bool:
     with tempfile.TemporaryDirectory() as tmp:
         staging = Path(tmp) / BUNDLE_PACKAGE_NAME
         included, missing = stage_bundle(staging)
+        conflicts = bridge_replacement_conflicts(APPLICATION_PACKAGE_DST)
+        if conflicts:
+            print("  FAILED: installed bridge is not a recognized superseded build; refusing to replace it: "
+                  + ", ".join(conflicts))
+            return False
         try:
             if APPLICATION_PACKAGE_DST.exists():
                 shutil.rmtree(APPLICATION_PACKAGE_DST)
