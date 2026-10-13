@@ -227,3 +227,18 @@ actual output; storage readback alone does not certify compilation.
 Reference imports/exports remain refused pending explicit portable binding
 semantics. Controller, texture and curve parameter writes remain unsupported.
 This extends an existing command; the MCP tool count stays 208.
+
+Validation: 53 focused iToo tests, 1,062 isolated tests and 1,075 integrated
+tests pass. Installed JSON-RPC calls changed actual Z to 7 and restored the
+guarded object identity and Z=19. Spline rebinding changed the four distances
+from 2.6–48.2 to 480.4–548.2 scene units. Tests cover null clearing, stale tokens,
+stale handles, duplicate names, wrong shapes, invalid batches and a source
+parented under the Forest. The last case requires checking dependencies against
+the target node as well as its base; a base-only check misses parent links.
+
+Scratch PID 16000 started in 53.537 seconds (221 samples; 2.874 seconds of total
+sampler suspension). Inclusive sampled stacks included USD 4.76 seconds and
+V-Ray 4.50 seconds; these overlapping measurements are not removable-cost
+benchmarks. Its saved reference fixture quit normally in 7.144 seconds with the
+client retained. The observer recorded exit code 0 and PID disappearance.
+Evidence: diagnostics/itoo-references-20261013/ on the shared repository.
