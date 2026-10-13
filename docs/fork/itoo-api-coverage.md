@@ -88,7 +88,7 @@ that current documentation omits. Remaining gaps are explicit:
 | Area | Remaining work / reason |
 |---|---|
 | Forest effect parameters | Numeric writes and numeric import initialization are implemented. Object/spline/controller/texture/curve writes and initialization need further live probes. Inspector retains raw reference metadata. |
-| Forest effect library | Search/read plus effect move and parameter-free load/export are implemented. Typed parameter import/export remains; add is parameter-free code only. |
+| Forest effect library | Search/read, ordering and numeric load/export are implemented. Reference/controller/texture/curve import/export remains; add is parameter-free code only. |
 | Forest Tools instances | No public native Instantiate method appeared in ForestPack/trees interfaces. Geometry fallback can be built from `forest_items`; billboard, Forest Color and edge behavior need preservation checks. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
 | Catalog writes/evaluation | `setMacro`, `evalMacro`, browser open/close/refresh/overlay are not exposed as general commands. Evaluation can run scripts; writes persist catalog state. Stored macro reads are implemented. |
@@ -195,3 +195,15 @@ remain independently scoped; moving one last changes actual Z from 37 to 31.
 Tests are repeated with Forest deselected to exclude modifier-panel effects.
 The native editor was used during early investigation, before the user reinforced
 the preference for API-only operation; no production command relies on it.
+
+Validation for the numeric extension: 49 iToo-specific tests, 1,058 isolated
+suite tests and 1,071 integrated wt-review tests pass. Fresh installed MCP
+clients expose 208 tools and verify parameter edits against actual item output.
+
+The installed MCP also passed a real vendor preset: Stepped Rotation imported
+three numeric parameters; changing the step from 90 to 45 degrees changed actual
+item rotations to the corresponding increments. No UI interaction was used.
+The first scratch launch measured 37.407 s; the later vendor-preset launch
+measured 89.968 s, still with Arnold absent. File-open stacks account for about
+47.06 sampled seconds in that slower run; MassFX accounts for about 2 seconds.
+This variability is logged separately and is not attributed to the new tools.
