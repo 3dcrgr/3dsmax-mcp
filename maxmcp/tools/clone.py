@@ -7,6 +7,28 @@ from ..server import mcp, client
 from ..helpers.maxscript import safe_string
 from ..helpers.spatial import build_clone_spatial_maxscript, enrich_spatial_payload
 
+# Max clones the outermost closed group around a member instead of the member,
+# stacked on the original. Mirrors ClosedGroupAround in the native handler.
+_CLOSED_GROUP_FUNCTIONS = r'''
+fn mcpClosedGroup n = (
+    local outermost = undefined
+    local member = n
+    while isGroupMember member and isValidNode member.parent do (
+        member = member.parent
+        if isGroupHead member and not isOpenGroupHead member do outermost = member
+    )
+    outermost
+)
+fn mcpClosedGroupError nodes = (
+    local msg = ""
+    for n in nodes while msg == "" do (
+        local g = mcpClosedGroup n
+        if g != undefined do msg = "Clone source '" + n.name + "' is in closed group '" + g.name + "'; Max would clone the whole group. Clone the group, or open it with manage_groups to clone the member alone."
+    )
+    msg
+)
+'''
+
 
 @mcp.tool()
 def clone_objects(
@@ -62,6 +84,7 @@ def clone_objects(
     name_arr = "#(" + ", ".join(f'"{safe_string(n)}"' for n in names) + ")"
 
     maxscript = f"""(
+        {_CLOSED_GROUP_FUNCTIONS}
         local nameList = {name_arr}
         local srcNodes = #()
         local notFound = #()
@@ -72,8 +95,11 @@ def clone_objects(
             else
                 append notFound n
         )
+        local groupError = mcpClosedGroupError srcNodes
         if srcNodes.count == 0 then (
             "{{\\\"error\\\":\\\"No valid objects found to clone\\\"}}"
+        ) else if groupError != "" then (
+            "{{\\\"error\\\":\\\"" + groupError + "\\\"}}"
         ) else (
             local newNodes = #()
             maxOps.cloneNodes srcNodes cloneType:{ms_mode} newNodes:&newNodes
@@ -133,13 +159,16 @@ def _clone_array(names: list[str], mode: str, offset: list[float], count: int) -
     # Keep the clone API's dependency/hierarchy mapping intact. Moving individual
     # nodes afterward would move parented descendants twice.
     script = f'''(
+        {_CLOSED_GROUP_FUNCTIONS}
         local src = #()
         local missing = #()
         for nm in {name_arr} do (
             local matches = getNodeByName nm exact:true all:true
             if matches.count != 1 then append missing nm else append src matches[1]
         )
+        local groupError = mcpClosedGroupError src
         if missing.count > 0 then ("__ERROR__|Sources must resolve uniquely: " + (missing as string))
+        else if groupError != "" then ("__ERROR__|" + groupError)
         else (
             local made = #()
             local failure = ""

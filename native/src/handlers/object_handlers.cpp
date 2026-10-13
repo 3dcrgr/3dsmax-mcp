@@ -804,6 +804,18 @@ std::string NativeHandlers::SetVisibility(const std::string& params, MCPBridgeGU
     });
 }
 
+// Outermost closed group around a member. CloneNodes clones that whole group
+// in place of the member, stacked on the original.
+static INode* ClosedGroupAround(INode* node) {
+    INode* closed = nullptr;
+    if (!node->IsGroupMember()) return nullptr;
+    for (INode* p = node->GetParentNode(); p && !p->IsRootNode(); p = p->GetParentNode()) {
+        if (p->IsGroupHead() && !p->IsOpenGroupHead()) closed = p;
+        if (!p->IsGroupMember()) break;
+    }
+    return closed;
+}
+
 // ── native:clone_objects (Pure SDK) ─────────────────────────────
 std::string NativeHandlers::CloneObjects(const std::string& params, MCPBridgeGUP* gup) {
     return gup->GetExecutor().ExecuteSync([&params]() -> std::string {
@@ -836,6 +848,10 @@ std::string NativeHandlers::CloneObjects(const std::string& params, MCPBridgeGUP
                 throw std::runtime_error("Clone source is ambiguous: " + name);
             INode* node = matches.empty() ? nullptr : matches.front();
             if (node) {
+                if (INode* group = ClosedGroupAround(node))
+                    throw std::runtime_error("Clone source '" + name + "' is in closed group '" +
+                        WideToUtf8(group->GetName()) + "'; Max would clone the whole group. Clone the group, "
+                        "or open it with manage_groups to clone the member alone.");
                 if (seenSources.insert(node).second) srcNodes.AppendNode(node);
             } else {
                 notFound.push_back(name);
