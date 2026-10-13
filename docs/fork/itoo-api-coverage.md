@@ -266,3 +266,17 @@ sequence, and a second effect can depend on item positions changed by the first.
 Running both simultaneously is not a valid portability comparison.
 Procedural item indices may reorder on rebuild; compare complete transforms
 independently of list order instead of assuming index stability.
+
+Validation: 58 focused tests, 1,067 isolated tests and 1,080 integrated tests
+pass. API-only live checks verify mixed imports, missing/extra bindings, invalid
+sources and cycles, export opt-in, distinct IDs on repeated imports and cleanup
+that preserves original rows. A fresh installed JSON-RPC client verifies the
+complete transform set on reload, explicit null bindings on a disabled effect,
+normalized UUID keys and restoration of the original effect. Tool count remains
+208. Current installed module SHA256:
+`7a5ec297406196c1964268f63b7cb3709402dffa09c1af0e35c6562fd2113f11`.
+
+Scratch PID 32800 started in 43.458 seconds; 181 samples, 1.951 seconds total
+sampler suspension. It saved its own fixture and quit normally in 5.202 seconds,
+with the client retained. Observer recorded exit code 0 and PID disappearance.
+Evidence: diagnostics/itoo-reference-files-20261013/ on the shared repository.
