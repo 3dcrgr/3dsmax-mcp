@@ -7,6 +7,12 @@ thread_local bool MainThreadExecutor::tl_direct_mode_ = false;
 WPARAM MainThreadExecutor::s_execute_cookie_ = 0;
 bool MainThreadExecutor::s_executing_ = false;
 std::deque<std::shared_ptr<MainThreadExecutor::WorkItem>> MainThreadExecutor::s_deferred_;
+std::mutex MainThreadExecutor::s_waiting_mutex_;
+std::unordered_map<UINT64, std::shared_ptr<MainThreadExecutor::WorkItem>> MainThreadExecutor::s_waiting_;
+UINT64 MainThreadExecutor::s_last_id_ = 0;
+bool MainThreadExecutor::s_accepting_ = true;
+
+static constexpr char kMaxExiting[] = "3ds Max is exiting; the request did not run";
 
 MainThreadExecutor::~MainThreadExecutor() {
     Shutdown();
@@ -54,7 +60,25 @@ void MainThreadExecutor::Initialize() {
     );
 }
 
+void MainThreadExecutor::StopAccepting() {
+    std::lock_guard<std::mutex> lock(s_waiting_mutex_);
+    s_accepting_ = false;
+    for (auto& entry : s_waiting_) {
+        WorkItem& item = *entry.second;
+        std::lock_guard<std::mutex> item_lock(item.mutex);
+        if (item.started || item.completed) continue;
+        // Cancelled, so a queued or deferred copy never runs it.
+        item.cancelled = true;
+        item.work = nullptr;
+        item.error = true;
+        item.error_message = kMaxExiting;
+        item.completed = true;
+        item.cv.notify_all();
+    }
+}
+
 void MainThreadExecutor::Shutdown() {
+    StopAccepting();
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
@@ -92,12 +116,24 @@ std::string MainThreadExecutor::ExecuteSync(
     item->request_id = DialogWatch::RequestId();
     item->command_type = DialogWatch::CommandType();
 
-    DialogWatch::MarkQueued();
-    // prevent shared_ptr from dying before main thread processes it
-    auto* raw = new std::shared_ptr<WorkItem>(item);
+    UINT64 id = 0;
+    {
+        std::lock_guard<std::mutex> waiting(s_waiting_mutex_);
+        if (!s_accepting_) throw std::runtime_error(kMaxExiting);
+        id = ++s_last_id_;
+        s_waiting_.emplace(id, item);
+    }
+    // Leaves the table on every exit, after the item lock below is released.
+    struct StopWaiting {
+        UINT64 id;
+        ~StopWaiting() {
+            std::lock_guard<std::mutex> waiting(s_waiting_mutex_);
+            s_waiting_.erase(id);
+        }
+    } stop_waiting{id};
 
-    if (!PostMessage(hwnd_, WM_MCP_EXECUTE, s_execute_cookie_, reinterpret_cast<LPARAM>(raw))) {
-        delete raw;
+    DialogWatch::MarkQueued();
+    if (!PostMessage(hwnd_, WM_MCP_EXECUTE, s_execute_cookie_, static_cast<LPARAM>(id))) {
         throw std::runtime_error("Failed to post work to main thread");
     }
 
@@ -146,13 +182,16 @@ LRESULT CALLBACK MainThreadExecutor::WndProc(
 
     if (msg == WM_MCP_EXECUTE) {
         // Reject any sender that doesn't know our per-process cookie. lParam
-        // is reinterpret_cast'd as a heap pointer; an attacker-supplied value
-        // would be an arbitrary read/write/free + vtable-call primitive.
+        // is a request id; a request nobody waits on any more is skipped.
         if (wp != s_execute_cookie_) return 0;
 
-        auto* raw = reinterpret_cast<std::shared_ptr<WorkItem>*>(lp);
-        auto item = *raw;
-        delete raw;
+        std::shared_ptr<WorkItem> item;
+        {
+            std::lock_guard<std::mutex> waiting(s_waiting_mutex_);
+            auto found = s_waiting_.find(static_cast<UINT64>(lp));
+            if (found == s_waiting_.end()) return 0;
+            item = found->second;
+        }
 
         // Delivered by a nested message pump while another item is running
         // (SDK work can pump: progress UI, redraws, deferred plugin loads).

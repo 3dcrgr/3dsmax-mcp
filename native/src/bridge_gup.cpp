@@ -213,6 +213,9 @@ DWORD MCPBridgeShellGUP::Start() {
 }
 
 void MCPBridgeShellGUP::Stop() {
+    // Pipe threads waiting on requests that will never start would hold the
+    // StopPipe join below; fail those requests first.
+    executor_.StopAccepting();
     AgentViewport::Shutdown(true);
     SceneJournal::Unregister();
     RenderHost::UnregisterNotifications();

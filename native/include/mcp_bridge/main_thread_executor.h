@@ -7,6 +7,7 @@
 #include <deque>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 
 // Executes work on the 3ds Max main thread from a background thread.
 // Uses a hidden Win32 window + WM_USER message to marshal calls.
@@ -23,6 +24,11 @@ public:
 
     // Call from main thread (GUP::Start)
     void Initialize();
+
+    // Main thread, before GUP::Stop joins the pipe threads. Max no longer
+    // pumps the window while it exits: every request that has not started
+    // fails now, and later requests fail without being queued.
+    void StopAccepting();
 
     // Call from main thread (GUP::Stop)
     void Shutdown();
@@ -67,6 +73,14 @@ private:
     // Set once in Initialize() (called on the Max main thread). Read-only after.
     DWORD main_thread_id_ = 0;
 
+    // Requests whose callers are waiting, by id. WM_MCP_EXECUTE carries only
+    // the id; a caller removes its entry when it stops waiting, so a message
+    // for a request nobody waits on finds nothing and is ignored.
+    static std::mutex s_waiting_mutex_;
+    static std::unordered_map<UINT64, std::shared_ptr<WorkItem>> s_waiting_;
+    static UINT64 s_last_id_;
+    static bool s_accepting_;
+
     static thread_local bool tl_direct_mode_;
     static constexpr UINT WM_MCP_EXECUTE = WM_USER + 0x4D43;
 
@@ -81,9 +95,8 @@ private:
     static std::deque<std::shared_ptr<WorkItem>> s_deferred_;
 
     // Per-process random secret. Sent in wParam alongside every
-    // WM_MCP_EXECUTE so cross-process attackers can't smuggle pointers
-    // for WndProc to reinterpret_cast — same-user processes can enumerate
-    // and PostMessage to top-level windows freely (UIPI doesn't block
-    // WM_USER+ between same-integrity processes).
+    // WM_MCP_EXECUTE so other processes can't start queued requests — same-user
+    // processes can enumerate and PostMessage to top-level windows freely
+    // (UIPI doesn't block WM_USER+ between same-integrity processes).
     static WPARAM s_execute_cookie_;
 };

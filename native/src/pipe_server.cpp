@@ -2,30 +2,32 @@
 #include "mcp_bridge/core_api.h"
 #include "mcp_bridge/core_host.h"
 
+#include <cstring>
+
 PipeServer::PipeServer(std::wstring pipe_name)
-    : pipe_name_(std::move(pipe_name)) {
-    shutdown_event_ = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-}
+    : pipe_name_(std::move(pipe_name)) {}
 
 PipeServer::~PipeServer() {
     Stop();
-    if (shutdown_event_) {
-        CloseHandle(shutdown_event_);
-        shutdown_event_ = nullptr;
-    }
 }
 
 void PipeServer::Start() {
     if (running_.load()) return;
     running_ = true;
-    ResetEvent(shutdown_event_);
     accept_thread_ = std::thread(&PipeServer::AcceptLoop, this);
 }
 
 void PipeServer::Stop() {
     if (!running_.load()) return;
     running_ = false;
-    SetEvent(shutdown_event_);
+
+    // MCP clients keep their pipe open between calls, so their threads sit in
+    // a read, and the accept thread waits for the next client. Cancelling
+    // every instance's I/O ends those waits.
+    {
+        std::lock_guard<std::mutex> lock(instances_mutex_);
+        for (HANDLE pipe : instances_) CancelIoEx(pipe, nullptr);
+    }
 
     if (accept_thread_.joinable()) {
         accept_thread_.join();
@@ -39,6 +41,24 @@ void PipeServer::Stop() {
         }
     }
     client_threads_.clear();
+}
+
+void PipeServer::Track(HANDLE pipe) {
+    std::lock_guard<std::mutex> lock(instances_mutex_);
+    instances_.insert(pipe);
+}
+
+void PipeServer::Untrack(HANDLE pipe) {
+    std::lock_guard<std::mutex> lock(instances_mutex_);
+    instances_.erase(pipe);
+}
+
+// Waits for a started overlapped operation on `pipe`. An operation started
+// after Stop() swept the instances cancels itself here, so no wait outlives
+// Stop(). GetOverlappedResult returns only once the kernel is done with `io`.
+bool PipeServer::Await(HANDLE pipe, OVERLAPPED& io, DWORD& bytes) {
+    if (!running_.load()) CancelIoEx(pipe, &io);
+    return GetOverlappedResult(pipe, &io, &bytes, TRUE) != FALSE;
 }
 
 void PipeServer::CleanupFinishedThreads() {
@@ -57,6 +77,9 @@ void PipeServer::CleanupFinishedThreads() {
 }
 
 void PipeServer::AcceptLoop() {
+    OVERLAPPED io = {};
+    io.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+
     while (running_.load()) {
         // Cleanup finished client threads periodically
         CleanupFinishedThreads();
@@ -76,33 +99,20 @@ void PipeServer::AcceptLoop() {
             Sleep(100);
             continue;
         }
+        Track(pipe);
 
-        // Wait for client with overlapped I/O so we can detect shutdown
-        OVERLAPPED overlapped = {};
-        overlapped.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-
-        BOOL connected = ConnectNamedPipe(pipe, &overlapped);
+        DWORD unused = 0;
+        BOOL connected = ConnectNamedPipe(pipe, &io);
         if (!connected) {
-            DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                HANDLE events[2] = { overlapped.hEvent, shutdown_event_ };
-                DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
-
-                if (wait == WAIT_OBJECT_0 + 1) {
-                    // Shutdown
-                    CancelIoEx(pipe, &overlapped);
-                    CloseHandle(overlapped.hEvent);
-                    CloseHandle(pipe);
-                    break;
-                }
-            } else if (err != ERROR_PIPE_CONNECTED) {
-                CloseHandle(overlapped.hEvent);
-                CloseHandle(pipe);
-                continue;
-            }
+            const DWORD err = GetLastError();
+            connected = err == ERROR_PIPE_CONNECTED ||  // the client was first
+                        (err == ERROR_IO_PENDING && Await(pipe, io, unused));
         }
-
-        CloseHandle(overlapped.hEvent);
+        if (!connected) {  // failed, or cancelled by Stop()
+            Untrack(pipe);
+            CloseHandle(pipe);
+            continue;
+        }
 
         // Spawn a thread for this client — accept loop immediately creates
         // the next pipe instance so another client can connect with zero delay
@@ -111,6 +121,7 @@ void PipeServer::AcceptLoop() {
         ct->thread = std::thread([this, pipe, ctPtr]() {
             HandleClient(pipe);
             DisconnectNamedPipe(pipe);
+            Untrack(pipe);
             CloseHandle(pipe);
             ctPtr->done.store(true);
         });
@@ -118,6 +129,8 @@ void PipeServer::AcceptLoop() {
         std::lock_guard<std::mutex> lock(threads_mutex_);
         client_threads_.push_back(std::move(ct));
     }
+
+    if (io.hEvent) CloseHandle(io.hEvent);
 }
 
 void PipeServer::HandleClient(HANDLE pipe) {
@@ -125,8 +138,12 @@ void PipeServer::HandleClient(HANDLE pipe) {
     const std::string client_id =
         "pipe-" + std::to_string(next_client_id.fetch_add(1));
 
+    // One operation at a time per client, so one OVERLAPPED serves them all.
+    OVERLAPPED io = {};
+    io.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+
     while (running_.load()) {
-        std::string request = ReadRequest(pipe);
+        std::string request = ReadRequest(pipe, io);
         if (request.empty()) break;
 
         std::string response;
@@ -136,40 +153,26 @@ void PipeServer::HandleClient(HANDLE pipe) {
             response = McpInternalErrorResponse(e.what());
         }
 
-        if (!WriteResponse(pipe, response)) {
+        if (!WriteResponse(pipe, io, response)) {
             break;
         }
     }
 
+    if (io.hEvent) CloseHandle(io.hEvent);
     CoreHost::ReleaseSession(client_id);
 }
 
-std::string PipeServer::ReadRequest(HANDLE pipe) {
+std::string PipeServer::ReadRequest(HANDLE pipe, OVERLAPPED& io) {
     std::string data;
     char buf[4096];
-    DWORD bytes_read = 0;
-
-    while (true) {
-        BOOL ok = ReadFile(pipe, buf, sizeof(buf), &bytes_read, nullptr);
-        if (bytes_read > 0) {
-            data.append(buf, bytes_read);
-        }
-        if (data.find('\n') != std::string::npos) {
-            break;
-        }
-        if (!ok) {
-            DWORD err = GetLastError();
-            if (err == ERROR_MORE_DATA) {
-                continue;
-            }
-            if (err == ERROR_BROKEN_PIPE || err == ERROR_OPERATION_ABORTED) {
-                break;
-            }
-            break;
-        }
-        if (bytes_read == 0) {
-            break;
-        }
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(pipe, buf, sizeof(buf), nullptr, &io) && GetLastError() != ERROR_IO_PENDING)
+            return {};
+        // Cut short by a disconnect or by Stop(): a partial request is dropped.
+        if (!Await(pipe, io, got) || got == 0) return {};
+        data.append(buf, got);
+        if (memchr(buf, '\n', got)) break;
     }
 
     while (!data.empty() && (data.back() == '\n' || data.back() == '\r')) {
@@ -178,17 +181,16 @@ std::string PipeServer::ReadRequest(HANDLE pipe) {
     return data;
 }
 
-bool PipeServer::WriteResponse(HANDLE pipe, const std::string& response) {
-    std::string out = response + "\n";
-    DWORD written = 0;
-    DWORD total = static_cast<DWORD>(out.size());
-    const char* ptr = out.c_str();
-
-    while (total > 0) {
-        BOOL ok = WriteFile(pipe, ptr, total, &written, nullptr);
-        if (!ok || written == 0) return false;
-        ptr += written;
-        total -= written;
+bool PipeServer::WriteResponse(HANDLE pipe, OVERLAPPED& io, const std::string& response) {
+    const std::string out = response + "\n";
+    size_t sent = 0;
+    while (sent < out.size()) {
+        DWORD wrote = 0;
+        const DWORD chunk = static_cast<DWORD>(out.size() - sent);
+        if (!WriteFile(pipe, out.data() + sent, chunk, nullptr, &io) && GetLastError() != ERROR_IO_PENDING)
+            return false;
+        if (!Await(pipe, io, wrote) || wrote == 0) return false;
+        sent += wrote;
     }
     return true;
 }
