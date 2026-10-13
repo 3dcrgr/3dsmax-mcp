@@ -3,7 +3,7 @@
 Fork issues #4 and #6, and the executor shutdown fix. Commits `adcfd93`, `a9d2a0d`, `ed1fb1c`, `2ce5928`, `011e547`, `f7dbb87`, `03f4d64`, `4ba8059` and `b4dd573`. Since the 1.7.5 merge (`a07ef93`), all of this is built to work alongside upstream's dialog handling; see [the last section](#upstream-175s-dialog-handling-fixed-on-the-merge).
 
 **Which bridge.** The client side, the Python half of the dialog fixes, `capture_hang_diagnostics` and the orphaned-server watchdog are Python, and work with upstream's bridges too. `health`, the shutdown drain and the native half of the dialog fixes need the fork's bridge:
-- In `native/bin/`, `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) and `mcp_bridge_2027.gup` (sha256 `ca5e16dd…`, built from `6397f1f` with the Max 2027 SDK) are fork builds with the same hang fixes (the 2027 one also has the V-Ray GPU preview fix). The 2023, 2024 and 2025 files are upstream's 1.7.5 builds.
+- In `native/bin/`, `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) and `mcp_bridge_2027.gup` (sha256 `3bd55e31…`, built from `205d467` with the Max 2027 SDK) are fork builds; only the 2027 one includes the newer connected-pipe shutdown cancellation and V-Ray GPU preview fixes. The 2023, 2024 and 2025 files are upstream's 1.7.5 builds.
 - The 2027 one has run on the production machine since 2026-10-11.
 
 ## What happened
@@ -237,3 +237,5 @@ Tests:
 Upstream 1.7.5 (2026-10-01) covers two parts: a call waiting on a modal dialog returns `BLOCKED_BY_DIALOG` (answered with `max_dialogs`), and a timed-out queued request is cancelled. The rest is not upstream: the reply deadline and process diagnosis (`MAX_BUSY` / `MAX_NOT_RESPONDING`), `health`, `capture_hang_diagnostics`, the shutdown drain and the orphaned-server watchdog. The fixes to 1.7.5's dialog handling above aren't upstream either. Related work:
 - Upstream PR 32 (executor cancellation, closed unmerged) was deliberately not ported. Its contributor's fork has been deleted.
 - The lock timeout idea comes from stoxsss111's fork. From Geddart's come the executor drain and the process-exit check (`_process_alive` there, rewritten here in `maxmcp/process_health.py`).
+
+Offline scratch-driver tests use SCRATCH_HELPER_PATH to locate a separately maintained helper. Set it to your helper path before running Python unittest discovery; the tests use fake clients and do not contact Max.

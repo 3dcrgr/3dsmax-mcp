@@ -6,7 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 
-HELPER = Path(r"\\devbox.kiko-egret.ts.net\src\CGGhost\autodesk\mcp\3dsmax\livetests-2027\scratch_max.py")
+HELPER = Path(os.environ.get("SCRATCH_HELPER_PATH", "livetests-2027/scratch_max.py"))
 
 
 @unittest.skipUnless(HELPER.exists(), "shared scratch helper unavailable")

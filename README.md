@@ -13,7 +13,7 @@ This is a fork of [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax
 
 It carries fixes for problems found while using the MCP on production architectural visualization. The worst of them hung 3ds Max and lost unsaved work. It also adds tools for Chaos Vantage, RailClone, Forest Pack and props that float or sink.
 
-Everything here is being offered back to upstream as small, separate pull requests. Until they're merged, this fork is where the fixes live.
+Verified and deployed improvements are published on the fork's default branch, `fix/fork-fixes`. We are consolidating the improvements into one pull request to upstream.
 
 ## At a glance
 
@@ -36,7 +36,8 @@ Everything here is being offered back to upstream as small, separate pull reques
   - Calls fail fast with `MAX_BUSY` or `MAX_NOT_RESPONDING` and a process diagnosis: whether the main window responds, CPU use, whether it exited.
   - The client never replays a request that may already have run.
 - `get_bridge_status` answers from a pipe thread while Max's main thread is blocked. It reports what holds the main thread and which clients are connected.
-- Max no longer stalls on exit when MCP requests are queued: queued work fails at once.
+- Max no longer stalls on exit with queued requests or connected idle pipe clients: queued work fails and pending pipe reads/writes are cancelled and drained. The 2027 bridge passed scratch-Max quit checks with clients retained.
+- Startup failures include native target and transport context. Exited instance registrations are cleaned conservatively, preserving live, uncertain and changed records.
 - An MCP server whose client crashed exits with it, instead of staying connected to Max.
 
 ### Dialogs and unsaved work
@@ -162,7 +163,7 @@ The installer's runtime ignores `PYTHONPATH`, hence the `sys.path` line. See [Ad
 
 | Max | Bridge in `native/bin/` |
 |---|---|
-| 2027 | Fork build, with every native fix, including the V-Ray GPU preview (sha256 `ca5e16dd…`) |
+| 2027 | Fork build, with every native fix, including the V-Ray GPU preview (sha256 `3bd55e31…`) |
 | 2026 | Fork build with every native fix except the V-Ray GPU preview (sha256 `d5cd6ba5…`) |
 | 2023–2025 | Upstream's 1.7.5 builds |
 
