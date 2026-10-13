@@ -298,8 +298,9 @@ _SCRIPT_TEMPLATE = r'''(
     local result = undefined
     try (
         local t0 = timeStamp()
-        local tol = %(tol)s
-        local near = %(near)s
+        -- Whole numbers format as Integer literals, which formattedPrint misreads.
+        local tol = %(tol)s as float
+        local near = %(near)s as float
         if tol <= 0 do tol = units.decodeValue "0.1mm"
         if near <= 0 do near = units.decodeValue "10mm"
         if near < tol do near = tol
