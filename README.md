@@ -17,7 +17,7 @@ Everything here is being offered back to upstream as small, separate pull reques
 
 ## At a glance
 
-- **207 tools:** all 179 of upstream's, plus 28 new ones (marked ★ in the [catalog](#tools)).
+- **208 tools:** all 179 of upstream's, plus 29 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
   - 3ds Max 2027.2, and 3ds Max 2026 before that;
   - V-Ray 7 (GPU as the production renderer);

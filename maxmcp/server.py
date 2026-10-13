@@ -87,7 +87,7 @@ _READ_ONLY_TOOLS = {
 
 _DESTRUCTIVE_TOOLS = {
     "railclone_slots", "railclone_metadata", "railclone_proxy", "railclone_instances", "forest_effects",
-    "railclone_settings", "forest_settings",
+    "railclone_settings", "forest_settings", "forest_effect_parameters",
     "mesh_edit",
     "drop_to_surface",
     "forest_edit_items",

@@ -14,7 +14,7 @@ on RailClone 7.3.5.687 / Forest Pack 9.4.3.766. Official references:
 [Forest Tools](https://docs.itoosoft.com/forestpack/instantiating-and-exporting/forest-tools).
 Live results override older documentation where they differ.
 
-## Eleven added tools
+## Twelve added tools
 
 | Tool | Actions or API coverage |
 |---|---|
@@ -25,7 +25,8 @@ Live results override older documentation where they differ.
 | `railclone_proxy` | Inspect; `setProxyMode` disabled/embedded/external, existing-file refusal unless overwrite requested |
 | `railclone_instances` | Capped `Instantiate`, `InstantiateEnable`, explicitly confirmed vendor `InstantiateDelete`; restores selection |
 | `forest_inspect` | Settings, geometry/surface/area/effect/parameter arrays, bounded readback, `getSelected`; no build |
-| `forest_effects` | List/get/add parameter-free effect, change code, toggle, remove; token guard and staged undo |
+| `forest_effects` | List/get/add, change code, toggle, move, load/export numeric effects, remove with parameter-row cleanup; token guard and staged undo |
+| `forest_effect_parameters` | Inspect parameters; edit integer, real, percentage and scene-unit values with schema and bounds checks |
 | `railclone_settings` | Token-guarded global/display/instancing settings; explicit confirmation before leaving manual-update mode |
 | `forest_settings` | Token-guarded density tile dimensions, direction, seed, caps, update and transform/effect flags |
 | `forest_effect_library` | Search/read default, user or custom .eff libraries; metadata, parameter definitions and hashes, code opt-in |
@@ -77,7 +78,7 @@ distinct from having dedicated semantic tools for them.
   otherwise fill lazily and immediately invalidate the initial state token.
   Effect edits currently require procedural mode; custom item caches are not
   replaced. Parameterized effects may be read, toggled and have code changed,
-  but are not removed until parameter cleanup is implemented.
+  and removal now cleans owned parameter rows.
 
 ## Remaining dedicated API gaps
 
@@ -86,7 +87,7 @@ that current documentation omits. Remaining gaps are explicit:
 
 | Area | Remaining work / reason |
 |---|---|
-| Forest effect parameters | Numeric/object/controller/texture/curve writes and parameter creation; native storage/type enums need further live probes. Current inspector exposes all arrays. |
+| Forest effect parameters | Numeric writes and numeric import initialization are implemented. Object/spline/controller/texture/curve writes and initialization need further live probes. Inspector retains raw reference metadata. |
 | Forest effect library | Search/read plus effect move and parameter-free load/export are implemented. Typed parameter import/export remains; add is parameter-free code only. |
 | Forest Tools instances | No public native Instantiate method appeared in ForestPack/trees interfaces. Geometry fallback can be built from `forest_items`; billboard, Forest Color and edge behavior need preservation checks. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
@@ -140,8 +141,8 @@ Load appends a parameter-free .eff file and requires its SHA256 from a current
 `forest_effect_library(action="get")` read plus the destination effects token.
 The exact XML metadata is preserved. Export writes only to a new absolute .eff
 path and refuses existing files, including a concurrent create. No UI or native
-Import command is invoked. Parameterized imports/exports are explicitly refused
-until typed parameter initialization/serialization is implemented. Nested XML
+Import command is invoked. The later numeric extension supports numeric parameter initialization and export;
+reference/controller/texture/curve import/export remains refused. Nested XML
 parameter definitions are now included in library inspection.
 
 Live export/import preserved exact XML and actual Z=10 output. The full suite
@@ -173,3 +174,24 @@ stopped, rather than reporting a pre-exit process snapshot as a lingering proces
 Offline observer checks pass. The integrated wt-review suite passes 1,064 tests.
 Fresh installed MCP clients see the new effect actions; existing server processes
 need their MCP connection restarted to reload the deployed module.
+
+## Numeric Forest Effects parameters — continuation on 2026-10-13
+
+forest_effect_parameters inspects parameters by effect and exact ID or unique
+name. set requires a fresh effects_token, enforces native limits and numeric
+types, refuses shared/custom bases and stages one undo hold. Percentage bounds
+follow the definition; vendor effects may allow signed values or values above
+100. XML and native names/types/IDs must agree.
+
+Measured subtype codes: 0=int, 1=real, 2=percentage, 3=unit; numerical parameter
+type is 0. Storage uses efpaint*, efpafloat* and efpaunit* arrays. Import initializes
+all 26 parameter-row arrays before effect XML, with fresh parameter IDs. Export
+writes current numeric values as defaults; remove deletes owned rows, preserving
+others. Non-numeric import/export is refused. No UI calls are in implementation.
+
+Live checks verify all four types: import 11, edit 27, export default 27, remove
+without orphan rows. Reimport preserves 27. Copies with identical parameter names
+remain independently scoped; moving one last changes actual Z from 37 to 31.
+Tests are repeated with Forest deselected to exclude modifier-panel effects.
+The native editor was used during early investigation, before the user reinforced
+the preference for API-only operation; no production command relies on it.

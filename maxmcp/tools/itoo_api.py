@@ -261,6 +261,190 @@ fn iaEffectsReport obj base = (
 )
 '''
 
+NUMERIC_KINDS = {"int": (0, "efpaint", "int"), "real": (1, "efpafloat", "number"),
+                 "percentage": (2, "efpafloat", "number"), "unit": (3, "efpaunit", "number")}
+PARAM_DEFAULTS = {
+    "efpaid": '""', "efpaeffid": '""', "efpatype": "0", "efpaname": '""',
+    "efpalimit": "false", "efpadesc": '""', "efpanumtype": "0",
+    **{f"efpaint{s}": "0" for s in ("val", "min", "max", "def")},
+    **{f"efpa{t}{s}": "0.0" for t in ("float", "unit") for s in ("val", "min", "max", "def")},
+    "efpainode": "undefined", "efpaspline": "undefined", "efpacontref": "undefined",
+    "efpacontanim": "0", "efpacontype": "0", "efpatexmap": "undefined", "efpacurve": '""',
+}
+
+
+def numeric_definitions(document: ET.Element) -> list[dict[str, Any]]:
+    """Validate the measured numeric subset of the native .eff schema."""
+    definitions = document.findall(".//parameter")
+    if definitions != document.findall("parameter"):
+        raise ValueError("EFFECT_FORMAT_UNSUPPORTED: parameters must be direct effect children")
+    if len(definitions) > 100:
+        raise ValueError("effect exceeds 100 parameters")
+    rows, names, ids = [], set(), set()
+    for definition in definitions:
+        kind, name = definition.get("numtype"), definition.get("name", "")
+        if definition.get("type") != "numerical" or kind not in NUMERIC_KINDS:
+            raise ValueError("PARAMETER_TYPE_UNSUPPORTED: only numeric parameters are supported")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) or name.lower() in names:
+            raise ValueError("parameter names must be unique identifiers")
+        ident = "{" + str(uuid.UUID(definition.get("id", ""))) + "}"
+        if ident in ids:
+            raise ValueError("parameter IDs must be unique")
+        names.add(name.lower()); ids.add(ident)
+        values = {}
+        for field in ("min", "max", "default"):
+            value = float(definition.get(field, "0"))
+            if not math.isfinite(value) or (kind == "int" and (not value.is_integer() or abs(value) > 2**31-1)):
+                raise ValueError("parameter bounds/default must be finite and match the numeric type")
+            values[field] = int(value) if kind == "int" else value
+        limited = definition.get("limits", "0")
+        if limited not in ("0", "1"):
+            raise ValueError("parameter limits must be 0 or 1")
+        if limited == "1" and not values["min"] <= values["default"] <= values["max"]:
+            raise ValueError("parameter default is outside its declared limits")
+        rows.append({"id": ident, "name": name, "kind": kind, "limited": limited == "1",
+                     "description": definition.get("description", ""), **values})
+    return rows
+
+
+def parameter_rows(state: dict[str, Any], effect: str = "") -> list[dict[str, Any]]:
+    arrays = {p.lower(): a["values"] for p, a in state["arrays"].items()}
+    effects = state["effects"]
+    if effect:
+        matches = [e for e in effects if e["id"] == effect] or [e for e in effects if e["name"] == effect]
+        if len(matches) != 1:
+            raise RailCloneError("EFFECT_NOT_UNIQUE", "use an exact effect ID")
+        effects = matches
+    by_id = {e["id"]: e for e in effects}; rows = []
+    count = len(arrays.get("efpaid", []))
+    for p in ("efpaeffid", "efpatype", "efpaname"):
+        if len(arrays.get(p, [])) != count:
+            raise RailCloneError("EFFECT_PARAMETER_LIST_MISMATCH", f"incomplete {p}")
+    def at(prop: str, i: int) -> Any:
+        values = arrays.get(prop, [])
+        if len(values) != count:
+            raise RailCloneError("EFFECT_PARAMETER_LIST_MISMATCH", f"incomplete {prop}")
+        return values[i]
+    for i, ident in enumerate(arrays.get("efpaid", [])):
+        owner = arrays["efpaeffid"][i]
+        if owner not in by_id:
+            if effect:
+                continue
+            raise RailCloneError("ORPHAN_EFFECT_PARAMETER", "parameter refers to a missing effect")
+        row = {"id": ident, "effect_id": owner, "name": arrays["efpaname"][i],
+               "native_type": arrays["efpatype"][i], "index": i + 1, "writable": False}
+        if row["native_type"] == 0:
+            code = at("efpanumtype", i)
+            kinds = [k for k, data in NUMERIC_KINDS.items() if data[0] == code]
+            if not kinds:
+                raise RailCloneError("PARAMETER_TYPE_UNSUPPORTED", "unknown native numeric subtype")
+            kind = kinds[0]; _, prefix, _ = NUMERIC_KINDS[kind]
+            definition = next((p for p in parse_effect_xml(by_id[owner]["xml"]).findall("parameter")
+                               if p.get("id", "").lower() == str(ident).lower()), None)
+            if definition is None or definition.get("name") != row["name"] or definition.get("type") != "numerical" or definition.get("numtype") != kind:
+                raise RailCloneError("PARAMETER_SCHEMA_MISMATCH", "XML and native parameter definition differ")
+            row.update(kind=kind, value=at(prefix+"val", i), min=at(prefix+"min", i),
+                       max=at(prefix+"max", i), default=at(prefix+"def", i), limited=at("efpalimit", i),
+                       writable=True)
+        rows.append(row)
+    return rows
+
+
+def append_numeric_parameters(rows: list[dict[str, Any]], owner: str) -> str:
+    if not rows:
+        return ""
+    script = 'local pc=staged.efpaid.count\n'
+    for prop in ("efpaeffid", "efpatype", "efpaname"):
+        script += f'if staged.{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"\n'
+    for prop, default in PARAM_DEFAULTS.items():
+        script += f'''local next_{prop}=staged.{prop} as array
+if next_{prop}.count==0 do next_{prop}=for j=1 to pc collect {default}
+if next_{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"
+'''
+        for row in rows:
+            subtype, prefix, typ = NUMERIC_KINDS[row["kind"]]
+            string_fields = {"efpaid": row["id"], "efpaeffid": owner,
+                             "efpaname": row["name"], "efpadesc": row["description"]}
+            if prop in string_fields:
+                value = f'(rcDecode "{rc._b64(string_fields[prop])}")'
+            elif prop == "efpanumtype":
+                value = str(subtype)
+            elif prop == "efpalimit":
+                value = rc._mxs_bool(row["limited"])
+            elif prop.startswith(prefix) and prop[len(prefix):] in ("val", "min", "max", "def"):
+                suffix = prop[len(prefix):]
+                value = _literal(row[{"val": "default", "def": "default"}.get(suffix, suffix)], typ)
+            else:
+                value = default
+            script += f'append next_{prop} {value}\n'
+        script += f'staged.{prop}=next_{prop}\n'
+    return script
+
+
+@mcp.tool()
+def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect",
+                             values: dict[str, Any] | None = None, expected_effects: str = "") -> dict[str, Any]:
+    """Inspect Forest effect parameters or set existing numeric values in one staged undo step.
+
+    Select by exact parameter ID or unique name, optionally scoped to an effect ID.
+    set requires effects_token from inspection. Integer, real, percentage and
+    scene-unit values are supported; enabled native limits are enforced. Percentage
+    values use the effect's declared range, not an assumed 0..100 cap. Reference,
+    controller, texture and curve writes are refused. XML/native schema must agree.
+    Does not build or compile-check; verify using forest_items(refresh_surfaces=true).
+    """
+    if action not in ("inspect", "set"):
+        raise ValueError("action must be inspect or set")
+    if action == "set" and (not isinstance(expected_effects, str) or not rc.TOKEN.fullmatch(expected_effects)):
+        raise ValueError("set requires expected_effects token")
+    if action == "set" and (not isinstance(values, dict) or not values or len(values) > 100):
+        raise ValueError("set requires 1..100 parameter values")
+    if action == "inspect" and values:
+        raise ValueError("inspect does not accept values")
+    state = forest_effects(name)
+    rows = parameter_rows(state, effect)
+    if action == "set":
+        if state["effects_token"] != expected_effects:
+            raise RailCloneError("STALE_EFFECTS", "read parameters again")
+        writes, touched = [], set()
+        for key, value in values.items():
+            matches = [p for p in rows if p["id"] == key] or [p for p in rows if p["name"] == key]
+            if len(matches) != 1:
+                raise ValueError("parameter must identify exactly one ID or unique name")
+            row = matches[0]
+            if row["index"] in touched:
+                raise ValueError("duplicate parameter target")
+            touched.add(row["index"])
+            if not row["writable"]:
+                raise ValueError("PARAMETER_TYPE_UNSUPPORTED: reference writes are not yet supported")
+            _, prefix, typ = NUMERIC_KINDS[row["kind"]]
+            literal = _literal(value, typ)
+            if row["limited"] and not row["min"] <= value <= row["max"]:
+                raise ValueError("parameter value is outside native limits")
+            writes.append(f'staged.{prefix}val[{row["index"]}]={literal}')
+        from ..helpers import forest as fh
+        body = fh.MXS_LIB + _EFFECT_LIB + f'\nlocal obj=fpForest "{rc._b64(name)}"\nlocal base=obj.baseObject\n'
+        body += f'''if fpBusy() do throw "USER_BUSY: an undo operation is active"
+if (rcShared obj).count>0 do throw "SHARED_BASE: make the Forest base unique first"
+if base.mode!=0 do throw "CUSTOM_EDIT_UNSUPPORTED: requires procedural mode"
+if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: read again"
+local staged=undefined
+with undo off (staged=copy base
+{chr(10).join(writes)})
+if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: state changed while staging"
+if fpBusy() do throw "USER_BUSY: an undo operation became active"
+local owns=false
+try (theHold.Begin(); owns=true; obj.baseObject=staged; theHold.Accept "MCP Forest effect parameters"; owns=false)
+catch (if owns do theHold.Cancel(); throw())
+"PARAMETERS_WRITTEN"
+'''
+        if rc._send(body).strip() != "PARAMETERS_WRITTEN":
+            raise RailCloneError("INVALID_READBACK", "parameter write did not acknowledge")
+        state = forest_effects(name); rows = parameter_rows(state, effect)
+    return {"action": action, "parameters": rows, "effects_token": state["effects_token"],
+            "read_only": action == "inspect", "undoable": action == "set", "rebuilt": False,
+            "refresh_required": action == "set", "compile_verified": False}
+
 
 @mcp.tool()
 def forest_effects(name: str, action: str = "list", effect: str = "", code: str = "",
@@ -274,8 +458,7 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     current read; effect identifies an exact ID or unique name (not an index).
     add creates a parameter-free effect from Forest Effects language, e.g.
     'fpItem.position.z = fpItem.position.z + 10;'. This is not MAXScript. Existing parameter
-    definitions/values are preserved when setting code or toggling. Removing a
-    parameterized effect is refused until parameter-row cleanup is implemented.
+    definitions/values are preserved when setting code or toggling. Removing an effect also removes its parameter rows; unknown parameter arrays are refused.
     remove additionally requires confirm_delete=true. Shared bases are refused.
     Edits are staged on a copied Forest base and adopted in one undo step.
     Does not rebuild the scatter, change procedural/custom mode or compile-check
@@ -286,8 +469,8 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     move uses a 1-based destination position and reorders all six effect rows,
     preserving parameter associations by ID. load appends a parameter-free .eff
     definition, preserving metadata; expected_file_hash must match a library read.
-    Parameterized files are refused until typed parameter initialization exists.
-    export writes a parameter-free effect to a new absolute .eff path; existing
+    Numeric parameters are initialized with fresh IDs; reference/curve/controller files are refused.
+    export writes an effect with current numeric values as defaults to a new absolute .eff path; existing
     files are never overwritten. Export does not edit Max and is not undoable.
     """
     from ..helpers import forest as fh
@@ -303,6 +486,7 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     if action == "remove" and not confirm_delete:
         raise ValueError("remove requires confirm_delete=true")
     imported_text = ""
+    imported_parameters: list[dict[str, Any]] = []
     file_hash = ""
     if action in ("load", "export"):
         if not isinstance(path, str) or "\x00" in path or not Path(path).is_absolute() or Path(path).suffix.lower() != ".eff":
@@ -314,7 +498,13 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
             if info["sha256"].lower() != expected_file_hash.lower():
                 raise ValueError("STALE_EFFECT_FILE: file changed; read the library again")
             if not info["parameter_free"]:
-                raise ValueError("PARAMETERIZED_EFFECT: typed parameter initialization is not yet supported")
+                document = parse_effect_xml(info["xml"])
+                imported_parameters = numeric_definitions(document)
+                # Repeated imports must not share parameter identities.
+                for definition, row in zip(document.findall("parameter"), imported_parameters):
+                    row["id"] = "{" + str(uuid.uuid4()) + "}"
+                    definition.set("id", row["id"])
+                info["xml"] = ET.tostring(document, encoding="unicode")
             effect_name = effect_name or info["title"] or info["name"]
             effect_xml(info["code"], effect_name)
             imported_text, file_hash = info["xml"], info["sha256"]
@@ -339,6 +529,7 @@ for p in rowProps do if (getProperty base p).count!=n do throw "EFFECT_LIST_MISM
         if action in ("add", "load"):
             text = imported_text or effect_xml(code, effect_name)
             new_id = "{" + str(uuid.uuid4()) + "}"
+            body += append_numeric_parameters(imported_parameters, new_id)
             body += f'''
 local ids=staged.efidlist as array, labels=staged.efnamelist as array
 local xmls=staged.efxmllist as array, flags=staged.efenablelist as array
@@ -386,7 +577,24 @@ for p in join rowProps #(#efselspeclist,#efspeclist) do (
 )
 '''
             else:
-                body += '''if findItem (base.efpaeffid as array) base.efidlist[idx]>0 do throw "PARAMETERIZED_EFFECT: parameter cleanup is not yet supported"
+                parameter_props = ",".join("#" + prop for prop in PARAM_DEFAULTS)
+                body += f'''local paramProps=#({parameter_props})
+local pc=base.efpaid.count, dead=#()
+if base.efpaeffid.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: effect owner array"
+for j=1 to pc where base.efpaeffid[j]==base.efidlist[idx] do append dead j
+if dead.count>0 do (
+    for p in iaEffectsProps staged where matchPattern (p as string) pattern:"efpa*" do (
+        if findItem paramProps p==0 do throw "PARAMETER_SCHEMA_UNSUPPORTED: unknown parameter array"
+    )
+    for p in paramProps do (
+        local a=getProperty staged p as array
+        if a.count!=0 and a.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: incomplete parameter array"
+        if a.count==pc do (
+            for j=dead.count to 1 by -1 do deleteItem a dead[j]
+            setProperty staged p a
+        )
+    )
+)
 for p in join rowProps #(#efselspeclist,#efspeclist) do (
     local a=getProperty staged p as array
     if a.count!=0 and a.count!=n do throw "EFFECT_LIST_MISMATCH: optional effect arrays have unequal lengths"
@@ -430,15 +638,27 @@ base=obj.baseObject
             raise RailCloneError("EFFECT_NOT_UNIQUE", "use a valid effect ID")
         result["effect"] = matches[0]
     if action == "load":
-        result.update(imported_path=path, imported_sha256=file_hash)
+        result.update(imported_path=path, imported_sha256=file_hash, initialized_parameters=len(imported_parameters))
     if action == "export":
         chosen = result["effect"]
-        # XML contains definitions/defaults, not live reference/controller state.
-        # Refuse parameterized exports rather than misrepresent a portable file.
         document = parse_effect_xml(chosen["xml"])
         if document.findall(".//parameter") or chosen["id"] in arrays.get("efpaeffid", []):
-            raise ValueError("PARAMETERIZED_EFFECT: exporting current typed values is not yet supported")
-        payload = chosen["xml"].encode("utf-8")
+            numeric_definitions(document)
+            parameters = parameter_rows(result, chosen["id"])
+            definitions = document.findall("parameter")
+            if len(parameters) != len(definitions):
+                raise ValueError("PARAMETER_SCHEMA_MISMATCH: native parameters and XML differ")
+            for definition in definitions:
+                matches = [p for p in parameters if str(p["id"]).lower() == definition.get("id", "").lower()]
+                if len(matches) != 1 or not matches[0]["writable"]:
+                    raise ValueError("PARAMETER_TYPE_UNSUPPORTED: only numeric exports are supported")
+                row = matches[0]
+                definition.set("default", str(row["value"]))
+                definition.set("min", str(row["min"])); definition.set("max", str(row["max"]))
+                definition.set("limits", "1" if row["limited"] else "0")
+            payload = ET.tostring(document, encoding="utf-8")
+        else:
+            payload = chosen["xml"].encode("utf-8")
         with Path(path).open("xb") as output:
             output.write(payload)
         result.update(exported_path=path, exported_sha256=hashlib.sha256(payload).hexdigest())

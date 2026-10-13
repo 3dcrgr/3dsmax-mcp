@@ -257,7 +257,7 @@ class AdditionalToolTests(unittest.TestCase):
             info=api.read_effect_file(p)
             self.assertFalse(info["parameter_free"])
             with patch.object(api.rc,"_send") as send:
-                with self.assertRaisesRegex(ValueError,"PARAMETERIZED_EFFECT"):
+                with self.assertRaisesRegex(ValueError,"EFFECT_FORMAT_UNSUPPORTED"):
                     api.forest_effects("forest",action="load",path=str(p),expected_file_hash=info["sha256"],expected_effects=TOKEN)
                 send.assert_not_called()
 
@@ -282,7 +282,7 @@ class AdditionalToolTests(unittest.TestCase):
         raw=f"ITOOEFFECTS\nT|{TOKEN}\nA|efidlist|1\nV|efidlist|1|s{api.rc._b64('id')}\nA|efxmllist|1\nV|efxmllist|1|s{api.rc._b64(xml)}\nA|efpaeffid|1\nV|efpaeffid|1|s{api.rc._b64('id')}\nEND\n"
         with tempfile.TemporaryDirectory() as td:
             p=Path(td)/"fixture.eff"
-            with patch.object(api.rc,"_send",return_value=raw), self.assertRaisesRegex(ValueError,"PARAMETERIZED_EFFECT"):
+            with patch.object(api.rc,"_send",return_value=raw), self.assertRaises(api.RailCloneError):
                 api.forest_effects("forest",action="export",effect="id",path=str(p))
             self.assertFalse(p.exists())
 
@@ -339,6 +339,68 @@ class AdditionalToolTests(unittest.TestCase):
     def test_effect_library_relative_root_refused(self):
         with self.assertRaises(ValueError):
             api.forest_effect_library(roots=["relative"])
+
+
+class NumericParameterTests(unittest.TestCase):
+    def state(self, kind="real", value=10):
+        pid="{33333333-3333-3333-3333-333333333333}"
+        xml=f'<effect><expression>fpItem.position.z = Lift;</expression><parameter id="{pid}" name="Lift" type="numerical" numtype="{kind}" limits="1" min="0" max="100" default="10"/></effect>'
+        subtype,prefix,_=api.NUMERIC_KINDS[kind]
+        arrays={"efpaid":[pid],"efpaeffid":["owner"],"efpatype":[0],"efpaname":["Lift"],"efpanumtype":[subtype],"efpalimit":[True],
+                prefix+"val":[value],prefix+"min":[0],prefix+"max":[100],prefix+"def":[10]}
+        return {"effects_token":TOKEN,"effects":[{"id":"owner","name":"MCP fixture","xml":xml}],"arrays":{k:{"values":v} for k,v in arrays.items()}}
+
+    def test_numeric_rows_all_measured_subtypes(self):
+        for kind in api.NUMERIC_KINDS:
+            with self.subTest(kind=kind):
+                row=api.parameter_rows(self.state(kind))[0]
+                self.assertEqual(row["kind"],kind)
+                self.assertTrue(row["writable"])
+
+    def test_schema_mismatch_and_orphan_refused(self):
+        state=self.state();state["arrays"]["efpaname"]["values"]=["Wrong"]
+        with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
+        state=self.state();state["arrays"]["efpaeffid"]["values"]=["missing"]
+        with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
+
+    def test_guarded_numeric_write(self):
+        with patch.object(api,"forest_effects",side_effect=[self.state(),self.state(value=27)]),patch.object(api.rc,"_send",return_value="PARAMETERS_WRITTEN") as send:
+            result=api.forest_effect_parameters("forest",action="set",values={"Lift":27},expected_effects=TOKEN)
+        script=send.call_args.args[0]
+        self.assertIn("staged.efpafloatval[1]=27.0",script)
+        self.assertIn("STALE_EFFECTS",script)
+        self.assertIn("SHARED_BASE",script)
+        self.assertIn("theHold.Cancel()",script)
+        self.assertNotIn("update_ui",script)
+        self.assertEqual(result["parameters"][0]["value"],27)
+
+    def test_limits_integer_and_duplicate_targets(self):
+        for kind,values in [("real",{"Lift":101}),("int",{"Lift":1.5}),("real",{"Lift":True}),
+                            ("real",{"Lift":2,"{33333333-3333-3333-3333-333333333333}":3})]:
+            with self.subTest(values=values),patch.object(api,"forest_effects",return_value=self.state(kind)),patch.object(api.rc,"_send") as send:
+                with self.assertRaises(ValueError):api.forest_effect_parameters("forest",action="set",values=values,expected_effects=TOKEN)
+                send.assert_not_called()
+
+    def test_stale_and_missing_token(self):
+        with patch.object(api,"forest_effects") as read:
+            with self.assertRaises(ValueError):api.forest_effect_parameters("forest",action="set",values={"Lift":2})
+            read.assert_not_called()
+        state=self.state();state["effects_token"]="CD-"*31+"CD"
+        with patch.object(api,"forest_effects",return_value=state),self.assertRaises(api.RailCloneError):
+            api.forest_effect_parameters("forest",action="set",values={"Lift":2},expected_effects=TOKEN)
+
+    def test_parameter_definitions_and_append_storage(self):
+        root=api.parse_effect_xml(self.state()["effects"][0]["xml"])
+        rows=api.numeric_definitions(root)
+        script=api.append_numeric_parameters(rows,"owner")
+        self.assertIn("staged.efpafloatval=next_efpafloatval",script)
+        self.assertIn("append next_efpanumtype 1",script)
+        self.assertIn("EFFECT_PARAMETER_LIST_MISMATCH",script)
+        self.assertEqual(len(api.PARAM_DEFAULTS),26)
+
+    def test_reference_import_refused(self):
+        root=api.parse_effect_xml('<effect><parameter id="{33333333-3333-3333-3333-333333333333}" name="Source" type="node"/></effect>')
+        with self.assertRaisesRegex(ValueError,"PARAMETER_TYPE_UNSUPPORTED"):api.numeric_definitions(root)
 
 
 if __name__ == "__main__":
