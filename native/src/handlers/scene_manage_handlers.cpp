@@ -113,7 +113,7 @@ std::string NativeHandlers::ManageScene(const std::string& params, MCPBridgeGUP*
             return "Fetched (restored) held state";
         }
         if (action == "reset") {
-            ip->FileReset(FALSE); // FALSE = no prompt
+            ip->FileReset(FALSE); // noPrompt=FALSE: a modified scene asks to save first
             NativeHandlers::ResetSceneDeltaSessions();
             return "Scene reset to empty";
         }

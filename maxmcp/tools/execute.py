@@ -20,6 +20,9 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool = True) -> 
     overwrite and missing-file warnings silently take their default answer.
     quiet=False shows them; a prompt then returns BLOCKED_BY_DIALOG to read and
     answer with max_dialogs. Use it when the user wants to be asked.
+    Quiet mode also skips the save-changes prompt: checkForSave() returns true
+    and resetMaxFile() discards unsaved work (loadMaxFile never asks). Ask the
+    user before resetting, loading, fetching or quitting, and pass quiet=False.
 
     Always pass #noPrompt to importFile, including OBJ/FBX imports:
     importFile @"C:/assets/model.fbx" #noPrompt

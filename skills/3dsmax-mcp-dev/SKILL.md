@@ -78,6 +78,7 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 ## Dialogs
 
 - `execute_maxscript` and tool scripts run in Max's quiet mode: prompts such as `queryBox`, overwrite or missing-file warnings silently take their default answer. Pass `execute_maxscript(quiet=False)` when the user wants to be asked.
+- Quiet mode also skips the save-changes prompt: `checkForSave()` returns true and `resetMaxFile()` discards unsaved work; `loadMaxFile` never asks. Reset with `manage_scene`, which keeps the prompt; for a load, fetch or quit script, ask the user first and pass `quiet=False`.
 - A call that opens or waits behind a modal dialog returns `BLOCKED_BY_DIALOG` with its title, text and buttons. The call keeps running inside Max: never repeat it. Other replies warn while any dialog is open.
 - Read and answer dialogs with `max_dialogs`. `respond` presses a button by label or index and returns the interrupted call's result.
 - Choose the button yourself only when the user asked you to proceed without confirmation and the task determines the answer. Otherwise show the user the dialog and ask. Always ask before save, overwrite, discard, Fetch, Reset or licensing choices.
