@@ -6,6 +6,8 @@ All notable changes to this project are documented here.
 
 ### Verified deployments, 2026-10-12–13
 
+- Diagnostic helpers now match zero-padded PIDs in Max.log and the lifecycle observer confirms the exact PID has disappeared before logging exit. It drains completed exits on stop and closes retained process handles. Mock observer checks and the saved padded-PID capture passed offline; no Max process was touched.
+
 - Forest Effects `move`, `load` and `export` (`416ef90`) are deployed. Fresh installed stdio enumeration reports 207 tools and the new actions; normalized source matches the installed module. Twelve scratch-Max checks passed, including effect ordering and parameter-free `.eff` roundtrip with exact-PID guards. Post-deployment Python suite: 1,064 passed. Overwrite refusal is unit-tested; parameterized files are unsupported and stored effect code is not compile-checked.
 
 - #29–#30: cancellable connected-pipe shutdown and native-aware startup failures, including unsent TCP connection timeouts. The reviewed 2027 bridge is SHA256 `3bd55e31d1088cbccac2ea90e6ca1a42b29d75f7c0e797b709240c94b5a8b6cf`, built from `205d467`. Native checks passed 6/6; scratch Max exited with connected clients retained (4.759 s and 4.092 s).

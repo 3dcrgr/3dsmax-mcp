@@ -31,6 +31,8 @@ Forest Effects supports guarded ordering and parameter-free `.eff` export/import
 
 [docs/FORK.md](docs/FORK.md) lists every change with how it was verified (live in Max, or unit-tested only). The pages under [docs/fork/](docs/fork/) give the details.
 
+Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs and confirm process disappearance before recording exit. Their offline checks are documented in [iToo coverage](docs/fork/itoo-api-coverage.md); these checks did not restart or modify Max.
+
 ## What it fixes
 
 ### When 3ds Max hangs or is busy
