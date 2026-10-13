@@ -265,10 +265,11 @@ fn iaEffectsReport obj base = (
 @mcp.tool()
 def forest_effects(name: str, action: str = "list", effect: str = "", code: str = "",
                    effect_name: str = "", enabled: bool = True, expected_effects: str = "",
-                   confirm_delete: bool = False) -> dict[str, Any]:
+                   confirm_delete: bool = False, position: int = 0,
+                   path: str = "", expected_file_hash: str = "") -> dict[str, Any]:
     """Read, add, replace code, toggle or remove Forest Pack effects with guarded staged undo.
 
-    action: list, get, add, set_code, toggle, remove. Read returns full effect XML,
+    action: list, get, add, load, export, move, set_code, toggle, remove. Read returns full effect XML,
     parameter arrays and effects_token. Mutations require expected_effects from a
     current read; effect identifies an exact ID or unique name (not an index).
     add creates a parameter-free effect from Forest Effects language, e.g.
@@ -281,19 +282,48 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     effect-language code. Readback confirms storage; verify using
     forest_items(refresh_surfaces=true), which forces evaluation (a normal read
     can return the cached distribution). Mutations return refresh_required=true.
+
+    move uses a 1-based destination position and reorders all six effect rows,
+    preserving parameter associations by ID. load appends a parameter-free .eff
+    definition, preserving metadata; expected_file_hash must match a library read.
+    Parameterized files are refused until typed parameter initialization exists.
+    export writes a parameter-free effect to a new absolute .eff path; existing
+    files are never overwritten. Export does not edit Max and is not undoable.
     """
     from ..helpers import forest as fh
     fh.node_name(name, "name")
-    if action not in ("list", "get", "add", "set_code", "toggle", "remove"):
+    if action not in ("list", "get", "add", "load", "export", "move", "set_code", "toggle", "remove"):
         raise ValueError("unknown effect action")
+    if type(position) is not int or (action == "move" and position < 1) or (action != "move" and position != 0):
+        raise ValueError("move requires a positive 1-based position; other actions use position=0")
     if type(enabled) is not bool or type(confirm_delete) is not bool:
         raise ValueError("flags must be boolean")
-    if action not in ("list", "add") and (not isinstance(effect, str) or not effect or "\x00" in effect):
+    if action not in ("list", "add", "load") and (not isinstance(effect, str) or not effect or "\x00" in effect):
         raise ValueError("effect must be an exact ID or unique name")
     if action == "remove" and not confirm_delete:
         raise ValueError("remove requires confirm_delete=true")
+    imported_text = ""
+    file_hash = ""
+    if action in ("load", "export"):
+        if not isinstance(path, str) or "\x00" in path or not Path(path).is_absolute() or Path(path).suffix.lower() != ".eff":
+            raise ValueError("load/export requires an absolute .eff path")
+        if action == "load":
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_file_hash):
+                raise ValueError("load requires expected_file_hash from a current library read")
+            info = read_effect_file(Path(path), include_xml=True)
+            if info["sha256"].lower() != expected_file_hash.lower():
+                raise ValueError("STALE_EFFECT_FILE: file changed; read the library again")
+            if not info["parameter_free"]:
+                raise ValueError("PARAMETERIZED_EFFECT: typed parameter initialization is not yet supported")
+            effect_name = effect_name or info["title"] or info["name"]
+            effect_xml(info["code"], effect_name)
+            imported_text, file_hash = info["xml"], info["sha256"]
+        elif not Path(path).parent.is_dir():
+            raise ValueError("export parent directory must exist")
+        elif Path(path).exists():
+            raise ValueError("EFFECT_FILE_EXISTS: export never overwrites existing files")
     body = fh.MXS_LIB + _EFFECT_LIB + f'\nlocal obj=fpForest "{rc._b64(name)}"\nlocal base=obj.baseObject\n'
-    if action not in ("list", "get"):
+    if action not in ("list", "get", "export"):
         if not isinstance(expected_effects, str) or rc.TOKEN.fullmatch(expected_effects) is None:
             raise ValueError("mutation requires effects_token as expected_effects")
         body += f'''if fpBusy() do throw "USER_BUSY: an undo operation is active"
@@ -306,8 +336,8 @@ local rowProps=#(#efidlist,#efnamelist,#efxmllist,#efenablelist)
 local n=base.efidlist.count
 for p in rowProps do if (getProperty base p).count!=n do throw "EFFECT_LIST_MISMATCH: effect arrays have unequal lengths"
 '''
-        if action == "add":
-            text = effect_xml(code, effect_name)
+        if action in ("add", "load"):
+            text = imported_text or effect_xml(code, effect_name)
             new_id = "{" + str(uuid.uuid4()) + "}"
             body += f'''
 local ids=staged.efidlist as array, labels=staged.efnamelist as array
@@ -342,6 +372,19 @@ staged.efxmllist[idx]=doc.OuterXml
 '''
             elif action == "toggle":
                 body += f'staged.efenablelist[idx]={rc._mxs_bool(enabled)}\n'
+            elif action == "move":
+                body += f'''if {position}>n do throw "BAD_POSITION: destination exceeds effect count"
+for p in join rowProps #(#efselspeclist,#efspeclist) do (
+    local a=getProperty staged p as array
+    if a.count!=0 and a.count!=n do throw "EFFECT_LIST_MISMATCH: optional effect arrays have unequal lengths"
+    if a.count==n do (
+        local item=a[idx]
+        deleteItem a idx
+        insertItem item a {position}
+        setProperty staged p a
+    )
+)
+'''
             else:
                 body += '''if findItem (base.efpaeffid as array) base.efidlist[idx]>0 do throw "PARAMETERIZED_EFFECT: parameter cleanup is not yet supported"
 for p in join rowProps #(#efselspeclist,#efspeclist) do (
@@ -360,8 +403,9 @@ base=obj.baseObject
 '''
     body += 'iaEffectsReport obj base\n'
     result: dict[str, Any] = {"action": action, "read_only": action in ("list", "get"),
-                             "undoable": action not in ("list", "get"), "rebuilt": False,
-                             "refresh_required": action not in ("list", "get"),
+                             "scene_read_only": action in ("list", "get", "export"),
+                             "undoable": action not in ("list", "get", "export"), "rebuilt": False,
+                             "refresh_required": action not in ("list", "get", "export"),
                              "compile_verified": False,
                              "arrays": {}, "effects": []}
     for row in rc._records(rc._send(body), "ITOOEFFECTS"):
@@ -378,13 +422,26 @@ base=obj.baseObject
             a = arrays.get(prop, [])
             e[label] = a[i] if i < len(a) else None
         result["effects"].append(e)
-    if action == "get":
+    if action in ("get", "export"):
         matches = [e for e in result["effects"] if e["id"] == effect]
         if not matches:
             matches = [e for e in result["effects"] if e["name"] == effect]
         if len(matches) != 1:
             raise RailCloneError("EFFECT_NOT_UNIQUE", "use a valid effect ID")
         result["effect"] = matches[0]
+    if action == "load":
+        result.update(imported_path=path, imported_sha256=file_hash)
+    if action == "export":
+        chosen = result["effect"]
+        # XML contains definitions/defaults, not live reference/controller state.
+        # Refuse parameterized exports rather than misrepresent a portable file.
+        document = parse_effect_xml(chosen["xml"])
+        if document.findall(".//parameter") or chosen["id"] in arrays.get("efpaeffid", []):
+            raise ValueError("PARAMETERIZED_EFFECT: exporting current typed values is not yet supported")
+        payload = chosen["xml"].encode("utf-8")
+        with Path(path).open("xb") as output:
+            output.write(payload)
+        result.update(exported_path=path, exported_sha256=hashlib.sha256(payload).hexdigest())
     return result
 
 
@@ -823,28 +880,41 @@ def forest_settings(name: str, action: str = "inspect", settings: dict[str, Any]
     return _settings("forest", name, action, settings, expected_settings, confirm_rebuild)
 
 
-def read_effect_file(path: Path) -> dict[str, Any]:
+def parse_effect_xml(text: str) -> ET.Element:
+    if not isinstance(text, str) or len(text.encode("utf-8")) > 2_000_000 or "\x00" in text:
+        raise ValueError("effect XML must be text without NUL, up to 2 MB")
+    if re.search(r"<!\s*(DOCTYPE|ENTITY)\b", text, re.I):
+        raise ValueError("effect DTDs/entities are unsupported")
+    root = ET.fromstring(text)
+    if root.tag != "effect":
+        raise ValueError("expected an effect XML root")
+    return root
+
+
+def read_effect_file(path: Path, include_xml: bool = False) -> dict[str, Any]:
     if path.suffix.lower() != ".eff" or not path.is_file():
         raise ValueError("path must be an existing .eff file")
     if path.stat().st_size > 2_000_000:
         raise ValueError("effect file exceeds 2 MB")
-    data = path.read_bytes()
+    with path.open("rb") as stream:
+        data = stream.read(2_000_001)
+    if len(data) > 2_000_000:
+        raise ValueError("effect file exceeds 2 MB")
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         text = data.decode("utf-16")
     else:
         text = data.decode("utf-8-sig")
         if "\x00" in text:
             raise ValueError("effect XML must be UTF-8 or UTF-16 with a BOM")
-    if re.search(r"<!\s*(DOCTYPE|ENTITY)\b", text, re.I):
-        raise ValueError("effect DTDs/entities are unsupported")
-    root = ET.fromstring(text)
-    if root.tag != "effect":
-        raise ValueError("expected an effect XML root")
-    params = [dict(p.attrib) for p in root.findall("parameter")]
-    return {"path": str(path), "name": path.stem, "title": root.get("title", "")[:256],
+    root = parse_effect_xml(text)
+    params = [dict(p.attrib) for p in root.findall(".//parameter")]
+    result = {"path": str(path), "name": path.stem, "title": root.get("title", "")[:256],
             "description": root.get("description", "")[:2000], "version": root.get("version"),
             "sha256": hashlib.sha256(data).hexdigest(), "parameters": params,
             "parameter_free": not params, "code": root.findtext("expression", default="")}
+    if include_xml:
+        result["xml"] = text
+    return result
 
 
 @mcp.tool()

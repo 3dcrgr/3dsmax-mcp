@@ -216,6 +216,76 @@ class CatalogTests(unittest.TestCase):
 
 
 class AdditionalToolTests(unittest.TestCase):
+    def test_effect_move_reorders_rows_preserves_parameter_arrays(self):
+        raw=f"ITOOEFFECTS\nT|{TOKEN}\nEND\n"
+        with patch.object(api.rc, "_send", return_value=raw) as send:
+            result=api.forest_effects("forest", action="move", effect="id", position=2, expected_effects=TOKEN)
+        script=send.call_args.args[0]
+        self.assertIn("insertItem item a 2", script)
+        self.assertIn("#efselspeclist,#efspeclist", script)
+        self.assertNotIn("staged.efpaeffid=", script)
+        self.assertIn("BAD_POSITION", script)
+        self.assertTrue(result["undoable"])
+
+    def test_effect_move_position_validation(self):
+        for position in (0, -1, True, 1.5):
+            with self.subTest(position=position), self.assertRaises(ValueError):
+                api.forest_effects("forest",action="move",effect="id",position=position,expected_effects=TOKEN)
+        with self.assertRaises(ValueError):
+            api.forest_effects("forest",position=1)
+
+    def test_effect_load_hash_and_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/"fixture.eff"
+            xml=api.effect_xml("fpItem.position.z = 10;", "Original Title").replace('Created through MCP','Original Description')
+            p.write_text(xml,encoding="utf-8")
+            info=api.read_effect_file(p)
+            with patch.object(api.rc,"_send",return_value=f"ITOOEFFECTS\nT|{TOKEN}\nEND\n") as send:
+                result=api.forest_effects("forest",action="load",path=str(p),expected_file_hash=info["sha256"],expected_effects=TOKEN)
+            self.assertIn(api.rc._b64(xml),send.call_args.args[0])
+            self.assertEqual(result["imported_sha256"],info["sha256"])
+            with patch.object(api.rc,"_send") as send:
+                for file_hash in ("", "0"*64):
+                    with self.assertRaises(ValueError):
+                        api.forest_effects("forest",action="load",path=str(p),expected_file_hash=file_hash,expected_effects=TOKEN)
+                send.assert_not_called()
+
+    def test_effect_load_nested_parameters_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/"fixture.eff"
+            p.write_text('<effect><parameters><parameter name="Value"/></parameters><expression>fpItem.position.z = Value;</expression></effect>',encoding="utf-8")
+            info=api.read_effect_file(p)
+            self.assertFalse(info["parameter_free"])
+            with patch.object(api.rc,"_send") as send:
+                with self.assertRaisesRegex(ValueError,"PARAMETERIZED_EFFECT"):
+                    api.forest_effects("forest",action="load",path=str(p),expected_file_hash=info["sha256"],expected_effects=TOKEN)
+                send.assert_not_called()
+
+    def test_effect_export_no_overwrite(self):
+        xml=api.effect_xml("fpItem.position.z = 10;","Export Fixture")
+        raw=f"ITOOEFFECTS\nT|{TOKEN}\nA|efidlist|1\nV|efidlist|1|s{api.rc._b64('id')}\nA|efxmllist|1\nV|efxmllist|1|s{api.rc._b64(xml)}\nEND\n"
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/"fixture.eff"
+            with patch.object(api.rc,"_send",return_value=raw) as send:
+                result=api.forest_effects("forest",action="export",effect="id",path=str(p))
+            self.assertEqual(p.read_text(encoding="utf-8"),xml)
+            self.assertTrue(result["scene_read_only"])
+            self.assertFalse(result["undoable"])
+            self.assertNotIn("theHold.Begin",send.call_args.args[0])
+            with patch.object(api.rc,"_send") as send:
+                with self.assertRaisesRegex(ValueError,"EFFECT_FILE_EXISTS"):
+                    api.forest_effects("forest",action="export",effect="id",path=str(p))
+                send.assert_not_called()
+
+    def test_effect_export_parameter_references_refused(self):
+        xml=api.effect_xml("fpItem.position.z = 10;","Export Fixture")
+        raw=f"ITOOEFFECTS\nT|{TOKEN}\nA|efidlist|1\nV|efidlist|1|s{api.rc._b64('id')}\nA|efxmllist|1\nV|efxmllist|1|s{api.rc._b64(xml)}\nA|efpaeffid|1\nV|efpaeffid|1|s{api.rc._b64('id')}\nEND\n"
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/"fixture.eff"
+            with patch.object(api.rc,"_send",return_value=raw), self.assertRaisesRegex(ValueError,"PARAMETERIZED_EFFECT"):
+                api.forest_effects("forest",action="export",effect="id",path=str(p))
+            self.assertFalse(p.exists())
+
     def test_settings_ranges(self):
         for settings, fields in [({"units_x": 0}, api.FP_SETTINGS), ({"direction": 101}, api.FP_SETTINGS),
                                  ({"seed": -1}, api.RC_SETTINGS), ({"vmesh": 5}, api.RC_SETTINGS),

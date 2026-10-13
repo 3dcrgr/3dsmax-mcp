@@ -87,7 +87,7 @@ that current documentation omits. Remaining gaps are explicit:
 | Area | Remaining work / reason |
 |---|---|
 | Forest effect parameters | Numeric/object/controller/texture/curve writes and parameter creation; native storage/type enums need further live probes. Current inspector exposes all arrays. |
-| Forest effect library | Search/read is implemented. Import/export and reordering remain; current add is parameter-free code only. |
+| Forest effect library | Search/read plus effect move and parameter-free load/export are implemented. Typed parameter import/export remains; add is parameter-free code only. |
 | Forest Tools instances | No public native Instantiate method appeared in ForestPack/trees interfaces. Geometry fallback can be built from `forest_items`; billboard, Forest Color and edge behavior need preservation checks. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
 | Catalog writes/evaluation | `setMacro`, `evalMacro`, browser open/close/refresh/overlay are not exposed as general commands. Evaluation can run scripts; writes persist catalog state. Stored macro reads are implemented. |
@@ -123,5 +123,27 @@ uninstalled and the user's fullMeshProxy=0 policy was preserved.
 
 A process observer recorded exits with Windows exit codes and confirmed their
 PIDs disappeared. The scratch fixture was saved to a new local test file before
-normal quit. A slow shutdown after iToo edits is tracked separately in
-MCP_ISSUES, with no attribution beyond measured evidence.
+normal quit. The old installed bridge caused the shutdown stall; restoring the
+fixed binary in both deployment locations passed saved-scene quit in 4.092
+seconds with the client retained. On 2026-10-13 another saved-fixture quit took
+18.402 seconds, also with the client retained and exit code 0.
+
+## 2026-10-13: Forest Effects file and ordering commands
+
+`forest_effects` now includes `move`, `load` and `export`. Move takes an exact
+effect ID and a 1-based destination, with the normal effect-state token. It
+reorders all six effect rows while leaving parameter associations keyed by ID.
+Live output confirmed the last writer wins: moving the first Z writer to the
+end changed all sampled items from Z=20 to Z=10.
+
+Load appends a parameter-free .eff file and requires its SHA256 from a current
+`forest_effect_library(action="get")` read plus the destination effects token.
+The exact XML metadata is preserved. Export writes only to a new absolute .eff
+path and refuses existing files, including a concurrent create. No UI or native
+Import command is invoked. Parameterized imports/exports are explicitly refused
+until typed parameter initialization/serialization is implemented. Nested XML
+parameter definitions are now included in library inspection.
+
+Live export/import preserved exact XML and actual Z=10 output. The full suite
+passed 1,051 tests; 42 iToo-specific tests pass. The lifecycle observer's stop
+signal now uses its configured output directory.
