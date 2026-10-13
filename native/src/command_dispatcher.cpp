@@ -39,7 +39,8 @@ static bool IsSafeModeEnabled() {
 // skipping the main-thread PostMessage roundtrip. ~25 handlers
 // benefit: scene reads, plugin introspection, reference walking.
 // Mutation handlers (create/delete/transform/assign) and MAXScript
-// execution always marshal to the main thread.
+// execution always marshal to the main thread, including reads that run
+// any MAXScript (introspect_instance, get_wired_params, state sets).
 // ping and native:max_dialogs never reach the core: the shell answers them
 // (core_control.cpp). watch_scene's reads run direct; the handler marshals its
 // start and stop, which register with Max, to the main thread itself.
@@ -72,7 +73,6 @@ static bool IsDirectHandler(const std::string& cmd_type) {
         "native:list_plugin_classes",
         "native:discover_classes",
         "native:introspect_class",
-        "native:introspect_instance",
         // Controller reads
         "native:inspect_track_view",
         "native:list_wireable_params",
@@ -83,11 +83,6 @@ static bool IsDirectHandler(const std::string& cmd_type) {
         "native:watch_scene",
         // Effects (read-only)
         "native:get_effects",
-        // Wire params (read-only)
-        "native:get_wired_params",
-        // State sets (read-only)
-        "native:get_state_sets",
-        "native:get_camera_sequence",
         // System discovery (read-only)
         "native:list_macroscripts",
         "native:list_action_tables",
