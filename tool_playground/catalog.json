@@ -6753,6 +6753,15 @@
           },
           "confirm_delete": {
             "type": "boolean"
+          },
+          "position": {
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          },
+          "expected_file_hash": {
+            "type": "string"
           }
         },
         "required": [

@@ -4,7 +4,7 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $ErrorActionPreference='Continue'
 $log=Join-Path $OutputDirectory 'process-lifecycle.jsonl'
 $tracked=@{}
-while (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'stop-observer'))) {
+while (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory 'stop-observer'))) {
   $current=@(Get-Process 3dsmax -ErrorAction SilentlyContinue)
   foreach ($p in $current) {
     if (-not $tracked.ContainsKey($p.Id)) {
