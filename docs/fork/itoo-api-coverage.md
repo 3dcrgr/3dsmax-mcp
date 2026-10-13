@@ -25,15 +25,15 @@ Live results override older documentation where they differ.
 | `railclone_proxy` | Inspect; `setProxyMode` disabled/embedded/external, existing-file refusal unless overwrite requested |
 | `railclone_instances` | Capped `Instantiate`, `InstantiateEnable`, explicitly confirmed vendor `InstantiateDelete`; restores selection |
 | `forest_inspect` | Settings, geometry/surface/area/effect/parameter arrays, bounded readback, `getSelected`; no build |
-| `forest_effects` | List/get/add, change code, toggle, move, load/export numeric effects, remove with parameter-row cleanup; token guard and staged undo |
-| `forest_effect_parameters` | Inspect parameters; edit integer, real, percentage and scene-unit values with schema and bounds checks |
+| `forest_effects` | List/get/add, change code, toggle, move, mixed numeric/object/spline import with explicit bindings, definitions export, remove with parameter-row cleanup; token guard and staged undo |
+| `forest_effect_parameters` | Inspect parameters; edit numeric values and object/spline bindings with schema, bounds, identity and dependency checks |
 | `railclone_settings` | Token-guarded global/display/instancing settings; explicit confirmation before leaving manual-update mode |
 | `forest_settings` | Token-guarded density tile dimensions, direction, seed, caps, update and transform/effect flags |
 | `forest_effect_library` | Search/read default, user or custom .eff libraries; metadata, parameter definitions and hashes, code opt-in |
 
 Tools are registered in the full profile and the progressive `itoo_api` toolset.
-The full server exposes 207 tools; the playground hides the existing
-`inspect_modifier_properties` compatibility alias and shows 206.
+The full server exposes 208 tools; the playground hides the existing
+`inspect_modifier_properties` compatibility alias and shows 207.
 
 ## Existing dedicated commands
 
@@ -87,7 +87,7 @@ that current documentation omits. Remaining gaps are explicit:
 
 | Area | Remaining work / reason |
 |---|---|
-| Forest effect parameters | Numeric writes and numeric import initialization are implemented. Object/spline/controller/texture/curve writes and initialization need further live probes. Inspector retains raw reference metadata. |
+| Forest effect parameters | Numeric/object/spline writes and import initialization are implemented; reference definition export requires explicit rebinding. Controller/texture/curve writes and initialization need further live probes. |
 | Forest effect library | Search/read, ordering and numeric load/export are implemented. Reference/controller/texture/curve import/export remains; add is parameter-free code only. |
 | Forest Tools instances | No public native Instantiate method appeared in ForestPack/trees interfaces. Geometry fallback can be built from `forest_items`; billboard, Forest Color and edge behavior need preservation checks. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
