@@ -93,10 +93,15 @@ void PrepareVRayPreview() {
     previewRenderer=Animatable::GetHandleByAnim(renderer);
     previousDenoiserLayerActive=RunMAXScript("((vfbControl #getLayerMgr)[1].denoiserLayer.active) as string");
     const auto handle=std::to_string(previewRenderer);
-    if(RunMAXScript("(isProperty (getAnimByHandle "+handle+") #ipr_progressiveMode) as string")!="true")
-        throw std::runtime_error("UNSUPPORTED: V-Ray preview requires the progressive IPR API");
-    LeaseProperty(previewRenderer,"ipr_progressiveMode","true");
-    LeaseProperty(previewRenderer,"system_effects_progressive_update","100");
+    // V-Ray CPU's IPR must be switched to progressive. V-Ray GPU's IPR is always
+    // progressive and has neither property.
+    const auto rendererClass=MaxScriptVisibleClassName(renderer);
+    if(rendererClass.find("GPU")==std::string::npos && rendererClass!="VRayRT") {
+        if(RunMAXScript("(isProperty (getAnimByHandle "+handle+") #ipr_progressiveMode) as string")!="true")
+            throw std::runtime_error("UNSUPPORTED: V-Ray preview requires the progressive IPR API");
+        LeaseProperty(previewRenderer,"ipr_progressiveMode","true");
+        LeaseProperty(previewRenderer,"system_effects_progressive_update","100");
+    }
     // One denoiser only. Preserve its engine/preset; a temporary default denoiser
     // works without requiring an NVIDIA GPU and is removed when preview stops.
     const auto found=RunMAXScript("(local m=maxOps.GetCurRenderElementMgr(); local ds=#(); "
