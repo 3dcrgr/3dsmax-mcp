@@ -88,7 +88,7 @@ that current documentation omits. Remaining gaps are explicit:
 | Area | Remaining work / reason |
 |---|---|
 | Forest effect parameters | Numeric writes and numeric import initialization are implemented. Object/spline/controller/texture/curve writes and initialization need further live probes. Inspector retains raw reference metadata. |
-| Forest effect library | Search/read plus effect move and parameter-free load/export are implemented. Typed parameter import/export remains; add is parameter-free code only. |
+| Forest effect library | Search/read, ordering and numeric load/export are implemented. Reference/controller/texture/curve import/export remains; add is parameter-free code only. |
 | Forest Tools instances | No public native Instantiate method appeared in ForestPack/trees interfaces. Geometry fallback can be built from `forest_items`; billboard, Forest Color and edge behavior need preservation checks. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
 | Catalog writes/evaluation | `setMacro`, `evalMacro`, browser open/close/refresh/overlay are not exposed as general commands. Evaluation can run scripts; writes persist catalog state. Stored macro reads are implemented. |
@@ -195,3 +195,50 @@ remain independently scoped; moving one last changes actual Z from 37 to 31.
 Tests are repeated with Forest deselected to exclude modifier-panel effects.
 The native editor was used during early investigation, before the user reinforced
 the preference for API-only operation; no production command relies on it.
+
+Validation for the numeric extension: 49 iToo-specific tests, 1,058 isolated
+suite tests and 1,071 integrated wt-review tests pass. Fresh installed MCP
+clients expose 208 tools and verify parameter edits against actual item output.
+
+The installed MCP also passed a real vendor preset: Stepped Rotation imported
+three numeric parameters; changing the step from 90 to 45 degrees changed actual
+item rotations to the corresponding increments. No UI interaction was used.
+The first scratch launch measured 37.407 s; the later vendor-preset launch
+measured 89.968 s, still with Arnold absent. File-open stacks account for about
+47.06 sampled seconds in that slower run; MassFX accounts for about 2 seconds.
+This variability is logged separately and is not attributed to the new tools.
+
+## Forest Effects object and spline bindings — 2026-10-13
+
+`forest_effect_parameters` now reads and edits existing object (`node`, native
+type 1, `efpainode`) and spline (`spline`, native type 5, `efpaspline`) bindings.
+Both mappings were measured against actual generated item positions through the
+API, with the Forest deselected. Values are canonical `{name, handle}` identities
+or null. Writes accept an exact unique name, a guarded identity, or null to clear.
+The handle is Max's animation handle, resolved through `getAnimByHandle`.
+
+XML/native type, ID and name must agree. Missing, ambiguous or stale sources,
+non-shape spline sources and dependency cycles are refused before adoption.
+All writes stage a copied base under the existing fresh-token, shared-base,
+custom-mode and busy-state guards, then adopt it in one undo hold. No UI or
+automatic build is needed. Use `forest_items(refresh_surfaces=true)` to verify
+actual output; storage readback alone does not certify compilation.
+
+Reference imports/exports remain refused pending explicit portable binding
+semantics. Controller, texture and curve parameter writes remain unsupported.
+This extends an existing command; the MCP tool count stays 208.
+
+Validation: 53 focused iToo tests, 1,062 isolated tests and 1,075 integrated
+tests pass. Installed JSON-RPC calls changed actual Z to 7 and restored the
+guarded object identity and Z=19. Spline rebinding changed the four distances
+from 2.6–48.2 to 480.4–548.2 scene units. Tests cover null clearing, stale tokens,
+stale handles, duplicate names, wrong shapes, invalid batches and a source
+parented under the Forest. The last case requires checking dependencies against
+the target node as well as its base; a base-only check misses parent links.
+
+Scratch PID 16000 started in 53.537 seconds (221 samples; 2.874 seconds of total
+sampler suspension). Inclusive sampled stacks included USD 4.76 seconds and
+V-Ray 4.50 seconds; these overlapping measurements are not removable-cost
+benchmarks. Its saved reference fixture quit normally in 7.144 seconds with the
+client retained. The observer recorded exit code 0 and PID disappearance.
+Evidence: diagnostics/itoo-references-20261013/ on the shared repository.
