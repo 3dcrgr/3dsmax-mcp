@@ -242,3 +242,27 @@ V-Ray 4.50 seconds; these overlapping measurements are not removable-cost
 benchmarks. Its saved reference fixture quit normally in 7.144 seconds with the
 client retained. The observer recorded exit code 0 and PID disappearance.
 Evidence: diagnostics/itoo-references-20261013/ on the shared repository.
+
+## Forest Effects reference preset portability — 2026-10-13
+
+`forest_effects(action="load")` now accepts mixed numerical, object and spline
+definitions. `bindings` must identify every reference parameter by its file ID
+or unique name, using an exact unique node name, `{name, handle}` identity or
+explicit null. Extra, duplicate and missing bindings are refused. References
+are resolved and checked for shape type and dependency cycles before adoption;
+all 26 parallel arrays are initialized before XML, with fresh parameter IDs.
+No source geometry is created from the preset.
+
+Reference export requires `export_reference_definitions=true`. The `.eff` file
+contains definitions, not scene node bindings. The response's `required_bindings`
+lists each ID/name/kind for explicit binding on reload. Numeric values are
+exported as current defaults. Missing opt-in or an existing destination refuses
+the export without writing a file. Cross-scene users must resolve new source
+identities rather than reuse scene handles. Controller, texture and curve
+definitions remain refused until their native semantics are measured.
+
+Round-trip verification evaluates each effect separately: effects execute in
+sequence, and a second effect can depend on item positions changed by the first.
+Running both simultaneously is not a valid portability comparison.
+Procedural item indices may reorder on rebuild; compare complete transforms
+independently of list order instead of assuming index stability.
