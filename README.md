@@ -17,7 +17,7 @@ Verified and deployed improvements are published on the fork's default branch, `
 
 ## At a glance
 
-Forest Effects supports guarded ordering, numeric parameter edits, and numeric and parameter-free `.eff` import/export. Live scratch-Max checks and 49 focused unit tests cover the numeric extension; stored code is not compile-checked and reference/controller/texture/curve parameters remain unsupported. See [iToo coverage](docs/fork/itoo-api-coverage.md).
+Forest Effects supports guarded ordering, numeric parameters, and object or spline bindings in existing effects. Numeric `.eff` import/export is supported; binding import/export and controller, texture or curve edits remain unsupported. Live API checks and 53 focused tests cover these operations. Stored code has no public compile-success signal. See [iToo coverage](docs/fork/itoo-api-coverage.md).
 
 - **208 tools:** all 179 of upstream's, plus 29 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
