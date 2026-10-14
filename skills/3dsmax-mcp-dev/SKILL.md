@@ -88,6 +88,9 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 
 - Replies are a `ToolEnvelope` dict (`ok`/`result`/`error`/`hint`), not a JSON string. Tool-authored hints win over automatic ones; `hint.suggested_tools` may list alternatives.
 - Classify raw structured errors by `error`, `code` or `status=error|failed`, never by `message` alone.
+- `status: "partial"` means only part of the request applied. Read `warnings` and the skipped items (`notFound`, `ambiguous`, `ignored`) before continuing.
+- `AMBIGUOUS`: several objects share the name. Retry with a candidate's `handle` where the tool takes one; otherwise rename them first (`set_object_property(handle=..., property="name")`). Never guess which object was meant.
+- `TRANSFORM_IGNORED`: a constraint, script or expression controller drives that part of the transform. Edit the controller's targets or values, or ask before replacing it; repeating the move changes nothing.
 - `USER_BUSY`: Max has an open undo operation and the write was rejected before any change. Continue read-only and retry after it finishes; never bypass it with MAXScript.
 - `MAX_BUSY`: Max did not answer within the call's deadline (about 130 s, or a long tool's own timeout). The call keeps running inside Max: never repeat it; `max_dialogs(action='inspect')` reports its result in `blocked_calls` once it finishes.
 
