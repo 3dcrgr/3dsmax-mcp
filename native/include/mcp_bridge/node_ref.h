@@ -10,7 +10,7 @@
 namespace NodeRefs {
 
 using HandlerHelpers::CollectNodes;
-using HandlerHelpers::CollectNodesByExactName;
+using HandlerHelpers::CollectNodesByName;
 using HandlerHelpers::FindNodeByHandle;
 using HandlerHelpers::NodeHandle;
 using HandlerHelpers::NodeIdentityJson;
@@ -184,7 +184,7 @@ inline INode* Resolve(const json& ref) {
                     "BAD_NODE_REF", "NodeRef name or path cannot be empty."));
             }
             if (!text.empty() && text.front() == '/') return ResolvePath(text);
-            const auto matches = CollectNodesByExactName(text);
+            const auto matches = CollectNodesByName(text);
             if (matches.empty()) {
                 throw std::runtime_error(StructuredErrorPayload(
                     "NOT_FOUND", "NodeRef name not found: " + text));
@@ -281,7 +281,7 @@ inline INode* Resolve(const json& ref) {
     }
 
     const std::string name = ref["name"].get<std::string>();
-    const auto matches = CollectNodesByExactName(name);
+    const auto matches = CollectNodesByName(name);
     if (matches.empty()) {
         throw std::runtime_error(StructuredErrorPayload(
             "NOT_FOUND", "NodeRef name not found: " + name));

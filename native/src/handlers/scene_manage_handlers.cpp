@@ -122,7 +122,7 @@ std::string NativeHandlers::BatchRenameObjects(const std::string& params, MCPBri
                 continue;
             }
 
-            const std::vector<INode*> matches = CollectNodesByExactName(oldName);
+            const std::vector<INode*> matches = CollectNodesByName(oldName);
             if (matches.empty()) {
                 notFound.push_back(oldName);
                 continue;
@@ -154,7 +154,7 @@ std::string NativeHandlers::BatchRenameObjects(const std::string& params, MCPBri
         // refuse them as ambiguous.
         for (INode* node : renamedNodes) {
             const std::string current = WideToUtf8(node->GetName());
-            if (CollectNodesByExactName(current).size() > 1 &&
+            if (CollectNodesByName(current).size() > 1 &&
                 std::find(duplicates.begin(), duplicates.end(), current) == duplicates.end())
                 duplicates.push_back(current);
         }

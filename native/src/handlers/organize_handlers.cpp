@@ -35,7 +35,7 @@ static NamedNodes ResolveNamedNodes(const json& names) {
 // one name do.
 static INode* FindGroupHead(const std::string& name) {
     std::vector<INode*> heads;
-    for (INode* node : CollectNodesByExactName(name))
+    for (INode* node : CollectNodesByName(name))
         if (node->IsGroupHead()) heads.push_back(node);
     if (heads.size() > 1) ThrowAmbiguousName(name, heads, kUniqueNamesAdvice);
     return heads.empty() ? nullptr : heads.front();
@@ -432,7 +432,7 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             const std::string name = p["name"].get<std::string>();
             INode* node = FindGroupHead(name);
             if (!node)
-                throw std::runtime_error((CollectNodesByExactName(name).empty()
+                throw std::runtime_error((CollectNodesByName(name).empty()
                     ? "Object not found: " : "Object is not a group head: ") + name);
 
             INodeTab nodes;

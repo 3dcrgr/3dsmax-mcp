@@ -127,7 +127,7 @@ std::string NativeHandlers::AssignMaterial(const std::string& params, MCPBridgeG
                     {{"handle", handle}}));
         }
         for (const auto& name : names) {
-            auto matches = CollectNodesByExactName(name);
+            auto matches = CollectNodesByName(name);
             if (matches.empty())
                 throw std::runtime_error(StructuredErrorPayload("NOT_FOUND", "Material target not found: " + name));
             if (matches.size() > 1)
@@ -194,7 +194,7 @@ std::string NativeHandlers::AssignMaterial(const std::string& params, MCPBridgeG
                     }
                 }
                 for (const auto& name : names) {
-                    std::vector<INode*> matches = CollectNodesByExactName(name);
+                    std::vector<INode*> matches = CollectNodesByName(name);
                     if (matches.empty()) {
                         notFound.push_back(name);
                         continue;
@@ -286,7 +286,7 @@ std::string NativeHandlers::AssignMaterial(const std::string& params, MCPBridgeG
             }
         }
         for (const auto& name : names) {
-            std::vector<INode*> matches = CollectNodesByExactName(name);
+            std::vector<INode*> matches = CollectNodesByName(name);
             if (matches.empty()) {
                 notFound.push_back(name);
                 continue;
@@ -570,7 +570,7 @@ std::string NativeHandlers::CreateShellMaterial(const std::string& params, MCPBr
         std::vector<INode*> assignmentTargets;
         std::set<INode*> seen;
         for (const std::string& name : assignTo) {
-            std::vector<INode*> matches = CollectNodesByExactName(name);
+            std::vector<INode*> matches = CollectNodesByName(name);
             if (matches.empty()) {
                 notFound.push_back(name);
                 continue;

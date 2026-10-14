@@ -674,7 +674,7 @@ static Mtl* FindInSceneMtlLib(const std::string& name) {
 static MaterialResolve ResolveMaterial(const std::string& name, int subMaterialIndex) {
     if (name.empty()) throw std::runtime_error("name is required");
 
-    const std::vector<INode*> owners = CollectNodesByExactName(name);
+    const std::vector<INode*> owners = CollectNodesByName(name);
     if (owners.size() > 1) {
         // Objects that share a name but carry one material still name that
         // material; with different materials the name cannot choose one.
@@ -1146,7 +1146,7 @@ static json BuildReplicationPlan(const json& request, Mtl* source, const std::st
     // skip it like a missing target.
     json targetInfo = json::array();
     for (const auto& target : targets) {
-        const std::vector<INode*> matches = CollectNodesByExactName(target);
+        const std::vector<INode*> matches = CollectNodesByName(target);
         json t;
         t["name"] = target;
         t["exists"] = !matches.empty();

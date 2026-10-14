@@ -206,17 +206,18 @@ inline void CollectNodes(INode* node, std::vector<INode*>& out) {
     }
 }
 
-inline std::vector<INode*> CollectNodesByExactName(const std::string& name) {
-    Interface* ip = GetCOREInterface();
-    INode* root = ip->GetRootNode();
-    std::vector<INode*> all, matched;
-    CollectNodes(root, all);
+// Nodes named `name`. Exact matches win; when there is none, names that differ
+// only in letter case match, as they do in MAXScript ($box001, getNodeByName).
+inline std::vector<INode*> CollectNodesByName(const std::string& name) {
+    std::vector<INode*> all, exact, caseless;
+    CollectNodes(GetCOREInterface()->GetRootNode(), all);
+    const std::wstring wide = Utf8ToWide(name);
     for (INode* n : all) {
-        if (WideToUtf8(n->GetName()) == name) {
-            matched.push_back(n);
-        }
+        const MCHAR* nodeName = n->GetName();
+        if (wide == nodeName) exact.push_back(n);
+        else if (exact.empty() && _wcsicmp(nodeName, wide.c_str()) == 0) caseless.push_back(n);
     }
-    return matched;
+    return exact.empty() ? caseless : exact;
 }
 
 inline unsigned long long PayloadHandleValue(const json& payload, const std::string& key = "handle") {
@@ -290,7 +291,7 @@ inline json NameCandidatesJson(const std::vector<INode*>& matches) {
 // The one object with this exact name, or nullptr when none has it; the
 // caller reports a missing name in its own words.
 inline INode* FindUniqueNodeByName(const std::string& name, const char* advice = kUniqueNamesAdvice) {
-    const std::vector<INode*> matches = CollectNodesByExactName(name);
+    const std::vector<INode*> matches = CollectNodesByName(name);
     if (matches.size() > 1) ThrowAmbiguousName(name, matches, advice);
     return matches.empty() ? nullptr : matches.front();
 }
@@ -374,6 +375,13 @@ inline NamedNodes ResolveNodesByNames(const std::vector<std::string>& names) {
     for (INode* node : all) {
         auto it = byName.find(WideToUtf8(node->GetName()));
         if (it != byName.end()) it->second.push_back(node);
+    }
+    // As in CollectNodesByName: a name with no exact match may match by case alone.
+    for (auto& entry : byName) {
+        if (!entry.second.empty()) continue;
+        const std::wstring wide = Utf8ToWide(entry.first);
+        for (INode* node : all)
+            if (_wcsicmp(node->GetName(), wide.c_str()) == 0) entry.second.push_back(node);
     }
 
     NamedNodes out;

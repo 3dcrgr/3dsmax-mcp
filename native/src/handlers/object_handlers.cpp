@@ -562,7 +562,7 @@ std::string NativeHandlers::DeleteObjects(const std::string& params, MCPBridgeGU
             }
         }
         for (const auto& name : names) {
-            std::vector<INode*> matches = CollectNodesByExactName(name);
+            std::vector<INode*> matches = CollectNodesByName(name);
             if (matches.empty()) {
                 notFound.push_back(name);
                 continue;
@@ -898,7 +898,7 @@ std::string NativeHandlers::CloneObjects(const std::string& params, MCPBridgeGUP
         std::set<INode*> seenSources;
         json notFound = json::array();
         for (const auto& name : names) {
-            const auto matches = CollectNodesByExactName(name);
+            const auto matches = CollectNodesByName(name);
             if (matches.size() > 1)
                 throw std::runtime_error("Clone source is ambiguous: " + name);
             INode* node = matches.empty() ? nullptr : matches.front();

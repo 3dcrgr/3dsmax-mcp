@@ -528,7 +528,7 @@ json Apply(const json& p) {
         auto* cd=Descriptor(item.at("class_ref")); const auto sid=cd->SuperClassID();
         if(sid!=LIGHT_CLASS_ID&&sid!=TEXMAP_CLASS_ID&&sid!=MATERIAL_CLASS_ID) Fail("BAD_CLASS_REF","Construction is limited to light, map and material classes.");
         if(item.contains("expected_schema")&&item["expected_schema"]!=Schema(cd)["schema_token"]) Fail("STALE_SCHEMA","Creation schema changed.");
-        const auto name=item.value("name",""); if(sid==LIGHT_CLASS_ID&&!name.empty()&&(!names.insert(name).second||!CollectNodesByExactName(name).empty())) Fail("NAME_COLLISION","Light name already exists: "+name);
+        const auto name=item.value("name",""); if(sid==LIGHT_CLASS_ID&&!name.empty()&&(!names.insert(name).second||!CollectNodesByName(name).empty())) Fail("NAME_COLLISION","Light name already exists: "+name);
         if(item.contains("matrix")) { if(sid!=LIGHT_CLASS_ID||!item["matrix"].is_array()||item["matrix"].size()!=4) Fail("BAD_PLAN","Only lights accept a four-row world matrix.");
             for(const auto& row:item["matrix"]) { if(!row.is_array()||row.size()!=3) Fail("BAD_PLAN","Invalid matrix row."); for(const auto& x:row) if(!x.is_number()||!std::isfinite(x.get<double>())) Fail("BAD_PLAN","Matrix must be finite."); } }
         classes[id]=cd;

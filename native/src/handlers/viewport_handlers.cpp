@@ -544,7 +544,7 @@ std::string NativeHandlers::CaptureMultiViewMainThread(const std::string& params
         }
 
         const std::vector<INode*> matches =
-            CollectNodesByExactName(requestedRoot);
+            CollectNodesByName(requestedRoot);
         if (matches.empty()) {
             throw std::runtime_error(
                 "frame_root not found: " + requestedRoot);

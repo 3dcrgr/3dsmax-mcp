@@ -631,7 +631,7 @@ Box3 Bounds(const json& p) {
     if (explicitNames) {
         for (const auto& name : p.at("frame_names")) {
             if (name.type()!=json::value_t::string) throw std::runtime_error("frame_names must contain names");
-            auto matches = CollectNodesByExactName(name.get<std::string>());
+            auto matches = CollectNodesByName(name.get<std::string>());
             if (matches.size()!=1) throw std::runtime_error("Framing name must resolve uniquely: "+name.get<std::string>());
             Descendants(matches.front(),nodes);
         }
