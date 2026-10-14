@@ -8,6 +8,7 @@ All notable changes to this project are documented here.
 - Removed `refresh_plugin_manifest`. `get_plugin_manifest` already rebuilds the manifest from the live runtime on every call; the removed tool only added `"refreshed": true`.
 - `create_tyflow` takes `preset` (rain, snow, fountain, burst, debris) with `amount` and `speed`, replacing `create_tyflow_preset`. Presets build the same operators, flow name and event name as before; `event_name` now overrides the preset's event name.
 - `connect_tyflow_operator` takes `create_if_missing` to add a missing Send Out, replacing `connect_tyflow_events`. Call `connect_tyflow_operator(name, from_event, from_operator="Send Out", to_event, create_if_missing=true)`; the reply reports `created_send_out`.
+- Removed `list_tyflow_operator_types`. It probed a fixed list of 34 operator names; `harvest_tyflow_manifest` probes the documented catalog the same way and caches it per tyFlow version, and `list_tyflow_operators` reports each type's `available` flag. Pass `operator_names` to `harvest_tyflow_manifest` to probe specific types live.
 
 ## [1.7.6] — 2026-10-14
 

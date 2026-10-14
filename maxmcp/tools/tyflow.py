@@ -28,44 +28,6 @@ SHAPE_3D_IDS: dict[str, int] = {
 }
 
 
-KNOWN_OPERATORS: tuple[str, ...] = (
-    "Birth",
-    "Birth Surface",
-    "Birth Objects",
-    "Birth Spline",
-    "Speed",
-    "Spin",
-    "Rotation",
-    "Scale",
-    "Mass",
-    "Force",
-    "Shape",
-    "Display",
-    "PhysX Shape",
-    "PhysX Collision",
-    "Collision",
-    "Delete",
-    "Spawn",
-    "Select",
-    "Send Out",
-    "Split",
-    "Time Test",
-    "Object Test",
-    "Surface Test",
-    "Property Test",
-    "Voronoi Fracture",
-    "Element Fracture",
-    "Face Fracture",
-    "Bounds Fracture",
-    "Brick Fracture",
-    "Multifracture",
-    "Convex Hull",
-    "Export Particles",
-    "Display Data",
-    "Position Object",
-)
-
-
 HELPERS = """
 local esc = MCP_Server.escapeJsonString
 
@@ -167,37 +129,6 @@ def _assignment_lines(values: dict[str, Any], var_name: str, raw_strings: bool =
         )
         names.append(prop_name)
     return "\n".join(lines), names
-
-
-@mcp.tool()
-def list_tyflow_operator_types() -> str:
-    """Return available and unavailable tyFlow operator names for this installation."""
-    candidates = _mxs_string_array(list(KNOWN_OPERATORS))
-    maxscript = f"""(
-{HELPERS}
-if tyFlow == undefined then (
-    "{{\\"error\\":\\"tyFlow plugin is not available\\"}}"
-) else (
-    local opNames = {candidates}
-    local flow = tyFlow name:"zzz_tyflow_op_probe"
-    local eventHandle = flow.tyFlow.addEvent()
-    local ev = eventHandle.Event
-    ev.setName "Probe"
-    local ok = #()
-    local fail = #()
-    for n in opNames do (
-        local op = undefined
-        try (op = ev.addOperator n -1) catch ()
-        if op == undefined then append fail n else (
-            append ok n
-            try (op.remove()) catch ()
-        )
-    )
-    delete flow
-    "{{\\"available\\":" + (jsonStringArray ok) + ",\\"unavailable\\":" + (jsonStringArray fail) + "}}"
-)
-)"""
-    return json.dumps(_send_json(maxscript, {"error": "Could not parse operator probe response."}))
 
 
 TYFLOW_PRESETS: tuple[str, ...] = ("rain", "snow", "fountain", "burst", "debris")

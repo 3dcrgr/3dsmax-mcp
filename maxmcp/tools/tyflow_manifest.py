@@ -243,8 +243,9 @@ def list_tyflow_operators(
     """Query the cached tyFlow operator manifest (no Max traffic).
 
     Matches query tokens against operator type names and property names
-    (case-insensitive substrings). Run harvest_tyflow_manifest first if no
-    cache exists.
+    (case-insensitive substrings). Each entry's `available` reports whether this
+    installation could add that type when probed. Run harvest_tyflow_manifest
+    first if no cache exists.
     """
     path = _latest_cache()
     manifest = _read_manifest(path) if path else None
