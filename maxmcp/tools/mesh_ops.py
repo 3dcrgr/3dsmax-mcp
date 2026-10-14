@@ -16,7 +16,8 @@ from typing import Any
 from ..server import client, mcp
 from ..coerce import DictList, DictValue
 from ..helpers.maxscript import safe_string
-from ..helpers.mesh import MESH_FUNCTIONS, integer, point, selection_script, target_script, vector
+from ..helpers.mesh import (MESH_FUNCTIONS, integer, point, resolve_script, run_mesh_script,
+                            selection_script, target_script, vector)
 from .splines import _parse_p3
 
 
@@ -105,7 +106,8 @@ def inspect_mesh(
         cleanup = 'try (unregisterRedrawViewsCallback MCPMeshOverlayDraw; MCPMeshOverlayDraw = undefined; MCPMeshOverlayData = undefined; MCPMeshOverlayError = undefined; MCPMeshOverlayCalls = undefined) catch ()'
         overlay = overlay.replace("MCPMeshOverlay", "MCPMeshOverlay_"+capture_id)
         cleanup = cleanup.replace("MCPMeshOverlay", "MCPMeshOverlay_"+capture_id)
-    raw = _run(f'''(
+    # The bridge hashes the reported node's base cage right after this script.
+    mesh = run_mesh_script(client, f'''(
         {MESH_FUNCTIONS}
         try (
             {target_script(name, handle)}
@@ -114,11 +116,12 @@ def inspect_mesh(
             local tm = obj.objectTransform
             {choose}
             local out = stringstream ""
+            format "%\\n" (mcHandle obj) to:out
             format "NAME|%\\n" ((dotNetClass "System.Convert").ToBase64String ((dotNetClass "System.Text.Encoding").UTF8.GetBytes obj.name)) to:out
             local instances = #()
             InstanceMgr.GetInstances obj &instances
             format "INSTANCES|%\\n" instances.count to:out
-            format "META|%|%|%|%\\n" (formattedPrint ((getHandleByAnim obj) as integer64) format:"d") (mcCounts mesh) obj.modifiers.count (mcToken obj) to:out
+            format "META|%|%|%\\n" (mcHandle obj) (mcCounts mesh) obj.modifiers.count to:out
             format "MATCH|%\\n" chosen.numberSet to:out
             local currentSelection = mcSelected mesh #{level}
             local currentIds = currentSelection as array
@@ -133,8 +136,9 @@ def inspect_mesh(
             )
             {overlay}
             out as string
-        ) catch ({cleanup}; "__ERROR__|" + (getCurrentException() as string))
+        ) catch ({cleanup}; throw())
     )''')
+    raw = mesh["output"]
     if capture_on_active:
         # Nitrous performs the callback after returning to Max's message loop.
         # Capturing in the registration request produces an unlabeled image.
@@ -154,7 +158,7 @@ def inspect_mesh(
     for line in raw.splitlines():
         fields = line.split("|")
         if fields[0] == "META":
-            result.update(handle=int(fields[1]), counts=_counts(fields[2]), modifiers_above=int(fields[3]), mesh_token=fields[4])
+            result.update(handle=int(fields[1]), counts=_counts(fields[2]), modifiers_above=int(fields[3]))
         elif fields[0] == "MATCH": result["matched"] = int(fields[1])
         elif fields[0] == "NAME": result["name"] = base64.b64decode(fields[1]).decode("utf-8")
         elif fields[0] == "INSTANCES": result["instance_count"] = int(fields[1])
@@ -164,8 +168,9 @@ def inspect_mesh(
             row = {"id":int(fields[1]), "center":_parse_p3(fields[2]), "vertices":_ids(fields[3])}
             if level == "face": row["normal"] = _parse_p3(fields[4])
             result["components"].append(row)
-    if "mesh_token" not in result:
+    if result.get("handle") != mesh["handle"]:
         raise RuntimeError(f"Invalid mesh readback: {raw[:200]}")
+    result["mesh_token"] = mesh["mesh_token"]
     result["returned"] = len(result["components"])
     result["truncated"] = result["returned"] < result["matched"]
     if capture:
@@ -291,45 +296,40 @@ def mesh_edit(
     if not operations or len(operations) > 100: raise ValueError("operations must contain 1-100 edits")
     steps = [_operation(op, i+1) for i,op in enumerate(operations)]
     target = target_script(name,handle)
-    guard = f'if classof obj.baseobject != Editable_Poly do throw "Stale mesh token: object type changed"; if mcToken obj != "{safe_string(expected_mesh)}" do throw "Stale mesh token: inspect_mesh again"' if expected_mesh else ""
+    convert_check = f'if classof obj.baseobject != Editable_Poly and not {str(convert).lower()} do throw "Editable Poly base required; pass convert=true explicitly to collapse the stack"'
     # subObjectLevel's MAXScript setter does not parse a case expression inside
-    # this try block. The final operation is already validated in Python.
+    # a try block. The final operation is already validated in Python.
     ui_level = {"vertex": 1, "edge": 2, "face": 4}[str(operations[-1].get("level", "face")).lower()]
     selection_ui = f'''select obj; max modify mode; modPanel.setCurrentObject obj.baseobject; subObjectLevel = {ui_level}''' if show_selection else ""
-    raw = _run(f'''(
+    # In one main-thread step the bridge resolves the node, checks expected_mesh,
+    # opens the "MCP mesh edit" hold (never joining an open one), runs the
+    # edits, reads the new token, and accepts; any failure cancels the hold.
+    # The selection UI runs after the accept, outside the undo step.
+    mesh = run_mesh_script(client, f'''(
         {MESH_FUNCTIONS}
-        local holding = false
-        try (
-            {target}
-            if classof obj.baseobject != Editable_Poly and not {str(convert).lower()} do throw "Editable Poly base required; pass convert=true explicitly to collapse the stack"
-            {guard or 'true'}
-            if theHold.Holding() do throw "An undo transaction is active; retry after it completes"
-            local wasConverted = false
-            theHold.Begin(); holding = true
-            if classof obj.baseobject != Editable_Poly do (convertToPoly obj; wasConverted = true)
-            local mesh = obj.baseobject
-            local out = stringstream ""
-            format "NAME|%\\n" ((dotNetClass "System.Convert").ToBase64String ((dotNetClass "System.Text.Encoding").UTF8.GetBytes obj.name)) to:out
-            local lastLevel = #face
-            {chr(10).join(steps)}
-            format "DONE|%|%|%|%\\n" (formattedPrint ((getHandleByAnim obj) as integer64) format:"d") (mcCounts mesh) wasConverted (mcToken obj) to:out
-            theHold.Accept "MCP mesh edit"; holding = false
-            try ({selection_ui or 'true'}) catch ()
-            completeredraw()
-            out as string
-        ) catch (
-            local err = getCurrentException() as string
-            if holding do (theHold.Cancel(); holding = false)
-            "__ERROR__|" + err
-        )
-    )''')
+        {target}
+        {convert_check}
+        local wasConverted = false
+        if classof obj.baseobject != Editable_Poly do (convertToPoly obj; wasConverted = true)
+        local mesh = obj.baseobject
+        local out = stringstream ""
+        format "%\\n" (mcHandle obj) to:out
+        format "NAME|%\\n" ((dotNetClass "System.Convert").ToBase64String ((dotNetClass "System.Text.Encoding").UTF8.GetBytes obj.name)) to:out
+        local lastLevel = #face
+        {chr(10).join(steps)}
+        format "DONE|%|%|%\\n" (mcHandle obj) (mcCounts mesh) wasConverted to:out
+        out as string
+    )''', resolve=resolve_script(name, handle, convert_check), expected_mesh=expected_mesh,
+        undo="MCP mesh edit", finish=f"try ({selection_ui or 'true'}) catch (); completeredraw()")
+    raw = mesh["output"]
     result = {"name":name, "steps":[]}
     for line in raw.splitlines():
         f = line.split("|")
         if f[0] == "NAME": result["name"] = base64.b64decode(f[1]).decode("utf-8")
         if f[0] == "STEP": result["steps"].append({"op":f[1],"matched":int(f[2]),"before":_counts(f[3]),"after":_counts(f[4])})
-        elif f[0] == "DONE": result.update(handle=int(f[1]),counts=_counts(f[2]),converted=f[3]=="true",mesh_token=f[4])
-    if "mesh_token" not in result: raise RuntimeError(f"Invalid mesh edit readback: {raw[:200]}")
+        elif f[0] == "DONE": result.update(handle=int(f[1]),counts=_counts(f[2]),converted=f[3]=="true")
+    if result.get("handle") != mesh["handle"]: raise RuntimeError(f"Invalid mesh edit readback: {raw[:200]}")
+    result["mesh_token"] = mesh["mesh_token"]
     return result
 
 
@@ -368,29 +368,17 @@ def _create_mesh(name: str, vertices: list[list[float]], faces: list[list[int]],
         raise ValueError("Use at most 500000 polygon corners")
     v_literal = "#(" + ",".join(point(v) for v in local_verts) + ")"
     f_literal = "#(" + ",".join("#("+",".join(map(str,f))+")" for f in faces) + ")"
-    raw = _run(f'''(
+    # The bridge owns the "MCP create mesh" hold and cancels it on any failure.
+    mesh = run_mesh_script(client, f'''(
         {MESH_FUNCTIONS}
-        local holding = false
-        try (
-            if (getNodeByName "{safe_string(name)}" exact:true) != undefined do throw "A node with this name already exists"
-            if theHold.Holding() do throw "An undo transaction is active"
-            theHold.Begin(); holding = true
-            local obj = Editable_Mesh name:"{safe_string(name)}" pos:{point(center)}
-            convertToPoly obj
-            local mesh = obj.baseobject
-            for p in {v_literal} do polyop.createVert mesh p
-            for f in {f_literal} do (local faceId = polyop.createPolygon mesh f; if faceId == undefined or faceId == 0 do throw "Could not create polygon; check winding and topology")
-            update obj
-            {before_accept or 'true'}
-            local answer = (formattedPrint ((getHandleByAnim obj) as integer64) format:"d") + "|" + (mcCounts mesh) + "|" + mcToken obj
-            theHold.Accept "MCP create mesh"; holding = false
-            completeredraw()
-            answer
-        ) catch (
-            local err = getCurrentException() as string
-            if holding do theHold.Cancel()
-            "__ERROR__|" + err
-        )
-    )''')
-    h,counts,token = raw.split("|",2)
-    return {"name":name,"handle":int(h),"counts":_counts(counts),"mesh_token":token}
+        if (getNodeByName "{safe_string(name)}" exact:true) != undefined do throw "A node with this name already exists"
+        local obj = Editable_Mesh name:"{safe_string(name)}" pos:{point(center)}
+        convertToPoly obj
+        local mesh = obj.baseobject
+        for p in {v_literal} do polyop.createVert mesh p
+        for f in {f_literal} do (local faceId = polyop.createPolygon mesh f; if faceId == undefined or faceId == 0 do throw "Could not create polygon; check winding and topology")
+        update obj
+        {before_accept or 'true'}
+        (mcHandle obj) + "\\n" + (mcCounts mesh)
+    )''', undo="MCP create mesh", finish="completeredraw()")
+    return {"name":name,"handle":mesh["handle"],"counts":_counts(mesh["output"]),"mesh_token":mesh["mesh_token"]}

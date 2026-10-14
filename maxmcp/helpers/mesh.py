@@ -5,6 +5,7 @@ parent transforms, and nonuniform scale. No evaluated triangle IDs are exposed.
 """
 from __future__ import annotations
 
+import json
 import math
 from .maxscript import safe_string
 
@@ -41,6 +42,43 @@ def target_script(name: str, handle: int):
     else:
         code += 'if selection.count != 1 do throw "Select exactly one mesh or pass name/handle"\nobj = selection[1]\n'
     return code
+
+
+def resolve_script(name: str, handle: int, checks: str = ""):
+    """MAXScript returning the target's handle after target_script and checks."""
+    return f'''(
+        {target_script(name, handle)}
+        {checks}
+        formattedPrint ((getHandleByAnim obj) as integer64) format:"d"
+    )'''
+
+
+def run_mesh_script(client, script: str, *, resolve: str = "", expected_mesh: str = "",
+                    undo: str = "", finish: str = "") -> dict:
+    """Run mesh MAXScript with its base-cage token in one Max main-thread step.
+
+    script returns "<node handle>\\n<output>". native:mesh_script hashes that
+    node's Editable Poly base cage after the script (mesh_token). resolve
+    returns the target handle before the script; with expected_mesh the bridge
+    rejects a changed cage before the script runs. undo labels the one hold
+    that wraps the script and rolls it back on failure; finish runs after the
+    hold is accepted, with obj bound to the script's node. Script errors raise;
+    nothing is retried.
+    """
+    payload = {"script": script}
+    for key, value in (("resolve", resolve), ("expected_mesh", expected_mesh),
+                       ("undo", undo), ("finish", finish)):
+        if value:
+            payload[key] = value
+    raw = client.send_command(json.dumps(payload), cmd_type="native:mesh_script").get("result", "")
+    try:
+        result = json.loads(raw)
+        if (not isinstance(result.get("output"), str) or not isinstance(result.get("mesh_token"), str)
+                or isinstance(result.get("handle"), bool) or not isinstance(result.get("handle"), int)):
+            raise ValueError("incomplete mesh readback")
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid mesh readback; inspect before retrying: {str(raw)[:200]}") from exc
+    return result
 
 
 def selection_script(selection: dict | None, level: str, *, default_all=False):
@@ -153,23 +191,8 @@ fn mcNormal mesh tm i = (
 fn mcCounts mesh = (
     (polyop.getNumVerts mesh as string) + "," + (polyop.getNumEdges mesh as string) + "," + (polyop.getNumFaces mesh as string)
 )
-fn mcToken obj = (
-    local mesh = obj.baseobject
-    local ss = stringstream ""
-    format "%|%|" (getHandleByAnim obj) (mcCounts mesh) to:ss
-    local tm = obj.objectTransform
-    for row = 1 to 4 do for axis = 1 to 3 do format "%;" (formattedPrint tm[row][axis] format:".9g") to:ss
-    for i = 1 to polyop.getNumVerts mesh do (
-        local p = polyop.getVert mesh i
-        for axis = 1 to 3 do format "%;" (formattedPrint p[axis] format:".9g") to:ss
-    )
-    for i = 1 to polyop.getNumEdges mesh do format "E%;" (polyop.getEdgeVerts mesh i) to:ss
-    for i = 1 to polyop.getNumFaces mesh do format "F%;" (polyop.getFaceVerts mesh i) to:ss
-    local sha = (dotNetClass "System.Security.Cryptography.SHA256").Create()
-    local bytes = (dotNetClass "System.Text.Encoding").UTF8.GetBytes (ss as string)
-    local digest = (dotNetClass "System.BitConverter").ToString (sha.ComputeHash bytes)
-    sha.Dispose()
-    digest as string
+fn mcHandle obj = (
+    formattedPrint ((getHandleByAnim obj) as integer64) format:"d"
 )
 fn mcSelected mesh level = (
     case level of (
