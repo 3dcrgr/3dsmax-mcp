@@ -7,7 +7,7 @@ from typing import Optional
 
 from ..coerce import StrList
 from ..server import mcp, client
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, report_ambiguous, safe_string
 
 
 def _maxscript_name_array(names: StrList) -> str:
@@ -44,9 +44,10 @@ def analyze_node_orientation(
         target_expr = f"""
             local nameList = {_maxscript_name_array(names)}
             for n in nameList do (
-                local obj = getNodeByName n
+                local obj = mcpBatchNode n missing ambiguous
                 if obj != undefined do append targets obj
             )
+            if targets.count == 0 and ambiguous.count > 0 do mcpThrowUnresolved missing ambiguous "no node was analyzed"
         """
     elif pattern:
         target_expr = f"""
@@ -68,7 +69,10 @@ def analyze_node_orientation(
     """ if include_children else ""
 
     maxscript = f"""(
+        {NODE_LOOKUP_FNS}
         local targets = #()
+        local missing = #()
+        local ambiguous = #()
         local includeChildren = {str(bool(include_children)).lower()}
         {target_expr}
         targets = makeUniqueArray targets
@@ -169,8 +173,18 @@ def analyze_node_orientation(
             if i > 1 do result += ","
             result += nodeJson targets[i]
         )
-        result += "],\\\"truncated\\\":" + (if targets.count > count then "true" else "false") + "}}"
+        result += "],\\\"truncated\\\":" + (if targets.count > count then "true" else "false")
+        if ambiguous.count > 0 do result += ",\\\"ambiguous\\\":" + (mcpAmbiguousJson ambiguous)
+        result += "}}"
         result
     )"""
     response = client.send_command(maxscript)
-    return response.get("result", "")
+    result = response.get("result", "")
+    try:
+        payload = _json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    # Names several objects share were skipped, as the native handler does.
+    if isinstance(payload, dict) and payload.get("ambiguous"):
+        return _json.dumps(report_ambiguous(payload, payload["ambiguous"]))
+    return result

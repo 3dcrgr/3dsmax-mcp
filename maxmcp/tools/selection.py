@@ -2,7 +2,7 @@ import json as _json
 from typing import Optional
 from ..server import mcp, client
 from ..coerce import StrList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, batch_reply, safe_string
 
 
 @mcp.tool()
@@ -40,18 +40,22 @@ def select_objects(
         )"""
     elif names:
         name_arr = "#(" + ", ".join(f'"{safe_string(n)}"' for n in names) + ")"
+        # Names that match no object or several objects are skipped; shared
+        # names are reported.
         maxscript = f"""(
-            clearSelection()
+            {NODE_LOOKUP_FNS}
             local nameList = {name_arr}
             local found = #()
+            local missing = #()
+            local ambiguous = #()
             for n in nameList do (
-                local obj = getNodeByName n
-                if obj != undefined do (
-                    selectMore obj
-                    append found n
-                )
+                local obj = mcpBatchNode n missing ambiguous
+                if obj != undefined do append found obj
             )
-            "Selected " + (found.count as string) + " of " + (nameList.count as string) + " objects"
+            if found.count == 0 and ambiguous.count > 0 do mcpThrowUnresolved missing ambiguous "the selection was not changed"
+            clearSelection()
+            select found
+            "Selected " + (found.count as string) + " of " + (nameList.count as string) + " objects" + (mcpAmbiguousReply ambiguous)
         )"""
     elif pattern:
         safe_pat = safe_string(pattern)
@@ -72,4 +76,4 @@ def select_objects(
         return "At least one parameter (names, pattern, class_name, or all) must be provided."
 
     response = client.send_command(maxscript)
-    return response.get("result", "")
+    return batch_reply(response.get("result", ""))
