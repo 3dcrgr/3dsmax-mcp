@@ -90,7 +90,7 @@ def stage(base: Path, wheel: Path, stage_dir: Path) -> None:
     shutil.copy2(ROOT / "LICENSE", app / "LICENSE.txt")
     docs = app / "docs"
     docs.mkdir()
-    for src in (ROOT / "README.md", ROOT / "docs" / "FORK.md", ROOT / "docs" / "CHANGELOG.md",
+    for src in (ROOT / "README.md", ROOT / "docs" / "FORK.md", ROOT / "docs" / "fork" / "overview.md", ROOT / "docs" / "CHANGELOG.md",
                 HERE / "WHAT-THIS-FORK-DOES.txt", ROOT / "RELEASE_NOTES.md"):
         if src.exists():
             shutil.copy2(src, docs / src.name)
