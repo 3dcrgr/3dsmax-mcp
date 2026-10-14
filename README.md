@@ -228,8 +228,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `inspect_plugin_constructor` | Creation notes for a plugin class |
 | `inspect_plugin_instance` | SDK schema v2: live values, linked maps and guarded edit tokens |
 | `plugin_patch` | Atomic typed PB2 edits with readback and stale/shared/animation guards |
-| `get_plugin_manifest` | Structured manifest (classes, workflows, gotchas) |
-| `refresh_plugin_manifest` | Rebuild manifest from live runtime |
+| `get_plugin_manifest` | Structured manifest (classes, workflows, gotchas), rebuilt from the live runtime on each call |
 | `introspect_class` | SDK parameter descriptors and published interface metadata |
 | `introspect_instance` | Deep SDK introspection with live values |
 

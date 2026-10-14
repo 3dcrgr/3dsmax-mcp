@@ -188,7 +188,6 @@ CUSTOM: dict[str, dict] = {
     "get_session_context": {"max_roots": 5, "max_selection": 5},
     "discover_plugin_surface": {"limit": 5},
     "get_plugin_manifest": {"plugin_name": "tyFlow"},
-    "refresh_plugin_manifest": {"plugin_name": "tyFlow"},
     "inspect_plugin_class": {"class_name": "Box"},
     "inspect_plugin_constructor": {"class_name": "Box"},
     "inspect_plugin_instance": {"name": SMOKE_TARGET},

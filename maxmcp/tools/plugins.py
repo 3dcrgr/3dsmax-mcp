@@ -1180,16 +1180,11 @@ def inspect_plugin_instance(name: str = "", detail: str = "normal", schema_versi
 
 @mcp.tool()
 def get_plugin_manifest(plugin_name: str) -> str:
-    """Return a structured plugin manifest derived from live runtime data plus curated hints."""
+    """Return a structured plugin manifest derived from live runtime data plus curated hints.
+
+    The manifest is rebuilt from the live runtime on every call; nothing is cached.
+    """
     return json.dumps(_build_manifest(plugin_name))
-
-
-@mcp.tool()
-def refresh_plugin_manifest(plugin_name: str) -> str:
-    """Refresh and return the plugin manifest."""
-    manifest = _build_manifest(plugin_name)
-    manifest["refreshed"] = True
-    return json.dumps(manifest)
 
 
 @mcp.resource(PLUGIN_INDEX_RESOURCE_URI, name="Plugin Index", mime_type="application/json")
