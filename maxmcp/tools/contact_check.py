@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..helpers.contact_check import build_script, parse_report, validate_args
+from ..helpers.contact_check import DEFAULT_TIME_BUDGET_S, build_script, parse_report, validate_args
 from ..server import client, mcp
 
 
@@ -17,6 +17,7 @@ def contact_check(
     limit: int = 50,
     max_pairs: int = 200,
     max_faces: int = 200000,
+    time_budget_s: float = DEFAULT_TIME_BUDGET_S,
 ) -> dict[str, Any]:
     """Find meshes that pass through each other, touch, or float just short of contact.
 
@@ -25,6 +26,16 @@ def contact_check(
     seat). With neither, the current selection is used, or all visible geometry
     when nothing is selected. Only pairs whose world bounding boxes come within
     near_gap are measured.
+
+    Named nodes that are not meshes (group heads, dummies, shapes, lights),
+    empty meshes and meshes over max_faces are returned in `skipped` with a
+    reason and a warning; missing or ambiguous names still fail. At least two
+    meshes must remain, with one in `names` and one in `against` when `against`
+    is used.
+
+    time_budget_s (1-300) bounds the run. Pairs are measured fewest faces
+    first; when time runs out the result has complete=false, pairs_measured
+    below candidate_pairs and a warning. Unmeasured pairs are unchecked, not clear.
 
     Status per pair, most severe first:
       penetrating  - a vertex lies inside the other closed mesh deeper than tolerance
@@ -41,11 +52,13 @@ def contact_check(
     intersecting; its own vertices can still sit inside a closed part and report
     penetrating. Read only; the scene is not changed.
     """
-    names_l, against_l, tol, near, max_pairs, max_faces = validate_args(
-        names, against, tolerance, near_gap, max_pairs, max_faces)
+    names_l, against_l, tol, near, max_pairs, max_faces, budget = validate_args(
+        names, against, tolerance, near_gap, max_pairs, max_faces, time_budget_s)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
         raise ValueError("limit must be an integer from 1 to 500")
-    response = client.send_command(build_script(names_l, against_l, tol, near, max_pairs, max_faces))
+    # The budget is checked between steps, so allow for one slow mesh evaluation past it.
+    response = client.send_command(build_script(names_l, against_l, tol, near, max_pairs, max_faces, budget),
+                                   timeout=max(client.timeout, budget + 60.0))
     report = parse_report(str(response.get("result", "")), include_separate=include_separate, limit=limit)
     report["notes"] = [
         "depth is sampled at vertices: a coarse mesh can hide a deeper overlap between its vertices.",
