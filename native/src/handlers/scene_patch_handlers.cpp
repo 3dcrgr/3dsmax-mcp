@@ -48,6 +48,12 @@ struct ExpectedSequence {
     unsigned long long value = 0;
 };
 
+// Raised when every operation was ignored; the transaction is already
+// cancelled and the payload already structured.
+struct ScenePatchIgnored : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 class ScenePatchTransaction {
 public:
     explicit ScenePatchTransaction(const std::string& label) {
@@ -490,16 +496,58 @@ std::vector<PlannedOperation> BuildPlan(
     return plan;
 }
 
-void ApplyTransform(const PlannedOperation& item, TimeValue time) {
+bool SameTransform(const Matrix3& a, const Matrix3& b) {
+    for (int row = 0; row < 4; ++row) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const float x = a.GetRow(row)[axis];
+            const float y = b.GetRow(row)[axis];
+            if (std::fabs(x - y) > 1e-6f * (std::max)({1.0f, std::fabs(x), std::fabs(y)})) return false;
+        }
+    }
+    return true;
+}
+
+std::string ControllerClass(Control* control) {
+    if (!control) return "";
+    MSTR name;
+    control->GetClassName(name, false);
+    return WideToUtf8(name.data());
+}
+
+// Names the controller that drives one part of the node's transform; a
+// transform-level controller (Link, LookAt) has no separate part controllers.
+std::string PartController(INode* node, const char* part) {
+    Control* tm = node->GetTMController();
+    if (!tm) return "";
+    Control* sub = nullptr;
+    if (std::string(part) == "move") sub = tm->GetPositionController();
+    else if (std::string(part) == "rotate") sub = tm->GetRotationController();
+    else sub = tm->GetScaleController();
+    return ControllerClass(sub ? sub : tm);
+}
+
+// Constraint, script and expression controllers ignore Move, Rotate and Scale
+// without an error. Each requested part is compared with the node transform
+// before it; the parts that left it unchanged are returned.
+json ApplyTransform(const PlannedOperation& item, TimeValue time) {
     Matrix3 axis(TRUE);
     if (item.args.value("coordinate_system", "world") == "local") {
         axis = item.target->GetNodeTM(time);
         axis.NoTrans();
     }
 
+    json ignored = json::array();
+    const auto check = [&](const char* part, const Matrix3& before) {
+        if (SameTransform(before, item.target->GetNodeTM(time)))
+            ignored.push_back({{"part", part}, {"controller", PartController(item.target, part)}});
+    };
     if (item.args.contains("move")) {
         const Point3 value = ParseVector3(item.args["move"], "move", item.index);
-        if (!IsZero(value)) item.target->Move(time, axis, value, TRUE, TRUE, PIV_NONE, TRUE);
+        if (!IsZero(value)) {
+            const Matrix3 before = item.target->GetNodeTM(time);
+            item.target->Move(time, axis, value, TRUE, TRUE, PIV_NONE, TRUE);
+            check("move", before);
+        }
     }
     if (item.args.contains("rotate")) {
         const Point3 degrees = ParseVector3(item.args["rotate"], "rotate", item.index);
@@ -507,26 +555,38 @@ void ApplyTransform(const PlannedOperation& item, TimeValue time) {
             const Quat x(AngAxis(Point3(1, 0, 0), DegToRad(degrees.x)));
             const Quat y(AngAxis(Point3(0, 1, 0), DegToRad(degrees.y)));
             const Quat z(AngAxis(Point3(0, 0, 1), DegToRad(degrees.z)));
+            const Matrix3 before = item.target->GetNodeTM(time);
             item.target->Rotate(time, axis, AngAxis(x * y * z), TRUE, TRUE, PIV_NONE, TRUE);
+            check("rotate", before);
         }
     }
     if (item.args.contains("scale")) {
         const Point3 value = ParseScale(item.args["scale"], item.index);
         if (!IsIdentityScale(value)) {
+            const Matrix3 before = item.target->GetNodeTM(time);
             item.target->Scale(time, axis, value, TRUE, TRUE, PIV_NONE, TRUE);
+            check("scale", before);
         }
     }
+    return ignored;
 }
 
-void ApplyOperation(const PlannedOperation& item, Interface* ip, TimeValue time) {
-    if (!item.changed) return;
+// Requested transform parts per operation, to tell a wholly ignored transform
+// from a partly applied one.
+size_t RequestedTransformParts(const PlannedOperation& item) {
+    size_t parts = 0;
+    if (item.args.contains("move") && !IsZero(ParseVector3(item.args["move"], "move", item.index))) ++parts;
+    if (item.args.contains("rotate") && !IsZero(ParseVector3(item.args["rotate"], "rotate", item.index))) ++parts;
+    if (item.args.contains("scale") && !IsIdentityScale(ParseScale(item.args["scale"], item.index))) ++parts;
+    return parts;
+}
+
+json ApplyOperation(const PlannedOperation& item, Interface* ip, TimeValue time) {
+    if (!item.changed) return json::array();
+    if (item.op == "transform") return ApplyTransform(item, time);
     if (item.op == "rename") {
         item.target->SetName(Utf8ToWide(item.args["name"].get<std::string>()).c_str());
-        return;
-    }
-    if (item.op == "transform") {
-        ApplyTransform(item, time);
-        return;
+        return json::array();
     }
     if (item.op == "set_flags") {
         const NodeFlags before = ReadFlags(item.target);
@@ -542,12 +602,12 @@ void ApplyOperation(const PlannedOperation& item, Interface* ip, TimeValue time)
         if (item.args.contains("renderable")) item.target->SetRenderable(item.args["renderable"].get<bool>());
         if (item.args.contains("cast_shadows")) item.target->SetCastShadows(item.args["cast_shadows"].get<bool>());
         if (item.args.contains("receive_shadows")) item.target->SetRcvShadows(item.args["receive_shadows"].get<bool>());
-        return;
+        return json::array();
     }
     if (item.op == "set_parent") {
         INode* parent = item.parent ? item.parent : ip->GetRootNode();
         parent->AttachChild(item.target, item.args.value("keep_transform", true) ? TRUE : FALSE);
-        return;
+        return json::array();
     }
     throw std::runtime_error("Unhandled preflighted operation: " + item.op);
 }
@@ -684,7 +744,7 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
                 beforeSeq, readySeq, "Scene changed while scene_patch was preflighting.");
         }
 
-        const size_t changedCount = ChangedCount(plan);
+        size_t changedCount = ChangedCount(plan);
         json result;
         result["dryRun"] = dryRun;
         result["status"] = dryRun ? "preflight" : (changedCount ? "applied" : "noop");
@@ -718,15 +778,54 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
         ScenePatchTransaction transaction(label);
         size_t applyingIndex = 0;
         try {
-            for (const auto& item : plan) {
+            std::unordered_map<size_t, json> ignored;
+            for (auto& item : plan) {
                 applyingIndex = item.index;
-                ApplyOperation(item, ip, time);
+                json parts = ApplyOperation(item, ip, time);
+                if (parts.empty()) continue;
+                if (parts.size() == RequestedTransformParts(item)) item.changed = false;
+                ignored[item.index] = std::move(parts);
+            }
+            McpHost::DialogWatch::ThrowIfDismissed();
+            changedCount = ChangedCount(plan);
+            json ignoredRows = json::array();
+            for (const auto& item : plan) {
+                const auto found = ignored.find(item.index);
+                if (found == ignored.end()) continue;
+                ignoredRows.push_back({{"index", item.index}, {"target", NodeRefs::ToJson(item.target)},
+                                       {"ignored", found->second}});
+            }
+            if (changedCount == 0) {
+                transaction.Cancel();
+                McpHost::SceneJournal::FlushPending();
+                throw ScenePatchIgnored(StructuredErrorPayload(
+                    "PATCH_APPLY_FAILED",
+                    "No operation took effect: the targets' transform controllers ignored the edit "
+                    "(constraint, script or expression controllers drive them). The scene is unchanged.",
+                    {{"ignored", ignoredRows},
+                     {"message", "Edit the controller's targets or values instead, or use assign_controller "
+                                 "to give the track a keyframable controller."}}));
             }
             ip->RedrawViews(time);
             result["operations"] = BuildProofArray(plan, time, true);
+            for (size_t i = 0; i < plan.size(); ++i) {
+                const auto found = ignored.find(plan[i].index);
+                if (found == ignored.end()) continue;
+                result["operations"][i]["changed"] = plan[i].changed;
+                result["operations"][i]["ignored"] = found->second;
+            }
+            if (!ignoredRows.empty()) {
+                result["status"] = "partial";
+                result["counts"]["changed"] = changedCount;
+                result["ignored"] = ignoredRows;
+                result["warnings"] = json::array({std::to_string(ignoredRows.size()) +
+                    " transform operation(s) were ignored in whole or part by the targets' transform "
+                    "controllers (constraint, script or expression); see ignored."});
+            }
             result["touched"] = UniqueTouchedRefs(plan);
-            McpHost::DialogWatch::ThrowIfDismissed();
             transaction.Accept();
+        } catch (const ScenePatchIgnored&) {
+            throw;
         } catch (const std::exception& error) {
             try {
                 transaction.Cancel();
