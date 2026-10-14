@@ -13,9 +13,11 @@ This is a fork of [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax
 
 It carries fixes for problems found while using the MCP on production architectural visualization. The worst of them hung 3ds Max and lost unsaved work. It also adds tools for Chaos Vantage, RailClone, Forest Pack and props that float or sink.
 
-Everything here is being offered back to upstream as small, separate pull requests. Until they're merged, this fork is where the fixes live.
+Verified and deployed improvements are published on the fork's default branch, `fix/fork-fixes`. We are consolidating the improvements into one pull request to upstream.
 
 ## At a glance
+
+Forest Effects supports guarded ordering, numeric parameters, and object or spline bindings. `.eff` import requires explicit scene bindings; export writes definitions with required bindings listed for the next import. Live API checks and 58 focused tests cover these operations. Controller, texture and curve definitions remain unsupported, and stored effect code has no public compile-success signal. See [iToo coverage](docs/fork/itoo-api-coverage.md).
 
 - **208 tools:** all 179 of upstream's, plus 29 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
@@ -29,6 +31,8 @@ Everything here is being offered back to upstream as small, separate pull reques
 
 [docs/FORK.md](docs/FORK.md) lists every change with how it was verified (live in Max, or unit-tested only). The pages under [docs/fork/](docs/fork/) give the details.
 
+Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs and confirm process disappearance before recording exit. Their offline checks are documented in [iToo coverage](docs/fork/itoo-api-coverage.md); these checks did not restart or modify Max.
+
 ## What it fixes
 
 ### When 3ds Max hangs or is busy
@@ -36,7 +40,8 @@ Everything here is being offered back to upstream as small, separate pull reques
   - Calls fail fast with `MAX_BUSY` or `MAX_NOT_RESPONDING` and a process diagnosis: whether the main window responds, CPU use, whether it exited.
   - The client never replays a request that may already have run.
 - `get_bridge_status` answers from a pipe thread while Max's main thread is blocked. It reports what holds the main thread and which clients are connected.
-- Max no longer stalls on exit when MCP requests are queued: queued work fails at once.
+- Max no longer stalls on exit with queued requests or connected idle pipe clients: queued work fails and pending pipe reads/writes are cancelled and drained. The 2027 bridge passed scratch-Max quit checks with clients retained.
+- Startup failures include native target and transport context. Exited instance registrations are cleaned conservatively, preserving live, uncertain and changed records.
 - An MCP server whose client crashed exits with it, instead of staying connected to Max.
 
 ### Dialogs and unsaved work
@@ -102,8 +107,8 @@ Everything here is being offered back to upstream as small, separate pull reques
 | Props | `resting_check`, `drop_to_surface` | Find props floating above or sunk into the surface below them, gaps in millimetres; drop floating ones onto it (dry run by default, one undo step) |
 | Chaos Vantage | `vantage_status`, `vantage_get_image`, `vantage_live_link` | Read Vantage's state over its local command port, save the frame it shows as a PNG, start or stop V-Ray GPU Live Link. Vantage's command port isn't documented by Chaos |
 | RailClone | `railclone_inspect`, `railclone_set_param`, `railclone_library`, `railclone_from_library` | Inspect bases, exposed parameters, segments and output; set parameters by name within their limits; search the library; create items by route or name, with splines assigned by role. They report the running RailClone version, warn about version-specific library bugs, and handle Proxy Cache |
-| Forest Pack | `forest_items`, `forest_edit_items`, `forest_set_mode`, `forest_library`, `forest_from_library`, `forest_validate` | Read items with instance-ready transforms; edit items in custom edit mode with a revert list (Forest doesn't undo item edits); search the library and place presets or 3D items; validate item and area lists, including a warning when random X/Y translation can cross active spline boundaries; name why a forest is empty |
-| iToo API extensions | `itoo_api_inventory`, `itoo_catalog`, `railclone_slots`, `railclone_metadata`, `railclone_proxy`, `railclone_instances`, `railclone_settings`, `forest_inspect`, `forest_effects`, `forest_settings`, `forest_effect_library` | [Coverage and remaining gaps](docs/fork/itoo-api-coverage.md): live API signatures, guarded source/segment/settings edits, read-only Forest translation extents, metadata, cache/instance controls and tested Forest Effects editing and library reads |
+| Forest Pack | `forest_items`, `forest_edit_items`, `forest_set_mode`, `forest_library`, `forest_from_library`, `forest_validate` | Read items with instance-ready transforms; edit items in custom edit mode with a revert list (Forest doesn't undo item edits); search the library and place presets or 3D items; validate item and area lists, including Reference-mode forests fed by a RailClone and warnings when random X/Y translation can cross active spline boundaries; name why a forest is empty |
+| iToo API extensions | `itoo_api_inventory`, `itoo_catalog`, `railclone_slots`, `railclone_metadata`, `railclone_proxy`, `railclone_instances`, `railclone_settings`, `forest_inspect`, `forest_effects`, `forest_effect_parameters`, `forest_settings`, `forest_effect_library` | [Coverage and remaining gaps](docs/fork/itoo-api-coverage.md): live API signatures, guarded source/segment/settings edits, read-only Forest translation extents, metadata, cache/instance controls and tested Forest Effects editing and library reads |
 | iToo → Vantage | `itoo_vantage_check` | Read-only check of how ready Forest Pack, RailClone and ForestIvy objects are for Chaos Vantage: colour-map slot 1, opacity maps, CPU-only features, ID-driven maps, render settings, caps and the `fullMeshProxy` setting. A fallback is suggested for objects with errors |
 
 New options on existing tools:
@@ -162,7 +167,7 @@ The installer's runtime ignores `PYTHONPATH`, hence the `sys.path` line. See [Ad
 
 | Max | Bridge in `native/bin/` |
 |---|---|
-| 2027 | Fork build, with every native fix, including the V-Ray GPU preview (sha256 `ca5e16dd…`) |
+| 2027 | Fork build, with every native fix, including the V-Ray GPU preview (sha256 `3bd55e31…`) |
 | 2026 | Fork build with every native fix except the V-Ray GPU preview (sha256 `d5cd6ba5…`) |
 | 2023–2025 | Upstream's 1.7.5 builds |
 
