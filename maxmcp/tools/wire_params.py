@@ -8,7 +8,7 @@ modifier's angle). These tools expose wiring as first-class operations.
 from typing import Optional
 import json as _json
 from ..server import mcp, client
-from ..helpers.maxscript import safe_string, safe_name, normalize_subanim_path
+from ..helpers.maxscript import safe_string, normalize_subanim_path, node_by_name, node_script_ref
 
 
 @mcp.tool()
@@ -44,7 +44,7 @@ def list_wireable_params(
         filter_check = f'local filterStr = "{safe_filter}"'
 
     maxscript = f"""(
-    local obj = getNodeByName "{safe}"
+    local obj = {node_by_name(name, missing_ok=True)}
     if obj == undefined do return "Object not found: {safe}"
     {filter_check}
     local results = #()
@@ -128,18 +128,18 @@ def wire_params(
     safe_tgt_param = safe_string(normalize_subanim_path(target_param))
     safe_expr = safe_string(expression)
 
-    # If path starts with "[", no dot separator needed (e.g. $'Obj'[#transform])
+    # If path starts with "[", no dot separator needed (e.g. node[#transform])
     src_sep = "" if safe_src_param.startswith("[") else "."
     tgt_sep = "" if safe_tgt_param.startswith("[") else "."
 
     lines = [
-        f'local srcObj = getNodeByName "{safe_src_obj}"',
+        f'local srcObj = {node_by_name(source_object, missing_ok=True)}',
         f'if srcObj == undefined do return "Source object not found: {safe_src_obj}"',
-        f'local tgtObj = getNodeByName "{safe_tgt_obj}"',
+        f'local tgtObj = {node_by_name(target_object, missing_ok=True)}',
         f'if tgtObj == undefined do return "Target object not found: {safe_tgt_obj}"',
-        f'local srcSA = execute("$\'" + srcObj.name + "\'{src_sep}" + "{safe_src_param}")',
+        f'local srcSA = execute ({node_script_ref("srcObj")} + "{src_sep}" + "{safe_src_param}")',
         f'if srcSA == undefined do return "Source param not found: {safe_src_param}"',
-        f'local tgtSA = execute("$\'" + tgtObj.name + "\'{tgt_sep}" + "{safe_tgt_param}")',
+        f'local tgtSA = execute ({node_script_ref("tgtObj")} + "{tgt_sep}" + "{safe_tgt_param}")',
         f'if tgtSA == undefined do return "Target param not found: {safe_tgt_param}"',
     ]
 
@@ -167,7 +167,7 @@ def get_wired_params(name: str) -> str:
 
     safe = safe_string(name)
     maxscript = f"""(
-    local obj = getNodeByName "{safe}"
+    local obj = {node_by_name(name, missing_ok=True)}
     if obj == undefined do return "Object not found: {safe}"
 
     local wireClasses = #("Float_Wire", "Point3_Wire", "Position_Wire", "Rotation_Wire", "Scale_Wire")
@@ -239,9 +239,9 @@ def unwire_params(
     safe_param = safe_string(normalize_subanim_path(param_path))
     param_sep = "" if safe_param.startswith("[") else "."
     maxscript = f"""(
-    local obj = getNodeByName "{safe_obj}"
+    local obj = {node_by_name(object_name, missing_ok=True)}
     if obj == undefined do return "Object not found: {safe_obj}"
-    local sa = execute("$'" + obj.name + "'{param_sep}" + "{safe_param}")
+    local sa = execute ({node_script_ref("obj")} + "{param_sep}" + "{safe_param}")
     if sa == undefined do return "Param not found: {safe_param}"
     local ctrl = sa.controller
     if ctrl == undefined do return "Error: No controller on: {safe_param}"

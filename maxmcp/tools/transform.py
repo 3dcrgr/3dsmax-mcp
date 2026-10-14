@@ -2,7 +2,7 @@ import json as _json
 from typing import Optional
 from ..server import mcp, client
 from ..coerce import FloatList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import safe_string, node_by_name
 
 
 @mcp.tool()
@@ -69,7 +69,7 @@ def transform_object(
     ops_str = "\n            ".join(ops)
 
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj != undefined then (
             {ops_str}
             local posStr = "[" + (obj.pos.x as string) + "," + (obj.pos.y as string) + "," + (obj.pos.z as string) + "]"

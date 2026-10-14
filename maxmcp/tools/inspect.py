@@ -7,7 +7,7 @@ InstanceMgr for instance awareness.
 
 import json as _json
 from ..server import mcp, client
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import safe_string, node_by_name
 
 
 @mcp.tool()
@@ -28,7 +28,7 @@ def inspect_object(name: str) -> str:
 
     safe = safe_string(name)
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "Object not found: {safe}"
         ) else (
@@ -158,7 +158,7 @@ def inspect_properties(
     blacklist = "#(#adTextureLock, #notused, #thelist, #geometryOrientationLookAtNode, #target_distance)"
 
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "{{\\\"error\\\": \\\"Object not found: {safe}\\\"}}"
         ) else (
@@ -250,23 +250,20 @@ def introspect_osl(
         return '{"error":"Provide class_name or name"}'
 
     safe_class = safe_string(class_name)
-    safe_name = safe_string(name)
     safe_osl = safe_string(osl_file)
 
     # Build the target expression
     if name:
         if sub_material_index > 0:
             target_setup = f'''
-            local obj = getNodeByName "{safe_name}"
-            if obj == undefined do throw "Object not found"
+            local obj = {node_by_name(name)}
             if obj.material == undefined do throw "No material on object"
             local m = obj.material[{sub_material_index}]
             if m == undefined do throw "Sub-material index {sub_material_index} not found"
             '''
         else:
             target_setup = f'''
-            local obj = getNodeByName "{safe_name}"
-            if obj == undefined do throw "Object not found"
+            local obj = {node_by_name(name)}
             if obj.material == undefined do throw "No material on object"
             local m = obj.material
             '''
