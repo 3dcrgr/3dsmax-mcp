@@ -3,7 +3,9 @@
 #include "mcp_bridge/core_bridge.h"
 
 #include <iparamb2.h>
+#include <map>
 #include <set>
+#include <utility>
 #include <vector>
 
 using json = nlohmann::json;
@@ -598,6 +600,349 @@ std::string NativeHandlers::CreateShellMaterial(const std::string& params, MCPBr
     });
 }
 
+// ── replace_material / batch_replace_materials ──────────────────
+// Targets match by exact name on an object's own material and in every
+// sub-material slot of its material tree (Multi/Sub and any other material
+// that exposes sub-materials). The source may live on an object, in a
+// sub-material slot or in a compact Material Editor slot.
+
+static constexpr int kMaterialEditorSlotCount = 24;
+
+static bool MaterialNamed(Mtl* mtl, const std::wstring& name) {
+    return mtl && name == mtl->GetName().data();
+}
+
+static std::string MaterialName(Mtl* mtl) {
+    return mtl ? WideToUtf8(mtl->GetName().data()) : std::string();
+}
+
+// A batch preview chains entries without touching the scene: later entries
+// read the assignments earlier entries planned through this overlay. Applied
+// runs leave it empty and read the live scene.
+struct MaterialReplaceOverlay {
+    std::map<INode*, Mtl*> nodes;
+    std::map<std::pair<Mtl*, int>, Mtl*> slots;
+
+    Mtl* NodeMtl(INode* node) const {
+        auto it = nodes.find(node);
+        return it != nodes.end() ? it->second : node->GetMtl();
+    }
+    Mtl* SubMtl(Mtl* parent, int index) const {
+        auto it = slots.find({parent, index});
+        return it != slots.end() ? it->second : parent->GetSubMtl(index);
+    }
+};
+
+// Distinct materials with one exact name, in lookup priority: object
+// materials, their sub-material trees, then Material Editor slots and their
+// trees. Each hit records where it was found.
+struct NamedMaterialSearch {
+    const std::wstring& name;
+    const MaterialReplaceOverlay& overlay;
+    std::set<Mtl*> visited;
+    std::set<Mtl*> seen;
+    std::vector<std::pair<Mtl*, json>> found;
+
+    void Add(Mtl* mtl, json where) {
+        if (seen.insert(mtl).second) found.push_back({mtl, std::move(where)});
+    }
+
+    void Walk(Mtl* parent, const json& origin) {
+        if (!parent || !visited.insert(parent).second) return;
+        for (int i = 0; i < parent->NumSubMtls(); ++i) {
+            Mtl* sub = overlay.SubMtl(parent, i);
+            if (!sub) continue;
+            if (MaterialNamed(sub, name)) {
+                json where = origin;
+                where["found_in"] = "sub_material";
+                where["parent_material"] = MaterialName(parent);
+                where["slot_index"] = i + 1;
+                Add(sub, std::move(where));
+            }
+            Walk(sub, origin);
+        }
+    }
+
+    void Run(const std::vector<INode*>& nodes) {
+        for (INode* node : nodes) {
+            Mtl* mtl = overlay.NodeMtl(node);
+            if (MaterialNamed(mtl, name))
+                Add(mtl, {{"found_in", "object"}, {"object", WideToUtf8(node->GetName())},
+                          {"handle", NodeHandle(node)}});
+        }
+        for (INode* node : nodes)
+            Walk(overlay.NodeMtl(node), {{"object", WideToUtf8(node->GetName())}});
+        Interface* ip = GetCOREInterface();
+        for (int slot = 0; slot < kMaterialEditorSlotCount; ++slot) {
+            MtlBase* entry = ip->GetMtlSlot(slot);
+            if (!entry || entry->SuperClassID() != MATERIAL_CLASS_ID) continue;
+            Mtl* mtl = static_cast<Mtl*>(entry);
+            const json origin = {{"material_editor_slot", slot + 1}};
+            if (MaterialNamed(mtl, name)) {
+                json where = origin;
+                where["found_in"] = "material_editor";
+                Add(mtl, std::move(where));
+            }
+            Walk(mtl, origin);
+        }
+    }
+};
+
+// One planned change: an object's own material, or one sub-material slot.
+struct MaterialReplaceMatch {
+    INode* node = nullptr;
+    Mtl* parent = nullptr;
+    int slot = -1;
+    Mtl* previous = nullptr;
+    std::vector<INode*> users;  // objects whose material tree reaches the slot
+};
+
+// Walks one object's material tree. A slot holding a material named `target`
+// is a match; the matched material is not descended because its slot is the
+// one being replaced.
+static void CollectSlotMatches(
+    Mtl* parent, INode* user, const std::wstring& target,
+    const MaterialReplaceOverlay& overlay, std::set<Mtl*>& visited,
+    std::vector<MaterialReplaceMatch>& matches,
+    std::map<std::pair<Mtl*, int>, size_t>& slotIndex) {
+    if (!parent || !visited.insert(parent).second) return;
+    for (int i = 0; i < parent->NumSubMtls(); ++i) {
+        Mtl* sub = overlay.SubMtl(parent, i);
+        if (!sub) continue;
+        if (!MaterialNamed(sub, target)) {
+            CollectSlotMatches(sub, user, target, overlay, visited, matches, slotIndex);
+            continue;
+        }
+        auto [it, inserted] = slotIndex.emplace(std::make_pair(parent, i), matches.size());
+        if (inserted) {
+            MaterialReplaceMatch match;
+            match.parent = parent;
+            match.slot = i;
+            match.previous = sub;
+            matches.push_back(std::move(match));
+        }
+        matches[it->second].users.push_back(user);
+    }
+}
+
+// True when `owner` referencing `source` would close a reference cycle, for
+// example when the source contains the slot's parent material. TestForLoop
+// returns REF_SUCCEED when the new reference is safe. A batch preview also
+// follows sub-material assignments planned by earlier entries, which the live
+// reference graph does not contain yet.
+static bool WouldCreateLoop(
+    Mtl* source, ReferenceMaker* owner, Mtl* ownerMtl,
+    const MaterialReplaceOverlay& overlay) {
+    if (source->TestForLoop(FOREVER, owner) != REF_SUCCEED) return true;
+    if (!ownerMtl || overlay.slots.empty()) return false;
+    std::set<Mtl*> visited;
+    std::vector<Mtl*> pending{source};
+    while (!pending.empty()) {
+        Mtl* mtl = pending.back();
+        pending.pop_back();
+        if (mtl == ownerMtl) return true;
+        if (!visited.insert(mtl).second) continue;
+        for (int i = 0; i < mtl->NumSubMtls(); ++i) {
+            if (Mtl* sub = overlay.SubMtl(mtl, i)) pending.push_back(sub);
+        }
+    }
+    return false;
+}
+
+static std::string DescribeMaterialLocation(const json& where) {
+    const std::string foundIn = where.value("found_in", "");
+    if (foundIn == "object")
+        return "on object '" + where.value("object", "") + "'";
+    if (foundIn == "material_editor")
+        return "in Material Editor slot " + std::to_string(where.value("material_editor_slot", 0));
+    return "in slot " + std::to_string(where.value("slot_index", 0)) + " of '" +
+           where.value("parent_material", "") + "'";
+}
+
+static std::string MaterialReplaceStatus(
+    size_t matchCount, int changed, const json& skipped, bool targetExists, bool preview) {
+    if (matchCount == 0) return targetExists ? "no_objects" : "no_match";
+    if (changed > 0) return preview ? "preview" : "replaced";
+    for (const json& skip : skipped) {
+        if (skip.value("reason", "") != "already_source") return "blocked";
+    }
+    return "unchanged";
+}
+
+// Plans one replacement against the scene as it is now (or as the overlay
+// says it will be), then applies it unless previewing. Every set is read back.
+static json RunMaterialReplacement(
+    const std::string& sourceName, const std::string& targetName, bool preview,
+    bool identityObjects, const std::vector<INode*>& nodes, MaterialReplaceOverlay& overlay) {
+    const std::wstring sourceW = Utf8ToWide(sourceName);
+    const std::wstring targetW = Utf8ToWide(targetName);
+
+    json entry;
+    entry["source_material"] = sourceName;
+    entry["target_material"] = targetName;
+
+    NamedMaterialSearch sourceSearch{sourceW, overlay};
+    sourceSearch.Run(nodes);
+    if (sourceSearch.found.empty()) {
+        entry["status"] = "error";
+        entry["error"] = "Source material '" + sourceName +
+            "' not found on objects, in sub-material slots or in the Material Editor";
+        return entry;
+    }
+
+    Mtl* source = sourceSearch.found.front().first;
+    json warnings = json::array();
+    json sourceInfo = sourceSearch.found.front().second;
+    sourceInfo["name"] = MaterialName(source);
+    sourceInfo["class"] = MaxScriptVisibleClassName(source);
+    sourceInfo["candidates"] = static_cast<int>(sourceSearch.found.size());
+    if (sourceSearch.found.size() > 1) {
+        warnings.push_back(std::to_string(sourceSearch.found.size()) + " materials are named '" +
+            sourceName + "'; used the one " + DescribeMaterialLocation(sourceInfo) + ".");
+    }
+    entry["source"] = sourceInfo;
+
+    std::vector<MaterialReplaceMatch> matches;
+    std::map<std::pair<Mtl*, int>, size_t> slotIndex;
+    for (INode* node : nodes) {
+        Mtl* own = overlay.NodeMtl(node);
+        if (!own) continue;
+        if (MaterialNamed(own, targetW)) {
+            MaterialReplaceMatch match;
+            match.node = node;
+            match.previous = own;
+            match.users.push_back(node);
+            matches.push_back(std::move(match));
+            continue;
+        }
+        std::set<Mtl*> visited;
+        CollectSlotMatches(own, node, targetW, overlay, visited, matches, slotIndex);
+    }
+
+    auto objectJson = [&](INode* node) -> json {
+        return identityObjects ? NodeIdentityJson(node) : json(WideToUtf8(node->GetName()));
+    };
+
+    json replacedObjects = json::array();
+    json replacedSlots = json::array();
+    json skipped = json::array();
+    std::set<INode*> affected;
+    for (MaterialReplaceMatch& match : matches) {
+        json where;
+        std::string reason;
+        if (match.node) {
+            where = {{"kind", "object"}, {"object", WideToUtf8(match.node->GetName())},
+                     {"handle", NodeHandle(match.node)}};
+            if (match.previous == source) {
+                reason = "already_source";
+            } else if (WouldCreateLoop(source, match.node, nullptr, overlay)) {
+                reason = "would_create_loop";
+            } else if (preview) {
+                overlay.nodes[match.node] = source;
+            } else {
+                match.node->SetMtl(source);
+                Mtl* now = match.node->GetMtl();
+                if (now != source) {
+                    reason = "readback_mismatch";
+                    where["actual_material"] = MaterialName(now);
+                }
+            }
+        } else {
+            MSTR slotLabel = match.parent->GetSubMtlSlotName(match.slot, false);
+            where = {{"kind", "sub_material"},
+                     {"parent_material", MaterialName(match.parent)},
+                     {"parent_class", MaxScriptVisibleClassName(match.parent)},
+                     {"slot_index", match.slot + 1},
+                     {"slot_name", WideToUtf8(slotLabel.data())},
+                     {"previous_material", MaterialName(match.previous)},
+                     {"object_count", static_cast<int>(match.users.size())}};
+            if (match.previous == source) {
+                reason = "already_source";
+            } else if (match.parent == source) {
+                reason = "parent_is_source";
+            } else if (WouldCreateLoop(source, match.parent, match.parent, overlay)) {
+                reason = "would_create_loop";
+            } else if (preview) {
+                overlay.slots[{match.parent, match.slot}] = source;
+            } else {
+                match.parent->SetSubMtl(match.slot, source);
+                Mtl* now = match.parent->GetSubMtl(match.slot);
+                if (now != source) {
+                    // Materials may expose a sub-material read-only and ignore SetSubMtl.
+                    reason = now == match.previous ? "set_rejected" : "readback_mismatch";
+                    where["actual_material"] = MaterialName(now);
+                } else {
+                    match.parent->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+                }
+            }
+        }
+
+        if (!reason.empty()) {
+            where["reason"] = reason;
+            skipped.push_back(std::move(where));
+            continue;
+        }
+        if (match.node) {
+            replacedObjects.push_back(objectJson(match.node));
+        } else {
+            where.erase("kind");
+            replacedSlots.push_back(std::move(where));
+        }
+        affected.insert(match.users.begin(), match.users.end());
+    }
+
+    json affectedObjects = json::array();
+    for (INode* node : nodes) {
+        if (affected.count(node)) affectedObjects.push_back(objectJson(node));
+    }
+
+    const int changed = static_cast<int>(replacedObjects.size() + replacedSlots.size());
+    bool targetExists = !matches.empty();
+    if (!targetExists) {
+        NamedMaterialSearch targetSearch{targetW, overlay};
+        targetSearch.Run(nodes);
+        targetExists = !targetSearch.found.empty();
+    }
+    const std::string status =
+        MaterialReplaceStatus(matches.size(), changed, skipped, targetExists, preview);
+
+    int refused = 0;
+    for (const json& skip : skipped) {
+        if (skip.value("reason", "") != "already_source") ++refused;
+    }
+    const std::string verb = preview ? "would be" : "was";
+    if (status == "no_match") {
+        warnings.push_back("No material named '" + targetName +
+            "' exists on objects, in their sub-material slots or in the Material Editor.");
+    } else if (status == "no_objects") {
+        warnings.push_back("'" + targetName + "' exists only in the Material Editor; no object "
+            "or sub-material slot uses it, so nothing " + verb + " replaced.");
+    } else if (status == "blocked") {
+        warnings.push_back("Every match of '" + targetName + "' was skipped, so nothing " + verb +
+            " replaced; see skipped for reasons.");
+    } else if (status == "unchanged") {
+        warnings.push_back("Every match of '" + targetName + "' already uses '" + sourceName +
+            "', so nothing " + verb + " replaced.");
+    } else if (refused > 0) {
+        warnings.push_back(std::to_string(refused) + " match(es) were skipped; see skipped for reasons.");
+    }
+
+    entry["status"] = status;
+    entry["preview"] = preview;
+    entry["match_count"] = static_cast<int>(matches.size());
+    entry["replaced_count"] = changed;
+    entry["reassigned_count"] = static_cast<int>(replacedObjects.size());
+    entry["replaced_objects"] = replacedObjects;
+    entry["replaced_slot_count"] = static_cast<int>(replacedSlots.size());
+    entry["replaced_slots"] = replacedSlots;
+    entry["skipped_count"] = static_cast<int>(skipped.size());
+    entry["skipped"] = skipped;
+    entry["affected_count"] = static_cast<int>(affectedObjects.size());
+    entry["affected_objects"] = affectedObjects;
+    if (!warnings.empty()) entry["warnings"] = warnings;
+    return entry;
+}
+
 // ── native:replace_material ─────────────────────────────────────
 std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridgeGUP* gup) {
     return gup->GetExecutor().ExecuteSync([&]() -> std::string {
@@ -610,68 +955,24 @@ std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridge
             throw std::runtime_error("source_material and target_material are required");
 
         Interface* ip = GetCOREInterface();
-        INode* root = ip->GetRootNode();
-        std::vector<INode*> all;
-        CollectNodes(root, all);
+        std::vector<INode*> nodes;
+        CollectNodes(ip->GetRootNode(), nodes);
 
-        // Find source and target material instances by scanning all nodes
-        Mtl* sourceMtl = nullptr;
-        Mtl* targetMtl = nullptr;
-        std::vector<INode*> affectedNodes;
+        MaterialReplaceOverlay overlay;
+        json result = RunMaterialReplacement(sourceName, targetName, preview, false, nodes, overlay);
+        if (result.value("status", "") == "error")
+            throw std::runtime_error(StructuredErrorPayload("NOT_FOUND", result.value("error", "")));
 
-        for (INode* node : all) {
-            Mtl* mtl = node->GetMtl();
-            if (!mtl) continue;
-            std::string mtlName = WideToUtf8(mtl->GetName().data());
-            if (mtlName == sourceName) sourceMtl = mtl;
-            if (mtlName == targetName) {
-                targetMtl = mtl;
-                affectedNodes.push_back(node);
-            }
-        }
-
-        if (!sourceMtl)
-            throw std::runtime_error("Source material '" + sourceName + "' not found in scene");
-
-        json affectedList = json::array();
-        for (INode* n : affectedNodes) {
-            affectedList.push_back(WideToUtf8(n->GetName()));
-        }
-
-        if (preview) {
-            json result;
-            result["source_material"] = sourceName;
-            result["target_material"] = targetName;
-            result["affected_count"] = (int)affectedNodes.size();
-            result["affected_objects"] = affectedList;
-            result["preview"] = true;
-            return result.dump();
-        }
-
-        // Replace: assign source material to all objects that had target
-        for (INode* n : affectedNodes) {
-            n->SetMtl(sourceMtl);
-        }
-
-        ip->RedrawViews(ip->GetTime());
-
-        json result;
-        result["source_material"] = sourceName;
-        result["target_material"] = targetName;
-        result["replaced_count"] = (int)affectedNodes.size();
-        result["replaced_objects"] = affectedList;
-        if (affectedNodes.empty()) {
-            result["status"] = "no_objects";
-            result["warnings"] = json::array({"No object uses '" + targetName +
-                "' as its material, so nothing was replaced. Sub-materials are not matched."});
-        } else {
-            result["status"] = "replaced";
-        }
+        if (!preview && result.value("replaced_count", 0) > 0)
+            ip->RedrawViews(ip->GetTime());
         return result.dump();
     });
 }
 
 // ── native:batch_replace_materials ──────────────────────────────
+// Entries apply in order inside the dispatcher's single undo transaction, and
+// each one is evaluated against the scene the previous entries left. Previews
+// chain the same way through an overlay instead of the scene.
 std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCPBridgeGUP* gup) {
     return gup->GetExecutor().ExecuteSync([&]() -> std::string {
         json p = json::parse(params);
@@ -680,78 +981,47 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
         bool preview = p.value("preview", false) || p.value("dry_run", false);
 
         Interface* ip = GetCOREInterface();
-        INode* root = ip->GetRootNode();
-        std::vector<INode*> all;
-        CollectNodes(root, all);
+        std::vector<INode*> nodes;
+        CollectNodes(ip->GetRootNode(), nodes);
 
-        // Build material name -> Mtl* map and name -> nodes map
-        std::map<std::string, Mtl*> mtlMap;
-        std::map<std::string, std::vector<INode*>> mtlNodes;
-
-        for (INode* node : all) {
-            Mtl* mtl = node->GetMtl();
-            if (!mtl) continue;
-            std::string name = WideToUtf8(mtl->GetName().data());
-            mtlMap[name] = mtl;
-            mtlNodes[name].push_back(node);
-        }
-
+        MaterialReplaceOverlay overlay;
         json results = json::array();
         int totalReplaced = 0;
+        int totalSkipped = 0;
+        int errorCount = 0;
 
         for (const auto& rep : replacements) {
-            std::string src = rep.value("source", rep.value("source_material", ""));
-            std::string tgt = rep.value("target", rep.value("target_material", ""));
-
-            json entry;
-            entry["source_material"] = src;
-            entry["target_material"] = tgt;
+            std::string src = rep.is_object() ? rep.value("source", rep.value("source_material", "")) : "";
+            std::string tgt = rep.is_object() ? rep.value("target", rep.value("target_material", "")) : "";
 
             if (src.empty() || tgt.empty()) {
+                json entry;
+                entry["source_material"] = src;
+                entry["target_material"] = tgt;
                 entry["status"] = "error";
                 entry["error"] = "missing source or target";
                 results.push_back(entry);
+                ++errorCount;
                 continue;
             }
 
-            auto srcIt = mtlMap.find(src);
-            if (srcIt == mtlMap.end()) {
-                entry["status"] = "error";
-                entry["error"] = "source material not found";
-                results.push_back(entry);
-                continue;
-            }
-
-            auto tgtIt = mtlNodes.find(tgt);
-            if (tgtIt == mtlNodes.end() || tgtIt->second.empty()) {
-                entry["replaced_count"] = 0;
-                entry["status"] = preview ? "preview" : "no_objects";
-                results.push_back(entry);
-                continue;
-            }
-
-            json objects = json::array();
-            for (INode* n : tgtIt->second) {
-                objects.push_back(NodeIdentityJson(n));
-                if (!preview) {
-                    n->SetMtl(srcIt->second);
-                }
-            }
-
-            entry["replaced_count"] = (int)tgtIt->second.size();
-            entry["replaced_objects"] = objects;
-            entry["status"] = preview ? "preview" : "replaced";
-            totalReplaced += (int)tgtIt->second.size();
+            json entry = RunMaterialReplacement(src, tgt, preview, true, nodes, overlay);
+            if (entry.value("status", "") == "error") ++errorCount;
+            totalReplaced += entry.value("replaced_count", 0);
+            totalSkipped += entry.value("skipped_count", 0);
             results.push_back(entry);
         }
 
-        if (!preview) {
+        if (!preview && totalReplaced > 0) {
             ip->RedrawViews(ip->GetTime());
         }
 
         json result;
         result["results"] = results;
         result["total_replaced"] = totalReplaced;
+        result["total_skipped"] = totalSkipped;
+        result["error_count"] = errorCount;
+        result["status"] = totalReplaced > 0 ? (preview ? "preview" : "replaced") : "no_changes";
         result["preview"] = preview;
         result["dry_run"] = p.value("dry_run", false);
         return result.dump();
