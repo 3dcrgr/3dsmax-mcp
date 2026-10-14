@@ -167,7 +167,7 @@ The installer's runtime ignores `PYTHONPATH`, hence the `sys.path` line. See [Ad
 
 | Max | Bridge in `native/bin/` |
 |---|---|
-| 2027 | Fork build, with every native fix, including the V-Ray GPU preview (sha256 `3bd55e31…`) |
+| 2027 | Fork build, with every native fix, including the V-Ray GPU preview (sha256 `b95802e2…`) |
 | 2026 | Fork build with every native fix except the V-Ray GPU preview (sha256 `d5cd6ba5…`) |
 | 2023–2025 | Upstream's 1.7.5 builds |
 

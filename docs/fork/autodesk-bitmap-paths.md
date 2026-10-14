@@ -35,7 +35,7 @@ Python (`material_roles`):
 ## Which bridge has it
 
 Everything under "Native" above runs in the bridge:
-- In `native/bin/`, `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) and `mcp_bridge_2027.gup` (sha256 `ca5e16dd…`, built from `6397f1f` with the Max 2027 SDK) are fork builds with this fix. The 2023, 2024 and 2025 files are upstream's 1.7.5 builds.
+- In `native/bin/`, `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) and `mcp_bridge_2027.gup` (sha256 `b95802e2…`, built from `374d0f8` with the Max 2027 SDK) are fork builds with this fix. The 2023, 2024 and 2025 files are upstream's 1.7.5 builds.
 - The 2027 one has run on the production machine since 2026-10-11.
 
 The Python checks work with any bridge. With an upstream bridge:
