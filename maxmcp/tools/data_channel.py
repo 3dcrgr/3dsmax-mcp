@@ -359,8 +359,13 @@ def _resolve_dc_modifier_lines(
     modifier_index: int,
     create_new: bool,
     display: bool,
+    preflight: Sequence[str] = (),
 ) -> list[str]:
-    """MAXScript to get or create the single Data Channel modifier on the object."""
+    """MAXScript to get or create the single Data Channel modifier on the object.
+
+    preflight runs after an existing modifier is found and before one is
+    created; dcMod is undefined there when the edit will create it.
+    """
     display_lit = "true" if display else "false"
     return [
         "local dcMod = undefined",
@@ -383,6 +388,7 @@ def _resolve_dc_modifier_lines(
         "        )",
         "    )",
         ")",
+        *preflight,
         "if dcMod == undefined then (",
         "    dcMod = DataChannelModifier()",
         f"    dcMod.display = {display_lit}",
@@ -564,6 +570,33 @@ def add_data_channel(
     except ValueError as exc:
         return _json.dumps({"error": str(exc)})
 
+    # Checks that can fail run before the first operator or modifier is
+    # added: nothing here undoes a partly applied edit.
+    preflight: list[str] = []
+    if expected_operator_count is not None:
+        preflight.extend([
+            "local preStackCount = if dcMod == undefined then 0 else dcMod.DataChannelModifier.StackCount()",
+            f"if preStackCount != {expected_operator_count} do throw "
+            f'("Data Channel stack changed: expected {expected_operator_count}, found " + preStackCount as string)',
+        ])
+    order_str = ""
+    if order is not None:
+        order_values = list(order)
+        if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in order_values):
+            return _json.dumps({"error": "order must contain non-negative integer storage indexes"})
+        if len(set(order_values)) != len(order_values):
+            return _json.dumps({"error": "order must not contain duplicates"})
+        order_str = ", ".join(str(item) for item in order_values)
+        # New operators take the next storage indexes and join the active order.
+        preflight.extend([
+            "local predictedOrder = if dcMod == undefined then #() else (for storageId in dcMod.operator_order collect storageId)",
+            "local predictedStorage = if dcMod == undefined then 0 else dcMod.operators.count",
+            f"for i = 0 to {len(operator_list) - 1} do append predictedOrder (predictedStorage + i)",
+            f"local requestedOrder = #({order_str})",
+            "if requestedOrder.count != predictedOrder.count do throw (\"Data Channel order length must equal the stack count after adding the operators, \" + predictedOrder.count as string)",
+            "for storageId in requestedOrder do if (findItem predictedOrder storageId) == 0 do throw (\"Data Channel order references storage index \" + storageId as string + \", which will not be active\")",
+        ])
+
     roles = [_operator_role(_operator_display_name(operator.get("type", ""))) for operator in operator_list]
     warnings: list[str] = []
     if "input" not in roles:
@@ -584,25 +617,14 @@ def add_data_channel(
             modifier_index=modifier_index,
             create_new=create_new,
             display=display,
-        ),
-        (
-            f"if beforeStackCount != {expected_operator_count} do throw "
-            f'(\"Data Channel stack changed: expected {expected_operator_count}, found \" + beforeStackCount as string)'
-            if expected_operator_count is not None
-            else ""
+            preflight=preflight,
         ),
         *op_lines,
         f'local warningText = "{warning_text}"',
     ]
     if order is not None:
-        order_values = list(order)
-        if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in order_values):
-            return _json.dumps({"error": "order must contain non-negative integer storage indexes"})
-        if len(set(order_values)) != len(order_values):
-            return _json.dumps({"error": "order must not contain duplicates"})
-        order_str = ", ".join(str(item) for item in order_values)
+        # The preflight predicted the active order; this confirms it.
         body_lines.extend([
-            f"local requestedOrder = #({order_str})",
             "if requestedOrder.count != dcIF.StackCount() do throw (\"Data Channel order length must equal active stack count \" + dcIF.StackCount() as string)",
             "for storageId in requestedOrder do if (findItem dcMod.operator_order storageId) == 0 do throw (\"Data Channel order references inactive storage index \" + storageId as string)",
             "dcMod.operator_order = requestedOrder",
@@ -1103,7 +1125,9 @@ def add_dc_script_operator(
 @mcp.tool()
 def list_dc_presets() -> str:
     """List available Data Channel presets without creating a scene object."""
-    maxscript = """(
+    # Preset names are user file names, so they are escaped as JSON strings.
+    maxscript = f"""(
+    {_dc_json_helpers()}
     local dcMod = DataChannelModifier()
     local dcIF = dcMod.DataChannelModifier
     dcIF.GatherOperators()
@@ -1113,7 +1137,7 @@ def list_dc_presets() -> str:
     for i = 1 to count do (
         local pname = ""
         dcIF.PresetName i &pname
-        result += "\\"" + pname + "\\""
+        result += mcpDcJsonString pname
         if i < count do result += ", "
     )
     result += "]"
