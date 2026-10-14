@@ -97,7 +97,8 @@ static Control* ControlFromAnimatable(Animatable* anim) {
     return nullptr;
 }
 
-static void CollectNodesForRequest(const json& p, Interface* ip, std::vector<INode*>& out) {
+static void CollectNodesForRequest(const json& p, Interface* ip, std::vector<INode*>& out,
+                                   json& notFound) {
     std::unordered_set<INode*> seen;
     auto push = [&](INode* node) {
         if (node && seen.insert(node).second) out.push_back(node);
@@ -106,7 +107,9 @@ static void CollectNodesForRequest(const json& p, Interface* ip, std::vector<INo
     auto names = p.value("names", std::vector<std::string>{});
     if (!names.empty()) {
         for (const auto& name : names) {
-            push(FindNodeByName(name));
+            INode* node = FindNodeByName(name);
+            if (!node) notFound.push_back(name);
+            push(node);
         }
         return;
     }
@@ -1550,10 +1553,21 @@ std::string NativeHandlers::KeyframeTracks(const std::string& params, MCPBridgeG
         }
 
         std::vector<INode*> nodes;
-        CollectNodesForRequest(p, ip, nodes);
+        json notFoundNames = json::array();
+        CollectNodesForRequest(p, ip, nodes, notFoundNames);
         if (nodes.empty()) {
             throw std::runtime_error("No target nodes found. Pass names, target='all', or select objects in 3ds Max.");
         }
+        // Names that matched nothing are reported, never silently dropped.
+        auto withMissingNames = [&](json result) {
+            if (!notFoundNames.empty()) {
+                result["notFound"] = notFoundNames;
+                result["status"] = "partial";
+                result["warnings"].push_back(std::to_string(notFoundNames.size()) +
+                    " requested name(s) matched no object and were skipped: " + JoinNames(notFoundNames));
+            }
+            return result;
+        };
 
         KeyframeBudget budget = BudgetFromRequest(p);
         if (p.contains("value") && p.contains("move")) {
@@ -1603,11 +1617,11 @@ std::string NativeHandlers::KeyframeTracks(const std::string& params, MCPBridgeG
             }
 
             MechanicalEditStats mechanical;
-            return BuildKeyframeResult(
+            return withMissingNames(BuildKeyframeResult(
                 action, nodes, tracks, budget,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 mechanical,
-                samples, loopGaps, true).dump();
+                samples, loopGaps, true)).dump();
         }
 
         json styleParams = p;
@@ -1851,12 +1865,22 @@ std::string NativeHandlers::KeyframeTracks(const std::string& params, MCPBridgeG
             }
         }
 
-        return BuildKeyframeResult(
+        json result = withMissingNames(BuildKeyframeResult(
             action, nodes, tracks, budget,
             keyed, matched, styled, styledControllerKeys,
             ranged, rangedControllerEdits,
             styleKeyCount, styleControllerKeyCount,
             mechanical,
-            samples, loopGaps, false).dump();
+            samples, loopGaps, false));
+        const long long edits = static_cast<long long>(keyed) + matched + styledControllerKeys +
+            rangedControllerEdits + mechanical.deletedKeys + mechanical.movedKeys +
+            mechanical.scaledKeys + mechanical.resampledKeys;
+        if (edits == 0) {
+            result["status"] = "no_change";
+            result["warnings"].push_back("The " + action + " request matched " +
+                std::to_string(tracks.size()) + " track(s) but changed no keys; check times, "
+                "track names and whether the tracks are keyable.");
+        }
+        return result.dump();
     });
 }
