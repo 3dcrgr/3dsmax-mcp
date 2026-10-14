@@ -2016,6 +2016,16 @@ class ForestInstancesTests(unittest.TestCase):
         # transforms are taken in the same call that builds the forest, never from an earlier read
         self.assertLess(script.find("t.update()"), script.find("t.getFullTransform i"))
         self.assertGreater(kwargs["timeout"], 60)
+        # thinning: the build runs with the viewport cap raised to 8 x max_items and restored, also on failure
+        self.assertIn("vmax > 0 and vmax < 2400", script)
+        self.assertIn("nd.vmaxitems = 2400", script)
+        self.assertEqual(script.count("nd.vmaxitems = vmax"), 2)
+        self.assertLess(script.find("nd.vmaxitems = 2400"), script.find("t.update()"))
+        self.assertIn(") catch (\n        if restoreV do (with undo off (nd.vmaxitems = vmax); t.update())\n        throw()", script)
+        # material walk: refs.dependsOn handles maps too (getSubTexmap took materials only)
+        self.assertIn("refs.dependsOn m", script)
+        self.assertNotIn("getSubTexmap", script)
+        self.assertNotIn("VIEWPORT_LIMIT", script)
         self.assertEqual(out["created"], 240)
         self.assertEqual(out["layer"], "Forest001_instances")
         self.assertEqual(out["skipped"], [{"geom_id": 2, "reason": "BILLBOARD", "count": 10, "item_name": "Pine billboard"}])

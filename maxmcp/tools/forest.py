@@ -683,12 +683,18 @@ local ss = stringStream ""
 format "FPOK\n" to:ss
 if @@CREATE@@ then (
     local t = nd.trees
+    -- Over Max Items Viewport (vmaxitems) Forest Pack keeps every k-th grid cell, so a thinned build lands
+    -- far below the cap (live: 354 items, cap 353 -> 89). The build is made with the cap raised to a probe
+    -- of 8 x max_items and the cap is restored afterwards, also on failure. A thinned probe build keeps at
+    -- least about a quarter of the probe, so thinning always trips ITEM_LIMIT, never a silent partial set.
+    local vmax = if isProperty nd #vmaxitems then nd.vmaxitems else 0
+    local restoreV = vmax > 0 and vmax < @@PROBE@@
+    try (
+    if restoreV do (with undo off (nd.vmaxitems = @@PROBE@@))
     t.update()
     local n = t.count()
     if n == 0 do throw "EMPTY_FOREST: the forest has no items to instance"
-    local vmax = if isProperty nd #vmaxitems then nd.vmaxitems else 0
-    if vmax > 0 and n >= vmax do throw ("VIEWPORT_LIMIT: the viewport build holds " + (n as string) + " items, the Max Items Viewport cap (vmaxitems " + (vmax as string) + "), so Forest Pack may have thinned it; raise vmaxitems with forest_settings first")
-    if n > @@MAX@@ do throw ("ITEM_LIMIT: the forest has " + (n as string) + " items; max_items is @@MAX@@")
+    if n > @@MAX@@ do throw ("ITEM_LIMIT: the forest has " + (n as string) + " or more items; max_items is @@MAX@@")
     local nl = nd.namelist as array, cl = nd.cobjlist as array, gl = nd.geomlist as array
     local nT = nl.count
     local src = #(), offInv = #(), reason = #()
@@ -715,8 +721,10 @@ if @@CREATE@@ then (
         if m != undefined and (findItem seen m) == 0 do (
             append seen m
             if matchPattern ((classOf m) as string) pattern:"*Forest*Color*" do fc += 1
-            if isKindOf m Material do (for k = 1 to getNumSubMtls m do append stack (getSubMtl m k))
-            for k = 1 to getNumSubTexmaps m do append stack (getSubTexmap m k)
+            -- refs.dependsOn works on materials and maps alike (the material-only sub-map getters failed on
+            -- a Checker map). Every non-node reference is followed: a Standard material keeps its maps in an
+            -- intermediate container that is neither a material nor a map (live). guard and seen bound it.
+            for r in (refs.dependsOn m) where r != undefined and not (isValidNode r) do append stack r
         )
     )
     local effects = 0
@@ -764,6 +772,12 @@ if @@CREATE@@ then (
     for g = 1 to nT where skipped[g] > 0 do format "S|%|%|%|%\n" g reason[g] skipped[g] (fpEnc (nl[g] as string)) to:ss
     if fc > 0 do format "W|FOREST_COLOR_TINT_LOST\n" to:ss
     if effects > 0 do format "W|EFFECTS_SNAPSHOT\n" to:ss
+    if restoreV do (with undo off (nd.vmaxitems = vmax); t.update())
+    ) catch (
+        if restoreV do (with undo off (nd.vmaxitems = vmax); t.update())
+        throw()
+    )
+    format "V|%\n" vmax to:ss
 ) else (
     local mine = for o in objects where ((getUserProp o "@@TAG@@") as string) == tag collect o
     if @@DELETE@@ and mine.count > 0 do (undo "MCP Forest instances delete" on (delete mine))
@@ -801,8 +815,9 @@ def forest_instances(
     disable_source=true sets the forest's Disabled switch in the same undo step.
 
     Refused before anything is created: Reference-mode forests (REFERENCE_MODE_UNSUPPORTED), an empty forest,
-    a viewport build at the Max Items Viewport cap (VIEWPORT_LIMIT: Forest Pack may have thinned it), and more
-    items than max_items (1..10000, ITEM_LIMIT). Instances are a snapshot of the current frame: they don't follow
+    and more items than max_items (1..10000, ITEM_LIMIT). Over Max Items Viewport Forest Pack thins the build
+    (every k-th grid cell), so the build is made with that cap temporarily raised to 8 x max_items and then
+    restored: a thinned build always trips ITEM_LIMIT instead of yielding a partial set. Instances are a snapshot of the current frame: they don't follow
     Forest Effects or animation. Forest Color tint variation isn't preserved (FOREST_COLOR_TINT_LOST is
     reported when Forest Color is found in the materials). Edge mode and other render-time behaviour aren't
     checked. count reports how many tagged instances of this forest exist; delete removes exactly those, in
@@ -827,6 +842,7 @@ def forest_instances(
             .replace("@@DELETE@@", _mxs_bool(action == "delete"))
             .replace("@@MAKE@@", INSTANCE_MODES[mode])
             .replace("@@DISABLE@@", _mxs_bool(disable_source))
+            .replace("@@PROBE@@", str(8 * max_items))
             .replace("@@MAX@@", str(max_items))
             .replace("@@TAG@@", INSTANCE_TAG)
             .replace("@@REFERENCE@@", str(fh.REFERENCE_MODE))
@@ -852,6 +868,8 @@ def forest_instances(
                           undoable=row[2] == "1")
         elif row[0] == "D":
             result["source_disabled"] = row[1] == "1"
+        elif row[0] == "V":
+            result["viewport_cap"] = int(float(row[1]))
     if action == "create" and "created" not in result:
         raise ForestError("INVALID_READBACK", "the instance report was incomplete")
     return result
