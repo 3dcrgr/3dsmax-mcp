@@ -1562,6 +1562,7 @@ def mcg_search_operators(
             limit=limit,
         )
         result["warning"] = f"Live typed operator catalog unavailable: {exc}"
+        result["warnings"] = [result["warning"] + "; results come from the offline catalog."]
         return result
 
 
@@ -1594,11 +1595,8 @@ def mcg_create_graph(
 
     context = _context_with_fallback()
     if context.get("bridge_available"):
-        try:
-            symbol_exists = _class_is_available(identifier)
-        except Exception:
-            symbol_exists = False
-        if symbol_exists:
+        # A probe that could not run is not proof the name is free.
+        if _class_is_available(identifier):
             raise ValueError(
                 f"identifier already resolves to a class or symbol in 3ds Max: {identifier}"
             )
