@@ -51,7 +51,7 @@ def scene_qa(
     if scope == "targets" and not names and not handles and not refs:
         raise ValueError("scope=targets requires refs, names, or handles")
     if not client.native_available:
-        return "Native bridge is required for scene_qa."
+        return json.dumps({"error": "Native bridge is required for scene_qa; nothing was scanned or repaired."})
 
     payload: dict = {
         "action": normalized_action,

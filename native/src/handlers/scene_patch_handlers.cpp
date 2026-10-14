@@ -705,6 +705,10 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
         };
         result["operations"] = BuildProofArray(plan, time, false);
         result["transaction"] = dryRun || changedCount == 0 ? "none" : "one_native_hold";
+        if (!dryRun && changedCount == 0) {
+            result["warnings"] = json::array(
+                {"No operation changed the scene: every target already matched the request."});
+        }
 
         if (dryRun || changedCount == 0) {
             result["touched"] = UniqueTouchedRefs(plan);
