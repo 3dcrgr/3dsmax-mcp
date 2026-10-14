@@ -14,7 +14,7 @@ import math
 from typing import Any, Optional
 
 from ..coerce import DictList, DictValue, StrList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, name_in_use, node_by_name, node_by_name_expr, safe_string
 from ..server import client, mcp
 
 # Agent-friendly tokens -> MAXScript operationType enums.
@@ -177,10 +177,11 @@ def _run(script: str) -> str:
     return raw
 
 
-def _base_guard(safe: str) -> str:
+def _base_guard(name: str) -> str:
     """Modifier-route prologue: require BooleanMod, resolve base node into `obj`, or emit __ERROR__."""
+    safe = safe_string(name)
     return (
-        f'local obj = getNodeByName "{safe}"\n'
+        f'local obj = {node_by_name(name, missing_ok=True)}\n'
         'if not isKindOf BooleanMod MAXClass then "__ERROR__|BooleanMod requires 3ds Max 2024 or newer; '
         'use backend=auto or backend=proboolean on this version"\n'
         f'else if obj == undefined then "__ERROR__|base object not found: {safe}" else '
@@ -200,7 +201,7 @@ def _boolean_backend(name: str, backend: str) -> str:
     if backend != "auto":
         return backend
     # Query the selected Max each time; routing must not survive an instance switch.
-    return _run(f'''(local obj = getNodeByName "{safe_string(name)}"
+    return _run(f'''(local obj = {node_by_name(name, missing_ok=True)}
         if obj != undefined and classof obj.baseobject == ProBoolean then "proboolean"
         else if isKindOf BooleanMod MAXClass then "modifier" else "proboolean")''')
 
@@ -222,20 +223,16 @@ def _apply_proboolean(safe, ops, per_op, cut_instances, cutter_block, use_operan
         local savedSelection = selection as array
         try (
             if theHold.Holding() do throw "USER_BUSY: an undo operation is active"
-            fn uniqueNode nm = (
-                local found = getNodeByName nm exact:true all:true
-                if found.count != 1 do throw ("Object name must resolve uniquely: " + nm)
-                found[1]
-            )
-            local original = uniqueNode "{safe}"
+            {NODE_LOOKUP_FNS}
+            local original = mcpUniqueNode "{safe}" "Base object"
             if superclassof original != GeometryClass do throw "Base object must be geometry"
             if not isKindOf ProBoolean MAXClass do throw "ProBoolean is unavailable"
             local opNames = {names_arr}
             local opEnums = {enums_arr}
             for nm in {inline_names} do (
-                if getNodeByName nm != undefined do throw ("Cutter name already exists: " + nm)
+                if {name_in_use("nm")} do throw ("Cutter name already exists: " + nm)
             )
-            local originals = for nm in opNames collect uniqueNode nm
+            local originals = for nm in opNames collect mcpUniqueNode nm "Operand"
             for n in originals do (
                 if n == original do throw "Base cannot be its own operand"
                 if superclassof n != GeometryClass do throw "Operand must be geometry"
@@ -486,14 +483,14 @@ def boolean_operation(
             "else try (oldProps = #(bm.useLiveReference, bm.useOperandMaterial, bm.method, bm.voxelSize, bm.name)) catch ()\n"
         )
         script = f"""(
-{_base_guard(safe)}(
+{_base_guard(name)}(
     local opNames = {names_arr}
     local opEnums = {enums_arr}
     local missing = ""
     local badKind = ""
     local opNodes = #()
     for nm in opNames do (
-        local o = getNodeByName nm
+        local o = {node_by_name_expr("nm", missing_ok=True)}
         if o == undefined then missing += nm + ", "
         else if superclassof o != GeometryClass then badKind += nm + " (" + ((classof o) as string) + "), "
         else append opNodes o
@@ -585,7 +582,7 @@ def boolean_operation(
 
     if action == "list":
         script = f"""(
-{_base_guard(safe)}(
+{_base_guard(name)}(
     {_find_boolmod()}
     if bm == undefined then "__ERROR__|no Boolean modifier on {safe}" else (
         local out = stringstream ""
@@ -701,7 +698,7 @@ def boolean_operation(
                 "        )"
             )
         script = f"""(
-{_base_guard(safe)}(
+{_base_guard(name)}(
     {_find_boolmod()}
     if bm == undefined then "__ERROR__|no Boolean modifier on {safe}" else (
         {body}

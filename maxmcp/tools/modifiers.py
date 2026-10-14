@@ -2,7 +2,13 @@ from typing import Optional
 import json as _json
 from ..server import mcp, client
 from ..coerce import StrList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import (
+    NODE_LOOKUP_FNS,
+    node_by_name,
+    report_ambiguous,
+    safe_string,
+    split_ambiguous_reply,
+)
 
 
 def _modifier_property_payload(
@@ -81,7 +87,7 @@ def add_modifier(name: str = "", modifier: str = "", params: str = "", handle: i
 
     safe = safe_string(name)
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj != undefined then (
             try (
                 local m = {modifier} {params}
@@ -118,7 +124,7 @@ def remove_modifier(name: str = "", modifier: str = "", handle: int = 0) -> str:
     safe = safe_string(name)
     safe_mod = safe_string(modifier)
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj != undefined then (
             local found = false
             for i = 1 to obj.modifiers.count do (
@@ -196,7 +202,7 @@ def set_modifier_state(
 
     ops_str = "\n                ".join(ops)
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj != undefined then (
             {find_mod}
             if mod != undefined then (
@@ -241,7 +247,7 @@ def collapse_modifier_stack(
     safe = safe_string(name)
     if to_index > 0:
         maxscript = f"""(
-            local obj = getNodeByName "{safe}"
+            local obj = {node_by_name(name, missing_ok=True)}
             if obj != undefined then (
                 if {to_index} <= obj.modifiers.count then (
                     if not {str(dry_run).lower()} do maxOps.CollapseNodeTo obj {to_index} off
@@ -255,7 +261,7 @@ def collapse_modifier_stack(
         )"""
     else:
         maxscript = f"""(
-            local obj = getNodeByName "{safe}"
+            local obj = {node_by_name(name, missing_ok=True)}
             if obj != undefined then (
                 if not {str(dry_run).lower()} do maxOps.CollapseNode obj off
                 (if {str(dry_run).lower()} then "Would collapse entire stack on " else "Collapsed entire stack on ") + obj.name + " — now: " + ((classof obj.baseobject) as string)
@@ -286,7 +292,7 @@ def make_modifier_unique(name: str = "", modifier_index: int = 0, handle: int = 
 
     safe = safe_string(name)
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj != undefined then (
             if {modifier_index} <= obj.modifiers.count then (
                 local mod = obj.modifiers[{modifier_index}]
@@ -370,10 +376,13 @@ def set_modifier_property(
     ms_value = _maxscript_property_value(str(property_value))
 
     if target_names:
+        # Missing names are skipped; shared names are skipped and reported.
         name_arr = "#(" + ", ".join(f'"{safe_string(n)}"' for n in target_names) + ")"
         collect_line = (
-            f"local objsel = for n in {name_arr} "
-            "where (getNodeByName n) != undefined collect (getNodeByName n)"
+            f"local objsel = for n in {name_arr} collect (mcpBatchNode n notFound ambiguous)\n"
+            "        objsel = for obj in objsel where obj != undefined collect obj\n"
+            "        if objsel.count == 0 and ambiguous.count > 0 do"
+            ' mcpThrowUnresolved notFound ambiguous "no modifier was changed"'
         )
     elif selection_only:
         collect_line = "local objsel = selection as array"
@@ -396,10 +405,13 @@ def set_modifier_property(
         mod_filter_close = ""
 
     maxscript = f"""(
+        {NODE_LOOKUP_FNS}
+        local notFound = #()
+        local ambiguous = #()
+        {collect_line}
+        local modCount = 0
         disableSceneRedraw()
         undo "Set Modifier Property {safe_prop}" on (
-            {collect_line}
-            local modCount = 0
             for obj in objsel do (
                 for m = 1 to obj.modifiers.count do (
                     {mod_filter}
@@ -413,18 +425,22 @@ def set_modifier_property(
         )
         enableSceneRedraw()
         redrawViews()
-        modCount as string
+        (modCount as string) + (mcpAmbiguousReply ambiguous)
     )"""
     response = client.send_command(maxscript)
-    raw = response.get("result", "0")
+    raw, ambiguous = split_ambiguous_reply(response.get("result", "0"))
     try:
         modified = int(str(raw).strip())
     except ValueError:
         return _json.dumps({"error": str(raw)})
 
     if modified == 0:
-        return _json.dumps({
-            "error": "No modifiers updated — check object names, modifier target, and property name",
-        })
+        error = {"error": "No modifiers updated — check object names, modifier target, and property name"}
+        if ambiguous:
+            error["hint"] = {"ambiguous": ambiguous}
+        return _json.dumps(error)
 
-    return _format_modifier_property_result(property_name, str(property_value), modified)
+    result = _format_modifier_property_result(property_name, str(property_value), modified)
+    if ambiguous:
+        return _json.dumps(report_ambiguous(_json.loads(result), ambiguous))
+    return result
