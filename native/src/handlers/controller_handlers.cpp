@@ -466,13 +466,19 @@ std::string NativeHandlers::AssignController(const std::string& params, MCPBridg
                 std::string targetObj = v.value("object", v.value("target", ""));
                 float weight = v.value("weight", 50.0f);
                 if (!targetObj.empty()) {
-                    ms += "  local tgt = getNodeByName \"" + JsonEscape(targetObj) + "\"\n";
+                    // A missing or rejected target throws: the dispatcher then
+                    // rolls back the new constraint instead of leaving one with
+                    // fewer targets than requested.
+                    const std::string safeTarget = JsonEscape(targetObj);
+                    ms += "  local tgt = getNodeByName \"" + safeTarget + "\"\n";
+                    ms += "  if tgt == undefined do throw \"Constraint target object missing: " + safeTarget + "\"\n";
                     if (ctrlType == "link_constraint") {
                         int frame = v.value("frame", 0);
-                        ms += "  if tgt != undefined do ctrl.addTarget tgt " + std::to_string(frame) + "\n";
+                        ms += "  if (ctrl.addTarget tgt " + std::to_string(frame) +
+                              ") == false do throw \"Constraint rejected target: " + safeTarget + "\"\n";
                     } else {
-                        ms += "  if tgt != undefined do ctrl.appendTarget tgt " +
-                              std::to_string(weight) + "\n";
+                        ms += "  if (ctrl.appendTarget tgt " + std::to_string(weight) +
+                              ") == false do throw \"Constraint rejected target: " + safeTarget + "\"\n";
                     }
                 }
             }
@@ -569,12 +575,15 @@ std::string NativeHandlers::SetControllerProps(const std::string& params, MCPBri
 
         if (name.empty() || paramPath.empty())
             throw std::runtime_error("name and param_path are required");
+        if (script.empty() && (!ctrlParams.is_object() || ctrlParams.empty()))
+            throw std::runtime_error("Nothing to set: pass script or params");
 
         std::string ms;
         ms += "(\n";
         ms += "  local obj = getNodeByName \"" + JsonEscape(name) + "\"\n";
         ms += "  if obj == undefined do throw \"Object not found\"\n";
         ms += "  local sa = execute (\"$'\" + obj.name + \"'\" + \"" + JsonEscape(paramPath) + "\")\n";
+        ms += "  if sa == undefined do throw \"Track not found: " + JsonEscape(paramPath) + "\"\n";
         ms += "  local ctrl = sa.controller\n";
         ms += "  if ctrl == undefined do throw \"No controller\"\n";
         if (!script.empty())
@@ -682,25 +691,28 @@ std::string NativeHandlers::AddControllerTarget(const std::string& params, MCPBr
         std::string safePath = JsonEscape(NormalizeSubAnimPath(paramPath));
         std::string sep = (safePath[0] == '[') ? "" : ".";
 
-        std::string ms;
+        std::string call;
         std::string lowerCls = cls;
         std::transform(lowerCls.begin(), lowerCls.end(), lowerCls.begin(), ::tolower);
 
         if (lowerCls.find("script") != std::string::npos) {
             // Script controllers: addNode
-            ms = "$'" + safeName + "'" + sep + safePath + ".controller.addNode \"" + safeVn + "\" (getNodeByName \"" + safeTgt + "\")";
+            call = "$'" + safeName + "'" + sep + safePath + ".controller.addNode \"" + safeVn + "\" (getNodeByName \"" + safeTgt + "\")";
         } else if (lowerCls.find("expression") != std::string::npos) {
             // Expression controllers: addScalarTarget
-            ms = "try ($'" + safeName + "'" + sep + safePath + ".controller.addScalarTarget \"" + safeVn + "\" (getNodeByName \"" + safeTgt + "\") 0) catch ($'" + safeName + "'" + sep + safePath + ".controller.addVectorTarget \"" + safeVn + "\" (getNodeByName \"" + safeTgt + "\") 0)";
+            call = "try ($'" + safeName + "'" + sep + safePath + ".controller.addScalarTarget \"" + safeVn + "\" (getNodeByName \"" + safeTgt + "\") 0) catch ($'" + safeName + "'" + sep + safePath + ".controller.addVectorTarget \"" + safeVn + "\" (getNodeByName \"" + safeTgt + "\") 0)";
         } else if (cls == "Link_Constraint") {
-            ms = "$'" + safeName + "'" + sep + safePath + ".controller.addTarget (getNodeByName \"" + safeTgt + "\") " + std::to_string(frame);
+            call = "$'" + safeName + "'" + sep + safePath + ".controller.addTarget (getNodeByName \"" + safeTgt + "\") " + std::to_string(frame);
         } else if (lowerCls.find("constraint") != std::string::npos) {
-            ms = "$'" + safeName + "'" + sep + safePath + ".controller.appendTarget (getNodeByName \"" + safeTgt + "\") " + std::to_string(weight);
+            call = "$'" + safeName + "'" + sep + safePath + ".controller.appendTarget (getNodeByName \"" + safeTgt + "\") " + std::to_string(weight);
         } else {
             throw std::runtime_error("Controller type '" + cls + "' does not support node targets. Use float_script or constraint controllers.");
         }
 
-        RunControllerScript(ms);
+        // These methods return false for a target they refuse (a duplicate
+        // variable name, a dependency loop); report that instead of "ok".
+        RunControllerScript("if (" + call + ") == false do throw \"" + JsonEscape(cls) +
+            " rejected target " + safeTgt + "\"");
 
         json result;
         result["status"] = "ok";
@@ -741,19 +753,23 @@ std::string NativeHandlers::WireParams(const std::string& params, MCPBridgeGUP* 
         ms += "  if srcSA == undefined do throw \"Source track not found\"\n";
         ms += "  if tgtSA == undefined do throw \"Target track not found\"\n";
 
+        // paramWire.connect/connect2Way return false when Max refuses the wire
+        // (incompatible tracks, a dependency loop); the script then throws.
         if (twoWay) {
             std::string fwdExpr = expression.empty() ? "target_value" : expression;
             std::string revExpr = reverseExpr.empty() ? "target_value" : reverseExpr;
-            ms += "  paramWire.connect2way srcSA tgtSA \"" + JsonEscape(fwdExpr) + "\" \"" + JsonEscape(revExpr) + "\"\n";
+            ms += "  if (paramWire.connect2way srcSA tgtSA \"" + JsonEscape(fwdExpr) + "\" \"" + JsonEscape(revExpr) +
+                  "\") == false do throw \"paramWire.connect2Way refused the wire\"\n";
         } else {
             std::string expr = expression.empty() ? "source_value" : expression;
-            ms += "  paramWire.connect srcSA tgtSA \"" + JsonEscape(expr) + "\"\n";
+            ms += "  if (paramWire.connect srcSA tgtSA \"" + JsonEscape(expr) +
+                  "\") == false do throw \"paramWire.connect refused the wire\"\n";
         }
 
         ms += "  \"OK\"\n";
         ms += ")\n";
 
-        RunMAXScript(ms);
+        RunControllerScript(ms);
 
         json result;
         result["status"] = "wired";
@@ -827,11 +843,16 @@ std::string NativeHandlers::UnwireParams(const std::string& params, MCPBridgeGUP
         ms += "  if obj == undefined do throw \"Object not found\"\n";
         ms += "  local sa = execute (\"$'\" + obj.name + \"'\" + \"" + JsonEscape(normPath) + "\")\n";
         ms += "  if sa == undefined do throw \"Track not found\"\n";
-        ms += "  paramWire.disconnect sa\n";
+        ms += "  if not (matchPattern ((classOf sa.controller) as string) pattern:\"*Wire*\") do\n";
+        ms += "    throw (\"Track is not wired: \" + ((classOf sa.controller) as string))\n";
+        // paramWire.disconnect takes the wire controller itself and handles
+        // one-way wires only.
+        ms += "  if (paramWire.disconnect sa.controller) == false do\n";
+        ms += "    throw \"paramWire.disconnect refused the track (it disconnects one-way wires only)\"\n";
         ms += "  \"OK\"\n";
         ms += ")\n";
 
-        RunMAXScript(ms);
+        RunControllerScript(ms);
 
         json result;
         result["status"] = "unwired";

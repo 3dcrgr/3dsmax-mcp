@@ -143,12 +143,13 @@ def wire_params(
         f'if tgtSA == undefined do return "Target param not found: {safe_tgt_param}"',
     ]
 
+    # paramWire.connect/connect2Way return false when Max refuses the wire.
     if two_way:
         safe_rev_expr = safe_string(reverse_expression)
-        lines.append(f'paramWire.connect2way srcSA tgtSA "{safe_expr}" "{safe_rev_expr}"')
+        lines.append(f'if (paramWire.connect2way srcSA tgtSA "{safe_expr}" "{safe_rev_expr}") == false then "Error: paramWire.connect2Way refused the wire" else')
         lines.append(f'"Wired 2-way: " + srcObj.name + ".{safe_src_param} <-> " + tgtObj.name + ".{safe_tgt_param} (fwd: {safe_expr}, rev: {safe_rev_expr})"')
     else:
-        lines.append(f'paramWire.connect srcSA tgtSA "{safe_expr}"')
+        lines.append(f'if (paramWire.connect srcSA tgtSA "{safe_expr}") == false then "Error: paramWire.connect refused the wire" else')
         lines.append(f'"Wired: " + srcObj.name + ".{safe_src_param} -> " + tgtObj.name + ".{safe_tgt_param} ({safe_expr})"')
 
     maxscript = "(\n    " + "\n    ".join(lines) + "\n)"
@@ -243,13 +244,13 @@ def unwire_params(
     local sa = execute("$'" + obj.name + "'{param_sep}" + "{safe_param}")
     if sa == undefined do return "Param not found: {safe_param}"
     local ctrl = sa.controller
-    if ctrl == undefined do return "No controller on: {safe_param}"
+    if ctrl == undefined do return "Error: No controller on: {safe_param}"
     local clsName = (classof ctrl) as string
     local wireClasses = #("Float_Wire", "Point3_Wire", "Position_Wire", "Rotation_Wire", "Scale_Wire")
     local isWire = false
     for wc in wireClasses where wc == clsName do isWire = true
-    if not isWire do return "Not a wire controller: " + clsName
-    paramWire.disconnect sa
+    if not isWire do return "Error: Not a wire controller: " + clsName
+    if (paramWire.disconnect ctrl) == false then "Error: paramWire.disconnect refused the track (it disconnects one-way wires only)" else
     "Unwired: " + obj.name + ".{safe_param} (was " + clsName + ")"
 )"""
     response = client.send_command(maxscript)
