@@ -207,7 +207,7 @@ inline void CollectNodes(INode* node, std::vector<INode*>& out) {
 }
 
 // Nodes named `name`. Exact matches win; when there is none, names that differ
-// only in letter case match, as they do in MAXScript ($box001, getNodeByName).
+// only in letter case match, as MAXScript name lookups do.
 inline std::vector<INode*> CollectNodesByName(const std::string& name) {
     std::vector<INode*> all, exact, caseless;
     CollectNodes(GetCOREInterface()->GetRootNode(), all);
