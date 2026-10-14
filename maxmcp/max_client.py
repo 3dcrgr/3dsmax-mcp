@@ -19,6 +19,13 @@ MCP_PIPE_ENV = "MCP_MAX_PIPE"
 DIALOG_CHECK_AFTER = 1.0
 DIALOG_POLL_INTERVAL = 1.0
 MAX_BLOCKED_CALLS = 16
+# Reply deadlines. Max cancels main-thread work that has not started within
+# its executor timeout (120 s unless the handler sets more) and replies, so an
+# ordinary call waits a little past that. A probe's timeout (at most
+# PROBE_TIMEOUT_MAX) is its deadline, as is every control request's.
+NATIVE_QUEUE_TIMEOUT = 120.0
+REPLY_GRACE = 10.0
+PROBE_TIMEOUT_MAX = 5.0
 # native:core control (hot-reloadable core). Only CORE_BUSY is retried: the
 # shell kept the old core and changed nothing. Waits above CORE_RETRY_MAX_WAIT_MS
 # get one attempt, so a long drain is never repeated.
@@ -57,6 +64,40 @@ class DialogBlocked(Exception):
                      "otherwise ask the user which button to press. Do not repeat the call: max_dialogs "
                      "reports its result after the dialog closes."),
             "details": {"request_id": request_id, "command": command, "dialogs": dialogs},
+        })
+        super().__init__(message)
+
+
+class MaxBusy(RequestOutcomeUnknown):
+    """A call got no reply within its deadline and may still be running in Max.
+
+    The client drops the connection the call holds and never replays it. An
+    ordinary call is tracked like a DialogBlocked one: blocked_calls() reports
+    its eventual result. Control requests are not tracked.
+    """
+
+    code = "MAX_BUSY"
+    retryable = False
+
+    def __init__(self, request_id: str, command: str, waited: float,
+                 state: str | None = None, tracked: bool = True) -> None:
+        self.request_id = request_id
+        if tracked:
+            where = "waiting for Max's main thread" if state == "queued" else "running inside 3ds Max"
+            message = f"3ds Max has not answered after {waited:g} s. The call is still {where}."
+            hint = ("Do not repeat the call: it is still in progress and would run twice. Check "
+                    "max_dialogs(action='inspect'): blocked_calls reports this call's result once Max "
+                    "finishes it, and dialogs lists anything holding Max.")
+        else:
+            message = f"3ds Max has not answered {command} after {waited:g} s."
+            hint = "The request may still finish inside Max. Check its effect with a fresh read before repeating it."
+        details: dict[str, Any] = {"request_id": request_id, "command": command, "waited_s": round(waited, 1)}
+        if state:
+            details["state"] = state
+        self.bridge_message = json.dumps({
+            "type": "MaxBusy", "code": self.code, "retryable": False, "message": message,
+            "hint": {"message": hint, "suggested_tools": ["max_dialogs"]} if tracked else hint,
+            "details": details,
         })
         super().__init__(message)
 
@@ -618,7 +659,7 @@ class MaxClient:
                                 "Pipe write returned 0 bytes written."
                             )
 
-                    return self._await_response(handle, request_id, cmd_type)
+                    return self._await_response(handle, request_id, cmd_type, self._reply_wait(timeout))
                 except BrokenPipeError:
                     self._close_pipe_handle()
                     if total_written:
@@ -634,24 +675,55 @@ class MaxClient:
                         continue
                     raise
 
-    def _await_response(self, handle: int, request_id: str, cmd_type: str) -> bytes:
+    def _reply_wait(self, timeout: float) -> float:
+        """Seconds a sent request waits for its reply before it is left running in Max."""
+        if self._control_channel or timeout <= PROBE_TIMEOUT_MAX:
+            return timeout
+        return max(timeout, NATIVE_QUEUE_TIMEOUT) + REPLY_GRACE
+
+    def _await_response(self, handle: int, request_id: str, cmd_type: str, wait: float) -> bytes:
         reader = _PipeReader(handle)
         watch = bool(request_id) and not self._control_channel
+        deadline = time.perf_counter() + wait
         delay = DIALOG_CHECK_AFTER
-        while not reader.done.wait(delay if watch else None):
+        while time.perf_counter() < deadline:
+            remaining = max(0.0, deadline - time.perf_counter())
+            if reader.done.wait(min(delay, remaining) if watch else remaining):
+                return reader.result()
+            if not watch:
+                continue
             delay = DIALOG_POLL_INTERVAL
             dialogs = self._dialogs_blocking(request_id)
             if dialogs:
-                # Max keeps running the call; its connection now belongs to the reader.
-                self._pipe_handle = None
-                reader.detach()
-                with self._blocked_lock:
-                    while len(self._blocked) >= MAX_BLOCKED_CALLS:
-                        self._blocked.pop(next(iter(self._blocked)))
-                    self._blocked[request_id] = {"command": cmd_type, "reader": reader,
-                                                 "blocked_at": time.perf_counter()}
+                self._detach(reader, request_id, cmd_type, dialog=True)
                 raise DialogBlocked(request_id, cmd_type, dialogs)
-        return reader.result()
+        # The status read can take a moment; a reply that lands meanwhile is used.
+        state = self._request_state(request_id) if watch else None
+        if reader.done.is_set():
+            return reader.result()
+        self._detach(reader, request_id, cmd_type, dialog=False)
+        raise MaxBusy(request_id, cmd_type, wait, state, tracked=not self._control_channel)
+
+    def _detach(self, reader: _PipeReader, request_id: str, cmd_type: str, *, dialog: bool) -> None:
+        # Max keeps running the call; its connection now belongs to the reader,
+        # and the next call opens a fresh one.
+        self._pipe_handle = None
+        reader.detach()
+        if self._control_channel:
+            return  # A control client serves one request; nothing asks it for results later.
+        with self._blocked_lock:
+            while len(self._blocked) >= MAX_BLOCKED_CALLS:
+                self._blocked.pop(next(iter(self._blocked)))
+            self._blocked[request_id] = {"command": cmd_type, "reader": reader,
+                                         "blocked_at": time.perf_counter(), "dialog": dialog}
+
+    def _request_state(self, request_id: str) -> str | None:
+        """The dialog monitor's state for a request (queued, running...), if it tracks it."""
+        try:
+            requests = self._dialog_control("status").get("requests", [])
+        except Exception:
+            return None
+        return next((r.get("state") for r in requests if r.get("request_id") == request_id), None)
 
     def _dialog_control(self, action: str) -> dict[str, Any]:
         """Query the dialog monitor over the control channel, keeping this call's metadata."""
@@ -733,22 +805,27 @@ class MaxClient:
             if not dialogs:
                 return []
             wanted = {d.get("dialog_id") for d in dialogs}
-            inspected = self._dialog_control("inspect").get("dialogs", [])
+            try:
+                inspected = self._dialog_control("inspect").get("dialogs", [])
+            except Exception:
+                inspected = []  # An inspect past its deadline still leaves the summaries.
             return [d for d in inspected if d.get("dialog_id") in wanted] or dialogs
         except Exception:
             return []
 
     def blocked_calls(self, wait: float = 0.0) -> list[dict[str, Any]]:
-        """Report calls that returned BLOCKED_BY_DIALOG; completed ones are reported once.
+        """Report calls that returned BLOCKED_BY_DIALOG or MAX_BUSY; completed ones are reported once.
 
-        wait: seconds to wait for the blocked calls to complete. Waiting stops
-        early when one of them is blocked by a dialog again.
+        wait: seconds to wait for the dialog-blocked calls to complete. Waiting
+        stops early when one of them is blocked by a dialog again.
         """
         deadline = time.perf_counter() + max(0.0, wait)
         while True:
             with self._blocked_lock:
                 pending = list(self._blocked.items())
-            waiting = [(rid, entry) for rid, entry in pending if not entry["reader"].done.is_set()]
+            # A MAX_BUSY call may run for minutes; answering a dialog does not wait for it.
+            waiting = [(rid, entry) for rid, entry in pending
+                       if entry["dialog"] and not entry["reader"].done.is_set()]
             if not waiting or time.perf_counter() >= deadline:
                 break
             waiting[0][1]["reader"].done.wait(min(0.5, max(0.0, deadline - time.perf_counter())))
