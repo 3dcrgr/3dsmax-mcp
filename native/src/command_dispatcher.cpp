@@ -449,6 +449,8 @@ std::string CommandDispatcher::Dispatch(
         } else if (cmd_type == "native:mesh_script") {
             RejectBlockedPayloadScripts(command, {"resolve", "script", "finish"});
             result = NativeHandlers::MeshScript(command, gup);
+        } else if (cmd_type == "native:geometry_snapshot") {
+            result = NativeHandlers::GeometrySnapshot(command, gup);
         // Phase 1: Object operations
         } else if (cmd_type == "native:get_object_properties") {
             result = NativeHandlers::GetObjectProperties(command, gup);

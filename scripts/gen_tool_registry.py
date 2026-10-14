@@ -152,6 +152,9 @@ SKIP_TOOL_NAMES = {
     "curve_model",
     "inspect_curve",
     "edit_curve",
+    # The native route only writes the evaluated mesh to Python's scratch file;
+    # the QA analysis runs in Python.
+    "geometry_qa",
     # Mixed Python orchestration: status is a local file read, start only arms
     # notifications, and cancel_capture uses a separate native route. Routing
     # every action to the first discovered send_command could send an abort

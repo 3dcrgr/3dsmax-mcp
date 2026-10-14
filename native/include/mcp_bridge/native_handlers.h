@@ -36,6 +36,7 @@ namespace NativeHandlers {
     // Mesh tool MAXScript with the Editable Poly base-cage token checked and
     // read back in the same main-thread step. Edits name their own undo hold.
     std::string MeshScript(const std::string& params, MCPBridgeGUP* gup);
+    std::string GeometrySnapshot(const std::string& params, MCPBridgeGUP* gup);
 
     // Phase 1: Object operations
     std::string GetObjectProperties(const std::string& params, MCPBridgeGUP* gup);

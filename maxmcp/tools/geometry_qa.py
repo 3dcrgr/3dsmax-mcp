@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import math
 import tempfile
 from pathlib import Path
@@ -110,6 +111,8 @@ def geometry_qa(
     """
     integer(limit, "limit", high=100)
     integer(max_faces, "max_faces", high=500000)
+    if handle:
+        integer(handle, "handle", high=2**63-1)
     if (isinstance(area_epsilon, bool) or not isinstance(area_epsilon, (int, float))
             or not math.isfinite(area_epsilon) or area_epsilon < 0):
         raise ValueError("area_epsilon must be a nonnegative finite number")
@@ -118,9 +121,18 @@ def geometry_qa(
     # transient TriMesh, including error paths; Python owns the scratch path.
     with tempfile.TemporaryDirectory(prefix="mcp_geometry_qa_") as directory:
         path = Path(directory) / "snapshot.txt"
-        response = str(client.send_command(
-            _snapshot_script(name, handle, path.as_posix(), max_faces)
-        ).get("result", ""))
+        # The native bridge writes the same snapshot without formatting every
+        # vertex in MAXScript, and safe mode does not block it the way it
+        # blocks the script's createFile.
+        if client.native_available:
+            request = {"name": name, "handle": handle, "path": str(path), "max_faces": max_faces}
+            response = str(client.send_command(
+                json.dumps(request), cmd_type="native:geometry_snapshot"
+            ).get("result", ""))
+        else:
+            response = str(client.send_command(
+                _snapshot_script(name, handle, path.as_posix(), max_faces)
+            ).get("result", ""))
         if response.startswith("__ERROR__|"):
             raise RuntimeError(response.split("|", 1)[1])
         if response != "OK":

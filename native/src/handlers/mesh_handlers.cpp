@@ -5,10 +5,12 @@
 #include <hold.h>
 #include <iepoly.h>
 #include <mnmesh.h>
+#include <triobj.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -337,5 +339,148 @@ std::string NativeHandlers::MeshScript(const std::string& params, MCPBridgeGUP* 
             try { RunMAXScript(finish); } catch (...) {}
         }
         return result.dump();
+    });
+}
+
+// ── native:geometry_snapshot ────────────────────────────────────
+// Writes the triangle mesh MAXScript's snapshotAsMesh returns (evaluated
+// stack, world space) in geometry_qa's text format. Nothing in the scene
+// changes and no undo record is made.
+namespace {
+
+std::string Base64(const std::string& bytes) {
+    static const char* kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 2 < bytes.size(); i += 3) {
+        const uint32_t n = (uint32_t(uint8_t(bytes[i])) << 16) | (uint32_t(uint8_t(bytes[i + 1])) << 8) |
+                           uint8_t(bytes[i + 2]);
+        out += kAlphabet[n >> 18];
+        out += kAlphabet[(n >> 12) & 63];
+        out += kAlphabet[(n >> 6) & 63];
+        out += kAlphabet[n & 63];
+    }
+    if (i < bytes.size()) {
+        const bool two = i + 1 < bytes.size();
+        const uint32_t n = (uint32_t(uint8_t(bytes[i])) << 16) | (two ? uint32_t(uint8_t(bytes[i + 1])) << 8 : 0);
+        out += kAlphabet[n >> 18];
+        out += kAlphabet[(n >> 12) & 63];
+        out += two ? kAlphabet[(n >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
+
+// node.modifiers counts the modifiers of every derived object on the node,
+// world-space ones included.
+int ModifierCount(INode* node) {
+    int count = 0;
+    for (Object* obj = node->GetObjectRef(); obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID;) {
+        auto* derived = static_cast<IDerivedObject*>(obj);
+        count += derived->NumModifiers();
+        obj = derived->GetObjRef();
+    }
+    return count;
+}
+
+INode* SnapshotTarget(const json& request) {
+    const std::string name = request.value("name", "");
+    if (const unsigned long long handle = PayloadHandleValue(request)) {
+        INode* node = FindNodeByHandle(handle);
+        if (!node) throw std::runtime_error("Node handle is no longer valid");
+        if (!name.empty() && WideToUtf8(node->GetName()) != name)
+            throw std::runtime_error("Node handle/name mismatch");
+        return node;
+    }
+    if (!name.empty()) {
+        INode* node = FindUniqueNodeByName(name, kPassHandleAdvice);
+        if (!node) throw std::runtime_error("Object not found: " + name);
+        return node;
+    }
+    Interface* ip = GetCOREInterface();
+    if (ip->GetSelNodeCount() != 1) throw std::runtime_error("Select exactly one mesh or pass name/handle");
+    return ip->GetSelNode(0);
+}
+
+// geometry_qa passes a new snapshot.txt inside its own mcp_geometry_qa_
+// scratch directory. Nothing else is accepted and an existing file is never
+// replaced, so the request cannot write anywhere else.
+std::filesystem::path ScratchFile(const std::string& path) {
+    const std::filesystem::path file(Utf8ToWide(path));
+    if (!file.is_absolute() || file.filename() != L"snapshot.txt" ||
+        file.parent_path().filename().wstring().rfind(L"mcp_geometry_qa_", 0) != 0)
+        throw std::runtime_error("path must be snapshot.txt in an mcp_geometry_qa_ scratch directory");
+    return file;
+}
+
+void WriteNewFile(const std::filesystem::path& file, const std::string& data) {
+    HANDLE handle = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot create geometry QA snapshot file");
+    size_t written = 0;
+    while (written < data.size()) {
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - written, size_t(1) << 30));
+        DWORD done = 0;
+        if (!WriteFile(handle, data.data() + written, chunk, &done, nullptr) || done == 0) break;
+        written += done;
+    }
+    CloseHandle(handle);
+    if (written != data.size()) {
+        DeleteFileW(file.c_str());
+        throw std::runtime_error("Cannot write geometry QA snapshot file");
+    }
+}
+
+// Releases a TriObject that ConvertToType made for this read only.
+struct ConvertedTri {
+    Object* source;
+    TriObject* tri;
+    ~ConvertedTri() { if (tri && tri != source) tri->MaybeAutoDelete(); }
+};
+
+}  // namespace
+
+std::string NativeHandlers::GeometrySnapshot(const std::string& params, MCPBridgeGUP* gup) {
+    return gup->GetExecutor().ExecuteSync([&params]() -> std::string {
+        const json request = json::parse(params, nullptr, false);
+        if (!request.is_object()) throw std::runtime_error("Invalid geometry snapshot request");
+        const std::filesystem::path file = ScratchFile(request.value("path", ""));
+        const long long maxFaces = request.value("max_faces", 100000LL);
+        if (maxFaces < 1 || maxFaces > 500000) throw std::runtime_error("max_faces must be from 1 to 500000");
+
+        INode* node = SnapshotTarget(request);
+        const TimeValue t = GetCOREInterface()->GetTime();
+        const ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || !os.obj->CanConvertToType(triObjectClassID))
+            throw std::runtime_error("Object does not provide an evaluated triangle mesh");
+        ConvertedTri converted{os.obj, static_cast<TriObject*>(os.obj->ConvertToType(t, triObjectClassID))};
+        if (!converted.tri) throw std::runtime_error("Object does not provide an evaluated triangle mesh");
+        const Mesh& mesh = converted.tri->GetMesh();
+        const int nv = mesh.getNumVerts();
+        const int nf = mesh.getNumFaces();
+        if (nf > maxFaces || nv > maxFaces * 3)
+            throw std::runtime_error("Geometry QA limit exceeded; reduce subdivision or raise max_faces (at most 500000)");
+
+        // An object already in world space (space warps applied) gets an
+        // identity matrix here, as in snapshotAsMesh.
+        const Matrix3 tm = node->GetObjTMAfterWSM(t);
+        std::string out;
+        out.reserve(64 + static_cast<size_t>(nv) * 40 + static_cast<size_t>(nf) * 24);
+        out += "NAME|" + Base64(WideToUtf8(node->GetName())) + "\n";
+        out += "META|" + std::to_string(NodeHandle(node)) + "|" + std::to_string(nv) + "|" + std::to_string(nf) +
+               "|" + std::to_string(ModifierCount(node)) + "|" + std::to_string(t) + "\n";
+        char line[128];
+        for (int i = 0; i < nv; ++i) {
+            const Point3 p = mesh.verts[i] * tm;
+            const int n = std::snprintf(line, sizeof(line), "V|%.9g,%.9g,%.9g\n", p.x, p.y, p.z);
+            out.append(line, static_cast<size_t>(n));
+        }
+        for (int i = 0; i < nf; ++i) {
+            const DWORD* v = mesh.faces[i].v;
+            const int n = std::snprintf(line, sizeof(line), "F|%lu,%lu,%lu\n", v[0] + 1, v[1] + 1, v[2] + 1);
+            out.append(line, static_cast<size_t>(n));
+        }
+        WriteNewFile(file, out);
+        return "OK";
     });
 }
