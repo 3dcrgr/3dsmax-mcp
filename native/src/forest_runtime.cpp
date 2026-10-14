@@ -120,7 +120,7 @@ Value* PrepareCurves(Value** args,int count) {
         auto* curve=control->GetControlCurve(index);if(!curve)Refuse(L"INVALID_READBACK: new curve slot is unavailable");
         curve->SetNumPts(2);
         for(int j=0;j<2;++j) {
-            CurvePoint point;point.p=Point2((float)j,(float)j);point.in=point.out=Point2(0,0);point.flags=CURVEP_CORNER;
+            CurvePoint point;point.p=Point2((float)j,1.0f);point.in=point.out=Point2(0,0);point.flags=CURVEP_CORNER|CURVEP_ENDPOINT;
             curve->SetPoint(time,j,&point,FALSE,FALSE);
         }
     }
