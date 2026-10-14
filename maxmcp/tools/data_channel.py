@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 from ..server import mcp, client
 from ..coerce import DictList, IntList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name, node_by_name_expr, safe_string
 
 
 # Friendly aliases resolve to the live catalog display name. AddOperator class
@@ -126,12 +126,11 @@ def _mxs_str(value: str) -> str:
 
 
 def _mxs_object_block(name: str, body: str, *, not_found: str = "") -> str:
-    safe_name = _mxs_str(name)
     msg = not_found or f"Object not found: {name}"
     safe_msg = msg.replace("\\", "\\\\").replace('"', '\\"')
     indented = "\n        ".join(line for line in body.splitlines() if line.strip())
     return f"""(
-    local obj = getNodeByName "{safe_name}"
+    local obj = {node_by_name(name, missing_ok=True)}
     if obj == undefined then "{safe_msg}"
     else
     (
@@ -254,11 +253,7 @@ def _authorize_executable(allow_executable: bool) -> None:
 
 def _dc_catalog_helpers() -> list[str]:
     return [
-        "fn mcpDcRequireNode nodeName = (",
-        "    local theNode = getNodeByName nodeName exact:true",
-        "    if theNode == undefined do throw (\"Data Channel node not found: \" + nodeName)",
-        "    theNode",
-        ")",
+        "fn mcpDcRequireNode nodeName = " + node_by_name_expr("nodeName", "Data Channel node"),
         "fn mcpDcAddOperatorByName theIF wantedName whereAt = (",
         "    local found = false",
         "    local idA = 0L",
@@ -722,7 +717,6 @@ def inspect_data_channel(
     if modifier_index < 0:
         return _json.dumps({"error": "modifier_index must be zero or 1-based"})
     max_properties = max(0, min(int(max_properties), 256))
-    safe = _mxs_str(name)
     property_block = ""
     if include_properties and max_properties:
         property_block = rf'''
@@ -745,8 +739,7 @@ def inspect_data_channel(
     maxscript = rf'''(
     try (
         {_dc_json_helpers()}
-        local obj = getNodeByName "{safe}" exact:true
-        if obj == undefined do throw "Object not found: {safe}"
+        local obj = {node_by_name(name)}
         local dcMod = undefined
         local modStackIndex = 0
         if {modifier_index} > 0 then (
