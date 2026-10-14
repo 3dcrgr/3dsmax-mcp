@@ -17,7 +17,7 @@ Verified and deployed improvements are published on the fork's default branch, `
 
 ## At a glance
 
-Forest Effects supports guarded ordering, numeric parameters, and object or spline bindings. `.eff` import requires explicit scene bindings; export writes definitions with required bindings listed for the next import. Live API checks and 58 focused tests cover these operations. Controller, texture and curve definitions remain unsupported, and stored effect code has no public compile-success signal. See [iToo coverage](docs/fork/itoo-api-coverage.md).
+Forest Effects supports guarded ordering, numeric parameters, and object, spline, or existing texture-map bindings. `.eff` import requires explicit scene bindings; export writes definitions with required bindings listed for the next import. Live API checks and 64 integrated focused tests cover these operations. Controller and curve definitions remain unsupported, and stored effect code has no public compile-success signal. See [iToo coverage](docs/fork/itoo-api-coverage.md).
 
 - **208 tools:** all 179 of upstream's, plus 29 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
