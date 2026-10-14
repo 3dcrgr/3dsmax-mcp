@@ -112,7 +112,8 @@ def _cleanup_smoke_fixture(client: MaxClient) -> None:
             client,
             {
                 "cmdType": "native:delete_objects",
-                "input": {"names": [SMOKE_TARGET, SMOKE_SPAWN, f"{SMOKE_TARGET}001"]},
+                # clone_objects copies the target with its parented spawn child.
+                "input": {"names": [SMOKE_TARGET, SMOKE_SPAWN, f"{SMOKE_TARGET}001", f"{SMOKE_SPAWN}001"]},
             },
         )
     except RuntimeError:
