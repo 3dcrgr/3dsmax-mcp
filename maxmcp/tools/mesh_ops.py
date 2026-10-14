@@ -300,7 +300,14 @@ def mesh_edit(
     # subObjectLevel's MAXScript setter does not parse a case expression inside
     # a try block. The final operation is already validated in Python.
     ui_level = {"vertex": 1, "edge": 2, "face": 4}[str(operations[-1].get("level", "face")).lower()]
-    selection_ui = f'''select obj; max modify mode; modPanel.setCurrentObject obj.baseobject; subObjectLevel = {ui_level}''' if show_selection else ""
+    # select and setCurrentObject rebuild the Modify panel (hundreds of ms) even
+    # when nothing changes, so each step runs only when the panel differs.
+    selection_ui = (
+        'if not (selection.count == 1 and selection[1] == obj) do select obj; '
+        'if getCommandPanelTaskMode() != #modify do max modify mode; '
+        'if modPanel.getCurrentObject() != obj.baseobject do modPanel.setCurrentObject obj.baseobject; '
+        f'if subObjectLevel != {ui_level} do subObjectLevel = {ui_level}'
+    ) if show_selection else ""
     # In one main-thread step the bridge resolves the node, checks expected_mesh,
     # opens the "MCP mesh edit" hold (never joining an open one), runs the
     # edits, reads the new token, and accepts; any failure cancels the hold.
