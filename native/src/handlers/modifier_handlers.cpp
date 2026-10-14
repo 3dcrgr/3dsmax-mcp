@@ -4,6 +4,7 @@
 #include "mcp_bridge/core_bridge.h"
 #include "mcp_bridge/modifier_helpers.h"
 
+#include <iInstanceMgr.h>
 #include <modstack.h>
 #include <iparamb2.h>
 #include <memory>
@@ -289,22 +290,20 @@ std::string NativeHandlers::CollapseModifierStack(const std::string& params, MCP
             return result.dump();
         }
 
+        // The node already resolved, by handle: never look it up again by name. noWarning
+        // is true so Max does not stop on a prompt during the call.
+        const std::string collapseTarget = "(maxOps.getNodeByHandle " + std::to_string(node->GetHandle()) + ")";
+
         if (toIndex > 0) {
             // Collapse to specific index (1-based)
             if (toIndex > numMods) {
                 throw std::runtime_error("Index " + std::to_string(toIndex) +
                     " out of range (stack has " + std::to_string(numMods) + " modifiers)");
             }
-            // Evaluate pipeline at that modifier and replace
-            // SDK approach: delete modifiers above the target index
-            // In Max SDK, modifier 0 is the top of stack
-            // toIndex=1 means keep only the topmost, collapse rest
-            // Actually, CollapseNodeTo in MAXScript does: evaluate pipeline down to that modifier
-            // Pure SDK: we evaluate the world state, convert to mesh, replace object ref
-            // For partial collapse, use RunMAXScript as it maps to maxOps.CollapseNodeTo
-            std::string script = "maxOps.CollapseNodeTo (getNodeByName \"" +
-                JsonEscape(name) + "\") " + std::to_string(toIndex) + " off";
-            RunMAXScriptChecked(script);
+            if (RunMAXScriptChecked("(maxOps.CollapseNodeTo " + collapseTarget + " " +
+                    std::to_string(toIndex) + " true) as string") != "true")
+                throw std::runtime_error("3ds Max could not collapse " + name + " to modifier index " +
+                    std::to_string(toIndex));
             ip->RedrawViews(t);
             json result = NodeIdentityJson(node);
             result["message"] = "Collapsed " + WideToUtf8(node->GetName()) + " to modifier index " + std::to_string(toIndex);
@@ -314,28 +313,14 @@ std::string NativeHandlers::CollapseModifierStack(const std::string& params, MCP
             return result.dump();
         }
 
-        // Full collapse: evaluate pipeline, get final object, replace
-        ObjectState os = node->EvalWorldState(t);
-        if (!os.obj) throw std::runtime_error("Failed to evaluate object");
-
-        // Convert to editable mesh
-        if (os.obj->CanConvertToType(triObjectClassID)) {
-            TriObject* tri = (TriObject*)os.obj->ConvertToType(t, triObjectClassID);
-            if (tri && tri != os.obj) {
-                node->SetObjectRef(tri);
-            } else if (tri == os.obj) {
-                // Already a tri, but need to strip the derived object wrapper
-                // Use the simple approach
-                std::string script = "maxOps.CollapseNode (getNodeByName \"" +
-                    JsonEscape(name) + "\") off";
-                RunMAXScriptChecked(script);
-            }
-        } else {
-            // Fallback for non-mesh objects
-            std::string script = "maxOps.CollapseNode (getNodeByName \"" +
-                JsonEscape(name) + "\") off";
-            RunMAXScriptChecked(script);
-        }
+        // Full collapse. The result keeps the type the stack evaluates to:
+        // an Edit Poly stack stays Editable Poly instead of becoming a mesh.
+        // CollapseNode returns OK, not its documented boolean: read the stack back.
+        RunMAXScriptChecked("maxOps.CollapseNode " + collapseTarget + " true");
+        Object* collapsed = node->GetObjectRef();
+        if (collapsed && collapsed->SuperClassID() == GEN_DERIVOB_CLASS_ID &&
+            static_cast<IDerivedObject*>(collapsed)->NumModifiers() > 0)
+            throw std::runtime_error("3ds Max could not collapse the stack on " + name);
 
         ip->RedrawViews(t);
 
@@ -379,19 +364,31 @@ std::string NativeHandlers::MakeModifierUnique(const std::string& params, MCPBri
 
         std::string modDisplayName = WideToUtf8(mod->GetName(false).data());
 
-        // Clone the modifier and replace
-        RemapDir* remap = NewRemapDir();
-        Modifier* cloned = (Modifier*)mod->Clone(*remap);
-        remap->DeleteThis();
-
-        if (!cloned) throw std::runtime_error("Failed to clone modifier");
-
-        // Replace: delete old, add cloned at same position
-        dobj->DeleteModifier(idx);
-        dobj->AddModifier(cloned, nullptr, idx);
+        // Max's own Make Unique: it knows which stacks share the modifier and
+        // keeps the slot's ModContext (gizmo, sub-object selection).
+        INodeTab nodes;
+        nodes.AppendNode(node);
+        Tab<ReferenceTarget*> mods;
+        ReferenceTarget* target = mod;
+        mods.Append(1, &target);
+        IInstanceMgr* instances = IInstanceMgr::GetInstanceMgr();
+        if (!instances->CanMakeModifiersUnique(nodes, mods)) {
+            json result = NodeIdentityJson(node);
+            result["status"] = "already_unique";
+            result["message"] = "Modifier " + modDisplayName + " on " + WideToUtf8(node->GetName()) +
+                " is not instanced; nothing was changed";
+            result["modifier"] = {{"name", modDisplayName}, {"index", modIndex}};
+            result["warnings"] = json::array({result["message"]});
+            result["stack"] = ModifierStackJson(node);
+            return result.dump();
+        }
+        instances->MakeModifiersUnique(nodes, mods, INSTANCE_MGR_MAKE_UNIQUE_INDIVIDUAL);
+        if (dobj->GetModifier(idx) == mod)
+            throw std::runtime_error("3ds Max did not make modifier " + modDisplayName + " unique");
 
         GetCOREInterface()->RedrawViews(GetCOREInterface()->GetTime());
         json result = NodeIdentityJson(node);
+        result["status"] = "made_unique";
         result["message"] = "Made modifier " + modDisplayName + " unique on " + WideToUtf8(node->GetName());
         result["modifier"] = {
             {"name", modDisplayName},
