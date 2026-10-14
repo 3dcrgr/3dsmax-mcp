@@ -422,3 +422,33 @@ curve write tool was used; production curve imports remain refused, now with the
 explicit CURVE_WRITES_UNSUPPORTED message. Do not repeat raw curve-row changes in
 a production scene. Curve parameter mapping and persistence remain unsupported.
 Evidence: diagnostics/itoo-curve-mapping-20261014/.
+
+### Controller sampling and curve-slot repair implementation
+
+Scalar bindings now use an internal `Float_Expression` on Forest's animatable
+`efpafloatval` track. Its `MCP_Source` scalar target references the original
+FloatController. This avoids the native controller-parameter path's observed
+frame-zero sampling while retaining the source controller and its keys.
+`forest_effect_parameters(action="repair_animation", expected_effects=...)`
+migrates existing scalar bindings; setting or importing a scalar binding creates
+this route automatically. Inspector rows expose `sampling_route`, driver/target
+identity and `sampling_valid`; replacing the source controller invalidates that
+confirmation until rebound. Staging rebuilds the driver against the original
+source reference, preventing `copy base` from leaving a cloned source target.
+Export writes portable controller definitions requiring explicit source bindings,
+without serializing the internal driver or source keys.
+
+Curve definition import initializes all native CurveControl slots on the detached
+Forest copy before adoption. The live probe established curve indices equal the
+full parameter-row index, including numeric rows. Existing static curve points
+are moved by parameter ID when preceding rows are removed; animated point
+reordering is refused. New curves start as linear `(0,0)` to `(1,1)`. Custom curve
+payloads and curve export/edit remain unsupported. Slot preparation and scalar
+driver assignment require the updated native bridge and reject attached owners.
+All live changes still use one guarded undo hold for adopting the prepared copy.
+
+Private route probes verified source/numeric/Forest values 31.5, 39.5 and 47.5 at
+frames 0, 5 and 10, source-key preservation, and save/reload linkage. A separate
+allocated `[numeric, curve, curve]` probe produced X=33/Z=22 and retained points
+and output after reload. These are mechanism probes; deployment regression of
+the public implementation is pending. Evidence: diagnostics/issue43-45-resolution-20261014/.

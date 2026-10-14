@@ -13,11 +13,35 @@ TOKEN = "-".join(["AB"] * 32)
 
 
 class InventoryTests(unittest.TestCase):
-    def test_curve_definition_import_is_explicitly_refused(self):
-        document = api.ET.fromstring('<effect><parameter name="Curve" type="curve"/></effect>')
+    def test_curve_definition_import_has_default_slots(self):
+        document = api.ET.fromstring('<effect><parameter id="{11111111-1111-1111-1111-111111111111}" name="Curve" type="curve"/></effect>')
         for allow_references in (False, True):
-            with self.subTest(allow_references=allow_references), self.assertRaisesRegex(ValueError, "CURVE_WRITES_UNSUPPORTED"):
-                api.parameter_definitions(document, allow_references=allow_references)
+            with self.subTest(allow_references=allow_references):
+                rows=api.parameter_definitions(document, allow_references=allow_references)
+                self.assertEqual(rows[0]['kind'],'curve')
+                self.assertNotIn('binding_literal',rows[0])
+
+    def test_custom_curve_payload_is_refused_before_max(self):
+        for content in (' points="unmeasured"','><point x="0" y="0"/></parameter'):
+            text='<effect><parameter id="{11111111-1111-1111-1111-111111111111}" name="Curve" type="curve"'+content
+            text += '/></effect>' if content.startswith(' ') else '></effect>'
+            with self.subTest(content=content),self.assertRaisesRegex(ValueError,'CURVE_SCHEMA_UNSUPPORTED'):
+                api.parameter_definitions(api.ET.fromstring(text),allow_references=True)
+
+    def test_mixed_numeric_curve_import_prepares_slots_before_commit(self):
+        xml='<effect version="500"><expression>fpItem.position.z=evaluateCurve(A,0.5);</expression>'
+        xml+='<parameter id="{11111111-1111-1111-1111-111111111111}" name="N" type="numerical" numtype="real"/>'
+        xml+='<parameter id="{22222222-2222-2222-2222-222222222222}" name="A" type="curve"/>'
+        xml+='<parameter id="{33333333-3333-3333-3333-333333333333}" name="B" type="curve"/></effect>'
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'mixed.eff';p.write_text(xml,encoding='utf-8')
+            info=api.read_effect_file(p)
+            with patch.object(api.rc,'_send',return_value=f'ITOOEFFECTS\nT|{TOKEN}\nEND\n') as send:
+                result=api.forest_effects('Forest',action='load',path=str(p),expected_file_hash=info['sha256'],expected_effects=TOKEN)
+        self.assertEqual(result['initialized_parameters'],3)
+        script=send.call_args.args[0]
+        self.assertLess(script.rfind('iaPrepareCurveSlots base staged'),script.rfind('obj.baseObject=staged'))
+        self.assertIn('append next_efpatype 4',script)
 
     def test_interface_signatures_and_coverage(self):
         text = """  Interface: trees
@@ -584,6 +608,43 @@ class ControllerParameterTests(unittest.TestCase):
         self.assertEqual(row['kind'],'controller');self.assertTrue(row['writable'])
         self.assertEqual(row['value']['subanim'],3)
 
+    def proxy_state(self):
+        state=self.state()
+        state['arrays']['efpatype']['values']=[0]
+        state['effects'][0]['xml']=state['effects'][0]['xml'].replace('type="controller"','type="numerical" numtype="real" mcp_controller_proxy="1"')
+        state['controller_drivers']={1:{'handle':987,'class':'Float_Expression','target_handle':456,'expression':'MCP_Source'}}
+        return state
+
+    def test_numeric_driver_identity_reports_scalar_binding(self):
+        row=api.parameter_rows(self.proxy_state())[0]
+        self.assertEqual(row['kind'],'controller')
+        self.assertEqual(row['sampling_route'],'numeric_proxy')
+        self.assertEqual(row['value']['controller_handle'],456)
+        self.assertTrue(row['controller_animation_verified'])
+
+    def test_replaced_source_controller_invalidates_proxy_confirmation(self):
+        state=self.proxy_state()
+        state['controller_bindings'][1]['controller_handle']=999
+        row=api.parameter_rows(state)[0]
+        self.assertFalse(row['sampling_valid'])
+        self.assertFalse(row['controller_animation_verified'])
+        self.assertTrue(row['writable'])
+
+    def test_repair_animation_preserves_binding_and_uses_driver(self):
+        with patch.object(api,'forest_effects',side_effect=[self.state(),self.proxy_state()]),patch.object(api.rc,'_send',return_value='PARAMETERS_WRITTEN') as send:
+            result=api.forest_effect_parameters('forest',action='repair_animation',expected_effects=TOKEN)
+        self.assertTrue(result['controller_animation_verified'])
+        self.assertTrue(result['undoable'])
+        self.assertIn('iaMarkControllerProxy staged 1',send.call_args.args[0])
+        self.assertIn('iaPrepareControllerProxies staged',send.call_args.args[0])
+        self.assertNotIn('with animate on',send.call_args.args[0])
+
+    def test_repair_requires_fresh_token_and_scalar_parameters(self):
+        with self.assertRaises(ValueError):
+            api.forest_effect_parameters('forest',action='repair_animation')
+        with patch.object(api,'forest_effects',return_value=self.state()),self.assertRaises(api.RailCloneError):
+            api.forest_effect_parameters('forest',action='repair_animation',expected_effects='-'.join(['CD']*32))
+
     def test_controller_identity_validation(self):
         value=self.state()['controller_bindings'][1]
         self.assertEqual(api.controller_literal(None),'#(undefined,0)')
@@ -626,7 +687,7 @@ class ControllerParameterTests(unittest.TestCase):
         self.assertIn('iaControllerIdentity base i',api._EFFECT_LIB)
 
     def test_unknown_parameter_type_stays_inspectable(self):
-        state=self.state();state['arrays']['efpatype']['values']=[4]
+        state=self.state();state['arrays']['efpatype']['values']=[999]
         with patch.object(api,'forest_effects',return_value=state):
             result=api.forest_effect_parameters('forest')
         self.assertFalse(result['parameters'][0]['writable'])

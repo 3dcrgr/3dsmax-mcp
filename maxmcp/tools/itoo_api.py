@@ -255,6 +255,64 @@ fn iaControllerIdentity base i = (
         (if ctrl==undefined then "0" else rcH ctrl)+":"+(rcEncode ((classOf ctrl) as string))
     )
 )
+fn iaControllerProxy base i = (
+    if base.efpatype[i]!=0 then false else (
+        local ei=findItem (base.efidlist as array) base.efpaeffid[i]
+        if ei==0 then false else (
+            local doc=dotNetObject "System.Xml.XmlDocument"
+            doc.XmlResolver=undefined; doc.LoadXml base.efxmllist[ei]
+            local found=false
+            for p in doc.SelectNodes "/effect/parameter" where (toLower (p.GetAttribute "id"))==(toLower base.efpaid[i]) do (
+                found=(p.GetAttribute "mcp_controller_proxy")=="1"
+            )
+            found
+        )
+    )
+)
+fn iaControllerDriverIdentity base i = (
+    if mcpForestFloatControllerHandle==undefined do throw "BRIDGE_CAPABILITY_MISSING: scalar sampling requires the updated native bridge"
+    local handle=mcpForestFloatControllerHandle ((getHandleByAnim base) as integer64) (i-1)
+    local driver=if handle==0 then undefined else getAnimByHandle handle
+    local target=try (driver.GetScalarTarget 5 asController:true) catch undefined
+    (if driver==undefined then "0" else rcH driver)+":"+(rcEncode ((classOf driver) as string))+":"+(if target==undefined then "0" else rcH target)+":"+(rcEncode (try (driver.GetExpression()) catch ""))
+)
+fn iaMarkControllerProxy staged i = (
+    local ei=findItem (staged.efidlist as array) staged.efpaeffid[i]
+    if ei==0 do throw "ORPHAN_EFFECT_PARAMETER: controller has no effect"
+    local doc=dotNetObject "System.Xml.XmlDocument"
+    doc.XmlResolver=undefined; doc.LoadXml staged.efxmllist[ei]
+    local found=undefined
+    for p in doc.SelectNodes "/effect/parameter" where (toLower (p.GetAttribute "id"))==(toLower staged.efpaid[i]) do found=p
+    if found==undefined do throw "PARAMETER_SCHEMA_MISMATCH: controller XML definition missing"
+    found.SetAttribute "type" "numerical"; found.SetAttribute "numtype" "real"
+    found.SetAttribute "limits" "0"; found.SetAttribute "default" "0"
+    found.SetAttribute "mcp_controller_proxy" "1"
+    staged.efxmllist[ei]=doc.OuterXml
+    staged.efpatype[i]=0; staged.efpanumtype[i]=1; staged.efpalimit[i]=false
+)
+fn iaPrepareControllerProxies staged = (
+    for i=1 to staged.efpaid.count where iaControllerProxy staged i do (
+        if mcpForestBindFloatController==undefined or mcpForestFloatControllerHandle==undefined do throw "BRIDGE_CAPABILITY_MISSING: scalar sampling requires the updated native bridge"
+        local owner=staged.efpacontref[i], driver=Float_Expression()
+        if owner==undefined then driver.SetExpression "0.0" else (
+            local source=try ((getSubAnim owner (staged.efpacontanim[i]+1)).controller) catch undefined
+            if source==undefined or superClassOf source!=FloatController do throw "STALE_CONTROLLER_REFERENCE: scalar source changed"
+            driver.AddScalarTarget "MCP_Source" source
+            driver.SetExpression "MCP_Source"
+        )
+        driver.Update()
+        local handle=(getHandleByAnim driver) as integer64
+        if (mcpForestBindFloatController ((getHandleByAnim staged) as integer64) (i-1) handle)!=handle do throw "INVALID_READBACK: scalar proxy assignment failed"
+    )
+)
+fn iaPrepareCurveSlots base staged = (
+    if (findItem (base.efpatype as array) 4)>0 or (findItem (staged.efpatype as array) 4)>0 do (
+        if mcpForestPrepareCurveSlots==undefined do throw "BRIDGE_CAPABILITY_MISSING: curve definitions require the updated native bridge"
+        local oldIds=base.efpaid as array
+        local mapping=for id in staged.efpaid collect ((findItem oldIds id)-1)
+        mcpForestPrepareCurveSlots ((getHandleByAnim staged) as integer64) ((getHandleByAnim staged.Effect_Curves) as integer64) oldIds.count mapping
+    )
+)
 fn iaEffectsToken obj base = (
     local ss=stringStream ""
     format "%|%|" (rcH obj) (rcH base) to:ss
@@ -263,7 +321,10 @@ fn iaEffectsToken obj base = (
         local a=getProperty base p
         for v in a do format "%|" (iaEffectValue v) to:ss
     )
-    for i=1 to base.efpaid.count where base.efpatype[i]==2 do format "%|" (iaControllerIdentity base i) to:ss
+    for i=1 to base.efpaid.count where base.efpatype[i]==2 or iaControllerProxy base i do (
+        format "%|" (iaControllerIdentity base i) to:ss
+        if iaControllerProxy base i do format "%|" (iaControllerDriverIdentity base i) to:ss
+    )
     rcHash (ss as string)
 )
 fn iaEffectsReport obj base = (
@@ -275,7 +336,10 @@ fn iaEffectsReport obj base = (
         rcRow ss #("A", p as string, a.count as string)
         for i=1 to a.count do rcRow ss #("V", p as string, i as string, iaEffectValue a[i])
     )
-    for i=1 to base.efpaid.count where base.efpatype[i]==2 do rcRow ss #("C",i as string,iaControllerIdentity base i)
+    for i=1 to base.efpaid.count where base.efpatype[i]==2 or iaControllerProxy base i do (
+        rcRow ss #("C",i as string,iaControllerIdentity base i)
+        if iaControllerProxy base i do rcRow ss #("D",i as string,iaControllerDriverIdentity base i)
+    )
     format "END\n" to:ss
     ss as string
 )
@@ -303,7 +367,17 @@ def parameter_definitions(document: ET.Element, allow_references: bool = False) 
     rows, names, ids = [], set(), set()
     for definition in definitions:
         if definition.get("type") == "curve":
-            raise ValueError("CURVE_WRITES_UNSUPPORTED: curve definitions cannot be imported safely; use forest_effect_curves for read-only inspection")
+            name = definition.get("name", "")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) or name.lower() in names:
+                raise ValueError("parameter names must be unique identifiers")
+            if set(definition.attrib) - {"id", "name", "description", "type"} or list(definition):
+                raise ValueError("CURVE_SCHEMA_UNSUPPORTED: only curve definitions with default points are supported")
+            ident = "{" + str(uuid.UUID(definition.get("id", ""))) + "}"
+            if ident in ids:
+                raise ValueError("parameter IDs must be unique")
+            names.add(name.lower()); ids.add(ident)
+            rows.append({"id": ident, "name": name, "kind": "curve", "description": definition.get("description", "")})
+            continue
         kind, name = definition.get("numtype"), definition.get("name", "")
         reference = definition.get("type") in ("node", "spline", "texture", "controller")
         if not ((reference and allow_references) or (definition.get("type") == "numerical" and kind in NUMERIC_KINDS)):
@@ -492,7 +566,12 @@ def parameter_rows(state: dict[str, Any], effect: str = "") -> list[dict[str, An
             raise RailCloneError("ORPHAN_EFFECT_PARAMETER", "parameter refers to a missing effect")
         row = {"id": ident, "effect_id": owner, "name": arrays["efpaname"][i],
                "native_type": arrays["efpatype"][i], "index": i + 1, "writable": False}
-        if row["native_type"] == 0:
+        definition = next((p for p in parse_effect_xml(by_id[owner]["xml"]).findall("parameter")
+                           if p.get("id", "").lower() == str(ident).lower()), None)
+        proxy = definition is not None and definition.get("mcp_controller_proxy") == "1"
+        if proxy and (row["native_type"] != 0 or definition.get("type") != "numerical" or definition.get("numtype") != "real"):
+            raise RailCloneError("PARAMETER_SCHEMA_MISMATCH", "scalar proxy storage and XML differ")
+        if row["native_type"] == 0 and not proxy:
             code = at("efpanumtype", i)
             kinds = [k for k, data in NUMERIC_KINDS.items() if data[0] == code]
             if not kinds:
@@ -505,10 +584,10 @@ def parameter_rows(state: dict[str, Any], effect: str = "") -> list[dict[str, An
             row.update(kind=kind, value=at(prefix+"val", i), min=at(prefix+"min", i),
                        max=at(prefix+"max", i), default=at(prefix+"def", i), limited=at("efpalimit", i),
                        writable=True)
-        elif row["native_type"] == 2:
+        elif row["native_type"] == 2 or proxy:
             definition = next((p for p in parse_effect_xml(by_id[owner]["xml"]).findall("parameter")
                                if p.get("id", "").lower() == str(ident).lower()), None)
-            if definition is None or definition.get("name") != row["name"] or definition.get("type") != "controller":
+            if definition is None or definition.get("name") != row["name"] or (not proxy and definition.get("type") != "controller"):
                 raise RailCloneError("PARAMETER_SCHEMA_MISMATCH", "XML and native controller definition differ")
             subtype = at("efpacontype", i)
             bindings = state.get("controller_bindings", {})
@@ -518,6 +597,20 @@ def parameter_rows(state: dict[str, Any], effect: str = "") -> list[dict[str, An
             row.update(kind="controller", value=value, native_controller_type=subtype,
                        bound=value is not None and value["controller_handle"] != 0,
                        writable=subtype == 0 and (value is None or value["controller_handle"] != 0))
+            row["sampling_route"] = "numeric_proxy" if proxy else "native_controller"
+            row["controller_animation_verified"] = False
+            if proxy:
+                driver = state.get("controller_drivers", {}).get(i + 1)
+                if driver is None:
+                    raise RailCloneError("INVALID_READBACK", "scalar proxy identity is missing")
+                source_handle = value["controller_handle"] if value else 0
+                valid = (driver["class"].lower() == "float_expression" and driver["target_handle"] == source_handle
+                         and driver["expression"] == ("MCP_Source" if value else "0.0"))
+                row.update(driver=driver, sampling_valid=valid, controller_animation_verified=valid)
+        elif row["native_type"] == 4:
+            if definition is None or definition.get("name") != row["name"] or definition.get("type") != "curve":
+                raise RailCloneError("PARAMETER_SCHEMA_MISMATCH", "curve storage and XML differ")
+            row.update(kind="curve", curve_index=i, binding_route="parameter_row_index", writable=False)
         elif row["native_type"] in REFERENCE_KINDS:
             kind, prop = REFERENCE_KINDS[row["native_type"]]
             definition = next((p for p in parse_effect_xml(by_id[owner]["xml"]).findall("parameter")
@@ -555,19 +648,19 @@ if next_{prop}.count==0 do next_{prop}=for j=1 to pc collect {default}
 if next_{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"
 '''
         for i, row in enumerate(rows):
-            reference = row["kind"] in ("node", "spline", "texture", "controller")
+            reference = row["kind"] in ("node", "spline", "texture", "controller", "curve")
             subtype, prefix, typ = (0, "", "") if reference else NUMERIC_KINDS[row["kind"]]
             string_fields = {"efpaid": row["id"], "efpaeffid": owner,
                              "efpaname": row["name"], "efpadesc": row["description"]}
             if prop in string_fields:
                 value = f'(rcDecode "{rc._b64(string_fields[prop])}")'
             elif reference and prop == "efpatype":
-                value = str({"node": 1, "spline": 5, "texture": 3, "controller": 2}[row["kind"]])
+                value = str({"node": 1, "spline": 5, "texture": 3, "controller": 2, "curve": 4}[row["kind"]])
             elif row["kind"] == "controller" and prop == "efpacontref":
                 value = f'import_reference_{i}[1]'
             elif row["kind"] == "controller" and prop == "efpacontanim":
                 value = f'import_reference_{i}[2]'
-            elif reference and prop == {"node": "efpainode", "spline": "efpaspline", "texture": "efpatexmap", "controller": "efpacontref"}[row["kind"]]:
+            elif reference and prop == {"node": "efpainode", "spline": "efpaspline", "texture": "efpatexmap", "controller": "efpacontref"}.get(row["kind"]):
                 value = f'import_reference_{i}'
             elif prop == "efpanumtype":
                 value = str(subtype)
@@ -633,22 +726,28 @@ def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect
     bindings require the canonical owner/track/controller identity from inspection;
     subanim is 1-based, native storage is 0-based. Only measured scalar float tracks
     with native controller type 0 are writable. Source keys/values are not edited.
-    Animated evaluation is unverified: live trees.update returned frame-zero values
-    after a time change. Do not infer animated output from binding readback.
-    Curve writes and other controller subtypes are refused. XML/native schema must agree.
+    Scalar bindings use a Float_Expression driver on the native real parameter
+    track, referencing the original source controller without keying or copying
+    it. repair_animation converts existing scalar bindings to this route in one
+    staged undo step; it requires expected_effects and accepts no values.
+    Curve point writes and other controller subtypes are refused. XML/native schema must agree.
     Does not build or compile-check; verify using forest_items(refresh_surfaces=true).
     """
-    if action not in ("inspect", "set"):
-        raise ValueError("action must be inspect or set")
-    if action == "set" and (not isinstance(expected_effects, str) or not rc.TOKEN.fullmatch(expected_effects)):
-        raise ValueError("set requires expected_effects token")
+    if action not in ("inspect", "set", "repair_animation"):
+        raise ValueError("action must be inspect, set or repair_animation")
+    if action != "inspect" and (not isinstance(expected_effects, str) or not rc.TOKEN.fullmatch(expected_effects)):
+        raise ValueError("mutation requires expected_effects token")
     if action == "set" and (not isinstance(values, dict) or not values or len(values) > 100):
         raise ValueError("set requires 1..100 parameter values")
-    if action == "inspect" and values:
-        raise ValueError("inspect does not accept values")
+    if action != "set" and values:
+        raise ValueError("only set accepts values")
     state = forest_effects(name)
     rows = parameter_rows(state, effect)
-    if action == "set":
+    if action == "repair_animation":
+        values = {p["id"]: p["value"] for p in rows if p.get("kind") == "controller"}
+        if not values:
+            raise ValueError("repair_animation requires a scalar controller parameter")
+    if action != "inspect":
         if state["effects_token"] != expected_effects:
             raise RailCloneError("STALE_EFFECTS", "read parameters again")
         writes, touched = [], set()
@@ -662,8 +761,9 @@ def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect
             touched.add(row["index"])
             if not row["writable"]:
                 raise ValueError("PARAMETER_TYPE_UNSUPPORTED: this parameter type is not supported")
-            if row["native_type"] in REFERENCE_KINDS or row["native_type"] == 2:
-                kind, prop = ("controller", "efpacontref") if row["native_type"] == 2 else REFERENCE_KINDS[row["native_type"]]
+            if row["kind"] in ("node", "spline", "texture", "controller"):
+                kind = row["kind"]
+                prop = {"controller": "efpacontref", "node": "efpainode", "spline": "efpaspline", "texture": "efpatexmap"}[kind]
                 literal = binding_literal(value, kind)
                 var = f'next_reference_{row["index"]}'
                 writes.append(f'local {var}={literal}')
@@ -674,6 +774,7 @@ def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect
                 writes.append(f'staged.{prop}[{row["index"]}]={source}')
                 if kind == "controller":
                     writes.append(f'staged.efpacontanim[{row["index"]}]={var}[2]')
+                    writes.append(f'iaMarkControllerProxy staged {row["index"]}')
                 continue
             _, prefix, typ = NUMERIC_KINDS[row["kind"]]
             literal = _literal(value, typ)
@@ -689,7 +790,8 @@ if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: read a
 local staged=undefined
 with undo off (staged=copy base
 iaPreserveEffectReferences base staged
-{chr(10).join(writes)})
+{chr(10).join(writes)}
+iaPrepareControllerProxies staged)
 if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: state changed while staging"
 if fpBusy() do throw "USER_BUSY: an undo operation became active"
 local owns=false
@@ -701,9 +803,10 @@ catch (if owns do theHold.Cancel(); throw())
             raise RailCloneError("INVALID_READBACK", "parameter write did not acknowledge")
         state = forest_effects(name); rows = parameter_rows(state, effect)
     return {"action": action, "parameters": rows, "effects_token": state["effects_token"],
-            "read_only": action == "inspect", "undoable": action == "set", "rebuilt": False,
-            "refresh_required": action == "set", "compile_verified": False,
-            "controller_animation_verified": False if any(r.get("kind") == "controller" for r in rows) else None}
+            "read_only": action == "inspect", "undoable": action != "inspect", "rebuilt": False,
+            "refresh_required": action != "inspect", "compile_verified": False,
+            "controller_animation_verified": all(r.get("controller_animation_verified", False) for r in rows if r.get("kind") == "controller")
+            if any(r.get("kind") == "controller" for r in rows) else None}
 
 
 @mcp.tool()
@@ -740,9 +843,12 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     contains definitions only, not scene bindings. required_bindings lists the
     parameters that must be bound explicitly on the next load. Controller bindings
     require canonical owner/track/controller identities for measured scalar float
-    tracks (native type 0); sources are reused and never keyed/edited. Curve files
-    and unmeasured controller definition attributes are refused. No source nodes
-    are created or serialized.
+    tracks (native type 0); source controllers are sampled through an internal
+    Float_Expression on the real parameter track and are never keyed/edited.
+    Curve definitions import with default linear points using SDK allocation on
+    the staged copy; existing static curve slots follow parameter IDs through
+    removal. Animated curve reordering and custom curve-file data are refused.
+    No source nodes are created or serialized.
     export writes an effect with current numeric values as defaults to a new absolute .eff path; existing
     files are never overwritten. Export does not edit Max and is not undoable.
     """
@@ -825,6 +931,9 @@ append selections false; append specs ""
 staged.efidlist=ids; staged.efnamelist=labels; staged.efxmllist=xmls; staged.efenablelist=flags
 staged.efselspeclist=selections; staged.efspeclist=specs
 '''
+            for i, row in enumerate(imported_parameters):
+                if row["kind"] == "controller":
+                    body += f'iaMarkControllerProxy staged (pc+{i + 1})\n'
         else:
             body += f'''
 local wanted=rcDecode "{rc._b64(effect)}", matches=#()
@@ -883,6 +992,9 @@ for p in join rowProps #(#efselspeclist,#efspeclist) do (
     if a.count==n do (deleteItem a idx; setProperty staged p a)
 )
 '''
+        body += '''iaPrepareCurveSlots base staged
+iaPrepareControllerProxies staged
+'''
         body += f'''
 if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: effects changed while staging"
 if fpBusy() do throw "USER_BUSY: an undo operation became active"
@@ -913,6 +1025,11 @@ base=obj.baseObject
                          "subanim": int(subanim), "controller_handle": int(ctrl_handle),
                          "controller_class": rc._unb64(ctrl_class)}
             result.setdefault("controller_bindings", {})[int(row[1])] = value
+        elif row[0] == "D":
+            handle, cls, target, expression = row[2].split(":")
+            result.setdefault("controller_drivers", {})[int(row[1])] = {
+                "handle": int(handle), "class": rc._unb64(cls), "target_handle": int(target),
+                "expression": rc._unb64(expression)}
     arrays = {p: a["values"] for p, a in result["arrays"].items()}
     for i, ident in enumerate(arrays.get("efidlist", [])):
         e = {"id": ident, "index": i + 1}
@@ -947,6 +1064,10 @@ base=obj.baseObject
                     if not export_reference_definitions:
                         raise ValueError("REFERENCE_EXPORT_CONFIRMATION_REQUIRED: definitions omit scene bindings; set export_reference_definitions=true")
                     result.setdefault("required_bindings", []).append({"id": row["id"], "name": row["name"], "kind": row["kind"]})
+                    if row["kind"] == "controller" and definition.get("mcp_controller_proxy") == "1":
+                        attrs = {k: definition.get(k, "") for k in ("id", "name", "description")}
+                        attrs["type"] = "controller"
+                        definition.attrib.clear(); definition.attrib.update(attrs)
                     continue
                 definition.set("default", str(row["value"]))
                 definition.set("min", str(row["min"])); definition.set("max", str(row["max"]))

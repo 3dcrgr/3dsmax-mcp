@@ -1,4 +1,5 @@
 #include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/forest_runtime.h"
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/gdiplus_runtime.h"
@@ -186,6 +187,7 @@ DWORD MCPBridgeGUP::Start() {
     g_gupInstance = this;
     executor_.Initialize();
     SetNativePipeRunningFlag(false);
+    ForestRuntime::RegisterPrimitives();
     instance_id_ = "pid-" + std::to_string(GetCurrentProcessId());
     pipe_name_utf8_ = "\\\\.\\pipe\\3dsmax-mcp-" + instance_id_;
 

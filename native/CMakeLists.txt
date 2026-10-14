@@ -105,6 +105,7 @@ set(SOURCES
     src/handlers/keyframe_handlers.cpp
     src/handlers/plugin_introspect_handlers.cpp
     src/plugin_access.cpp
+    src/forest_runtime.cpp
     src/handlers/plugin_access_handlers.cpp
     src/handlers/organize_handlers.cpp
     src/handlers/learning_handlers.cpp

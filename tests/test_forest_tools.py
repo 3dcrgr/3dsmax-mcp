@@ -1201,7 +1201,7 @@ class ForestFromLibraryTests(LibraryFixture):
         catch_at = script.index(") catch (\n    -- fpNewNodes again")
         self.assertLess(phase2_try, phase2)
         for step in ("newNodes = fpNewNodes mark2", "f.surflist = surfs", "loadTempMaterialLibrary mp",
-                     "hide c", "f.trees.update()\n    )\n", 'format "FPOK\\n" to:ss',
+                     "hide c", "fpGuard f; f.trees.update())\n    )\n", 'format "FPOK\\n" to:ss',
                      'for x in notes do format "W|%\\n" x to:ss'):
             with self.subTest(step=step):
                 self.assertLess(phase2, script.index(step, phase2))

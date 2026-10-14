@@ -66,7 +66,8 @@ ERROR_CODES = frozenset({
     "AMBIGUOUS", "BAD_GEOM_ID", "BAD_INDEX", "BAD_SIZE", "BAD_SPLINE", "BAD_SURFACE", "BAD_GEOMETRY",
     "CONFIRM_DISCARD_REQUIRED", "CRASH_RISK", "CUSTOM_EDIT_REQUIRED", "FILE_NOT_FOUND", "FREEZE_MISMATCH",
     "MERGE_FAILED", "NOT_FOREST", "NOT_FOUND", "OBJECT_NOT_IN_FILE", "PLUGIN_MISSING", "STALE",
-    "UNSUPPORTED_ITEM", "UNSUPPORTED_MODE", "USER_BUSY",
+    "UNSUPPORTED_ITEM", "UNSUPPORTED_MODE", "USER_BUSY", "CURVE_STATE_INVALID",
+    "EFFECT_PARAMETER_LIST_MISMATCH", "BRIDGE_CAPABILITY_MISSING",
 })
 _RETRYABLE = {"USER_BUSY", "STALE"}
 
@@ -184,6 +185,10 @@ fn fpGeomBad nd = (
 fn fpGuard nd = (
     local bad = fpGeomBad nd
     if bad > 0 do throw ("CRASH_RISK: geomlist[" + (bad as string) + "] is " + (nd.geomlist[bad] as string) + "; only 0, 1 and 2 rebuild safely (3 crashed Max in testing). Run forest_validate.")
+    if isProperty nd.baseObject #efpatype and (findItem (nd.baseObject.efpatype as array) 4)>0 do (
+        if mcpForestValidateCurveSlots==undefined do throw "BRIDGE_CAPABILITY_MISSING: curve scatters require the updated native guard"
+        mcpForestValidateCurveSlots ((getHandleByAnim nd.baseObject) as integer64) ((getHandleByAnim nd.baseObject.Effect_Curves) as integer64)
+    )
 )
 fn fpMark = (
     local h = (getHandleByAnim (bezier_float())) as integer64
@@ -525,7 +530,7 @@ fn fpCollect nd ss doBuild = (
         format "S|%|%|%|%\n" i (fpState s) (if isValidNode s then fpEnc s.name else "") (if isValidNode s then fpF (fpXYArea s 50000) else "0") to:ss
     )
     local bad = fpGeomBad nd
-    if bad > 0 then (format "C|-1|0|%\n" bad to:ss) else if doBuild then (nd.trees.update(); format "C|%|1|0\n" (nd.trees.count()) to:ss) else (format "C|-1|0|0\n" to:ss)
+    if bad > 0 then (format "C|-1|0|%\n" bad to:ss) else if doBuild then (fpGuard nd; nd.trees.update(); format "C|%|1|0\n" (nd.trees.count()) to:ss) else (format "C|-1|0|0\n" to:ss)
     -- after the build, so a linked RailClone's output is the one the forest just read
     if nd.distmode == @@REFERENCE@@ do fpRefRows nd ss
 )

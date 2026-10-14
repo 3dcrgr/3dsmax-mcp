@@ -194,8 +194,9 @@ def forest_items(
 
     When the Forest has enabled controller-bound effect parameters and the current
     frame is nonzero, a CONTROLLER_ANIMATION_UNVERIFIED warning is returned. The
-    plugin's animated controller sampling has not been validated and may return
-    item transforms that do not reflect the current frame.
+    legacy native controller path may return frame-zero transforms. Use
+    forest_effect_parameters(action="repair_animation") with a fresh token to
+    migrate supported scalar bindings to a source-linked numeric driver.
 
     A forest in Reference mode (distmode 2) also returns reference, read only: use_railclone_items
     (distrefusercitems), match_by_name (distrefmatchname) and nodes, each with name, handle and railclone; a
@@ -266,7 +267,8 @@ def forest_items(
         warnings.append(
             "CONTROLLER_ANIMATION_UNVERIFIED: this Forest has "
             f"{active_controller_parameters} enabled controller-bound effect parameter(s) at frame {current_frame}; "
-            "animated controller evaluation is unverified and item transforms may not reflect the current frame"
+            "animated controller evaluation is unverified and item transforms may not reflect the current frame; "
+            "use forest_effect_parameters(action='repair_animation') with a fresh effects token to migrate scalar bindings"
         )
     if mode == 0:
         warnings.append("procedural mode: indices are valid until the forest rebuilds")
@@ -825,7 +827,7 @@ try (
         local k3 = findItem (f.artypelist as array) 3
         fpKeepAreas f (if k3 > 0 then #(k3) else #())
         k3 = findItem (f.artypelist as array) 3
-        if k3 == 0 and (fpGeomBad f) == 0 do (f.trees.update(); k3 = findItem (f.artypelist as array) 3)
+        if k3 == 0 and (fpGeomBad f) == 0 do (fpGuard f; f.trees.update(); k3 = findItem (f.artypelist as array) 3)
         if k3 > 0 then (
             local act = f.pf_aractivelist as array
             while act.count < k3 do append act false
@@ -858,7 +860,7 @@ try (
         if @@HIDE@@ do (
             for c in (f.cobjlist as array) where isValidNode c and (findItem newNodes c) > 0 and not c.isHidden do (hide c; append hidden c.name)
         )
-        if (fpGeomBad f) > 0 then append notes "CRASH_RISK" else f.trees.update()
+        if (fpGeomBad f) > 0 then append notes "CRASH_RISK" else (fpGuard f; f.trees.update())
     )
     -- The report, still inside the try: a failure here also removes the placed nodes
     format "FPOK\n" to:ss
