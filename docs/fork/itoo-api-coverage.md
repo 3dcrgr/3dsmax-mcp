@@ -27,7 +27,7 @@ Live results override older documentation where they differ.
 | `forest_inspect` | Settings, geometry/surface/area/effect/parameter arrays, bounded readback, `getSelected`; no build |
 | `forest_effects` | List/get/add, change code, toggle, move, mixed numeric/object/spline import with explicit bindings, definitions export, remove with parameter-row cleanup; token guard and staged undo |
 | `forest_effect_parameters` | Inspect parameters; edit numeric values and object/spline bindings with schema, bounds, identity and dependency checks |
-| `forest_effect_curves` | Read SDK CurveControl points, tangents, flags and ranges with ownership checks and bounded pagination; no editor or rebuild |
+| `forest_effect_curves` | Read SDK CurveControl points, tangents, flags and ranges with ownership checks and bounded pagination; `set_points` writes one curve parameter's points on a staged copy in one undo step; no editor or rebuild |
 | `railclone_settings` | Token-guarded global/display/instancing settings; explicit confirmation before leaving manual-update mode |
 | `forest_settings` | Token-guarded density tile dimensions, direction, seed, caps, update and transform/effect flags; reports Forest X/Y/Z translation extents read-only |
 | `forest_effect_library` | Search/read default, user or custom .eff libraries; metadata, parameter definitions and hashes, code opt-in |
@@ -443,7 +443,7 @@ Forest copy before adoption. The live probe established curve indices equal the
 full parameter-row index, including numeric rows. Existing static curve points
 are moved by parameter ID when preceding rows are removed; animated point
 reordering is refused. New curves start flat at `(0,1)` to `(1,1)` with pinned endpoints, matching the measured Forest default. Custom curve
-payloads and curve export/edit remain unsupported. Slot preparation and scalar
+payloads and curve export/edit were unsupported at this point; see "Forest Effect curve points" below. Slot preparation and scalar
 driver assignment require the updated native bridge and reject attached owners.
 All live changes still use one guarded undo hold for adopting the prepared copy.
 
@@ -451,3 +451,32 @@ Private route probes verified source/numeric/Forest values 31.5, 39.5 and 47.5 a
 frames 0, 5 and 10, source-key preservation, and save/reload linkage. A separate
 allocated `[numeric, curve, curve]` probe produced X=33/Z=22 and retained points
 and output after reload. The subsequent public implementation passed deployed animation, save/reload, numeric-before-curves, static-shape reindexing and malformed-slot refusal checks. See [deployed verification](forest-effects-verification-2026-10-14.md) for exact scope and hashes.
+
+## Forest Effect curve points — 2026-10-14 (#44)
+
+Status: implemented and unit-tested; the live check on a scratch Max 2027 is pending, and so is
+the bridge deploy that it needs.
+
+- `forest_effect_curves(action="set_points", parameter=, points=, expected_effects=)` writes one
+  curve parameter. The curve slot is the parameter's global row (`curve_index`), verified live in
+  #45. The edit runs on a copied Forest base (`copy base` deep-clones the CurveControl) through
+  the new native primitive `mcpForestSetCurvePoints`, then the copy is adopted in one undo hold.
+  The live base's slots are validated first (`mcpForestValidateCurveSlots`).
+- The primitive accepts only an unattached staged Forest, a CurveControl it owns, and a slot whose
+  row is a curve (native type 4). It refuses animated curves (`ANIMATED_CURVE_UNSUPPORTED`), flag
+  bits outside corner, bezier, the two locks, endpoint and no-X-constraint, X values that don't
+  increase, endpoints off the control's X range, and values outside the X/Y range
+  (`CURVE_VALUE_OUT_OF_RANGE`). Every point is read back natively, then again by the Python tool.
+- Points: `[x, y]` pairs (corner), `{x, y, type, in, out, lock_x, lock_y}` objects, or the rows that
+  `inspect` returns. The first and last points are always endpoints; the editor's selection bit is
+  dropped.
+- Persistence: Forest saves each slot into `efpacurve[r]` and rebuilds the slot from it on load
+  (verified in #45), so edited points travel with the scene.
+- `.eff`: a curve definition may hold one `<curves><curve><point px py inx iny outx outy flags/>`
+  child, the exact format Forest writes into `efpacurve`. Load applies the points after the slots are
+  prepared and stores the definition without the child (Forest's stored effect XML never holds
+  points). Export reads each curve parameter's points and writes that child (`exported_curves`).
+  iToo doesn't document curve data in `.eff` files, so whether Forest's own Import button reads
+  this child is untested.
+- The effects token doesn't cover curve shapes (they live in the native slot, not in the `efpa*`
+  arrays), so two concurrent curve edits aren't detected as stale.

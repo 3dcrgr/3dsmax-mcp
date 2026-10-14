@@ -4,6 +4,7 @@
 #include <maxscript/foundation/arrays.h>
 #include <maxscript/foundation/numbers.h>
 #include <maxscript/foundation/functions.h>
+#include <cmath>
 #include <set>
 #include <vector>
 
@@ -131,6 +132,69 @@ Value* PrepareCurves(Value** args,int count) {
     }
     return Integer::intern(control->GetNumCurves());
 }
+// Writes one static curve's points on a staged (unattached) Forest copy. The slot is the global
+// parameter row (verified live: slot index = efpa* row, across effects). Points arrive as
+// #(px,py,inx,iny,outx,outy,flags) arrays; every one is validated before any write, and the
+// result is read back. Animated curves, unknown flag bits and out-of-range values are refused.
+Value* SetCurvePoints(Value** args,int count) {
+    if(count!=4)Refuse(L"BAD_PARAM: mcpForestSetCurvePoints expects four arguments");
+    auto* owner=ForestOwner(args[0],true);
+    auto* candidate=Animatable::GetAnimByHandle((AnimHandle)args[1]->to_int64());
+    if(!candidate||candidate->ClassID()!=CURVE_CONTROL_CLASS_ID)
+        Refuse(L"NOT_CURVE_CONTROL: staged CurveControl is unavailable");
+    CheckControlOwnership(owner,candidate);
+    auto* control=static_cast<ICurveCtl*>(candidate);
+    const int slot=args[2]->to_int();
+    if(!is_array(args[3]))Refuse(L"BAD_PARAM: curve points must be an array");
+    auto* input=static_cast<Array*>(args[3]);
+    if(input->size<2||input->size>256)Refuse(L"BAD_PARAM: a curve needs 2..256 points");
+    auto types=FindField(owner,L"efpatype",TYPE_INT_TAB);
+    const int rows=types.block->Count(types.id);
+    const auto time=GetCOREInterface()->GetTime();
+    if(slot<0||slot>=rows||slot>=control->GetNumCurves())
+        Refuse(L"CURVE_STATE_INVALID: curve slot does not match a parameter row");
+    int type=0;Interval valid=FOREVER;
+    if(!types.block->GetValue(types.id,time,type,valid,slot))Refuse(L"INVALID_READBACK: parameter type is unavailable");
+    if(type!=4)Refuse(L"PARAMETER_TYPE_UNSUPPORTED: the parameter row is not a curve");
+    auto* curve=control->GetControlCurve(slot);
+    if(!curve)Refuse(L"CURVE_STATE_INVALID: curve slot is unavailable");
+    for(int j=0;j<curve->GetNumPts();++j)
+        if(curve->IsAnimated(j))Refuse(L"ANIMATED_CURVE_UNSUPPORTED: the curve has animated points");
+    const Point2 xr=control->GetXRange(),yr=control->GetYRange();
+    const int allowed=CURVEP_BEZIER|CURVEP_CORNER|CURVEP_LOCKED_Y|CURVEP_LOCKED_X|CURVEP_ENDPOINT|CURVEP_NO_X_CONSTRAINT;
+    constexpr float eps=1e-5f;
+    std::vector<CurvePoint> points;
+    for(int j=0;j<input->size;++j) {
+        if(!is_array(input->data[j]))Refuse(L"BAD_PARAM: each point must be #(px,py,inx,iny,outx,outy,flags)");
+        auto* item=static_cast<Array*>(input->data[j]);
+        if(item->size!=7)Refuse(L"BAD_PARAM: each point must be #(px,py,inx,iny,outx,outy,flags)");
+        float v[6];
+        for(int k=0;k<6;++k){v[k]=item->data[k]->to_float();if(!std::isfinite(v[k]))Refuse(L"BAD_PARAM: curve values must be finite");}
+        const int flags=item->data[6]->to_int();
+        if(flags&~allowed)Refuse(L"BAD_PARAM: unsupported curve point flags");
+        if(((flags&CURVEP_BEZIER)!=0)==((flags&CURVEP_CORNER)!=0))Refuse(L"BAD_PARAM: a point is either corner or bezier");
+        const bool end=j==0||j==input->size-1;
+        if(((flags&CURVEP_ENDPOINT)!=0)!=end)Refuse(L"BAD_PARAM: only the first and last points are endpoints");
+        if(v[0]<xr.x-eps||v[0]>xr.y+eps||v[1]<yr.x-eps||v[1]>yr.y+eps)
+            Refuse(L"CURVE_VALUE_OUT_OF_RANGE: a point lies outside the curve's X/Y range");
+        if(j==0&&std::fabs(v[0]-xr.x)>eps)Refuse(L"BAD_PARAM: the first point must sit at the start of the X range");
+        if(j==input->size-1&&std::fabs(v[0]-xr.y)>eps)Refuse(L"BAD_PARAM: the last point must sit at the end of the X range");
+        if(!points.empty()&&v[0]<=points.back().p.x+eps)Refuse(L"BAD_PARAM: point X values must increase");
+        if(v[2]>eps||v[4]<-eps)Refuse(L"BAD_PARAM: in tangents point left (x<=0), out tangents right (x>=0)");
+        CurvePoint p;p.p=Point2(v[0],v[1]);p.in=Point2(v[2],v[3]);p.out=Point2(v[4],v[5]);p.flags=flags;
+        points.push_back(p);
+    }
+    curve->SetNumPts((int)points.size());
+    for(int j=0;j<(int)points.size();++j){auto p=points[j];curve->SetPoint(time,j,&p,FALSE,FALSE);}
+    if(curve->GetNumPts()!=(int)points.size())Refuse(L"INVALID_READBACK: curve point count did not persist");
+    for(int j=0;j<(int)points.size();++j) {
+        auto got=curve->GetPoint(time,j);const auto& want=points[j];
+        auto off=[&](Point2 a,Point2 b){return std::fabs(a.x-b.x)>eps||std::fabs(a.y-b.y)>eps;};
+        if(off(got.p,want.p)||off(got.in,want.in)||off(got.out,want.out)||(got.flags&allowed)!=want.flags)
+            Refuse(L"INVALID_READBACK: curve point did not persist as written");
+    }
+    return Integer::intern((int)points.size());
+}
 Value* BindFloat(Value** args,int count) {
     if(count!=3)Refuse(L"BAD_PARAM: mcpForestBindFloatController expects three arguments");
     auto* owner=ForestOwner(args[0],true);const int index=args[1]->to_int();
@@ -187,5 +251,6 @@ void RegisterPrimitives() {
     static Primitive bind(L"mcpForestBindFloatController",BindFloat);
     static Primitive read(L"mcpForestFloatControllerHandle",ReadFloat);
     static Primitive validate(L"mcpForestValidateCurveSlots",ValidateCurves);
+    static Primitive points(L"mcpForestSetCurvePoints",SetCurvePoints);
 }
 }

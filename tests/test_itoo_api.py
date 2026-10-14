@@ -723,5 +723,136 @@ class ForestCurveInspectorTests(unittest.TestCase):
         native.assert_not_called()
 
 
+class ForestCurvePointTests(unittest.TestCase):
+    NID, CID = "{11111111-1111-1111-1111-111111111111}", "{22222222-2222-2222-2222-222222222222}"
+
+    def state(self):
+        xml = (f'<effect><expression>fpItem.scale.z = evaluateCurve(Falloff, 0.5);</expression>'
+               f'<parameter id="{self.NID}" name="N" type="numerical" numtype="real"/>'
+               f'<parameter id="{self.CID}" name="Falloff" type="curve"/></effect>')
+        arrays = {"efpaid": [self.NID, self.CID], "efpaeffid": ["owner", "owner"], "efpatype": [0, 4],
+                  "efpaname": ["N", "Falloff"], "efpanumtype": [1, 0], "efpalimit": [False, False],
+                  "efpafloatval": [0.0, 0.0], "efpafloatmin": [0.0, 0.0], "efpafloatmax": [0.0, 0.0], "efpafloatdef": [0.0, 0.0]}
+        return {"effects_token": TOKEN, "effects": [{"id": "owner", "name": "fx", "xml": xml}],
+                "arrays": {k: {"values": v} for k, v in arrays.items()}}
+
+    def readback(self, points, index=1):
+        rows = [{"index": j, "position": list(p[:2]), "in_tangent": list(p[2:4]), "out_tangent": list(p[4:6]), "flags": p[6]}
+                for j, p in enumerate(api.curve_points(points))]
+        return {"kind": "curve_control", "curves": [{"index": index, "points": rows, "points_complete": True}]}
+
+    def test_point_forms_normalise(self):
+        pts = api.curve_points([[0, 1], {"x": 0.5, "y": 0.2, "type": "bezier", "in": [-0.1, 0], "out": [0.1, 0], "lock_y": True},
+                                {"position": [1, 0.5], "in_tangent": [0, 0], "out_tangent": [0, 0], "flags": 2 | 16 | 256}])
+        self.assertEqual(pts[0], (0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2 | 256))
+        self.assertEqual(pts[1][6], 1 | 4)
+        self.assertEqual(pts[2][6], 2 | 256)  # selection bit dropped, endpoint kept
+
+    def test_bad_points_refused_before_max(self):
+        bad = ([[0, 0]], [[0, 0]] * 257, [[0, 0], [0, 1]], [[0, 0], [float("nan"), 1]],
+               [[0, 0], {"x": 1, "y": 1, "in": [-0.1, 0]}], [[0, 0], {"x": 1, "y": 1, "type": "bezier", "out": [-1, 0]}],
+               [[0, 0], {"position": [1, 1], "flags": 3}], [[0, 0], {"x": 1, "y": 1, "zz": 1}], "0,0;1,1")
+        for points in bad:
+            with self.subTest(points=str(points)[:40]), self.assertRaises(ValueError):
+                api.curve_points(points)
+
+    def test_set_points_stages_writes_and_reads_back(self):
+        points = [[0, 1], [0.5, 0.25], [1, 1]]
+        with patch.object(api, 'forest_effects', return_value=self.state()), \
+             patch.object(api.rc, '_send', side_effect=['CURVE_WRITTEN', '10|20|30']) as send, \
+             patch('maxmcp.helpers.plugin_schema.native', return_value=self.readback(points)):
+            result = api.forest_effect_curves('Forest', action='set_points', parameter='Falloff', points=points, expected_effects=TOKEN)
+        script = send.call_args_list[0].args[0]
+        self.assertIn('mcpForestValidateCurveSlots ((getHandleByAnim base)', script)
+        self.assertIn('mcpForestSetCurvePoints ((getHandleByAnim staged) as integer64) ((getHandleByAnim staged.Effect_Curves) as integer64) 1 #(#(0.0,1.0', script)
+        self.assertLess(script.find('mcpForestSetCurvePoints ((getHandleByAnim staged)'), script.find('obj.baseObject=staged'))
+        self.assertIn('base.efpatype[2]!=4', script)
+        self.assertEqual(result['parameter']['curve_index'], 1)
+        self.assertTrue(result['undoable'])
+
+    def test_set_points_refuses_non_curve_and_stale(self):
+        with patch.object(api, 'forest_effects', return_value=self.state()), patch.object(api.rc, '_send') as send:
+            with self.assertRaisesRegex(ValueError, 'PARAMETER_TYPE_UNSUPPORTED'):
+                api.forest_effect_curves('Forest', action='set_points', parameter='N', points=[[0, 0], [1, 1]], expected_effects=TOKEN)
+            with self.assertRaises(api.RailCloneError):
+                api.forest_effect_curves('Forest', action='set_points', parameter='Falloff', points=[[0, 0], [1, 1]],
+                                         expected_effects="-".join(["CD"] * 32))
+            with self.assertRaises(ValueError):
+                api.forest_effect_curves('Forest', action='set_points', parameter='Falloff', points=[[0, 0], [1, 1]])
+            send.assert_not_called()
+
+    def test_set_points_readback_mismatch_is_reported(self):
+        with patch.object(api, 'forest_effects', return_value=self.state()), \
+             patch.object(api.rc, '_send', side_effect=['CURVE_WRITTEN', '10|20|30']), \
+             patch('maxmcp.helpers.plugin_schema.native', return_value=self.readback([[0, 1], [1, 1]])), \
+             self.assertRaises(api.RailCloneError):
+            api.forest_effect_curves('Forest', action='set_points', parameter='Falloff', points=[[0, 1], [0.5, 0.2], [1, 1]], expected_effects=TOKEN)
+
+    def test_inspect_rejects_write_arguments(self):
+        with patch.object(api.rc, '_send') as send, self.assertRaises(ValueError):
+            api.forest_effect_curves('Forest', points=[[0, 0], [1, 1]])
+        send.assert_not_called()
+
+    def test_curve_definition_with_points_imports_and_strips_xml(self):
+        points = '<curves><curve><point px="0" py="1" inx="0" iny="0" outx="0" outy="0" flags="258"/>'
+        points += '<point px="0.5" py="0.25" inx="0" iny="0" outx="0" outy="0" flags="2"/>'
+        points += '<point px="1" py="1" inx="0" iny="0" outx="0" outy="0" flags="258"/></curve></curves>'
+        xml = '<effect version="500"><expression>fpItem.scale.z=evaluateCurve(A,0.5);</expression>'
+        xml += f'<parameter id="{self.NID}" name="N" type="numerical" numtype="real"/>'
+        xml += f'<parameter id="{self.CID}" name="A" type="curve">{points}</parameter></effect>'
+        rows = api.parameter_definitions(api.ET.fromstring(xml), allow_references=True)
+        self.assertEqual(rows[1]['points'][1][:2], (0.5, 0.25))
+        with tempfile.TemporaryDirectory() as folder:
+            p = Path(folder) / 'shaped.eff'; p.write_text(xml, encoding='utf-8')
+            info = api.read_effect_file(p)
+            with patch.object(api.rc, '_send', return_value=f'ITOOEFFECTS\nT|{TOKEN}\nEND\n') as send:
+                api.forest_effects('Forest', action='load', path=str(p), expected_file_hash=info['sha256'], expected_effects=TOKEN)
+        script = send.call_args.args[0]
+        self.assertIn('(pc+1) #(#(0.0,1.0,0.0,0.0,0.0,0.0,258),#(0.5,0.25', script)
+        self.assertLess(script.find('iaPrepareCurveSlots base staged'), script.find('mcpForestSetCurvePoints'))
+        self.assertLess(script.find('mcpForestSetCurvePoints'), script.find('obj.baseObject=staged'))
+        stored = base64.b64decode(script.split('append xmls (rcDecode "')[1].split('"')[0]).decode('utf-8')
+        self.assertNotIn('<curves', stored)
+
+    def test_malformed_curve_points_refused(self):
+        for inner in ('<curves><curve><point px="0" py="1"/></curve></curves>', '<curves><curve/><curve/></curves>',
+                      '<curves extra="1"><curve/></curves>', '<other/>',
+                      '<curves><curve><point px="x" py="1" inx="0" iny="0" outx="0" outy="0" flags="2"/></curve></curves>'):
+            xml = f'<effect><parameter id="{self.CID}" name="A" type="curve">{inner}</parameter></effect>'
+            with self.subTest(inner=inner), self.assertRaises(ValueError):
+                api.parameter_definitions(api.ET.fromstring(xml), allow_references=True)
+
+    def report(self):
+        state = self.state()
+        def enc(v):
+            if isinstance(v, bool):
+                return "b1" if v else "b0"
+            if isinstance(v, int):
+                return f"i{v}"
+            if isinstance(v, float):
+                return f"f{v}"
+            return "s" + api.rc._b64(v)
+        arrays = {**{k: v["values"] for k, v in state["arrays"].items()},
+                  "efidlist": ["owner"], "efnamelist": ["fx"], "efxmllist": [state["effects"][0]["xml"]], "efenablelist": [True]}
+        lines = ["ITOOEFFECTS", f"T|{TOKEN}"]
+        for prop, values in arrays.items():
+            lines.append(f"A|{prop}|{len(values)}")
+            lines += [f"V|{prop}|{i + 1}|{enc(v)}" for i, v in enumerate(values)]
+        return "\n".join(lines + ["END", ""])
+
+    def test_export_writes_curve_points(self):
+        points = [[0, 1], [0.5, 0.25], [1, 1]]
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder) / "out.eff"
+            with patch.object(api.rc, "_send", return_value=self.report()),                  patch.object(api, "forest_effect_curves", return_value=self.readback(points)) as curves:
+                result = api.forest_effects("Forest", action="export", effect="owner", path=str(out))
+            self.assertEqual(curves.call_args.kwargs["offset"], 1)
+            self.assertEqual(result["exported_curves"][0]["points"], 3)
+            document = api.parse_effect_xml(out.read_text(encoding="utf-8"))
+            rows = api.parameter_definitions(document, allow_references=True)
+            self.assertEqual(rows[1]["points"][1][:2], (0.5, 0.25))
+            self.assertEqual(rows[1]["points"][0][6], 258)
+
+
 if __name__ == "__main__":
     unittest.main()

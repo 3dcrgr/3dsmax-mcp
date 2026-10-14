@@ -358,6 +358,109 @@ PARAM_DEFAULTS = {
 }
 
 
+CURVE_BEZIER, CURVE_CORNER, CURVE_LOCKED_Y, CURVE_LOCKED_X = 1, 2, 4, 8
+CURVE_SELECTED, CURVE_ENDPOINT, CURVE_NO_X_CONSTRAINT = 16, 256, 512
+CURVE_WRITE_FLAGS = CURVE_BEZIER | CURVE_CORNER | CURVE_LOCKED_Y | CURVE_LOCKED_X | CURVE_ENDPOINT | CURVE_NO_X_CONSTRAINT
+
+
+def curve_points(points: Any) -> list[tuple[float, float, float, float, float, float, int]]:
+    """Normalise curve points to (px, py, inx, iny, outx, outy, flags) tuples.
+
+    Accepts [x, y] pairs (corner points), {"x", "y", "type": "corner"|"bezier", "in": [dx, dy],
+    "out": [dx, dy], "lock_x", "lock_y"} dicts, or the {"position", "in_tangent", "out_tangent",
+    "flags"} rows that forest_effect_curves returns, so a read can be edited and written back.
+    The first and last points are marked as endpoints; the editor's selection bit is dropped.
+    The X/Y range and the endpoint positions are checked again natively against the curve control.
+    """
+    if not isinstance(points, list) or not 2 <= len(points) <= 256:
+        raise ValueError("points must be a list of 2..256 points")
+    out = []
+    for j, point in enumerate(points):
+        if isinstance(point, (list, tuple)) and len(point) == 2:
+            x, y, tin, tout, flags = point[0], point[1], (0.0, 0.0), (0.0, 0.0), CURVE_CORNER
+        elif isinstance(point, dict) and "position" in point:
+            if set(point) - {"index", "position", "in_tangent", "out_tangent", "flags"}:
+                raise ValueError("unknown curve point field")
+            (x, y), tin, tout = point["position"], point.get("in_tangent", (0.0, 0.0)), point.get("out_tangent", (0.0, 0.0))
+            flags = point.get("flags")
+            if type(flags) is not int or flags < 0:
+                raise ValueError("flags must be a nonnegative integer")
+            flags &= ~(CURVE_SELECTED | CURVE_ENDPOINT)
+        elif isinstance(point, dict):
+            if set(point) - {"x", "y", "type", "in", "out", "lock_x", "lock_y"}:
+                raise ValueError("unknown curve point field")
+            kind = point.get("type", "corner")
+            if kind not in ("corner", "bezier"):
+                raise ValueError("point type must be corner or bezier")
+            x, y = point.get("x"), point.get("y")
+            tin, tout = point.get("in", (0.0, 0.0)), point.get("out", (0.0, 0.0))
+            if kind == "corner" and ("in" in point or "out" in point):
+                raise ValueError("corner points take no tangents; use type bezier")
+            flags = CURVE_BEZIER if kind == "bezier" else CURVE_CORNER
+            for key, bit in (("lock_x", CURVE_LOCKED_X), ("lock_y", CURVE_LOCKED_Y)):
+                if type(point.get(key, False)) is not bool:
+                    raise ValueError(f"{key} must be boolean")
+                if point.get(key):
+                    flags |= bit
+        else:
+            raise ValueError("each point must be [x, y] or a point object")
+        if not all(isinstance(t, (list, tuple)) and len(t) == 2 for t in (tin, tout)):
+            raise ValueError("tangents must be [dx, dy] pairs")
+        values = []
+        for value in (x, y, *tin, *tout):
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError("curve coordinates and tangents must be finite numbers")
+            values.append(float(value))
+        if flags & ~CURVE_WRITE_FLAGS or bool(flags & CURVE_BEZIER) == bool(flags & CURVE_CORNER):
+            raise ValueError("a point is exactly one of corner or bezier, with supported flags only")
+        if values[2] > 0 or values[4] < 0:
+            raise ValueError("in tangents point left (dx<=0) and out tangents right (dx>=0)")
+        if out and values[0] <= out[-1][0]:
+            raise ValueError("point x values must increase")
+        if j in (0, len(points) - 1):
+            flags |= CURVE_ENDPOINT
+        out.append((*values, flags))
+    return out
+
+
+def curve_points_literal(points: list[tuple]) -> str:
+    return "#(" + ",".join("#(" + ",".join(repr(v) for v in p[:6]) + f",{p[6]})" for p in points) + ")"
+
+
+def curve_points_xml(points: list[tuple]) -> ET.Element:
+    """The <curves> element Forest itself writes into efpacurve when a scene is saved."""
+    curves = ET.Element("curves")
+    curve = ET.SubElement(curves, "curve")
+    for px, py, inx, iny, outx, outy, flags in points:
+        ET.SubElement(curve, "point", {"px": repr(px), "py": repr(py), "inx": repr(inx), "iny": repr(iny),
+                                       "outx": repr(outx), "outy": repr(outy), "flags": str(flags)})
+    return curves
+
+
+def parse_curve_points_xml(definition: ET.Element) -> list[tuple] | None:
+    """Points from a curve definition's <curves><curve><point .../> child, or None for default points."""
+    children = list(definition)
+    if not children:
+        return None
+    if len(children) != 1 or children[0].tag != "curves" or children[0].attrib:
+        raise ValueError("CURVE_SCHEMA_UNSUPPORTED: a curve definition may only hold one <curves><curve> element")
+    curves = list(children[0])
+    if len(curves) != 1 or curves[0].tag != "curve" or curves[0].attrib:
+        raise ValueError("CURVE_SCHEMA_UNSUPPORTED: a curve definition holds exactly one <curve>")
+    rows = []
+    for point in curves[0]:
+        if point.tag != "point" or set(point.attrib) != {"px", "py", "inx", "iny", "outx", "outy", "flags"} or list(point):
+            raise ValueError("CURVE_SCHEMA_UNSUPPORTED: points need px, py, inx, iny, outx, outy and flags")
+        try:
+            rows.append({"position": [float(point.get("px")), float(point.get("py"))],
+                         "in_tangent": [float(point.get("inx")), float(point.get("iny"))],
+                         "out_tangent": [float(point.get("outx")), float(point.get("outy"))],
+                         "flags": int(point.get("flags"))})
+        except ValueError as exc:
+            raise ValueError("CURVE_SCHEMA_UNSUPPORTED: point values must be numbers") from exc
+    return curve_points(rows)
+
+
 def parameter_definitions(document: ET.Element, allow_references: bool = False) -> list[dict[str, Any]]:
     """Validate measured numeric and optionally node/spline .eff definitions."""
     definitions = document.findall(".//parameter")
@@ -371,13 +474,15 @@ def parameter_definitions(document: ET.Element, allow_references: bool = False) 
             name = definition.get("name", "")
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) or name.lower() in names:
                 raise ValueError("parameter names must be unique identifiers")
-            if set(definition.attrib) - {"id", "name", "description", "type"} or list(definition):
-                raise ValueError("CURVE_SCHEMA_UNSUPPORTED: only curve definitions with default points are supported")
+            if set(definition.attrib) - {"id", "name", "description", "type"}:
+                raise ValueError("CURVE_SCHEMA_UNSUPPORTED: unmeasured curve definition attributes")
+            points = parse_curve_points_xml(definition)
             ident = "{" + str(uuid.UUID(definition.get("id", ""))) + "}"
             if ident in ids:
                 raise ValueError("parameter IDs must be unique")
             names.add(name.lower()); ids.add(ident)
-            rows.append({"id": ident, "name": name, "kind": "curve", "description": definition.get("description", "")})
+            rows.append({"id": ident, "name": name, "kind": "curve", "points": points,
+                         "description": definition.get("description", "")})
             continue
         kind, name = definition.get("numtype"), definition.get("name", "")
         reference = definition.get("type") in ("node", "spline", "texture", "controller")
@@ -611,7 +716,8 @@ def parameter_rows(state: dict[str, Any], effect: str = "") -> list[dict[str, An
         elif row["native_type"] == 4:
             if definition is None or definition.get("name") != row["name"] or definition.get("type") != "curve":
                 raise RailCloneError("PARAMETER_SCHEMA_MISMATCH", "curve storage and XML differ")
-            row.update(kind="curve", curve_index=i, binding_route="parameter_row_index", writable=False)
+            row.update(kind="curve", curve_index=i, binding_route="parameter_row_index", writable=False,
+                       points_route="forest_effect_curves(action=set_points)")
         elif row["native_type"] in REFERENCE_KINDS:
             kind, prop = REFERENCE_KINDS[row["native_type"]]
             definition = next((p for p in parse_effect_xml(by_id[owner]["xml"]).findall("parameter")
@@ -679,18 +785,38 @@ if next_{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"
 
 @mcp.tool()
 def forest_effect_curves(name: str, limit: int = 16, offset: int = 0,
-                         point_limit: int = 128) -> dict[str, Any]:
-    """Read Forest's SDK CurveControl without opening the curve editor or rebuilding.
+                         point_limit: int = 128, action: str = "inspect", parameter: str = "",
+                         effect: str = "", points: list[Any] | None = None,
+                         expected_effects: str = "") -> dict[str, Any]:
+    """Read Forest's SDK CurveControl, or set one curve parameter's points in one staged undo step.
 
-    Returns bounded curve points, tangents, flags and ranges at the current time.
-    Curve indices are zero-based. Follow next_offset for more curves; points_complete
-    is false when point_limit truncated a curve. Does not edit curves or claim to
-    map undocumented efpacurve strings to these indices. Requires the updated
-    native SDK inspector; old bridges return BRIDGE_CAPABILITY_MISSING.
+    inspect returns bounded curve points, tangents, flags and ranges at the current time,
+    without opening the curve editor or rebuilding. Curve indices are zero-based and equal
+    the curve parameter's global row (forest_effect_parameters reports it as curve_index).
+    Follow next_offset for more curves; points_complete is false when point_limit
+    truncated a curve.
+
+    set_points writes one curve parameter, chosen by exact parameter ID or unique name
+    (optionally scoped to an effect ID), and requires expected_effects from a current
+    read. points: 2..256 points as [x, y] pairs (corner points), {x, y, type
+    corner|bezier, in [dx, dy], out [dx, dy], lock_x, lock_y} objects, or the point
+    rows inspect returns (so a read can be edited and written back). X must increase,
+    start and end at the curve's X range, and every point stay inside its X/Y range
+    (Forest's curves are 0..1). Animated curves are refused. The edit is staged on a
+    copied Forest base and adopted in one undo step; points persist with the scene
+    (Forest saves each slot into efpacurve). Does not rebuild; verify with
+    forest_items(refresh_surfaces=true). Requires the updated native bridge; old
+    bridges return BRIDGE_CAPABILITY_MISSING.
     """
     from ..helpers import forest as fh
     from ..helpers.plugin_schema import native
     fh.node_name(name, "name")
+    if action not in ("inspect", "set_points"):
+        raise ValueError("action must be inspect or set_points")
+    if action == "set_points":
+        return _set_curve_points(name, parameter, effect, points, expected_effects)
+    if parameter or effect or points is not None or expected_effects:
+        raise ValueError("parameter, effect, points and expected_effects are accepted only by set_points")
     if type(limit) is not int or not 1 <= limit <= 64 or type(offset) is not int or offset < 0:
         raise ValueError("limit must be 1..64 and offset nonnegative")
     if type(point_limit) is not int or not 1 <= point_limit <= 256:
@@ -709,6 +835,59 @@ if cc==undefined do throw "CURVE_CONTROL_UNAVAILABLE: Forest has no curve contro
         raise RailCloneError("BRIDGE_CAPABILITY_MISSING", "install the native CurveControl inspector")
     result["forest"] = name
     return result
+
+
+def _set_curve_points(name: str, parameter: str, effect: str, points: Any, expected_effects: str) -> dict[str, Any]:
+    if not isinstance(expected_effects, str) or not rc.TOKEN.fullmatch(expected_effects):
+        raise ValueError("set_points requires expected_effects token")
+    if not isinstance(parameter, str) or not parameter or "\x00" in parameter:
+        raise ValueError("set_points requires a curve parameter ID or unique name")
+    normalized = curve_points(points)
+    state = forest_effects(name)
+    if state["effects_token"] != expected_effects:
+        raise RailCloneError("STALE_EFFECTS", "read the curve parameters again")
+    rows = parameter_rows(state, effect)
+    matches = [p for p in rows if p["id"] == parameter] or [p for p in rows if p["name"] == parameter]
+    if len(matches) != 1:
+        raise ValueError("parameter must identify exactly one ID or unique name")
+    row = matches[0]
+    if row.get("kind") != "curve":
+        raise ValueError("PARAMETER_TYPE_UNSUPPORTED: set_points writes curve parameters only")
+    from ..helpers import forest as fh
+    body = fh.MXS_LIB + _EFFECT_LIB + _REFERENCE_LIB + f'\nlocal obj=fpForest "{rc._b64(name)}"\nlocal base=obj.baseObject\n'
+    body += f'''if mcpForestSetCurvePoints==undefined or mcpForestValidateCurveSlots==undefined do throw "BRIDGE_CAPABILITY_MISSING: curve points require the updated native bridge"
+if fpBusy() do throw "USER_BUSY: an undo operation is active"
+if (rcShared obj).count>0 do throw "SHARED_BASE: make the Forest base unique first"
+if base.mode!=0 do throw "CUSTOM_EDIT_UNSUPPORTED: requires procedural mode"
+if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: read again"
+if base.efpaid[{row["index"]}]!=(rcDecode "{rc._b64(str(row["id"]))}") or base.efpatype[{row["index"]}]!=4 do throw "STALE_EFFECTS: curve row moved"
+mcpForestValidateCurveSlots ((getHandleByAnim base) as integer64) ((getHandleByAnim base.Effect_Curves) as integer64)
+local staged=undefined
+with undo off (staged=copy base
+iaPreserveEffectReferences base staged
+iaPrepareControllerProxies staged
+mcpForestSetCurvePoints ((getHandleByAnim staged) as integer64) ((getHandleByAnim staged.Effect_Curves) as integer64) {row["curve_index"]} {curve_points_literal(normalized)})
+if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: state changed while staging"
+if fpBusy() do throw "USER_BUSY: an undo operation became active"
+local owns=false
+try (theHold.Begin(); owns=true; obj.baseObject=staged; theHold.Accept "MCP Forest curve points"; owns=false)
+catch (if owns do theHold.Cancel(); throw())
+"CURVE_WRITTEN"
+'''
+    if rc._send(body).strip() != "CURVE_WRITTEN":
+        raise RailCloneError("INVALID_READBACK", "curve write did not acknowledge")
+    read = forest_effect_curves(name, limit=1, offset=row["curve_index"], point_limit=256)
+    curve = read["curves"][0] if read.get("curves") else None
+    if curve is None or curve["index"] != row["curve_index"] or len(curve["points"]) != len(normalized):
+        raise RailCloneError("INVALID_READBACK", "curve points did not read back")
+    for want, got in zip(normalized, curve["points"]):
+        have = (*got["position"], *got["in_tangent"], *got["out_tangent"])
+        if any(abs(a - b) > 1e-4 for a, b in zip(want[:6], have)) or (got["flags"] & CURVE_WRITE_FLAGS) != want[6]:
+            raise RailCloneError("INVALID_READBACK", "curve points read back differently")
+    after = forest_effects(name)
+    return {"action": "set_points", "parameter": {"id": row["id"], "name": row["name"], "curve_index": row["curve_index"]},
+            "curve": curve, "effects_token": after["effects_token"], "undoable": True, "rebuilt": False,
+            "refresh_required": True, "compile_verified": False}
 
 
 @mcp.tool()
@@ -731,7 +910,8 @@ def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect
     track, referencing the original source controller without keying or copying
     it. repair_animation converts existing scalar bindings to this route in one
     staged undo step; it requires expected_effects and accepts no values.
-    Curve point writes and other controller subtypes are refused. XML/native schema must agree.
+    Curve points are written with forest_effect_curves(action="set_points"); other controller
+    subtypes are refused. XML/native schema must agree.
     Does not build or compile-check; verify using forest_items(refresh_surfaces=true).
     """
     if action not in ("inspect", "set", "repair_animation"):
@@ -846,9 +1026,11 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     require canonical owner/track/controller identities for measured scalar float
     tracks (native type 0); source controllers are sampled through an internal
     Float_Expression on the real parameter track and are never keyed/edited.
-    Curve definitions import with default linear points using SDK allocation on
-    the staged copy; existing static curve slots follow parameter IDs through
-    removal. Animated curve reordering and custom curve-file data are refused.
+    Curve definitions import with Forest's flat default points, or with the points in the
+    definition's <curves><curve><point px py inx iny outx outy flags/> child (the format Forest
+    saves in efpacurve), using SDK allocation on the staged copy; existing static curve slots
+    follow parameter IDs through removal. Animated curve reordering is refused. export writes
+    each curve parameter's current points in that same format (exported_curves lists them).
     No source nodes are created or serialized.
     export writes an effect with current numeric values as defaults to a new absolute .eff path; existing
     files are never overwritten. Export does not edit Max and is not undoable.
@@ -891,6 +1073,9 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
                 for definition, row in zip(document.findall("parameter"), imported_parameters):
                     row["id"] = "{" + str(uuid.uuid4()) + "}"
                     definition.set("id", row["id"])
+                    # Curve points go to the native slot; Forest's stored effect XML never holds them.
+                    for child in list(definition):
+                        definition.remove(child)
                 info["xml"] = ET.tostring(document, encoding="unicode")
             else:
                 bind_definitions([], bindings)
@@ -996,6 +1181,12 @@ for p in join rowProps #(#efselspeclist,#efspeclist) do (
         body += '''iaPrepareCurveSlots base staged
 iaPrepareControllerProxies staged
 '''
+        shaped = [(i, row) for i, row in enumerate(imported_parameters) if row["kind"] == "curve" and row.get("points")]
+        if shaped:
+            body += 'if mcpForestSetCurvePoints==undefined do throw "BRIDGE_CAPABILITY_MISSING: curve points require the updated native bridge"\n'
+            for i, row in shaped:
+                body += (f'mcpForestSetCurvePoints ((getHandleByAnim staged) as integer64) '
+                         f'((getHandleByAnim staged.Effect_Curves) as integer64) (pc+{i}) {curve_points_literal(row["points"])}\n')
         body += f'''
 if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: effects changed while staging"
 if fpBusy() do throw "USER_BUSY: an undo operation became active"
@@ -1058,6 +1249,18 @@ base=obj.baseObject
                 raise ValueError("PARAMETER_SCHEMA_MISMATCH: native parameters and XML differ")
             for definition in definitions:
                 matches = [p for p in parameters if str(p["id"]).lower() == definition.get("id", "").lower()]
+                if len(matches) == 1 and matches[0]["kind"] == "curve":
+                    row = matches[0]
+                    read = forest_effect_curves(name, limit=1, offset=row["curve_index"], point_limit=256)
+                    curve = read["curves"][0] if read.get("curves") else None
+                    if curve is None or curve["index"] != row["curve_index"] or not curve["points_complete"]:
+                        raise RailCloneError("INVALID_READBACK", "curve points could not be read completely")
+                    for child in list(definition):
+                        definition.remove(child)
+                    definition.append(curve_points_xml(curve_points(curve["points"])))
+                    result.setdefault("exported_curves", []).append({"id": row["id"], "name": row["name"],
+                                                                     "points": len(curve["points"])})
+                    continue
                 if len(matches) != 1 or not matches[0]["writable"]:
                     raise ValueError("PARAMETER_TYPE_UNSUPPORTED: parameter cannot be exported")
                 row = matches[0]
