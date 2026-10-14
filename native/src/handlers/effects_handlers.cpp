@@ -65,6 +65,8 @@ std::string NativeHandlers::ToggleEffect(const std::string& params, MCPBridgeGUP
         int index = p.value("index", 0);
         std::string effectType = p.value("effect_type", "atmospheric");
         bool active = p.value("active", true);
+        if (effectType != "atmospheric" && effectType != "render")
+            throw std::runtime_error("effect_type must be \"atmospheric\" or \"render\", got \"" + effectType + "\"");
 
         Interface* ip = GetCOREInterface();
 
@@ -102,6 +104,8 @@ std::string NativeHandlers::DeleteEffect(const std::string& params, MCPBridgeGUP
         json p = json::parse(params);
         int index = p.value("index", 0);
         std::string effectType = p.value("effect_type", "atmospheric");
+        if (effectType != "atmospheric" && effectType != "render")
+            throw std::runtime_error("effect_type must be \"atmospheric\" or \"render\", got \"" + effectType + "\"");
 
         Interface* ip = GetCOREInterface();
 

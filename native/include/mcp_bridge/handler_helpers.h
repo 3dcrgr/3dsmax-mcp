@@ -629,6 +629,28 @@ inline ClassDesc* FindClassDescByName(const std::string& className, SClass_ID su
     return found;
 }
 
+// Whole-string numbers only: std::stof and std::stoi read "12abc" as 12 and
+// throw on "abc"; a value that is not entirely a number is rejected instead.
+inline bool ParseWholeNumber(const std::string& text, float& out) {
+    try {
+        size_t used = 0;
+        out = std::stof(text, &used);
+        return text.find_first_not_of(" 	", used) == std::string::npos;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+inline bool ParseWholeNumber(const std::string& text, int& out) {
+    try {
+        size_t used = 0;
+        out = std::stoi(text, &used);
+        return text.find_first_not_of(" 	", used) == std::string::npos;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 // ── Parse a MAXScript-style value string into typed PB2 value ───
 // Returns true if the param was set successfully.
 inline bool SetPB2ParamFromString(IParamBlock2* pb, ParamID pid, ParamType2 ptype,
@@ -642,7 +664,8 @@ inline bool SetPB2ParamFromString(IParamBlock2* pb, ParamID pid, ParamType2 ptyp
     case TYPE_PCNT_FRAC:
     case TYPE_WORLD:
     case TYPE_COLOR_CHANNEL: {
-        float f = std::stof(valStr);
+        float f = 0.0f;
+        if (!ParseWholeNumber(valStr, f)) return false;
         return pb->SetValue(pid, t, f) != 0;
     }
     case TYPE_INT:
@@ -653,7 +676,8 @@ inline bool SetPB2ParamFromString(IParamBlock2* pb, ParamID pid, ParamType2 ptyp
         // Handle "true"/"false" for bools
         if (valStr == "true" || valStr == "on") return pb->SetValue(pid, t, 1) != 0;
         if (valStr == "false" || valStr == "off") return pb->SetValue(pid, t, 0) != 0;
-        int i = std::stoi(valStr);
+        int i = 0;
+        if (!ParseWholeNumber(valStr, i)) return false;
         return pb->SetValue(pid, t, i) != 0;
     }
     case TYPE_RGBA:
