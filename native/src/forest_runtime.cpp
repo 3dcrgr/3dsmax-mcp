@@ -16,9 +16,9 @@ Animatable* ForestOwner(Value* handle,bool detached) {
         Refuse(L"MAIN_THREAD_REQUIRED: Forest SDK preparation requires Max's main thread");
     auto* owner=Animatable::GetAnimByHandle((AnimHandle)handle->to_int64());
     if(!owner) Refuse(L"STALE_BINDING: Forest staging handle is unavailable");
-    auto* entry=ClassDirectory::GetInstance().FindClassEntry(owner->SuperClassID(),owner->ClassID());
-    auto* cd=entry?entry->FullCD():nullptr;
-    if(!cd || !cd->InternalName() || _wcsicmp(cd->InternalName(),L"Forest_Pro")!=0)
+    MSTR className;
+    owner->GetClassName(className,false);
+    if(owner->SuperClassID()!=GEOMOBJECT_CLASS_ID || _wcsicmp(className.data(),L"Forest_Pro")!=0)
         Refuse(L"NOT_FOREST: SDK preparation requires a Forest Pro base");
     if(!detached)return owner;
     std::vector<ReferenceTarget*> pending;
