@@ -667,7 +667,7 @@ catch (if owns do theHold.Cancel(); throw())
     return {"action": action, "parameters": rows, "effects_token": state["effects_token"],
             "read_only": action == "inspect", "undoable": action == "set", "rebuilt": False,
             "refresh_required": action == "set", "compile_verified": False,
-            "controller_animation_verified": False if any(r["kind"] == "controller" for r in rows) else None}
+            "controller_animation_verified": False if any(r.get("kind") == "controller" for r in rows) else None}
 
 
 @mcp.tool()

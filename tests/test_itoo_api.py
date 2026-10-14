@@ -619,6 +619,12 @@ class ControllerParameterTests(unittest.TestCase):
         for prop in ('efpainode','efpaspline','efpatexmap','efpacontref'):self.assertIn('#'+prop,api._EFFECT_LIB)
         self.assertIn('iaControllerIdentity base i',api._EFFECT_LIB)
 
+    def test_unknown_parameter_type_stays_inspectable(self):
+        state=self.state();state['arrays']['efpatype']['values']=[4]
+        with patch.object(api,'forest_effects',return_value=state):
+            result=api.forest_effect_parameters('forest')
+        self.assertFalse(result['parameters'][0]['writable'])
+
 
 if __name__ == "__main__":
     unittest.main()
