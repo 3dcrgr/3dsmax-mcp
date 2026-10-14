@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..helpers.maxscript import safe_name, safe_string
+from ..helpers.maxscript import name_in_use, name_literal, safe_name, safe_string
 from ..helpers.mcg_catalog import (
     compound_root,
     find_max_installations,
@@ -951,7 +951,7 @@ try (
     testMesh = undefined
     try (delete testObject) catch ()
     testObject = undefined
-    local disposed = (getNodeByName "{object_name}" == undefined)
+    local disposed = not {name_in_use(name_literal(object_name))}
     local result = "MCG_VERIFY|geometry|" + (b64 className) + "|" +
         (numVerts as string) + "|" + (numFaces as string) + "|" +
         (dims.x as string) + "|" + (dims.y as string) + "|" + (dims.z as string) + "|" +
@@ -1009,7 +1009,7 @@ try (
     afterMesh = undefined
     try (delete testObject) catch ()
     testObject = undefined
-    local disposed = (getNodeByName "{object_name}" == undefined)
+    local disposed = not {name_in_use(name_literal(object_name))}
     local result = "MCG_VERIFY|modifier|" + (b64 className) + "|" +
         (beforeVerts as string) + "|" + (beforeFaces as string) + "|" +
         (beforeDims.x as string) + "|" + (beforeDims.y as string) + "|" + (beforeDims.z as string) + "|" +

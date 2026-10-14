@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..server import mcp, client
 from ..coerce import StrList, FloatList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name_expr, safe_string
 
 
 def _name_array(names: list[str]) -> str:
@@ -103,13 +103,14 @@ def scatter_forest_pack(
             local surfaceNodes = #()
             local geometryNodes = #()
 
+            -- A name several objects share fails the call like a missing one.
             for n in surfaceNames do (
-                local node = getNodeByName n
+                local node = {node_by_name_expr("n", missing_ok=True)}
                 if node == undefined then append missingSurfaces n else append surfaceNodes node
             )
 
             for n in geometryNames do (
-                local node = getNodeByName n
+                local node = {node_by_name_expr("n", missing_ok=True)}
                 if node == undefined then append missingGeometry n else append geometryNodes node
             )
 

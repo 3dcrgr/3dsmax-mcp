@@ -13,7 +13,7 @@ import json
 from typing import Any, Optional
 
 from ..coerce import FloatList, IntList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name, safe_string
 from ..server import client, mcp
 
 MAX_GET = 2000
@@ -38,8 +38,16 @@ def _err(message: str, **extra: Any) -> dict[str, Any]:
     return out
 
 
+_MAXSCRIPT_ERROR = "__MCP_MS_ERR__:"
+
+
 def _run(script: str) -> str:
-    return str(client.send_command(script).get("result", ""))
+    raw = str(client.send_command(script).get("result", ""))
+    # The bridge returns uncaught script exceptions (such as a shared object
+    # name) as a sentinel string; report them as script errors.
+    if raw.startswith(_MAXSCRIPT_ERROR):
+        return "__ERROR__|MAXScript error: " + raw[len(_MAXSCRIPT_ERROR):].strip()
+    return raw
 
 
 def _p3_lit(p: list[float]) -> str:
@@ -70,14 +78,15 @@ def _normalize_positions(positions: Any) -> tuple[list[list[float]], str]:
     return out, ""
 
 
-def _poly_guard(safe: str, convert: bool) -> str:
+def _poly_guard(name: str, convert: bool) -> str:
+    safe = safe_string(name)
     convert_branch = (
         "(convertTo obj Editable_Poly; wasConverted = true; \"\")"
         if convert
         else '"__ERROR__|base object is not Editable_Poly (class: " + ((classof obj.baseobject) as string) + ") -- pass convert=true to collapse, or collapse_modifier_stack first"'
     )
     return (
-        f'local obj = getNodeByName "{safe}"\n'
+        f'local obj = {node_by_name(name, missing_ok=True)}\n'
         f'if obj == undefined then "__ERROR__|object not found: {safe}" else (\n'
         "local wasConverted = false\n"
         "local guardMsg = if classof obj.baseobject != Editable_Poly then (\n"
@@ -141,7 +150,7 @@ def edit_vertices(
     idx_list = [int(i) for i in (indices or []) if int(i) > 0]
     if len(idx_list) > MAX_INDICES:
         return _err(f"{len(idx_list)} indices exceeds the {MAX_INDICES} cap")
-    guard = _poly_guard(safe, convert)
+    guard = _poly_guard(name, convert)
     tail = "\n)\n)\n)"
 
     if action == "get":
@@ -352,7 +361,7 @@ def edit_vertices(
                 )"""
         script = f"""(
 {guard}
-    local tgt = getNodeByName "{safe_t}"
+    local tgt = {node_by_name(target, missing_ok=True)}
     if tgt == undefined then "__ERROR__|target not found: {safe_t}" else (
     local isShape = superclassof tgt == Shape
     if not isShape and superclassof tgt != GeometryClass then "__ERROR__|target must be a spline shape or geometry, got " + ((classof tgt) as string) else (

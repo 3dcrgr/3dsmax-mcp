@@ -15,7 +15,7 @@ import re
 from typing import Any, Optional
 
 from ..coerce import DictList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import name_in_use, node_by_name, safe_string
 from ..helpers.curves import add, sub, mul, length
 from ..helpers.curve_runtime import editable_spline
 from ..server import client, mcp
@@ -41,8 +41,16 @@ def _err(message: str, **extra: Any) -> dict[str, Any]:
     return out
 
 
+_MAXSCRIPT_ERROR = "__MCP_MS_ERR__:"
+
+
 def _run(script: str) -> str:
-    return str(client.send_command(script).get("result", ""))
+    raw = str(client.send_command(script).get("result", ""))
+    # The bridge returns uncaught script exceptions (such as a shared object
+    # name) as a sentinel string; report them as script errors.
+    if raw.startswith(_MAXSCRIPT_ERROR):
+        return "__ERROR__|MAXScript error: " + raw[len(_MAXSCRIPT_ERROR):].strip()
+    return raw
 
 
 def _p3(value: Any) -> list[float] | None:
@@ -297,7 +305,7 @@ def draw_spline(
             return _err("create needs at least 2 points")
         lines = [
             f'local finalName = "{safe}"',
-            f'if (getNodeByName finalName) != undefined do finalName = uniquename "{safe}"',
+            f'if {name_in_use("finalName")} do finalName = uniquename "{safe}"',
             "local ss = splineShape name:finalName pos:[0,0,0]",
             "addNewSpline ss",
         ]
@@ -322,7 +330,7 @@ def draw_spline(
             summary["renamed_from"] = name
         return summary
 
-    guard = f'local obj = getNodeByName "{safe}"\nif obj == undefined then "__ERROR__|shape not found: {safe}" else '
+    guard = f'local obj = {node_by_name(name, missing_ok=True)}\nif obj == undefined then "__ERROR__|shape not found: {safe}" else '
 
     if action == "add_spline":
         pts, perr = _normalize_points(points, default_type)
