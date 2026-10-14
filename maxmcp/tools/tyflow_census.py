@@ -21,7 +21,7 @@ from ..helpers.maxscript import safe_string
 
 from ..coerce import IntList
 from ..server import client, mcp
-from ._tyflow_core import CORE_HELPERS, graph_payload
+from ._tyflow_core import CORE_HELPERS, MAXSCRIPT_ERROR, graph_payload
 
 _CENSUS_OP_NAME = "zzz_mcp_census"
 
@@ -103,6 +103,28 @@ def tyflow_event_census(
                 while probe > 0 and ordinal < 17 do (ordinal += 1; if (mod probe 2) >= 1 then probe = 0 else probe = probe / 2)
 """
 
+    cleanup_block = ""
+    if cleanup:
+        cleanup_block = f"""
+    for ei = 1 to evNames.count do (
+        local ev = mcpTySubAnimByName bo evNames[ei]
+        local guard = 0
+        while guard < 8 do (
+            guard += 1
+            local censusOp = mcpTySubAnimByName ev "{_CENSUS_OP_NAME}"
+            if censusOp == undefined then guard = 99
+            else (
+                local realOp = undefined
+                try (realOp = censusOp.object) catch ()
+                if realOp == undefined do realOp = censusOp
+                try (realOp.remove()) catch (guard = 99)
+            )
+        )
+        -- A refused removal leaves instrumentation in the user's flow.
+        if (mcpTySubAnimByName ev "{_CENSUS_OP_NAME}") != undefined do format "LEFTOVER|%\\n" (mcpTyClean evNames[ei]) to:out
+    )
+    """
+
     maxscript = f"""(
 {CORE_HELPERS}
 local flow = getNodeByName "{safe_string(name)}"
@@ -116,6 +138,7 @@ if flow == undefined then (
     local chanProp = ""
     local valProp = ""
     local mainErr = ""
+    local instrumented = 0
     try (
         if evNames.count == 0 do throw "Flow has no events"
         {"if evNames.count > 16 do throw \"groups method supports at most 16 events\"" if method_key == "groups" else ""}
@@ -129,6 +152,7 @@ if flow == undefined then (
             if op == undefined then (
                 append instErrs ("addOperator {operator_type} failed: " + evNames[ei])
             ) else (
+                instrumented += 1
                 op.Operator.setName "{_CENSUS_OP_NAME}"
                 {instrument_block}
             )
@@ -153,40 +177,27 @@ if flow == undefined then (
             format "SAMPLED|%|%|%|%\\n" (f as string) (take as string) (total as string) (unknown as string) to:out
         )
     ) catch (mainErr = (getCurrentException()) as string)
-    {"" if not cleanup else '''
-    for ei = 1 to evNames.count do (
-        local ev = mcpTySubAnimByName bo evNames[ei]
-        local guard = 0
-        while guard < 8 do (
-            guard += 1
-            local censusOp = mcpTySubAnimByName ev "''' + _CENSUS_OP_NAME + '''"
-            if censusOp == undefined then guard = 99
-            else (
-                local realOp = undefined
-                try (realOp = censusOp.object) catch ()
-                if realOp == undefined do realOp = censusOp
-                try (realOp.remove()) catch (guard = 99)
-            )
-        )
-    )
-    '''}
+    {cleanup_block}
     if mainErr != "" do format "MAINERR|%\\n" (mcpTyClean mainErr) to:out
+    format "INSTRUMENTED|%|%\\n" (instrumented as string) (evNames.count as string) to:out
     for e in instErrs do format "INSTERR|%\\n" (mcpTyClean e) to:out
     format "RESOLVED|%|%\\n" (mcpTyClean chanProp) (mcpTyClean valProp) to:out
     out as string
 )
 )"""
-    try:
-        response = client.send_command(maxscript, timeout=600)
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
+    # Transport and call-state exceptions propagate with their code and hint.
+    response = client.send_command(maxscript, timeout=600)
     raw = str(response.get("result", ""))
     if raw.startswith("__ERROR__|"):
         return json.dumps({"error": raw.split("|", 1)[1]})
+    if raw.startswith(MAXSCRIPT_ERROR):
+        return raw
 
     def _decode(token: str) -> str:
         return token.replace("<pipe>", "|")
 
+    leftovers: list[str] = []
+    instrumented: tuple[int, int] | None = None
     frames_out: dict[str, dict[str, int]] = {}
     sampled: dict[str, dict[str, int]] = {}
     instrumentation: dict[str, Any] = {"method": method_key, "errors": []}
@@ -218,6 +229,13 @@ if flow == undefined then (
         elif tag == "RESOLVED" and len(parts) >= 3:
             instrumentation["channelProperty"] = _decode(parts[1])
             instrumentation["valueProperty"] = _decode(parts[2])
+        elif tag == "LEFTOVER" and len(parts) >= 2:
+            leftovers.append(_decode("|".join(parts[1:])))
+        elif tag == "INSTRUMENTED" and len(parts) >= 3:
+            try:
+                instrumented = (int(parts[1]), int(parts[2]))
+            except ValueError:
+                pass
     payload: dict[str, Any] = {
         "name": name,
         "frames": frames_out,
@@ -225,8 +243,30 @@ if flow == undefined then (
         "instrumentation": instrumentation,
         "cleanup": bool(cleanup),
     }
+    warnings: list[str] = []
+    if instrumentation["errors"]:
+        # Particles of an event whose stamp failed are counted as unbucketed.
+        warnings.append(
+            "Instrumentation failed in part, so the affected events' counts are unreliable: "
+            + "; ".join(instrumentation["errors"])
+        )
+    if leftovers:
+        payload["leftover_events"] = leftovers
+        warnings.append(
+            f"{_CENSUS_OP_NAME} operators could not be removed from: {', '.join(leftovers)}"
+        )
     if main_error:
         payload["error"] = main_error
+    elif instrumented is not None and instrumented[1] and not instrumented[0]:
+        payload["error"] = "The census added no instrumentation operator, so it measured nothing: " + (
+            "; ".join(instrumentation["errors"]) or "addOperator failed in every event"
+        )
+    if "error" in payload:
+        if warnings:
+            payload["details"] = {"warnings": warnings, "instrumentation": instrumentation}
+    elif warnings:
+        payload["status"] = "partial"
+        payload["warnings"] = warnings
     return json.dumps(payload)
 
 
@@ -266,21 +306,29 @@ local flow = getNodeByName "{safe_string(name)}"
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
-    try (flow.tyFlow.editor_open()) catch ()
+    local openError = ""
+    try (flow.tyFlow.editor_open()) catch (openError = getCurrentException() as string)
     {reset_lines}
     try (windows.processPostedMessages()) catch ()
     sleep 0.4
     try (windows.processPostedMessages()) catch ()
-    "OK"
+    if openError == "" then "OK" else ("OPENERR|" + openError)
 )
 )"""
-    try:
-        response = client.send_command(maxscript)
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
+    # Transport and call-state exceptions propagate with their code and hint.
+    response = client.send_command(maxscript)
     raw = str(response.get("result", ""))
     if raw.startswith("__ERROR__|"):
         return json.dumps({"error": raw.split("|", 1)[1]})
+    if raw.startswith(MAXSCRIPT_ERROR):
+        return raw
+    warnings: list[str] = []
+    if raw.startswith("OPENERR|"):
+        # The capture still runs: an editor that was already open may be on screen.
+        warnings.append(
+            "tyFlow editor_open raised, so the capture may not show the editor: "
+            + raw.split("|", 1)[1]
+        )
 
     if output_path:
         capture_path = output_path.replace("\\", "/")
@@ -294,17 +342,24 @@ if flow == undefined then (
     except Exception as exc:
         return json.dumps({"error": f"Screen capture failed: {exc}"})
 
-    graph = graph_payload(name)
+    try:
+        graph = graph_payload(name)
+    except Exception as exc:  # the capture is already on disk
+        graph = {"error": str(exc)}
     events = [
         {"name": event["name"], "position": event.get("position"), "width": event.get("width")}
         for event in graph.get("events", [])
     ] if "error" not in graph else []
-    return json.dumps(
-        {
-            "name": name,
-            "imagePath": capture_path,
-            "events": events,
-            "ledger_status": graph.get("ledger_status"),
-            "note": "tyFlow editor left open; wires must be read visually from the image.",
-        }
-    )
+    if "error" in graph:
+        warnings.append(f"Event rectangles are missing because the graph read failed: {graph['error']}")
+    payload: dict[str, Any] = {
+        "name": name,
+        "imagePath": capture_path,
+        "events": events,
+        "ledger_status": graph.get("ledger_status"),
+        "note": "tyFlow editor left open; wires must be read visually from the image.",
+    }
+    if warnings:
+        payload["status"] = "partial"
+        payload["warnings"] = warnings
+    return json.dumps(payload)

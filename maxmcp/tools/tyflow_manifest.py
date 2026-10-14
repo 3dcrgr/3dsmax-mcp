@@ -20,8 +20,9 @@ from ..helpers.maxscript import safe_string
 from ..helpers.tyflow_catalog import EXECUTABLE_OPERATOR_NAMES, TYFLOW_OPERATOR_NAMES
 
 from ..coerce import StrList
+from ..max_client import CALL_STATE_ERRORS
 from ..server import client, mcp
-from ._tyflow_core import CORE_HELPERS
+from ._tyflow_core import CORE_HELPERS, MAXSCRIPT_ERROR
 
 _PROBE_FLOW = "zzz_mcp_manifest_probe"
 _BATCH_SIZE = 40
@@ -60,10 +61,8 @@ def _tyflow_version() -> int | dict[str, Any]:
 if tyFlow == undefined then "__ERROR__|tyFlow plugin is not available"
 else ((tyFlow_version()) as string)
 )"""
-    try:
-        response = client.send_command(maxscript)
-    except Exception as exc:
-        return {"error": str(exc)}
+    # Transport and call-state exceptions propagate with their code and hint.
+    response = client.send_command(maxscript)
     raw = str(response.get("result", "")).strip()
     if raw.startswith("__ERROR__|"):
         return {"error": raw.split("|", 1)[1]}
@@ -113,11 +112,15 @@ if tyFlow == undefined then (
 )"""
     try:
         response = client.send_command(maxscript, timeout=300)
+    except CALL_STATE_ERRORS:
+        raise  # the probe may still run; never report it as an ordinary failure
     except Exception as exc:
         return {"error": str(exc)}
     raw = str(response.get("result", ""))
     if raw.startswith("__ERROR__|"):
         return {"error": raw.split("|", 1)[1]}
+    if raw.startswith(MAXSCRIPT_ERROR):
+        return {"error": "MAXScript error: " + raw[len(MAXSCRIPT_ERROR):].strip()}
 
     def _decode(token: str) -> str:
         return token.replace("<pipe>", "|")
@@ -147,16 +150,18 @@ if tyFlow == undefined then (
     return list(entries.values())
 
 
-def _cleanup_probe_flow() -> None:
+def _cleanup_probe_flow() -> str | None:
+    """Delete the scratch flow; return why it may still be in the scene."""
     maxscript = f"""(
 local flow = getNodeByName "{_PROBE_FLOW}"
 if flow != undefined do (try (delete flow) catch ())
-"OK"
+if isValidNode flow then "LEFT" else "OK"
 )"""
     try:
-        client.send_command(maxscript)
-    except Exception:
-        pass
+        raw = str(client.send_command(maxscript).get("result", "")).strip()
+    except Exception as exc:
+        return str(exc)
+    return None if raw == "OK" else f"delete was refused ({raw[:120]})"
 
 
 @mcp.tool()
@@ -193,6 +198,7 @@ def harvest_tyflow_manifest(
     harvested: list[dict[str, Any]] = []
     errors: list[str] = []
     step = max(1, int(batch_size))
+    cleanup_error: str | None = None
     try:
         for start in range(0, len(names), step):
             batch = names[start : start + step]
@@ -202,12 +208,16 @@ def harvest_tyflow_manifest(
                 break
             harvested.extend(outcome)
     finally:
-        _cleanup_probe_flow()
+        cleanup_error = _cleanup_probe_flow()
 
     if not harvested:
         return json.dumps({"error": "Manifest probe produced no entries", "details": errors})
 
-    if operator_names and existing:
+    probed = {op["type"] for op in harvested}
+    unprobed = [item for item in names if item not in probed]
+    # A probe that stopped early merges into the cache instead of replacing it,
+    # so operators it never reached keep their earlier entries.
+    if (operator_names or errors) and existing:
         merged = {op["type"]: op for op in existing["operators"]}
         for op in harvested:
             merged[op["type"]] = op
@@ -220,17 +230,28 @@ def harvest_tyflow_manifest(
         "operators": operators,
     }
     cache.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
-    return json.dumps(
-        {
-            "cached": False,
-            "tyflowVersion": version,
-            "operatorCount": len(operators),
-            "availableCount": sum(1 for op in operators if op.get("available")),
-            "unavailable": [op["type"] for op in operators if not op.get("available")],
-            "errors": errors,
-            "cachePath": str(cache),
-        }
-    )
+    payload: dict[str, Any] = {
+        "cached": False,
+        "tyflowVersion": version,
+        "operatorCount": len(operators),
+        "availableCount": sum(1 for op in operators if op.get("available")),
+        "unavailable": [op["type"] for op in operators if not op.get("available")],
+        "errors": errors,
+        "cachePath": str(cache),
+    }
+    warnings: list[str] = []
+    if errors:
+        payload["unprobed"] = unprobed
+        warnings.append(
+            f"The probe stopped early; {len(unprobed)} operator type(s) were not probed: "
+            + "; ".join(errors)
+        )
+    if cleanup_error:
+        warnings.append(f"Scratch flow {_PROBE_FLOW} may remain in the scene: {cleanup_error}")
+    if warnings:
+        payload["status"] = "partial"
+        payload["warnings"] = warnings
+    return json.dumps(payload)
 
 
 @mcp.tool()
