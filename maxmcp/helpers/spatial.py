@@ -220,9 +220,9 @@ def build_create_object_maxscript(
 
 
 def build_clone_spatial_maxscript(node_names: list[str], *, node_handles: list[int] | None = None) -> str:
-    from .maxscript import safe_string
+    from .maxscript import node_by_name_expr, safe_string
     names_array = "#(" + ", ".join(f'"{safe_string(name)}"' for name in node_names) + ")"
-    node_expression = f'for n in {names_array} collect (getNodeByName n exact:true)'
+    node_expression = f'for n in {names_array} collect {node_by_name_expr("n", missing_ok=True)}'
     if node_handles is not None:
         handles_array = "#(" + ",".join(str(int(h)) for h in node_handles) + ")"
         node_expression = f'for h in {handles_array} collect (getAnimByHandle h)'
@@ -310,7 +310,7 @@ def enrich_spatial_payload(payload: dict[str, Any], type_name: str) -> dict[str,
 
 
 def apply_pos_mode_fix_maxscript(name: str, pos: list[float] | None, pos_mode: str) -> str:
-    safe_name = name.replace('"', '\\"')
+    from .maxscript import node_by_name
     has_pos = pos is not None
     target_pos = _format_point(pos) if has_pos else "undefined"
     mode = normalize_pos_mode(pos_mode)
@@ -325,7 +325,7 @@ def apply_pos_mode_fix_maxscript(name: str, pos: list[float] | None, pos_mode: s
             local bbMax = obj.max
             (bbMin + bbMax) * 0.5
         )
-        local obj = getNodeByName "{safe_name}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "missing"
         ) else (

@@ -4,8 +4,11 @@ from typing import Optional
 
 from ..coerce import FloatList, StrList
 from ..server import mcp, client
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name_expr, safe_string
 from ..helpers.spatial import build_clone_spatial_maxscript, enrich_spatial_payload
+
+# The bridge returns an uncaught MAXScript exception as this prefixed string.
+_MAXSCRIPT_ERROR = "__MCP_MS_ERR__:"
 
 # Max clones the outermost closed group around a member instead of the member,
 # stacked on the original. Mirrors ClosedGroupAround in the native handler.
@@ -88,8 +91,9 @@ def clone_objects(
         local nameList = {name_arr}
         local srcNodes = #()
         local notFound = #()
+        -- A source name several objects share fails the call before anything is cloned.
         for n in nameList do (
-            local obj = getNodeByName n
+            local obj = {node_by_name_expr("n", missing_ok=True)}
             if obj != undefined then
                 append srcNodes obj
             else
@@ -118,7 +122,13 @@ def clone_objects(
                 notFoundJson += ("\\\"" + notFound[i] + "\\\"")
             )
             notFoundJson += "]"
-            "{{\\\"cloned\\\":" + namesJson + ",\\\"notFound\\\":" + notFoundJson + "}}"
+            local handlesJson = "["
+            for i = 1 to newNodes.count do (
+                if i > 1 do handlesJson += ","
+                handlesJson += formattedPrint ((getHandleByAnim newNodes[i]) as integer64) format:"d"
+            )
+            handlesJson += "]"
+            "{{\\\"cloned\\\":" + namesJson + ",\\\"notFound\\\":" + notFoundJson + ",\\\"handles\\\":" + handlesJson + "}}"
         )
     )"""
     response = client.send_command(maxscript)
@@ -136,7 +146,10 @@ def clone_objects(
 
     cloned = payload.get("cloned", [])
     if cloned:
-        spatial_response = client.send_command(build_clone_spatial_maxscript(cloned))
+        # Clones are read back by handle; a clone's name may also be carried
+        # by another object.
+        handles = [int(h) for h in payload.get("handles") or []]
+        spatial_response = client.send_command(build_clone_spatial_maxscript(cloned, node_handles=handles or None))
         spatial_raw = spatial_response.get("result", "")
         if spatial_raw:
             try:
@@ -163,8 +176,8 @@ def _clone_array(names: list[str], mode: str, offset: list[float], count: int) -
         local src = #()
         local missing = #()
         for nm in {name_arr} do (
-            local matches = getNodeByName nm exact:true all:true
-            if matches.count != 1 then append missing nm else append src matches[1]
+            local hit = {node_by_name_expr("nm", missing_ok=True)}
+            if hit == undefined then append missing nm else append src hit
         )
         local groupError = mcpClosedGroupError src
         if missing.count > 0 then ("__ERROR__|Sources must resolve uniquely: " + (missing as string))
@@ -197,6 +210,8 @@ def _clone_array(names: list[str], mode: str, offset: list[float], count: int) -
     raw = str(client.send_command(script).get("result", ""))
     if raw.startswith("__ERROR__|"):
         raise RuntimeError(raw.split("|", 1)[1])
+    if raw.startswith(_MAXSCRIPT_ERROR):
+        raise RuntimeError(raw[len(_MAXSCRIPT_ERROR):].strip())
     handles = [int(h) for h in raw.split(",") if h.strip()]
     if not handles:
         raise RuntimeError("Clone array returned no node handles")
