@@ -85,7 +85,7 @@ std::string NativeHandlers::ToggleEffect(const std::string& params, MCPBridgeGUP
             script = "setActive (getEffect " + msIndex + ") " + msActive;
         }
 
-        RunMAXScript(script);
+        RunMAXScriptChecked(script);
 
         json result;
         result["status"] = "ok";

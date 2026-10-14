@@ -32,7 +32,7 @@ std::string NativeHandlers::RenderScene(const std::string& params, MCPBridgeGUP*
             script += " outputFile:\"" + JsonEscape(outputPath) + "\"";
         }
 
-        RunMAXScript(script);
+        RunMAXScriptChecked(script);
 
         json result;
         result["status"] = "rendered";

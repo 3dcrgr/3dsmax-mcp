@@ -438,7 +438,7 @@ std::string NativeHandlers::InvokeInterface(const std::string& params, MCPBridge
                         // Use MAXScript for setting — type coercion is complex
                         try {
                             std::string script = ifaceName + "." + key + " = " + val.get<std::string>();
-                            RunMAXScript(script);
+                            RunMAXScriptChecked(script);
                             setResults[key] = "ok";
                         } catch (...) {
                             setResults[key] = "error";
@@ -450,6 +450,14 @@ std::string NativeHandlers::InvokeInterface(const std::string& params, MCPBridge
                 if (!found) setResults[key] = "not_found";
             }
             result["set"] = setResults;
+            json unset = json::array();
+            for (auto& [key, state] : setResults.items()) {
+                if (state != "ok") unset.push_back(key + " (" + state.get<std::string>() + ")");
+            }
+            if (!unset.empty()) {
+                result["warnings"] = json::array({std::to_string(unset.size()) +
+                    " interface propert(ies) were not set: " + JoinNames(unset)});
+            }
         }
 
         // Call function (if specified)
