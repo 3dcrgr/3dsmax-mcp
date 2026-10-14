@@ -98,7 +98,7 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "forest_edit_items",
             "forest_set_mode",
             "forest_validate",
-            "forest_inspect", "forest_effects", "forest_settings", "forest_effect_library", "forest_effect_parameters",
+            "forest_inspect", "forest_effects", "forest_settings", "forest_effect_library", "forest_effect_parameters", "forest_effect_curves",
             "itoo_api_inventory", "itoo_catalog",
             "itoo_vantage_check",
         ],

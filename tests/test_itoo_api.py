@@ -626,5 +626,31 @@ class ControllerParameterTests(unittest.TestCase):
         self.assertFalse(result['parameters'][0]['writable'])
 
 
+class ForestCurveInspectorTests(unittest.TestCase):
+    def test_native_curve_inspection_contract(self):
+        with patch.object(api.rc,'_send',return_value='10|20|30'),patch('maxmcp.helpers.plugin_schema.native',return_value={'kind':'curve_control','curve_count':2}) as native:
+            result=api.forest_effect_curves('Forest',limit=1,offset=1,point_limit=2)
+        payload=native.call_args.args[1]
+        self.assertEqual(payload['expected_base_handle'],'20')
+        self.assertEqual(payload['curve_handle'],'30')
+        self.assertTrue(payload['curve_control'])
+        self.assertEqual(payload['point_limit'],2)
+        self.assertEqual(result['forest'],'Forest')
+
+    def test_old_bridge_refused(self):
+        with patch.object(api.rc,'_send',return_value='10|20|30'),patch('maxmcp.helpers.plugin_schema.native',return_value={'properties':[]}),self.assertRaises(api.RailCloneError) as raised:
+            api.forest_effect_curves('Forest')
+        self.assertEqual(raised.exception.code,'BRIDGE_CAPABILITY_MISSING')
+
+    def test_curve_limits_before_max(self):
+        for args in ({'limit':True},{'limit':65},{'offset':-1},{'point_limit':257},{'point_limit':False}):
+            with self.subTest(args=args),patch.object(api.rc,'_send') as send,self.assertRaises(ValueError):api.forest_effect_curves('Forest',**args)
+            send.assert_not_called()
+
+    def test_curve_identity_malformed(self):
+        with patch.object(api.rc,'_send',return_value='10|wrong|30'),patch('maxmcp.helpers.plugin_schema.native') as native,self.assertRaises(api.RailCloneError):api.forest_effect_curves('Forest')
+        native.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

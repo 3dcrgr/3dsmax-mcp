@@ -9,6 +9,7 @@
 #include <set>
 #include <sstream>
 #include <memory>
+#include <icurvctl.h>
 #include <lslights.h>
 #if MAX_SDK_VERSION >= 2024
 #include <ColorManagement/IColorPipelineMgr.h>
@@ -325,9 +326,59 @@ json DescribeInterface(FPInterface* value) {
     }
     return out;
 }
+json InspectCurveControl(Animatable* root, const json& p) {
+    if (!root || !p.contains("curve_handle")) Fail("BAD_PARAM", "Curve inspection requires an owner and curve_handle.");
+    auto* candidate=Animatable::GetAnimByHandle((AnimHandle)NodeRefs::ParseHandle(p.at("curve_handle")));
+    if (!candidate || candidate->ClassID()!=CURVE_CONTROL_CLASS_ID) Fail("NOT_CURVE_CONTROL", "The handle is not an SDK CurveControl.");
+    if (p.contains("expected_base_handle") &&
+        NodeRefs::ParseHandle(p.at("expected_base_handle"))!=(uint64_t)Animatable::GetHandleByAnim(root))
+        Fail("STALE_BINDING", "The inspected base object changed.");
+    std::vector<std::pair<Animatable*,int>> pending={{root,0}};
+    std::set<Animatable*> seen;
+    bool found=false;
+    for(size_t i=0;i<pending.size();++i) {
+        if(seen.size()>=2048 || pending.size()>4096) Fail("REFERENCE_LIMIT", "Curve ownership traversal exceeded its bound.");
+        auto [value,depth]=pending[i];
+        if(!value || !seen.insert(value).second) continue;
+        if(value==candidate) {found=true;break;}
+        if(depth>=4) continue;
+        auto* maker=dynamic_cast<ReferenceMaker*>(value); if(!maker) continue;
+        if(maker->NumRefs()>1024) Fail("REFERENCE_LIMIT", "Owner has too many references.");
+        for(int j=0;j<maker->NumRefs();++j) if(auto* ref=maker->GetReference(j)) pending.push_back({ref,depth+1});
+    }
+    if(!found) Fail("STALE_BINDING", "Curve control is not referenced by the target owner.");
+    auto* control=static_cast<ICurveCtl*>(candidate);
+    const int limit=p.value("limit",16),offset=p.value("offset",0),pointLimit=p.value("point_limit",128);
+    if(limit<1||limit>64||offset<0||pointLimit<1||pointLimit>256) Fail("BAD_PARAM", "Curve limits are 1..64 curves and 1..256 points.");
+    const int count=control->GetNumCurves();
+    if(count<0||count>100000) Fail("INVALID_READBACK", "Invalid curve count.");
+    const auto time=GetCOREInterface()->GetTime();
+    auto point=[](Point2 v)->json {
+        if(!std::isfinite(v.x)||!std::isfinite(v.y)) Fail("INVALID_READBACK", "Curve contains nonfinite coordinates.");
+        return {v.x,v.y};
+    };
+    json curves=json::array();
+    for(int i=offset;i<count&&curves.size()<(size_t)limit;++i) {
+        auto* curve=control->GetControlCurve(i); if(!curve) Fail("INVALID_READBACK", "Curve is unavailable.");
+        const int points=curve->GetNumPts(); if(points<0||points>100000) Fail("INVALID_READBACK", "Invalid point count.");
+        json data=json::array();
+        for(int j=0;j<points&&j<pointLimit;++j) {
+            auto value=curve->GetPoint(time,j);
+            data.push_back({{"index",j},{"position",point(value.p)},{"in_tangent",point(value.in)},
+                            {"out_tangent",point(value.out)},{"flags",value.flags}});
+        }
+        curves.push_back({{"index",i},{"owner_ref",OwnerRef(curve)},{"point_count",points},{"points",data},
+                          {"points_complete",points<=pointLimit},{"out_of_range_type",curve->GetOutOfRangeType()}});
+    }
+    return {{"kind","curve_control"},{"read_only",true},{"rebuilt",false},{"owner_ref",OwnerRef(control)},
+            {"time",time},{"curve_count",count},{"offset",offset},{"curves",curves},
+            {"next_offset",offset+(int)curves.size()<count?json(offset+curves.size()):json(nullptr)},
+            {"x_range",point(control->GetXRange())},{"y_range",point(control->GetYRange())}};
+}
 json Inspect(const json& p) {
     Animatable* owner=nullptr;
     if(p.contains("owner_ref")&&!p["owner_ref"].is_null()) owner=ResolveOwner(p["owner_ref"]);
+    if(p.value("curve_control",false)) return InspectCurveControl(owner,p);
     auto* cd=owner?Descriptor(ClassRef(owner)):FindClass(p);
     auto schema=Schema(cd,owner); const int limit=p.value("limit",25),offset=p.value("offset",0);
     if(limit<1||limit>256||offset<0) Fail("BAD_PARAM","limit must be 1..256 and offset nonnegative.");

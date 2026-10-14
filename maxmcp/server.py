@@ -82,7 +82,7 @@ _READ_ONLY_TOOLS = {
     "railclone_inspect",
     "railclone_library",
     "itoo_vantage_check",
-    "itoo_api_inventory", "itoo_catalog", "forest_inspect", "forest_effect_library",
+    "itoo_api_inventory", "itoo_catalog", "forest_inspect", "forest_effect_library", "forest_effect_curves",
 }
 
 _DESTRUCTIVE_TOOLS = {

@@ -582,6 +582,40 @@ if next_{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"
 
 
 @mcp.tool()
+def forest_effect_curves(name: str, limit: int = 16, offset: int = 0,
+                         point_limit: int = 128) -> dict[str, Any]:
+    """Read Forest's SDK CurveControl without opening the curve editor or rebuilding.
+
+    Returns bounded curve points, tangents, flags and ranges at the current time.
+    Curve indices are zero-based. Follow next_offset for more curves; points_complete
+    is false when point_limit truncated a curve. Does not edit curves or claim to
+    map undocumented efpacurve strings to these indices. Requires the updated
+    native SDK inspector; old bridges return BRIDGE_CAPABILITY_MISSING.
+    """
+    from ..helpers import forest as fh
+    from ..helpers.plugin_schema import native
+    fh.node_name(name, "name")
+    if type(limit) is not int or not 1 <= limit <= 64 or type(offset) is not int or offset < 0:
+        raise ValueError("limit must be 1..64 and offset nonnegative")
+    if type(point_limit) is not int or not 1 <= point_limit <= 256:
+        raise ValueError("point_limit must be 1..256")
+    raw = rc._send(fh.MXS_LIB + f'''local n=fpForest "{rc._b64(name)}"
+local base=n.baseObject, cc=base.Effect_Curves
+if cc==undefined do throw "CURVE_CONTROL_UNAVAILABLE: Forest has no curve control"
+(rcH n)+"|"+(rcH base)+"|"+(rcH cc)
+''').strip().split("|")
+    if len(raw) != 3 or any(not v.isdigit() for v in raw):
+        raise RailCloneError("INVALID_READBACK", "curve control identity was not returned")
+    result = native("native:plugin_inspect", {"owner_ref": {"node": {"handle": raw[0], "name": name}, "scope": "base_object"},
+                    "expected_base_handle": raw[1], "curve_handle": raw[2], "curve_control": True,
+                    "limit": limit, "offset": offset, "point_limit": point_limit})
+    if result.get("kind") != "curve_control":
+        raise RailCloneError("BRIDGE_CAPABILITY_MISSING", "install the native CurveControl inspector")
+    result["forest"] = name
+    return result
+
+
+@mcp.tool()
 def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect",
                              values: dict[str, Any] | None = None, expected_effects: str = "") -> dict[str, Any]:
     """Inspect Forest effect parameters or set existing numeric/reference values in one staged undo step.
