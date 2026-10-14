@@ -51,6 +51,10 @@ public:
         return main_thread_id_ != 0 && GetCurrentThreadId() == main_thread_id_;
     }
 
+    // Max's main thread: true while it runs a request, including inside the
+    // nested message loops that request's SDK work pumps.
+    static bool IsRunningWork() { return s_executing_; }
+
     struct WorkItem {
         std::function<std::string()> work;
         std::string result;
