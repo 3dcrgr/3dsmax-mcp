@@ -1,5 +1,6 @@
 """Shared escaping helpers for building MAXScript strings."""
 
+import json
 import re
 
 
@@ -110,6 +111,12 @@ def node_script_ref(node_var: str) -> str:
 #   mcpAmbiguousJson ambiguous
 #                           JSON for the ambiguous entries:
 #                           [{"name", "candidates": [{name, handle, class, layer}]}]
+#   mcpAmbiguousReply ambiguous
+#                           "" or the tagged JSON a text reply ends with; see
+#                           batch_reply
+#   mcpThrowUnresolved missing ambiguous consequence
+#                           fails a batch that resolved no name while some
+#                           were shared; consequence says what was left unchanged
 NODE_LOOKUP_FNS = r'''
 fn mcpNamedNodes nm = (
     local hits = getNodeByName nm exact:true ignoreCase:false all:true
@@ -158,7 +165,39 @@ fn mcpAmbiguousJson ambiguous = (
     )
     out + "]"
 )
+fn mcpAmbiguousReply ambiguous = if ambiguous.count == 0 then "" else ("\n__MCP_AMBIGUOUS__:" + (mcpAmbiguousJson ambiguous))
+fn mcpThrowUnresolved missing ambiguous consequence = (
+    local s = (if missing.count == 0 then "Each requested name is shared by several objects; " else "No requested name matched exactly one object; ") + consequence + ". Ambiguous object names: "
+    for i = 1 to ambiguous.count do (
+        local handles = ""
+        for n in ambiguous[i][2] do handles += (if handles == "" then "" else ", ") + (mcpHandleText n)
+        s += (if i == 1 then "" else "; ") + ambiguous[i][1] + " (handles " + handles + ")"
+    )
+    throw s
+)
 '''
+
+_AMBIGUOUS_TAG = "\n__MCP_AMBIGUOUS__:"
+
+
+def split_ambiguous_reply(raw):
+    """Split a text reply from the ambiguous-name JSON mcpAmbiguousReply appended."""
+    if not isinstance(raw, str) or _AMBIGUOUS_TAG not in raw:
+        return raw, []
+    text, _, tail = raw.rpartition(_AMBIGUOUS_TAG)
+    try:
+        ambiguous = json.loads(tail)
+    except ValueError:
+        return raw, []
+    return text, ambiguous if isinstance(ambiguous, list) else []
+
+
+def batch_reply(raw):
+    """A batch fallback's text reply, or a partial result when it skipped shared names."""
+    text, ambiguous = split_ambiguous_reply(raw)
+    if not ambiguous:
+        return text
+    return report_ambiguous({"message": text}, ambiguous)
 
 
 def ambiguous_names_warning(ambiguous: list) -> str:
