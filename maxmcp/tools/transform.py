@@ -59,7 +59,12 @@ def transform_object(
         ops.append(f"scale obj [{scale[0]},{scale[1]},{scale[2]}]")
 
     if not ops:
-        return "No transform parameters provided."
+        return _json.dumps({
+            "name": name,
+            "status": "noop",
+            "message": "No transform parameters provided.",
+            "warnings": ["No move, rotate or scale was given, so the object was not transformed."],
+        })
 
     ops_str = "\n            ".join(ops)
 

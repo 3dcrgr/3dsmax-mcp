@@ -238,23 +238,26 @@ std::string NativeHandlers::SetObjectProperty(const std::string& params, MCPBrid
             return propertyResult("Set name on " + WideToUtf8(node->GetName()));
         }
 
+        const bool flagProperty = lprop == "ishidden" || lprop == "hidden" ||
+            lprop == "isfrozen" || lprop == "frozen" || lprop == "renderable";
+        bool flag = false;
+        if (flagProperty && !ParseBoolLiteral(value, flag))
+            throw std::runtime_error("Cannot parse boolean from: " + value + " (use true or false)");
+
         if (lprop == "ishidden" || lprop == "hidden") {
-            bool v = (value == "true" || value == "1" || value == "on");
-            node->Hide(v ? TRUE : FALSE);
+            node->Hide(flag ? TRUE : FALSE);
             ip->RedrawViews(t);
             return propertyResult("Set isHidden on " + WideToUtf8(node->GetName()));
         }
 
         if (lprop == "isfrozen" || lprop == "frozen") {
-            bool v = (value == "true" || value == "1" || value == "on");
-            node->Freeze(v ? TRUE : FALSE);
+            node->Freeze(flag ? TRUE : FALSE);
             ip->RedrawViews(t);
             return propertyResult("Set isFrozen on " + WideToUtf8(node->GetName()));
         }
 
         if (lprop == "renderable") {
-            bool v = (value == "true" || value == "1" || value == "on");
-            node->SetRenderable(v ? TRUE : FALSE);
+            node->SetRenderable(flag ? TRUE : FALSE);
             return propertyResult("Set renderable on " + WideToUtf8(node->GetName()));
         }
 
@@ -519,7 +522,7 @@ std::string NativeHandlers::CreateObject(const std::string& params, MCPBridgeGUP
                     ms += "createdNode." + key + " = " + val + "; ";
                 }
                 ms += "\"OK\")";
-                RunMAXScript(ms); // A rejected parameter must cancel the dispatcher-owned hold.
+                RunMAXScriptChecked(ms); // A rejected parameter must cancel the dispatcher-owned hold.
             }
         }
 
@@ -584,6 +587,13 @@ std::string NativeHandlers::DeleteObjects(const std::string& params, MCPBridgeGU
             }
         }
 
+        if (targets.empty()) {
+            throw std::runtime_error(StructuredErrorPayload(
+                "NOT_FOUND",
+                "No object matched the requested names or handles; nothing was deleted.",
+                {{"notFound", notFound}}));
+        }
+
         // Resolve and validate every selector before the first mutation. This
         // both deduplicates matching handle/name selectors and prevents an
         // ambiguous later name from leaving a partially deleted scene.
@@ -599,8 +609,11 @@ std::string NativeHandlers::DeleteObjects(const std::string& params, MCPBridgeGU
         result["message"] = std::string(dryRun ? "Would delete " : "Deleted ") +
             std::to_string(deleted.size()) + " objects";
         if (!notFound.empty()) {
+            result["status"] = "partial";
             result["message"] = result["message"].get<std::string>() +
-                " | Not found: " + std::to_string(notFound.size());
+                " | " + std::to_string(notFound.size()) + " not found";
+            result["warnings"] = json::array({std::to_string(notFound.size()) +
+                " requested object(s) matched nothing and were skipped: " + JoinNames(notFound)});
         }
         return result.dump();
     });
@@ -671,6 +684,8 @@ std::string NativeHandlers::TransformObject(const std::string& params, MCPBridge
             json result = NodeIdentityJson(node);
             result["status"] = "noop";
             result["message"] = "No transform parameters provided.";
+            result["warnings"] = json::array({
+                "No move, rotate or scale was given, so the object was not transformed."});
             return result.dump();
         }
 
@@ -694,6 +709,14 @@ std::string NativeHandlers::SelectObjects(const std::string& params, MCPBridgeGU
         std::string pattern = p.value("pattern", "");
         std::string className = p.value("class_name", "");
 
+        auto selectionResult = [&](int selected, const std::string& message) {
+            json result;
+            result["selected"] = selected;
+            result["selectionCount"] = ip->GetSelNodeCount();
+            result["message"] = message;
+            return result;
+        };
+
         if (selectAll) {
             // Select all objects
             INode* root = ip->GetRootNode();
@@ -704,22 +727,39 @@ std::string NativeHandlers::SelectObjects(const std::string& params, MCPBridgeGU
                 ip->SelectNode(n, FALSE);
             }
             ip->RedrawViews(ip->GetTime());
-            return "Selected " + std::to_string(nodes.size()) + " objects";
+            return selectionResult(static_cast<int>(nodes.size()),
+                "Selected " + std::to_string(nodes.size()) + " objects").dump();
         }
 
         if (!names.empty()) {
-            ip->ClearNodeSelection(FALSE);
-            int found = 0;
+            // Resolve every name first: a request that names only missing
+            // objects fails and leaves the current selection untouched.
+            std::vector<INode*> found;
+            json notFound = json::array();
             for (const auto& name : names) {
                 INode* node = FindNodeByName(name);
-                if (node) {
-                    ip->SelectNode(node, FALSE);
-                    found++;
-                }
+                if (node) found.push_back(node);
+                else notFound.push_back(name);
             }
+            if (found.empty()) {
+                throw std::runtime_error(StructuredErrorPayload(
+                    "NOT_FOUND",
+                    "No object matched the requested names; the selection was not changed.",
+                    {{"notFound", notFound}}));
+            }
+            ip->ClearNodeSelection(FALSE);
+            for (INode* node : found) ip->SelectNode(node, FALSE);
             ip->RedrawViews(ip->GetTime());
-            return "Selected " + std::to_string(found) + " of " +
-                   std::to_string(names.size()) + " objects";
+            json result = selectionResult(static_cast<int>(found.size()),
+                "Selected " + std::to_string(found.size()) + " of " +
+                std::to_string(names.size()) + " objects");
+            result["notFound"] = notFound;
+            if (!notFound.empty()) {
+                result["status"] = "partial";
+                result["warnings"] = json::array({std::to_string(notFound.size()) +
+                    " requested name(s) matched no object and were not selected: " + JoinNames(notFound)});
+            }
+            return result.dump();
         }
 
         if (!pattern.empty() || !className.empty()) {
@@ -746,10 +786,18 @@ std::string NativeHandlers::SelectObjects(const std::string& params, MCPBridgeGU
             std::string desc = !pattern.empty()
                 ? ("matching \"" + pattern + "\"")
                 : ("of class " + className);
-            return "Selected " + std::to_string(found) + " objects " + desc;
+            json result = selectionResult(found, "Selected " + std::to_string(found) + " objects " + desc);
+            if (found == 0) {
+                // The selection is still cleared so a later selection_only edit
+                // cannot act on objects the caller did not ask for.
+                result["status"] = "no_match";
+                result["warnings"] = json::array({"No object " + desc +
+                    "; the selection is now empty."});
+            }
+            return result.dump();
         }
 
-        return "At least one parameter (names, pattern, class_name, or all) must be provided.";
+        throw std::runtime_error("At least one parameter (names, pattern, class_name, or all) must be provided.");
     });
 }
 
@@ -764,13 +812,26 @@ std::string NativeHandlers::SetVisibility(const std::string& params, MCPBridgeGU
         if (names.empty() && pattern.empty()) {
             throw std::runtime_error("At least one of names or pattern must be provided.");
         }
+        if (action != "hide" && action != "show" && action != "toggle" &&
+            action != "freeze" && action != "unfreeze") {
+            throw std::runtime_error("Unknown action: " + action +
+                ". Use hide, show, toggle, freeze, or unfreeze.");
+        }
 
         // Collect target nodes
         std::vector<INode*> targets;
+        json notFound = json::array();
         if (!names.empty()) {
             for (const auto& name : names) {
                 INode* node = FindNodeByName(name);
                 if (node) targets.push_back(node);
+                else notFound.push_back(name);
+            }
+            if (targets.empty()) {
+                throw std::runtime_error(StructuredErrorPayload(
+                    "NOT_FOUND",
+                    "No object matched the requested names; visibility was not changed.",
+                    {{"notFound", notFound}}));
             }
         } else {
             targets = CollectNodesByPattern(pattern);
@@ -786,10 +847,8 @@ std::string NativeHandlers::SetVisibility(const std::string& params, MCPBridgeGU
                 node->Hide(!node->IsHidden());
             } else if (action == "freeze") {
                 node->Freeze(TRUE);
-            } else if (action == "unfreeze") {
-                node->Freeze(FALSE);
             } else {
-                throw std::runtime_error("Unknown action: " + action);
+                node->Freeze(FALSE);
             }
             count++;
         }
@@ -800,6 +859,16 @@ std::string NativeHandlers::SetVisibility(const std::string& params, MCPBridgeGU
         result["action"] = action;
         result["count"] = count;
         result["message"] = action + ": " + std::to_string(count) + " objects";
+        if (!names.empty()) result["notFound"] = notFound;
+        if (!notFound.empty()) {
+            result["status"] = "partial";
+            result["warnings"] = json::array({std::to_string(notFound.size()) +
+                " requested name(s) matched no object and were skipped: " + JoinNames(notFound)});
+        } else if (count == 0) {
+            result["status"] = "no_match";
+            result["warnings"] = json::array({"No object matches pattern \"" + pattern +
+                "\", so nothing was changed."});
+        }
         return result.dump();
     });
 }

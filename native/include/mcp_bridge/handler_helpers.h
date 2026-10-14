@@ -313,6 +313,21 @@ inline INode* ResolveNodeFromPayload(
 // returns either the user's value, or a string with this sentinel prefix.
 inline const char* MaxScriptErrorSentinel() { return "__MCP_MS_ERR__:"; }
 
+// Joins names for a warning. Callers keep the text free of "not found:",
+// which the Python envelope reads as an error even inside a success payload.
+inline std::string JoinNames(const json& names, size_t limit = 10) {
+    std::string out;
+    size_t shown = 0;
+    for (const auto& entry : names) {
+        if (shown == limit) { out += ", ..."; break; }
+        if (shown++) out += ", ";
+        if (entry.type() == json::value_t::string) out += entry.get<std::string>();
+        else if (entry.is_object() && entry.contains("handle")) out += "handle " + entry["handle"].dump();
+        else out += entry.dump();
+    }
+    return out;
+}
+
 inline std::wstring WrapForErrorCapture(const std::wstring& wcmd) {
     return std::wstring(
         L"(\n"
@@ -405,6 +420,27 @@ inline bool EvaluateMAXScript(const std::wstring& script, const std::function<vo
         return std::string();
     });
     return ok;
+}
+
+// RunMAXScript returns a runtime exception as a sentinel string, so a caller
+// that ignores the result reports success for an edit Max rejected. Mutations
+// use this form: the throw reaches the dispatcher, which cancels its undo hold.
+inline std::string RunMAXScriptChecked(const std::string& script) {
+    std::string result = RunMAXScript(script);
+    const std::string sentinel = MaxScriptErrorSentinel();
+    if (result.compare(0, sentinel.size(), sentinel) == 0)
+        throw std::runtime_error(result.substr(sentinel.size()));
+    return result;
+}
+
+// Parses an explicit boolean literal. Anything else is rejected rather than
+// read as false, so "True" or "yes" cannot silently clear a flag.
+inline bool ParseBoolLiteral(const std::string& value, bool& out) {
+    std::string lower = value;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "true" || lower == "1" || lower == "on" || lower == "yes") { out = true; return true; }
+    if (lower == "false" || lower == "0" || lower == "off" || lower == "no") { out = false; return true; }
+    return false;
 }
 
 // ── JSON escape utility ─────────────────────────────────────────
