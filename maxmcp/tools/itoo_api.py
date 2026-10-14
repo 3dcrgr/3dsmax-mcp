@@ -1185,18 +1185,32 @@ fn iaSettingsToken obj base props = (
 format "ITOOSETTINGS\\n" to:ss
 rcRow ss #("T", iaSettingsToken obj base props)
 for p in props do rcRow ss #("P", p as string, rcV (if isProperty base p then getProperty base p else undefined))
+-- Forest exposes its translation extents on the Forest object; checking the
+-- base object reports them as unavailable in FP 9.4.3 even though they are readable.
+for p in #(#transxmin, #transxmax, #transymin, #transymax, #transzmin, #transzmax) do
+    rcRow ss #("X", p as string, rcV (if isProperty obj p then getProperty obj p else undefined))
 format "END\\n" to:ss
 ss as string
 '''
     result: dict[str, Any] = {"plugin": plugin, "action": action, "settings": {}, "field_types": fields,
                              "read_only": action == "inspect", "undoable": action == "set",
                              "geometry_undoable": False, "forced_rebuild": False}
+    if plugin == "forest":
+        result["translation_extents"] = {"x_min": None, "x_max": None, "y_min": None, "y_max": None,
+                                         "z_min": None, "z_max": None}
     for row in rc._records(rc._send(body), "ITOOSETTINGS"):
         if row[0] == "T":
             result["settings_token"] = row[1]
         elif row[0] == "P":
             canonical = next((p for p in fields if p.lower() == row[1].lower()), row[1])
             result["settings"][canonical] = rc._dv(row[2])
+        elif row[0] == "X" and plugin == "forest":
+            names = {"transxmin": "x_min", "transxmax": "x_max", "transymin": "y_min",
+                     "transymax": "y_max", "transzmin": "z_min", "transzmax": "z_max"}
+            key = names.get(row[1].lstrip("#").lower())
+            if key:
+                value = rc._dv(row[2])
+                result["translation_extents"][key] = int(value) if isinstance(value, (int, float)) else None
     return result
 
 

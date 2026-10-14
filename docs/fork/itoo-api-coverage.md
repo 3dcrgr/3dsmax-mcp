@@ -28,7 +28,7 @@ Live results override older documentation where they differ.
 | `forest_effects` | List/get/add, change code, toggle, move, mixed numeric/object/spline import with explicit bindings, definitions export, remove with parameter-row cleanup; token guard and staged undo |
 | `forest_effect_parameters` | Inspect parameters; edit numeric values and object/spline bindings with schema, bounds, identity and dependency checks |
 | `railclone_settings` | Token-guarded global/display/instancing settings; explicit confirmation before leaving manual-update mode |
-| `forest_settings` | Token-guarded density tile dimensions, direction, seed, caps, update and transform/effect flags |
+| `forest_settings` | Token-guarded density tile dimensions, direction, seed, caps, update and transform/effect flags; reports Forest X/Y/Z translation extents read-only |
 | `forest_effect_library` | Search/read default, user or custom .eff libraries; metadata, parameter definitions and hashes, code opt-in |
 
 Tools are registered in the full profile and the progressive `itoo_api` toolset.

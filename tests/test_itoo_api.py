@@ -306,6 +306,21 @@ class AdditionalToolTests(unittest.TestCase):
         for text in ["NOT_RAILCLONE", "STALE_SETTINGS", "REBUILD_CONFIRMATION_REQUIRED", "theHold.Cancel()"]:
             self.assertIn(text,script)
 
+    def test_forest_settings_reads_translation_extents_without_exposing_writes(self):
+        raw = f"ITOOSETTINGS\nT|{TOKEN}\nP|applyTranslation|b1\nX|#transxmin|i-20\nX|#transxmax|i20\nX|#transymin|i-10\nX|#transymax|i10\nX|#transzmin|i0\nX|#transzmax|i0\nEND\n"
+        with patch.object(api.rc, "_send", return_value=raw) as send:
+            out = api.forest_settings("forest", action="inspect")
+        script = send.call_args.args[0]
+        self.assertEqual(out["settings"]["applyTranslation"], True)
+        self.assertEqual(out["translation_extents"], {"x_min": -20, "x_max": 20, "y_min": -10,
+                                                       "y_max": 10, "z_min": 0, "z_max": 0})
+        self.assertNotIn("transxmin", api.FP_SETTINGS)
+        self.assertNotIn("setProperty base #transxmin", script)
+        self.assertIn("#transxmin", script)
+        self.assertIn('rcRow ss #(\"X\", p as string', script)
+        self.assertIn("isProperty obj p then getProperty obj p", script)
+        self.assertNotIn("isProperty base p then getProperty base p)) to:ss", script)
+
     def test_settings_missing_token(self):
         with patch.object(api.rc,"_send") as send:
             with self.assertRaises(ValueError):

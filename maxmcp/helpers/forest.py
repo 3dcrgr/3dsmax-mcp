@@ -488,6 +488,7 @@ COLLECT_FN = r'''
 fn fpCollect nd ss doBuild = (
     local upm = units.decodeValue "1m"
     format "N|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%\n" (fpEnc nd.name) (nd.mode as string) (fpF nd.units_x) (fpF nd.units_y) (fpB nd.lock_ratio) (fpEnc (nd.mapname as string)) (nd.threshold as string) (fpB nd.densityMap) (nd.distmode as string) (fpB nd.disabled) (fpB nd.manualupdate) (nd.vmesh as string) (fpB nd.surfanim) (nd.direction as string) (fpF upm) to:ss
+    format "T|%|%|%|%|%|%|%\n" (fpPropV nd #applytranslation) (fpPropV nd #transxmin) (fpPropV nd #transxmax) (fpPropV nd #transymin) (fpPropV nd #transymax) (fpPropV nd #transzmin) (fpPropV nd #transzmax) to:ss
     -- the caps: viewport and render item limits, the candidate-cell cap (millions) and the map's pixels
     format "Q|%|%|%|%|%|%|%\n" (fpPropV nd #vmaxitems) (fpPropV nd #rmaxitems) (fpPropV nd #maxdensity) (fpPropV nd #pixels_x) (fpPropV nd #pixels_y) (fpHasDistMap nd) (fpPropV nd #scalelope) to:ss
     for p in @@ITEM_LISTS@@ do format "L|%|%\n" p ((getProperty nd p).count) to:ss
@@ -545,6 +546,13 @@ def parse_state(report: list[str]) -> dict[str, Any]:
                          density_map=f[8] == "1", distmode=int(float(f[9])), disabled=f[10] == "1",
                          manual_update=f[11] == "1", vmesh=int(float(f[12])), surfanim=f[13] == "1",
                          direction=int(float(f[14])), upm=float(f[15]))
+        elif tag == "T":
+            state["translation"] = {
+                "enabled": _flag(f[1]),
+                "x_min": _int(f[2]), "x_max": _int(f[3]),
+                "y_min": _int(f[4]), "y_max": _int(f[5]),
+                "z_min": _int(f[6]), "z_max": _int(f[7]),
+            }
         elif tag == "Q":
             values = [num(v) for v in f[1:8]]
             for key, value in zip(("vmaxitems", "rmaxitems", "maxdensity", "pixels_x", "pixels_y"), values):
@@ -839,6 +847,21 @@ def analyze(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = froz
     elif len(surface_areas) > 1:
         errors.append(_issue("SURFACE_AREA_COUNT", f"{len(surface_areas)} Surface Area entries (type 3); expected 1"))
     active = [a for a in areas if a["active"]]
+    translation = state.get("translation") or {}
+    translated_xy = any(translation.get(k) not in (None, 0) for k in ("x_min", "x_max", "y_min", "y_max"))
+    unknown_xy = any(translation.get(k) is None for k in ("x_min", "x_max", "y_min", "y_max"))
+    active_splines = [a for a in active if a["type"] == 0]
+    if (translation.get("enabled") is True and active_splines and (translated_xy or unknown_xy) and not reference):
+        names = ", ".join(f"{a['index']} ('{a['name']}')" for a in active_splines)
+        warnings.append(_issue(
+            "TRANSLATION_SPLINE_BOUNDARY",
+            "applyTranslation is on with active spline areas " + names + "; live Forest Pack 9.4.3 checks "
+            "showed X/Y translation can move item pivots outside include splines or into exclude holes even "
+            "with Boundary Checking set to Point or Size. This validator cannot repair it: reduce the X/Y "
+            "translation extents or inspect forest_items positions and use a tested edge/falloff workflow",
+            areas=[a["index"] for a in active_splines], translation={k: translation.get(k) for k in
+                ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max")},
+        ))
     if not active:
         area_errors.append(_issue("NO_ACTIVE_AREA", "no area is active (stock presets ship their Surface Area "
                                   "inactive); set pf_aractivelist for the Surface Area or a spline area"))

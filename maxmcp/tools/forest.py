@@ -834,7 +834,7 @@ try (
     -- The report, still inside the try: a failure here also removes the placed nodes
     format "FPOK\n" to:ss
     local n = if (fpGeomBad f) > 0 then -1 else f.trees.count()
-    format "F|%|%|%|%|%|%|%|%\n" (fpEnc f.name) kind n (fpF f.units_x) (fpF f.units_y) (f.mode as string) (fpF (units.decodeValue "1m")) (fpPropV f #vmaxitems) to:ss
+    format "F|%|%|%|%|%|%|%|%|%|%|%|%|%|%|%\n" (fpEnc f.name) kind n (fpF f.units_x) (fpF f.units_y) (f.mode as string) (fpF (units.decodeValue "1m")) (fpPropV f #vmaxitems) (fpPropV f #applytranslation) (fpPropV f #transxmin) (fpPropV f #transxmax) (fpPropV f #transymin) (fpPropV f #transymax) (fpPropV f #transzmin) (fpPropV f #transzmax) to:ss
     local nl = f.namelist as array, cl = f.cobjlist as array, gl = f.geomlist as array, pl = f.problist as array
     for g = 1 to nl.count do (
         local c = if g <= cl.count then cl[g] else undefined
@@ -881,6 +881,13 @@ def _parse_from_library(report: list[str]) -> dict[str, Any]:
                           units_per_meter=float(f[7]))
             vmax = fh.num(f[8]) if len(f) > 8 else None
             result["viewport_max_items"] = None if vmax is None else int(vmax)
+            if len(f) >= 16:
+                result["translation"] = {
+                    "enabled": fh._flag(f[9]),
+                    "x_min": fh._int(f[10]), "x_max": fh._int(f[11]),
+                    "y_min": fh._int(f[12]), "y_max": fh._int(f[13]),
+                    "z_min": fh._int(f[14]), "z_max": fh._int(f[15]),
+                }
             result["warnings"] += [f"{code}: {detail}" for code, detail in
                                    _viewport_notes(result["count"], vmax)]
         elif tag == "G":
@@ -910,6 +917,18 @@ def _parse_from_library(report: list[str]) -> dict[str, Any]:
     unlinked = [i["name"] for i in result["items"] if i["geom_type"] == 2 and not i["source_linked"]]
     if unlinked:
         result["warnings"].append(f"item types without a linked source (empty items): {', '.join(unlinked)}")
+    translation = result.get("translation") or {}
+    active_splines = [a for a in result["areas"] if a["active"] and a["type"] == "spline"]
+    translated_xy = any(translation.get(k) not in (None, 0) for k in ("x_min", "x_max", "y_min", "y_max"))
+    unknown_xy = any(translation.get(k) is None for k in ("x_min", "x_max", "y_min", "y_max"))
+    if translation.get("enabled") is True and active_splines and (translated_xy or unknown_xy):
+        names = ", ".join(f"{a['index']} ('{a['name'] or 'unnamed'}')" for a in active_splines)
+        result["warnings"].append(
+            "TRANSLATION_SPLINE_BOUNDARY: applyTranslation is on with active spline areas " + names + "; "
+            "live Forest Pack 9.4.3 checks showed X/Y translation can move item pivots outside include splines "
+            "or into exclude holes even with Boundary Checking set to Point or Size. Reduce X/Y translation "
+            "extents or inspect forest_items positions and use a tested edge/falloff workflow"
+        )
     return result
 
 
@@ -938,6 +957,8 @@ def forest_from_library(
     then inactive, since areas add up); exclude_splines cut holes. A 3D item becomes the source of a new forest
     (items_per_m2 sets its density; default 300 cm tiles, about 160 per m2). matlib_renderer (vray, corona, ...)
     swaps materials for the item library's .mat ones by name. Fails with ZERO_ITEMS when nothing is scattered.
+    The result reads back applyTranslation and its X/Y/Z min/max extents. When translation is enabled with active
+    spline areas, it warns that Forest Pack can move item pivots beyond include/exclude boundaries.
     2D billboards and Forest Ivy (.fp) items can't be placed (placeable=false in forest_library).
     """
     if not isinstance(item, str) or not item.strip() or len(item) > 300:
@@ -1134,6 +1155,7 @@ def _validation(state: dict[str, Any], padded_gaps: set[int] | frozenset[int] = 
         "units": {"x": state.get("units_x"), "y": state.get("units_y"),
                   "per_meter": state.get("upm"), "lock_ratio": state.get("lock_ratio")},
         "direction": state.get("direction"),
+        "translation": state.get("translation"),
         "limits": {"viewport_max_items": state.get("vmaxitems"), "render_max_items": state.get("rmaxitems"),
                    "maxdensity_millions": state.get("maxdensity"), "candidate_cells": analysis["candidate_cells"],
                    "viewport_thinned": analysis["viewport_thinned"],

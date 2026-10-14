@@ -1102,8 +1102,8 @@ class ForestLibraryKindsTests(LibraryFixture):
         self.assertEqual(str(ctx.exception).count("no uuid, name or object finds it alone"), 2)
 
 
-def library_report(count=23473, kind="preset", extra=()):
-    lines = [f"F|{b64('Lawn')}|{kind}|{count}|203.2|25400|0|100",
+def library_report(count=23473, kind="preset", extra=(), translation="0|0|0|0|0|0|0"):
+    lines = [f"F|{b64('Lawn')}|{kind}|{count}|203.2|25400|0|100|100000|{translation}",
              f"G|1|2|100|{b64('_fp_wildgrass_09')}|{b64('_fp_wildgrass_09')}|n",
              f"A|1|3|1|0|{b64('Surface Area')}",
              f"A|2|0|1|1|{b64('Hole')}",
@@ -1239,6 +1239,22 @@ class ForestFromLibraryTests(LibraryFixture):
         out, _ = self.run_place(library_report())
         self.assertFalse(any(w.startswith("VIEWPORT_LIMIT") for w in out["warnings"]))
 
+    def test_library_translation_readback_warns_for_active_spline_areas(self):
+        include = f"A|3|0|1|0|{b64('Bed')}"
+        out, fake = self.run_place(library_report(translation="1|-10|10|-10|10|0|0", extra=[include]),
+                                   include_splines=["Bed"], exclude_splines=["Hole"])
+        self.assertIn("(fpPropV f #applytranslation)", fake.scripts[0])
+        for prop in ("transxmin", "transxmax", "transymin", "transymax", "transzmin", "transzmax"):
+            self.assertIn(f"(fpPropV f #{prop})", fake.scripts[0])
+        self.assertEqual(out["translation"], {"enabled": True, "x_min": -10, "x_max": 10,
+                                              "y_min": -10, "y_max": 10, "z_min": 0, "z_max": 0})
+        warning = next(w for w in out["warnings"] if w.startswith("TRANSLATION_SPLINE_BOUNDARY:"))
+        self.assertIn("Bed", warning)
+        self.assertIn("Hole", warning)
+        disabled, _ = self.run_place(library_report(translation="0|-10|10|-10|10|0|0"),
+                                     include_splines=["Bed"])
+        self.assertFalse(any(w.startswith("TRANSLATION_SPLINE_BOUNDARY:") for w in disabled["warnings"]))
+
     def test_3d_without_matlib_warns(self):
         out, _ = self.run_place(library_report(kind="3d", count=5), item="_fp_cane01")
         self.assertTrue(any("matlib_renderer" in w for w in out["warnings"]))
@@ -1286,10 +1302,11 @@ LISTS_OK = {"namelist": 2, "cobjlist": 2, "geomlist": 2, "problist": 2, "widthli
 
 
 def collect_lines(lengths=None, items=None, areas=None, surfaces=None, count="12933|1|0", mode=0, units=100.0,
-                  ar_len=None, caps=None, units_y=None, lock="1", distmode=0):
+                  ar_len=None, caps=None, units_y=None, lock="1", distmode=0, translation="0|0|0|0|0|0|0"):
     lengths = dict(LISTS_OK, **(lengths or {}))
     out = [f"N|{b64('Forest001')}|{mode}|{units}|{units if units_y is None else units_y}|{lock}|{b64('dense.bmp')}"
            f"|50|0|{distmode}|0|0|2|0|100|100"]
+    out.append("T|" + translation)
     if caps is not None:  # vmaxitems, rmaxitems, maxdensity, pixels_x, pixels_y, distmap, scalelope
         out.append("Q|" + caps)
     for name in fh.ITEM_LISTS:
@@ -1406,6 +1423,26 @@ class ForestValidateTests(unittest.TestCase):
         fine = [(1, "3", "1", "0", "u", "", "Surface Area"), (2, "0", "1", "0", "n", "Bed", "Bed"),
                 (3, "0", "1", "1", "n", "Hole", "Hole")]
         self.assertNotIn("EXCLUDE_BEFORE_INCLUDE", codes(fh.analyze(self.state(areas=fine))["warnings"]))
+
+    def test_translation_with_active_spline_areas_warns(self):
+        areas = [(1, "3", "0", "0", "u", "", "Surface Area"),
+                 (2, "0", "1", "0", "n", "Include", "Include"),
+                 (3, "0", "1", "1", "n", "Exclude", "Exclude")]
+        state = self.state(areas=areas, translation="1|-20|20|-20|20|0|0")
+        analysis = fh.analyze(state)
+        warning, = [w for w in analysis["warnings"] if w["code"] == "TRANSLATION_SPLINE_BOUNDARY"]
+        self.assertEqual(warning["areas"], [2, 3])
+        self.assertEqual(warning["translation"], {"x_min": -20, "x_max": 20, "y_min": -20,
+                                                   "y_max": 20, "z_min": 0, "z_max": 0})
+        out = forest._validation(state)
+        self.assertEqual(out["translation"], state["translation"])
+        zero_xy = self.state(areas=areas, translation="1|0|0|0|0|-50|50")
+        self.assertNotIn("TRANSLATION_SPLINE_BOUNDARY", codes(fh.analyze(zero_xy)["warnings"]))
+        no_active_spline = self.state(areas=[(1, "3", "1", "0", "u", "", "Surface Area")],
+                                      translation="1|-20|20|-20|20|0|0")
+        self.assertNotIn("TRANSLATION_SPLINE_BOUNDARY", codes(fh.analyze(no_active_spline)["warnings"]))
+        reference = self.state(areas=areas, distmode=fh.REFERENCE_MODE, translation="1|-20|20|-20|20|0|0")
+        self.assertNotIn("TRANSLATION_SPLINE_BOUNDARY", codes(fh.analyze(reference)["warnings"]))
 
     def test_fix_plan(self):
         state = self.state(
