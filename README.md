@@ -157,7 +157,6 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `set_modifier_property` | Set a modifier parameter on one or many objects |
 | `collapse_modifier_stack` | Collapse the stack |
 | `make_modifier_unique` | De-instance a shared modifier |
-| `inspect_modifier_properties` | Compatibility alias for `inspect_properties(target="modifier")` |
 
 ### Modeling
 

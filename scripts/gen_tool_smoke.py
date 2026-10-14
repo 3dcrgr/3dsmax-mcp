@@ -96,8 +96,6 @@ SKIP_DEFAULT = {
     "discover_plugin_classes",
     "execute_maxscript",
     "execute_python",
-    # Compatibility aliases stay callable but are not part of the default smoke pass.
-    "inspect_modifier_properties",
 }
 
 # Explicit inputs — ${SMOKE_TARGET} / ${SMOKE_SPAWN} replaced at runtime.
@@ -194,7 +192,6 @@ CUSTOM: dict[str, dict] = {
     "inspect_plugin_class": {"class_name": "Box"},
     "inspect_plugin_constructor": {"class_name": "Box"},
     "inspect_plugin_instance": {"name": SMOKE_TARGET},
-    "inspect_modifier_properties": {"name": SMOKE_TARGET, "modifier_index": 1},
 }
 
 MUTATE_TOOLS = {

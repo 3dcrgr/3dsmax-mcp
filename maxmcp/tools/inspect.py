@@ -239,12 +239,6 @@ def inspect_properties(
 
 
 @mcp.tool()
-def inspect_modifier_properties(name: str, modifier_index: int) -> str:
-    """Compatibility alias for inspect_properties(target="modifier")."""
-    return inspect_properties(name, target="modifier", modifier_index=modifier_index)
-
-
-@mcp.tool()
 def introspect_osl(
     class_name: str = "",
     name: str = "",
