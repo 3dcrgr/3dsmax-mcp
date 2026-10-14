@@ -353,7 +353,7 @@ and existing procedural skies use the provider's dome or environment binding.
 | `list_tyflow_operators` | Query the cached tyFlow operator manifest without touching Max |
 | `get_tyflow_graph` | Read events, operators, properties, ledger edges, and wiring staleness |
 | `tyflow_apply_patch` | Apply a batch of tyFlow graph operations as one verified transaction |
-| `connect_tyflow_operator` | Connect or retarget a test/Send Out operator to an event |
+| `connect_tyflow_operator` | Connect or retarget a test/Send Out operator to an event, optionally creating the Send Out |
 | `disconnect_tyflow_operator` | Disconnect an operator output and remove its ledger edge |
 | `set_tyflow_wiring_ledger` | Reconcile recorded graph wiring after external or visual edits |
 | `tyflow_event_census` | Count particles per event at probe frames with temporary instrumentation |
@@ -363,7 +363,6 @@ and existing procedural skies use the provider's dome or environment binding.
 | `set_tyflow_physx` | Object-level PhysX settings |
 | `add_tyflow_collision` | Collision operator + collider list |
 | `add_tyflow_event` | Add an event |
-| `connect_tyflow_events` | Wire Send Out destinations |
 | `remove_tyflow_element` | Remove operator or event |
 | `get_tyflow_particle_count` | Particle count at a frame |
 | `get_tyflow_particles` | Particle data rows |

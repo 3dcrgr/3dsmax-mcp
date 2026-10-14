@@ -66,7 +66,7 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "set_tyflow_shape",
             "set_tyflow_physx",
             "add_tyflow_collision",
-            "connect_tyflow_events",
+            "connect_tyflow_operator",
             "get_tyflow_particle_count",
             "get_tyflow_particles",
             "reset_tyflow_simulation",

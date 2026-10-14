@@ -78,7 +78,7 @@ SKIP_DEFAULT = {
     "list_tyflow_operator_types",
     "modify_tyflow_operator",
     "add_tyflow_event",
-    "connect_tyflow_events",
+    "connect_tyflow_operator",
     "set_tyflow_shape",
     "set_tyflow_physx",
     "add_tyflow_collision",

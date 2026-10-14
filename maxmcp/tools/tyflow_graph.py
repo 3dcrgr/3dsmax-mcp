@@ -67,10 +67,32 @@ def get_tyflow_graph(
 
 
 def _run_connect_maxscript(
-    name: str, from_event: str, from_operator: str, to_event: str | None
+    name: str,
+    from_event: str,
+    from_operator: str,
+    to_event: str | None,
+    create_if_missing: bool = False,
 ) -> dict[str, Any]:
-    """Shared connect/disconnect MAXScript. `to_event=None` means disconnect."""
+    """Shared connect/disconnect MAXScript. `to_event=None` means disconnect.
+
+    `create_if_missing` adds a Send Out named `from_operator` when the source
+    event has no operator of that name (connect only). Nothing is created when
+    the target event is missing.
+    """
     from .tyflow import HELPERS  # lazy: avoids import cycle during registration
+    create_block = ""
+    if create_if_missing and to_event is not None:
+        create_block = f"""
+        if op == undefined and (findEventSubAnim flow "{safe_string(to_event)}") != undefined do (
+            local srcReal = undefined
+            try (srcReal = src.object) catch ()
+            if srcReal == undefined do srcReal = src
+            try (
+                op = srcReal.Event.addOperator "Send Out" -1
+                op.Operator.setName "{safe_string(from_operator)}"
+                created = true
+            ) catch (err = getCurrentException())
+        )"""
     if to_event is None:
         action = 'if err == "" do (try (realOp.disconnect(); ok = true) catch (err = getCurrentException()))'
         target_block = ""
@@ -92,12 +114,14 @@ if flow == undefined then (
 ) else (
     local err = ""
     local ok = false
+    local created = false
     local src = findEventSubAnim flow "{safe_string(from_event)}"
     if src == undefined do err = "Event not found: {safe_string(from_event)}"
     local op = undefined
     if err == "" do (
         op = findOperatorSubAnim src "{safe_string(from_operator)}"
-        if op == undefined do err = "Operator not found: {safe_string(from_operator)}"
+        {create_block}
+        if err == "" and op == undefined do err = "Operator not found: {safe_string(from_operator)}"
     )
     local realOp = undefined
     if err == "" do (
@@ -107,7 +131,7 @@ if flow == undefined then (
     {target_block}
     {action}
     if ok then (
-        "{{\\"ok\\":true}}"
+        "{{\\"ok\\":true,\\"created\\":" + (created as string) + "}}"
     ) else (
         "{{\\"error\\":\\"" + (esc (err as string)) + "\\"}}"
     )
@@ -129,24 +153,40 @@ def _rewrite_ledger_edges(
 
 @mcp.tool()
 def connect_tyflow_operator(
-    name: str, from_event: str, from_operator: str, to_event: str
+    name: str,
+    from_event: str,
+    from_operator: str,
+    to_event: str,
+    create_if_missing: bool = False,
 ) -> str:
     """Connect a test/Send Out operator's output to a target event (documented API).
 
     Re-connecting an operator that already has a connection re-targets it; the
     ledger edge for (from_event, from_operator) is replaced accordingly.
+    create_if_missing adds a Send Out named from_operator to from_event when no
+    operator of that name exists (created_send_out reports it).
     """
-    outcome = _run_connect_maxscript(name, from_event, from_operator, to_event)
+    outcome = _run_connect_maxscript(
+        name, from_event, from_operator, to_event, create_if_missing=create_if_missing
+    )
     if "error" in outcome:
         return json.dumps(outcome)
+    created = bool(outcome.get("created"))
     payload: dict[str, Any] = {
         "name": name,
         "from_event": from_event,
         "from_operator": from_operator,
         "to_event": to_event,
         "connected": True,
+        "created_send_out": created,
     }
-    payload.update(_rewrite_ledger_edges(name, from_event, from_operator, to_event))
+    payload.update(
+        ledger_update(
+            name,
+            replace_edge=(from_event, from_operator, to_event),
+            record_ops={f"{from_event}/{from_operator}": "Send Out"} if created else None,
+        )
+    )
     return json.dumps(payload)
 
 
