@@ -565,10 +565,12 @@ def create(specs, requested="current", unit="scene", expected_context=None) -> d
         try: entry["state"] = summary(inspect_one(resource["owner_ref"], family))
         except Exception as error: entry.update(committed=True, inspection_error=str(error))
         actual.append(entry)
-    return {"status": applied["status"], "renderer": chosen, "lights": actual, "resources": applied["resources"],
+    out = {"status": applied["status"], "renderer": chosen, "lights": actual, "resources": applied["resources"],
             "verification": applied["verification"], "transaction": applied["transaction"],
             "requested": [s.model_dump(exclude_none=True) for s in specs],
             "compatible_with_production": chosen["class_id"] == context["renderer"]["class_id"]}
+    _warn_uninspected(out, actual)
+    return out
 
 
 def inspect_one(owner_ref: dict, family: str | None = None) -> dict:
@@ -863,4 +865,14 @@ def edit(edits: list[dict], unit="scene") -> dict:
     for ref, family in inspected:
         try: result["lights"].append(summary(inspect_one(ref, family)))
         except Exception as error: result["lights"].append({"owner_ref": ref, "inspection_error": str(error), "committed": True})
+    _warn_uninspected(result, result["lights"])
     return result
+
+
+def _warn_uninspected(result: dict[str, Any], lights: list[dict[str, Any]]) -> None:
+    """The commit is verified natively; a failed read-back leaves its state unreported."""
+    failed = [entry for entry in lights if "inspection_error" in entry]
+    if failed:
+        result.setdefault("warnings", []).append(
+            f"{len(failed)} committed light(s) could not be inspected afterwards; their state is not "
+            f"reported (see inspection_error): {failed[0]['inspection_error']}")
