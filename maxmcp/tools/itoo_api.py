@@ -229,6 +229,11 @@ def effect_xml(code: str, title: str) -> str:
 
 
 _EFFECT_LIB = r'''
+fn iaPreserveEffectReferences base staged = (
+    for p in #(#efpainode,#efpaspline,#efpatexmap,#efpacontref) do (
+        if isProperty base p and isProperty staged p do setProperty staged p ((getProperty base p) as array)
+    )
+)
 fn iaEffectsProps base = (
     local props=#()
     for p in getPropNames base where matchPattern (p as string) pattern:"ef*" do (
@@ -242,6 +247,14 @@ fn iaEffectValue v = (
         "t"+(rcH v)+":"+(rcEncode v.name)+":"+(rcEncode ((classOf v) as string))
     ) else rcV v
 )
+fn iaControllerIdentity base i = (
+    local owner=base.efpacontref[i], sub=base.efpacontanim[i]+1
+    if owner==undefined then "u" else (
+        local ctrl=try ((getSubAnim owner sub).controller) catch undefined
+        (rcH owner)+":"+(rcEncode ((classOf owner) as string))+":"+(sub as string)+":"+
+        (if ctrl==undefined then "0" else rcH ctrl)+":"+(rcEncode ((classOf ctrl) as string))
+    )
+)
 fn iaEffectsToken obj base = (
     local ss=stringStream ""
     format "%|%|" (rcH obj) (rcH base) to:ss
@@ -250,6 +263,7 @@ fn iaEffectsToken obj base = (
         local a=getProperty base p
         for v in a do format "%|" (iaEffectValue v) to:ss
     )
+    for i=1 to base.efpaid.count where base.efpatype[i]==2 do format "%|" (iaControllerIdentity base i) to:ss
     rcHash (ss as string)
 )
 fn iaEffectsReport obj base = (
@@ -261,6 +275,7 @@ fn iaEffectsReport obj base = (
         rcRow ss #("A", p as string, a.count as string)
         for i=1 to a.count do rcRow ss #("V", p as string, i as string, iaEffectValue a[i])
     )
+    for i=1 to base.efpaid.count where base.efpatype[i]==2 do rcRow ss #("C",i as string,iaControllerIdentity base i)
     format "END\n" to:ss
     ss as string
 )
@@ -288,7 +303,7 @@ def parameter_definitions(document: ET.Element, allow_references: bool = False) 
     rows, names, ids = [], set(), set()
     for definition in definitions:
         kind, name = definition.get("numtype"), definition.get("name", "")
-        reference = definition.get("type") in ("node", "spline", "texture")
+        reference = definition.get("type") in ("node", "spline", "texture", "controller")
         if not ((reference and allow_references) or (definition.get("type") == "numerical" and kind in NUMERIC_KINDS)):
             raise ValueError("PARAMETER_TYPE_UNSUPPORTED: only measured numeric/node/spline/texture parameters are supported")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) or name.lower() in names:
@@ -298,6 +313,8 @@ def parameter_definitions(document: ET.Element, allow_references: bool = False) 
             raise ValueError("parameter IDs must be unique")
         names.add(name.lower()); ids.add(ident)
         if reference:
+            if definition.get("type") == "controller" and set(definition.attrib) - {"id", "name", "description", "type"}:
+                raise ValueError("CONTROLLER_SCHEMA_UNSUPPORTED: unmeasured controller definition attributes")
             rows.append({"id": ident, "name": name, "kind": definition.get("type"),
                          "description": definition.get("description", "")})
             continue
@@ -323,7 +340,7 @@ def numeric_definitions(document: ET.Element) -> list[dict[str, Any]]:
 
 def bind_definitions(rows: list[dict[str, Any]], bindings: dict[str, Any] | None) -> None:
     """Require an explicit binding, including explicit null, for every reference."""
-    refs = [r for r in rows if r["kind"] in ("node", "spline", "texture")]
+    refs = [r for r in rows if r["kind"] in ("node", "spline", "texture", "controller")]
     if bindings is None:
         bindings = {}
     if not isinstance(bindings, dict):
@@ -343,12 +360,37 @@ def bind_definitions(rows: list[dict[str, Any]], bindings: dict[str, Any] | None
         if row["id"] in touched:
             raise ValueError("duplicate reference binding")
         touched.add(row["id"])
-        row["binding_literal"] = texture_literal(value) if row["kind"] == "texture" else reference_literal(value)
+        row["binding_literal"] = binding_literal(value, row["kind"])
     if len(touched) != len(refs):
         raise ValueError("REFERENCE_BINDINGS_REQUIRED: explicitly bind every node/spline/texture parameter, or use null")
 
 
 REFERENCE_KINDS = {1: ("node", "efpainode"), 5: ("spline", "efpaspline"), 3: ("texture", "efpatexmap")}
+
+
+def binding_literal(value: Any, kind: str) -> str:
+    if kind == "texture":
+        return texture_literal(value)
+    if kind == "controller":
+        return controller_literal(value)
+    return reference_literal(value)
+
+
+def controller_literal(value: Any) -> str:
+    if value is None:
+        return "#(undefined,0)"
+    keys = {"owner_handle", "owner_class", "subanim", "controller_handle", "controller_class"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError("controller binding requires canonical owner/track/controller identity or null")
+    for key in ("owner_handle", "controller_handle", "subanim"):
+        if type(value[key]) is not int or not 0 < value[key] < 2**63:
+            raise ValueError("controller handles/subanim must be positive integers")
+    if value["subanim"] > 100000:
+        raise ValueError("controller subanim exceeds supported range")
+    for key in ("owner_class", "controller_class"):
+        if not isinstance(value[key], str) or not value[key] or len(value[key]) > 1024 or "\x00" in value[key]:
+            raise ValueError("controller classes must be nonempty bounded strings")
+    return f'(iaEffectController {value["owner_handle"]} "{rc._b64(value["owner_class"])}" {value["subanim"]} {value["controller_handle"]} "{rc._b64(value["controller_class"])}")'
 
 
 def effect_value(value: str) -> Any:
@@ -390,6 +432,16 @@ def reference_literal(value: Any) -> str:
 
 
 _REFERENCE_LIB = '''
+fn iaEffectController handle cls sub ctrlHandle ctrlCls = (
+    local owner=getAnimByHandle handle
+    if owner==undefined or ((classOf owner) as string)!=(rcDecode cls) do throw "STALE_CONTROLLER_REFERENCE: owner changed"
+    if sub>owner.numSubs do throw "STALE_CONTROLLER_REFERENCE: track no longer exists"
+    local ctrl=try ((getSubAnim owner sub).controller) catch undefined
+    if ctrl==undefined do throw "CONTROLLER_NOT_BOUND: track has no controller"
+    if (rcH ctrl)!=(ctrlHandle as string) or ((classOf ctrl) as string)!=(rcDecode ctrlCls) do throw "STALE_CONTROLLER_REFERENCE: controller changed"
+    if superClassOf ctrl!=FloatController do throw "CONTROLLER_TYPE_UNSUPPORTED: only verified scalar float controllers are supported"
+    #(owner,sub-1)
+)
 fn iaEffectMap text handle cls = (
     local m=getAnimByHandle handle
     if m==undefined do throw "STALE_MAP_REFERENCE: map no longer exists"
@@ -451,6 +503,19 @@ def parameter_rows(state: dict[str, Any], effect: str = "") -> list[dict[str, An
             row.update(kind=kind, value=at(prefix+"val", i), min=at(prefix+"min", i),
                        max=at(prefix+"max", i), default=at(prefix+"def", i), limited=at("efpalimit", i),
                        writable=True)
+        elif row["native_type"] == 2:
+            definition = next((p for p in parse_effect_xml(by_id[owner]["xml"]).findall("parameter")
+                               if p.get("id", "").lower() == str(ident).lower()), None)
+            if definition is None or definition.get("name") != row["name"] or definition.get("type") != "controller":
+                raise RailCloneError("PARAMETER_SCHEMA_MISMATCH", "XML and native controller definition differ")
+            subtype = at("efpacontype", i)
+            bindings = state.get("controller_bindings", {})
+            if i+1 not in bindings:
+                raise RailCloneError("INVALID_READBACK", "controller identity is missing")
+            value = bindings[i+1]
+            row.update(kind="controller", value=value, native_controller_type=subtype,
+                       bound=value is not None and value["controller_handle"] != 0,
+                       writable=subtype == 0 and (value is None or value["controller_handle"] != 0))
         elif row["native_type"] in REFERENCE_KINDS:
             kind, prop = REFERENCE_KINDS[row["native_type"]]
             definition = next((p for p in parse_effect_xml(by_id[owner]["xml"]).findall("parameter")
@@ -473,10 +538,11 @@ def append_numeric_parameters(rows: list[dict[str, Any]], owner: str) -> str:
         return ""
     script = 'local pc=staged.efpaid.count\n'
     for i, row in enumerate(rows):
-        if row["kind"] in ("node", "spline", "texture"):
+        if row["kind"] in ("node", "spline", "texture", "controller"):
             var = f'import_reference_{i}'
             script += f'local {var}={row["binding_literal"]}\n'
-            script += f'if {var}!=undefined and ({var}==obj or (refs.dependencyLoopTest {var} obj) or (refs.dependencyLoopTest {var} base)) do throw "DEPENDENCY_CYCLE: source depends on target"\n'
+            source = f'{var}[1]' if row["kind"] == "controller" else var
+            script += f'if {source}!=undefined and ({source}==obj or (refs.dependencyLoopTest {source} obj) or (refs.dependencyLoopTest {source} base)) do throw "DEPENDENCY_CYCLE: source depends on target"\n'
             if row["kind"] == "spline":
                 script += f'if {var}!=undefined and superClassOf {var}.baseObject!=Shape do throw "NOT_SPLINE: binding requires a shape"\n'
     for prop in ("efpaeffid", "efpatype", "efpaname"):
@@ -487,15 +553,19 @@ if next_{prop}.count==0 do next_{prop}=for j=1 to pc collect {default}
 if next_{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"
 '''
         for i, row in enumerate(rows):
-            reference = row["kind"] in ("node", "spline", "texture")
+            reference = row["kind"] in ("node", "spline", "texture", "controller")
             subtype, prefix, typ = (0, "", "") if reference else NUMERIC_KINDS[row["kind"]]
             string_fields = {"efpaid": row["id"], "efpaeffid": owner,
                              "efpaname": row["name"], "efpadesc": row["description"]}
             if prop in string_fields:
                 value = f'(rcDecode "{rc._b64(string_fields[prop])}")'
             elif reference and prop == "efpatype":
-                value = str({"node": 1, "spline": 5, "texture": 3}[row["kind"]])
-            elif reference and prop == {"node": "efpainode", "spline": "efpaspline", "texture": "efpatexmap"}[row["kind"]]:
+                value = str({"node": 1, "spline": 5, "texture": 3, "controller": 2}[row["kind"]])
+            elif row["kind"] == "controller" and prop == "efpacontref":
+                value = f'import_reference_{i}[1]'
+            elif row["kind"] == "controller" and prop == "efpacontanim":
+                value = f'import_reference_{i}[2]'
+            elif reference and prop == {"node": "efpainode", "spline": "efpaspline", "texture": "efpatexmap", "controller": "efpacontref"}[row["kind"]]:
                 value = f'import_reference_{i}'
             elif prop == "efpanumtype":
                 value = str(subtype)
@@ -524,7 +594,12 @@ def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect
     null to clear. Spline bindings require shapes; cycles and stale identities are
     refused. Texture bindings require {name, handle, class} identities or null;
     handles resolve existing texture maps only and never create a map. Controller
-    and curve writes are refused. XML/native schema must agree.
+    bindings require the canonical owner/track/controller identity from inspection;
+    subanim is 1-based, native storage is 0-based. Only measured scalar float tracks
+    with native controller type 0 are writable. Source keys/values are not edited.
+    Animated evaluation is unverified: live trees.update returned frame-zero values
+    after a time change. Do not infer animated output from binding readback.
+    Curve writes and other controller subtypes are refused. XML/native schema must agree.
     Does not build or compile-check; verify using forest_items(refresh_surfaces=true).
     """
     if action not in ("inspect", "set"):
@@ -551,15 +626,18 @@ def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect
             touched.add(row["index"])
             if not row["writable"]:
                 raise ValueError("PARAMETER_TYPE_UNSUPPORTED: this parameter type is not supported")
-            if row["native_type"] in REFERENCE_KINDS:
-                kind, prop = REFERENCE_KINDS[row["native_type"]]
-                literal = texture_literal(value) if kind == "texture" else reference_literal(value)
+            if row["native_type"] in REFERENCE_KINDS or row["native_type"] == 2:
+                kind, prop = ("controller", "efpacontref") if row["native_type"] == 2 else REFERENCE_KINDS[row["native_type"]]
+                literal = binding_literal(value, kind)
                 var = f'next_reference_{row["index"]}'
                 writes.append(f'local {var}={literal}')
-                writes.append(f'if {var}!=undefined and ({var}==obj or (refs.dependencyLoopTest {var} obj) or (refs.dependencyLoopTest {var} base)) do throw "DEPENDENCY_CYCLE: source depends on the target"')
+                source = f'{var}[1]' if kind == "controller" else var
+                writes.append(f'if {source}!=undefined and ({source}==obj or (refs.dependencyLoopTest {source} obj) or (refs.dependencyLoopTest {source} base)) do throw "DEPENDENCY_CYCLE: source depends on the target"')
                 if kind == "spline":
                     writes.append(f'if {var}!=undefined and superClassOf {var}.baseObject!=Shape do throw "NOT_SPLINE: reference requires a shape"')
-                writes.append(f'staged.{prop}[{row["index"]}]={var}')
+                writes.append(f'staged.{prop}[{row["index"]}]={source}')
+                if kind == "controller":
+                    writes.append(f'staged.efpacontanim[{row["index"]}]={var}[2]')
                 continue
             _, prefix, typ = NUMERIC_KINDS[row["kind"]]
             literal = _literal(value, typ)
@@ -574,6 +652,7 @@ if base.mode!=0 do throw "CUSTOM_EDIT_UNSUPPORTED: requires procedural mode"
 if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: read again"
 local staged=undefined
 with undo off (staged=copy base
+iaPreserveEffectReferences base staged
 {chr(10).join(writes)})
 if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: state changed while staging"
 if fpBusy() do throw "USER_BUSY: an undo operation became active"
@@ -587,7 +666,8 @@ catch (if owns do theHold.Cancel(); throw())
         state = forest_effects(name); rows = parameter_rows(state, effect)
     return {"action": action, "parameters": rows, "effects_token": state["effects_token"],
             "read_only": action == "inspect", "undoable": action == "set", "rebuilt": False,
-            "refresh_required": action == "set", "compile_verified": False}
+            "refresh_required": action == "set", "compile_verified": False,
+            "controller_animation_verified": False if any(r["kind"] == "controller" for r in rows) else None}
 
 
 @mcp.tool()
@@ -622,8 +702,11 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     existing maps are reused, not recreated or serialized into the preset.
     export of references requires export_reference_definitions=true: the file
     contains definitions only, not scene bindings. required_bindings lists the
-    parameters that must be bound explicitly on the next load. Controller
-    and curve files are refused. No source nodes are created or serialized.
+    parameters that must be bound explicitly on the next load. Controller bindings
+    require canonical owner/track/controller identities for measured scalar float
+    tracks (native type 0); sources are reused and never keyed/edited. Curve files
+    and unmeasured controller definition attributes are refused. No source nodes
+    are created or serialized.
     export writes an effect with current numeric values as defaults to a new absolute .eff path; existing
     files are never overwritten. Export does not edit Max and is not undoable.
     """
@@ -684,7 +767,7 @@ if (rcShared obj).count>0 do throw "SHARED_BASE: make the Forest base unique fir
 if base.mode!=0 do throw "CUSTOM_EDIT_UNSUPPORTED: effect edits currently require procedural mode"
 if iaEffectsToken obj base!="{expected_effects}" do throw "STALE_EFFECTS: effects changed; read again"
 local staged=undefined
-with undo off (staged=copy base)
+with undo off (staged=copy base; iaPreserveEffectReferences base staged)
 local rowProps=#(#efidlist,#efnamelist,#efxmllist,#efenablelist)
 local n=base.efidlist.count
 for p in rowProps do if (getProperty base p).count!=n do throw "EFFECT_LIST_MISMATCH: effect arrays have unequal lengths"
@@ -786,6 +869,14 @@ base=obj.baseObject
             result["arrays"][row[1]] = {"count": int(row[2]), "values": []}
         elif row[0] == "V":
             result["arrays"][row[1]]["values"].append(effect_value(row[3]))
+        elif row[0] == "C":
+            value = None
+            if row[2] != "u":
+                owner_handle, owner_class, subanim, ctrl_handle, ctrl_class = row[2].split(":", 4)
+                value = {"owner_handle": int(owner_handle), "owner_class": rc._unb64(owner_class),
+                         "subanim": int(subanim), "controller_handle": int(ctrl_handle),
+                         "controller_class": rc._unb64(ctrl_class)}
+            result.setdefault("controller_bindings", {})[int(row[1])] = value
     arrays = {p: a["values"] for p, a in result["arrays"].items()}
     for i, ident in enumerate(arrays.get("efidlist", [])):
         e = {"id": ident, "index": i + 1}
@@ -816,7 +907,7 @@ base=obj.baseObject
                 if len(matches) != 1 or not matches[0]["writable"]:
                     raise ValueError("PARAMETER_TYPE_UNSUPPORTED: parameter cannot be exported")
                 row = matches[0]
-                if row["kind"] in ("node", "spline", "texture"):
+                if row["kind"] in ("node", "spline", "texture", "controller"):
                     if not export_reference_definitions:
                         raise ValueError("REFERENCE_EXPORT_CONFIRMATION_REQUIRED: definitions omit scene bindings; set export_reference_definitions=true")
                     result.setdefault("required_bindings", []).append({"id": row["id"], "name": row["name"], "kind": row["kind"]})

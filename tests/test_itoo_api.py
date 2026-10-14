@@ -564,5 +564,61 @@ class TextureParameterTests(unittest.TestCase):
         with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
 
 
+class ControllerParameterTests(unittest.TestCase):
+    def state(self):
+        state=ReferenceParameterTests().state()
+        state['arrays']['efpatype']['values']=[2]
+        state['effects'][0]['xml']=state['effects'][0]['xml'].replace('type="node"','type="controller"')
+        state['arrays'].update(efpacontype={'values':[0]},efpacontref={'values':[None]},efpacontanim={'values':[2]})
+        state['controller_bindings']={1:{'owner_handle':123,'owner_class':'ParamBlock2','subanim':3,'controller_handle':456,'controller_class':'bezier_float'}}
+        return state
+
+    def test_controller_identity_read(self):
+        row=api.parameter_rows(self.state())[0]
+        self.assertEqual(row['kind'],'controller');self.assertTrue(row['writable'])
+        self.assertEqual(row['value']['subanim'],3)
+
+    def test_controller_identity_validation(self):
+        value=self.state()['controller_bindings'][1]
+        self.assertEqual(api.controller_literal(None),'#(undefined,0)')
+        for wrong in ({}, 'track', {**value,'subanim':0},{**value,'controller_handle':True},{**value,'owner_class':''}):
+            with self.subTest(wrong=wrong),self.assertRaises(ValueError):api.controller_literal(wrong)
+
+    def test_controller_write_preserves_references(self):
+        state=self.state()
+        with patch.object(api,'forest_effects',return_value=state),patch.object(api.rc,'_send',return_value='PARAMETERS_WRITTEN') as send:
+            result=api.forest_effect_parameters('forest',action='set',values={'Source':state['controller_bindings'][1]},expected_effects=TOKEN)
+        script=send.call_args.args[0]
+        for text in ('iaPreserveEffectReferences base staged','STALE_CONTROLLER_REFERENCE','FloatController','staged.efpacontanim[1]=next_reference_1[2]','sub-1'):
+            self.assertIn(text,script)
+        self.assertFalse(result['controller_animation_verified'])
+
+    def test_unmeasured_subtype_and_missing_identity(self):
+        state=self.state();state['arrays']['efpacontype']['values']=[2]
+        self.assertFalse(api.parameter_rows(state)[0]['writable'])
+        del state['controller_bindings']
+        with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
+
+    def test_controller_import_initialization(self):
+        state=self.state();rows=api.parameter_definitions(api.parse_effect_xml(state['effects'][0]['xml']),allow_references=True)
+        api.bind_definitions(rows,{'Source':state['controller_bindings'][1]})
+        script=api.append_numeric_parameters(rows,'owner')
+        self.assertIn('append next_efpatype 2',script)
+        self.assertIn('append next_efpacontref import_reference_0[1]',script)
+        self.assertIn('append next_efpacontanim import_reference_0[2]',script)
+        self.assertIn('refs.dependencyLoopTest import_reference_0[1] obj',script)
+
+    def test_unmeasured_controller_schema_refused(self):
+        doc=api.parse_effect_xml(self.state()['effects'][0]['xml'].replace('type="controller"','type="controller" contype="vector"'))
+        with self.assertRaisesRegex(ValueError,'CONTROLLER_SCHEMA_UNSUPPORTED'):api.parameter_definitions(doc,allow_references=True)
+
+    def test_effect_staging_reference_guard(self):
+        with patch.object(api.rc,'_send',return_value=f'ITOOEFFECTS\nT|{TOKEN}\nEND\n') as send:
+            api.forest_effects('forest',action='toggle',effect='id',expected_effects=TOKEN)
+        self.assertIn('copy base; iaPreserveEffectReferences base staged',send.call_args.args[0])
+        for prop in ('efpainode','efpaspline','efpatexmap','efpacontref'):self.assertIn('#'+prop,api._EFFECT_LIB)
+        self.assertIn('iaControllerIdentity base i',api._EFFECT_LIB)
+
+
 if __name__ == "__main__":
     unittest.main()

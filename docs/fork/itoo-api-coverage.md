@@ -315,3 +315,36 @@ sampler suspension. NtCreateFile/NtOpenFile account for about 37.04 sampled
 seconds; this does not identify the file, caller or external source of delay.
 Saved own fixture, normal quit 8.910 seconds, client retained, observer exit
 code 0 and PID disappearance. Evidence: diagnostics/itoo-textures-20261014/.
+
+## Scalar controller bindings and reference preservation — 2026-10-14
+
+Measured controller parameter type 2 and the scalar storage case with native
+`efpacontype=0`. `efpacontref` holds the track's parameter-block owner, while
+`efpacontanim` is the zero-based subanim index. A direct controller or the scene
+node's base object did not evaluate the measured height track. The correct
+parameter-block/index binding returned 13.5.
+
+`forest_effect_parameters` now exposes canonical owner/track/controller identity
+and can rebind verified FloatController tracks or explicitly clear them. Public
+`subanim` is one-based; native storage is zero-based. Fresh handles, owner and
+controller class guards, type checks and dependency checks apply. Tokens include
+the selected controller identity, so replacing the controller invalidates them.
+No controller values, keys or expressions are written by the binding tools.
+
+`forest_effects` imports scalar controller definitions with required explicit
+bindings and exports definitions using the existing opt-in contract. Extra
+controller XML attributes are refused until measured. Other controller subtype
+writes and curve definitions remain unsupported.
+
+**Fixed bug:** `copy base` cloned linked parameter blocks during staging and
+broke source linkage. Both effect edit paths now restore the four external
+reference arrays before modifying the staged copy: object, spline, texture and
+controller owner. Live checks preserve canonical controller and texture identity
+through load, toggle, move, parameter set and remove. Scalar rebind 13.5→29.5,
+null clearing, portable round trips and replacing the source controller passed.
+
+**Animation limitation:** after setting the source track to 47.5 at frame 10,
+`forest_items(refresh_surfaces=true)` returned frame-zero Z=31.5. Reapplying the
+binding did not change this. The cause is unresolved; do not claim animated
+output works. Responses explicitly say `controller_animation_verified=false`.
+Storage/binding checks and scalar output checks do not establish time evaluation.
