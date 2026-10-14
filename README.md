@@ -17,7 +17,7 @@ Verified and deployed improvements are published on the fork's default branch, `
 
 ## At a glance
 
-Forest Effects supports guarded ordering, numeric parameters, object, spline, existing texture-map, and scalar `FloatController` bindings. Scalar bindings use a source-linked expression driver on Forest's animated real parameter track; `forest_effect_parameters(action="repair_animation")` migrates earlier bindings that sampled frame zero. `.eff` import requires explicit scene bindings; export writes portable definitions with required bindings listed for the next import. Curve definitions allocate native slots on the staged copy before commit, with default linear points and parameter-ID preservation during removal. `forest_effect_curves` remains read-only; animated curve reordering, curve point editing and custom `.eff` curve data remain unsupported. Stored effect code has no public compile-success signal. See [iToo coverage](docs/fork/itoo-api-coverage.md).
+Forest Effects supports guarded ordering, numeric parameters, object, spline, existing texture-map, and scalar `FloatController` bindings. Scalar bindings use a source-linked expression driver on Forest's animated real parameter track; `forest_effect_parameters(action="repair_animation")` migrates earlier bindings that sampled frame zero. `.eff` import requires explicit scene bindings; export writes portable definitions with required bindings listed for the next import. Curve definitions allocate native slots on the staged copy before commit, with neutral flat y=1 points and parameter-ID preservation during removal. `forest_effect_curves` remains read-only; animated curve reordering, curve point editing and custom `.eff` curve data remain unsupported. Stored effect code has no public compile-success signal. See [iToo coverage](docs/fork/itoo-api-coverage.md).
 
 - **209 tools:** all 179 of upstream's, plus 30 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
@@ -534,3 +534,7 @@ uv run python -m unittest discover -s tests
 ## License
 
 [MIT](LICENSE), as upstream.
+
+### Forest Effects verification, 2026-10-14
+
+Issues #43 and #45 passed deployed scratch-Max 2027 checks: source animation before/after save-reload, numeric-before-curves import, static curve reindexing, and malformed-slot refusal. The new repair action requires reloading the Python MCP server and the updated native bridge. Only the Max 2027 bridge was rebuilt; Setup/release distribution remains pending. See [verification and hashes](docs/fork/forest-effects-verification-2026-10-14.md).

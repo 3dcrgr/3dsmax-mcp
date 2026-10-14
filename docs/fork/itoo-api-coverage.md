@@ -398,7 +398,7 @@ safe mode. Native SHA256: 2f033113935c1bcdb690d487dca9941221d00e87bc6dd58dde4640
 The reviewed manifest supersedes the prior shutdown-safe bridge; both installed
 copies match. Python itoo_api SHA256: f1143f49e0c4e5958b27fc4ec8a6c040be54b32885c4a2a7874748ca3419920c.
 
-Controller issue 43 still reproduces after scene reload. A direct controller with
+Before the repair below, controller issue 43 still reproduced after scene reload. A direct controller with
 index -1 also returned zero; no unsupported controller subtype is promoted.
 
 Measured scratch starts: 42.223, 37.943, 35.906, 34.036 and 35.884 seconds.
@@ -418,9 +418,9 @@ leave prior evaluated output cached.
 Inserting a numeric parameter before two curve parameters and refreshing items
 terminated Max. Minidump: access violation 0xc0000005 in ForestPackPro.dlo+0x14f63f,
 read address 0x20. Observer recorded exit code -1 and PID disappearance. No public
-curve write tool was used; production curve imports remain refused, now with the
+curve write tool was used. At this point production curve imports were refused with the
 explicit CURVE_WRITES_UNSUPPORTED message. Do not repeat raw curve-row changes in
-a production scene. Curve parameter mapping and persistence remain unsupported.
+a production scene. Mapping and persistence had not yet been implemented.
 Evidence: diagnostics/itoo-curve-mapping-20261014/.
 
 ### Controller sampling and curve-slot repair implementation
@@ -442,7 +442,7 @@ Curve definition import initializes all native CurveControl slots on the detache
 Forest copy before adoption. The live probe established curve indices equal the
 full parameter-row index, including numeric rows. Existing static curve points
 are moved by parameter ID when preceding rows are removed; animated point
-reordering is refused. New curves start as linear `(0,0)` to `(1,1)`. Custom curve
+reordering is refused. New curves start flat at `(0,1)` to `(1,1)` with pinned endpoints, matching the measured Forest default. Custom curve
 payloads and curve export/edit remain unsupported. Slot preparation and scalar
 driver assignment require the updated native bridge and reject attached owners.
 All live changes still use one guarded undo hold for adopting the prepared copy.
@@ -450,5 +450,4 @@ All live changes still use one guarded undo hold for adopting the prepared copy.
 Private route probes verified source/numeric/Forest values 31.5, 39.5 and 47.5 at
 frames 0, 5 and 10, source-key preservation, and save/reload linkage. A separate
 allocated `[numeric, curve, curve]` probe produced X=33/Z=22 and retained points
-and output after reload. These are mechanism probes; deployment regression of
-the public implementation is pending. Evidence: diagnostics/issue43-45-resolution-20261014/.
+and output after reload. The subsequent public implementation passed deployed animation, save/reload, numeric-before-curves, static-shape reindexing and malformed-slot refusal checks. See [deployed verification](forest-effects-verification-2026-10-14.md) for exact scope and hashes.
