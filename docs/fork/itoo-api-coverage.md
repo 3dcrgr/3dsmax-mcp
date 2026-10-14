@@ -88,7 +88,7 @@ that current documentation omits. Remaining gaps are explicit:
 | Area | Remaining work / reason |
 |---|---|
 | Forest effect parameters | Numeric/object/spline/texture writes and import initialization are implemented; reference definition export requires explicit rebinding. Controller/curve writes and initialization need further live probes. |
-| Forest effect library | Search/read, ordering and numeric load/export are implemented. Reference/controller/texture/curve import/export remains; add is parameter-free code only. |
+| Forest effect library | Search/read, ordering and numeric/reference/texture load/export are implemented. Controller/curve import/export remains; add is parameter-free code only. |
 | Forest Tools instances | No public native Instantiate method appeared in ForestPack/trees interfaces. Geometry fallback can be built from `forest_items`; billboard, Forest Color and edge behavior need preservation checks. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
 | Catalog writes/evaluation | `setMacro`, `evalMacro`, browser open/close/refresh/overlay are not exposed as general commands. Evaluation can run scripts; writes persist catalog state. Stored macro reads are implemented. |
@@ -302,3 +302,16 @@ Live tests verify 25→75→25, null clearing, invalid identities without state
 changes, export/reimport with identical complete transforms, and removal that
 preserves the original parameter row. Controller and curve definitions remain
 unsupported. No computer-use calls were used in this phase.
+
+Validation: 63 focused tests in the feature checkout (64 in the integrated
+checkout), 1,072 isolated tests, and 1,088 integrated tests (5 skipped).
+Fresh installed JSON-RPC verifies texture rebind, export/import and restoration
+of the original map. Installed module SHA256:
+`63f869edf7cd57fbcd616800a9e1dc8dae3220cf38dea9cdac86979a264e0d19`.
+The integrated deployment preserves the newer Forest translation-extents change.
+
+Scratch PID 15684 started in 73.418 seconds; 293 samples and 2.847 seconds total
+sampler suspension. NtCreateFile/NtOpenFile account for about 37.04 sampled
+seconds; this does not identify the file, caller or external source of delay.
+Saved own fixture, normal quit 8.910 seconds, client retained, observer exit
+code 0 and PID disappearance. Evidence: diagnostics/itoo-textures-20261014/.
