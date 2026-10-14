@@ -302,6 +302,8 @@ def parameter_definitions(document: ET.Element, allow_references: bool = False) 
         raise ValueError("effect exceeds 100 parameters")
     rows, names, ids = [], set(), set()
     for definition in definitions:
+        if definition.get("type") == "curve":
+            raise ValueError("CURVE_WRITES_UNSUPPORTED: curve definitions cannot be imported safely; use forest_effect_curves for read-only inspection")
         kind, name = definition.get("numtype"), definition.get("name", "")
         reference = definition.get("type") in ("node", "spline", "texture", "controller")
         if not ((reference and allow_references) or (definition.get("type") == "numerical" and kind in NUMERIC_KINDS)):

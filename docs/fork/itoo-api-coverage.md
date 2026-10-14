@@ -406,3 +406,19 @@ Normal exits with retained clients: 4.615, 4.734, 4.192, 4.133 and 4.273 seconds
 Each observer exit has code 0 and PID disappearance. Evidence is stored under
 diagnostics/itoo-controller-time-20261014/; timing variability is not an isolated
 removable-plugin cost measurement.
+
+### Curve binding probe follow-up, 2026-10-14
+
+Safe-mode scratch PID 33352 started in 42.083 seconds (173 samples, 1.890 seconds
+sampler suspension). A private raw-array probe of native type 4 evaluated the
+existing first curve to 0.25 at X=0.5. Changing efpacurve strings did not change
+that result. This does not establish a binding map: changing expression/XML can
+leave prior evaluated output cached.
+
+Inserting a numeric parameter before two curve parameters and refreshing items
+terminated Max. Minidump: access violation 0xc0000005 in ForestPackPro.dlo+0x14f63f,
+read address 0x20. Observer recorded exit code -1 and PID disappearance. No public
+curve write tool was used; production curve imports remain refused, now with the
+explicit CURVE_WRITES_UNSUPPORTED message. Do not repeat raw curve-row changes in
+a production scene. Curve parameter mapping and persistence remain unsupported.
+Evidence: diagnostics/itoo-curve-mapping-20261014/.

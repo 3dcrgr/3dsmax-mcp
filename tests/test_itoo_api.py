@@ -13,6 +13,12 @@ TOKEN = "-".join(["AB"] * 32)
 
 
 class InventoryTests(unittest.TestCase):
+    def test_curve_definition_import_is_explicitly_refused(self):
+        document = api.ET.fromstring('<effect><parameter name="Curve" type="curve"/></effect>')
+        for allow_references in (False, True):
+            with self.subTest(allow_references=allow_references), self.assertRaisesRegex(ValueError, "CURVE_WRITES_UNSUPPORTED"):
+                api.parameter_definitions(document, allow_references=allow_references)
+
     def test_interface_signatures_and_coverage(self):
         text = """  Interface: trees
     <integer>count()
