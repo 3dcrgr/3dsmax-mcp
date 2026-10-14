@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- A call that 3ds Max does not answer no longer freezes the MCP server. After its deadline (about 130 s for ordinary calls, the exact timeout for probes, longer timeouts honored) it returns `MAX_BUSY`, not retryable; the call keeps running in Max and `max_dialogs(action="inspect")` reports its result once it finishes.
+- Mutating tools report what actually happened. A MAXScript error inside a native edit fails the call and rolls back its undo step instead of returning success. Requests that matched nothing are errors; requests that applied only in part return `status: "partial"` with the skipped names and warnings. This covers objects, selection, visibility, modifiers, layers, groups, selection sets, `set_parent`, `batch_rename_objects`, `manage_scene` save, materials, texture maps, controllers, wires, keyframes, effects and render.
+- `replace_material` and `batch_replace_materials` also replace materials inside sub-material slots (Multi/Sub and other material trees), find the source in sub-material slots and the Material Editor, refuse slots that would create a reference loop, and report `replaced_slots`, `skipped` and a status of `replaced`, `no_match`, `no_objects`, `blocked` or `unchanged`. Batch entries apply in order.
+- `contact_check` takes `time_budget_s` (default 20 s): it measures pairs with the fewest faces first and returns `complete: false` with what it measured when time runs out. Named group heads, dummies, shapes, lights, empty meshes and meshes over `max_faces` are returned in `skipped` instead of failing the call.
+- The agent viewport restores its preview settings (temporary denoiser, render elements, VFB denoiser layer, render view lock) when a V-Ray or Corona preview is stopped from the renderer's own UI.
+- MAXScript reached from a read handler that runs off Max's main thread now runs on the main thread; `inspect_properties` on modifiers without parameter blocks (Normal, Surface) no longer evaluated MAXScript off it.
+- `set_modifier_property` matches `modifier_class` by the MAXScript class name (`Bend`) as well as the SDK name (`BendMod`).
+- `add_tyflow_event` returns the new event instead of a parse error.
 - Removed `inspect_modifier_properties`, a compatibility alias. Call `inspect_properties(name, target="modifier", modifier_index=N)`.
 - Removed `refresh_plugin_manifest`. `get_plugin_manifest` already rebuilds the manifest from the live runtime on every call; the removed tool only added `"refreshed": true`.
 - `create_tyflow` takes `preset` (rain, snow, fountain, burst, debris) with `amount` and `speed`, replacing `create_tyflow_preset`. Presets build the same operators, flow name and event name as before; `event_name` now overrides the preset's event name.
