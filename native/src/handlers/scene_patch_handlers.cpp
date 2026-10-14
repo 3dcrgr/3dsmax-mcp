@@ -496,36 +496,6 @@ std::vector<PlannedOperation> BuildPlan(
     return plan;
 }
 
-bool SameTransform(const Matrix3& a, const Matrix3& b) {
-    for (int row = 0; row < 4; ++row) {
-        for (int axis = 0; axis < 3; ++axis) {
-            const float x = a.GetRow(row)[axis];
-            const float y = b.GetRow(row)[axis];
-            if (std::fabs(x - y) > 1e-6f * (std::max)({1.0f, std::fabs(x), std::fabs(y)})) return false;
-        }
-    }
-    return true;
-}
-
-std::string ControllerClass(Control* control) {
-    if (!control) return "";
-    MSTR name;
-    control->GetClassName(name, false);
-    return WideToUtf8(name.data());
-}
-
-// Names the controller that drives one part of the node's transform; a
-// transform-level controller (Link, LookAt) has no separate part controllers.
-std::string PartController(INode* node, const char* part) {
-    Control* tm = node->GetTMController();
-    if (!tm) return "";
-    Control* sub = nullptr;
-    if (std::string(part) == "move") sub = tm->GetPositionController();
-    else if (std::string(part) == "rotate") sub = tm->GetRotationController();
-    else sub = tm->GetScaleController();
-    return ControllerClass(sub ? sub : tm);
-}
-
 // Constraint, script and expression controllers ignore Move, Rotate and Scale
 // without an error. Each requested part is compared with the node transform
 // before it; the parts that left it unchanged are returned.
@@ -539,7 +509,7 @@ json ApplyTransform(const PlannedOperation& item, TimeValue time) {
     json ignored = json::array();
     const auto check = [&](const char* part, const Matrix3& before) {
         if (SameTransform(before, item.target->GetNodeTM(time)))
-            ignored.push_back({{"part", part}, {"controller", PartController(item.target, part)}});
+            ignored.push_back(IgnoredTransformPart(item.target, part));
     };
     if (item.args.contains("move")) {
         const Point3 value = ParseVector3(item.args["move"], "move", item.index);
@@ -803,8 +773,7 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
                     "No operation took effect: the targets' transform controllers ignored the edit "
                     "(constraint, script or expression controllers drive them). The scene is unchanged.",
                     {{"ignored", ignoredRows},
-                     {"message", "Edit the controller's targets or values instead, or use assign_controller "
-                                 "to give the track a keyframable controller."}}));
+                     {"message", kTransformIgnoredAdvice}}));
             }
             ip->RedrawViews(time);
             result["operations"] = BuildProofArray(plan, time, true);

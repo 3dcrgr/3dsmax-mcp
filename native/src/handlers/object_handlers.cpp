@@ -211,8 +211,17 @@ std::string NativeHandlers::SetObjectProperty(const std::string& params, MCPBrid
             Point3 pt;
             if (ParsePoint3(value, pt)) {
                 Matrix3 tm = node->GetNodeTM(t);
+                const Matrix3 before = tm;
                 tm.SetTrans(pt);
                 node->SetNodeTM(t, tm);
+                if (!SameTransform(before, tm) && SameTransform(before, node->GetNodeTM(t))) {
+                    throw std::runtime_error(StructuredErrorPayload(
+                        "TRANSFORM_IGNORED",
+                        WideToUtf8(node->GetName()) + " did not move: its position controller ignored the edit "
+                        "(constraint, script or expression).",
+                        {{"ignored", json::array({IgnoredTransformPart(node, "move")})},
+                         {"message", kTransformIgnoredAdvice}}));
+                }
                 ip->RedrawViews(t);
                 return propertyResult("Set pos on " + WideToUtf8(node->GetName()));
             }
@@ -259,6 +268,14 @@ std::string NativeHandlers::SetObjectProperty(const std::string& params, MCPBrid
         if (lprop == "renderable") {
             node->SetRenderable(flag ? TRUE : FALSE);
             return propertyResult("Set renderable on " + WideToUtf8(node->GetName()));
+        }
+
+        if (lprop == "rotation" || lprop == "scale" || lprop == "transform") {
+            throw std::runtime_error(StructuredErrorPayload(
+                "BAD_PARAM",
+                "set_object_property sets the position but not " + prop +
+                    ". Use transform_object(rotate=[x,y,z] degrees, scale=[x,y,z]) or scene_patch transform; "
+                    "both apply relative to the current transform."));
         }
 
         // ── Base object IParamBlock2 properties ─────────────────
@@ -630,12 +647,23 @@ std::string NativeHandlers::TransformObject(const std::string& params, MCPBridge
         std::string coordSys = p.value("coordinate_system", "world");
 
         bool didSomething = false;
+        // Requested parts that change the transform, and those its
+        // controllers ignored.
+        int requested = 0;
+        json ignored = json::array();
+        const auto check = [&](const char* part, const Matrix3& before, bool nonTrivial) {
+            if (!nonTrivial) return;
+            ++requested;
+            if (SameTransform(before, node->GetNodeTM(t))) ignored.push_back(IgnoredTransformPart(node, part));
+        };
 
         // Move
         if (p.contains("move") && p["move"].type() == json::value_t::array && p["move"].size() == 3) {
             Point3 offset(p["move"][0].get<float>(), p["move"][1].get<float>(), p["move"][2].get<float>());
             Matrix3 tmAxis;  // identity by default in Max 2026
+            const Matrix3 before = node->GetNodeTM(t);
             node->Move(t, tmAxis, offset, TRUE, TRUE, PIV_NONE, TRUE);
+            check("move", before, offset != Point3(0, 0, 0));
             didSomething = true;
         }
 
@@ -659,7 +687,9 @@ std::string NativeHandlers::TransformObject(const std::string& params, MCPBridge
             Quat combined = qx * qy * qz;
             AngAxis finalAA(combined);
 
+            const Matrix3 before = node->GetNodeTM(t);
             node->Rotate(t, tmAxis, finalAA, TRUE, TRUE, PIV_NONE, TRUE);
+            check("rotate", before, rx != 0.0f || ry != 0.0f || rz != 0.0f);
             didSomething = true;
         }
 
@@ -676,7 +706,9 @@ std::string NativeHandlers::TransformObject(const std::string& params, MCPBridge
                 throw std::runtime_error("scale must be [s] or [x,y,z]");
             }
             Matrix3 tmAxis;
+            const Matrix3 before = node->GetNodeTM(t);
             node->Scale(t, tmAxis, scaleVal, TRUE, TRUE, PIV_NONE, TRUE);
+            check("scale", before, scaleVal != Point3(1, 1, 1));
             didSomething = true;
         }
 
@@ -689,11 +721,24 @@ std::string NativeHandlers::TransformObject(const std::string& params, MCPBridge
             return result.dump();
         }
 
+        if (requested > 0 && static_cast<int>(ignored.size()) == requested) {
+            throw std::runtime_error(StructuredErrorPayload(
+                "TRANSFORM_IGNORED",
+                WideToUtf8(node->GetName()) + " did not move: its transform controllers ignored the edit "
+                "(constraint, script or expression).",
+                {{"ignored", ignored}, {"message", kTransformIgnoredAdvice}}));
+        }
         ip->RedrawViews(t);
 
         json result = SpatialSnapshot::BuildSpatialSnapshot(node, t);
         result["message"] = "Transformed " + WideToUtf8(node->GetName());
         result["coordinateSystem"] = coordSys;
+        if (!ignored.empty()) {
+            result["status"] = "partial";
+            result["ignored"] = ignored;
+            result["warnings"] = json::array({"Part of the transform was ignored by the object's transform "
+                                              "controllers (constraint, script or expression); see ignored."});
+        }
         return result.dump();
     });
 }

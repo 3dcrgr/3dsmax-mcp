@@ -4,6 +4,7 @@
 #include <unordered_set>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
@@ -295,6 +296,45 @@ inline INode* FindUniqueNodeByName(const std::string& name, const char* advice =
     if (matches.size() > 1) ThrowAmbiguousName(name, matches, advice);
     return matches.empty() ? nullptr : matches.front();
 }
+
+// ── Transform readback ──────────────────────────────────────────
+// Constraint, script and expression controllers ignore Move, Rotate, Scale
+// and SetNodeTM without an error, so edits compare the node transform before
+// and after each requested part.
+inline bool SameTransform(const Matrix3& a, const Matrix3& b) {
+    for (int row = 0; row < 4; ++row) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const float x = a.GetRow(row)[axis];
+            const float y = b.GetRow(row)[axis];
+            if (std::fabs(x - y) > 1e-6f * (std::max)({1.0f, std::fabs(x), std::fabs(y)})) return false;
+        }
+    }
+    return true;
+}
+
+inline std::string ControllerClassName(Control* control) {
+    if (!control) return "";
+    MSTR name;
+    control->GetClassName(name, false);
+    return WideToUtf8(name.data());
+}
+
+// part is "move", "rotate" or "scale". A transform-level controller (Link,
+// LookAt) has no separate part controllers, so it is named instead.
+inline json IgnoredTransformPart(INode* node, const std::string& part) {
+    Control* tm = node->GetTMController();
+    Control* sub = nullptr;
+    if (tm) {
+        if (part == "move") sub = tm->GetPositionController();
+        else if (part == "rotate") sub = tm->GetRotationController();
+        else sub = tm->GetScaleController();
+    }
+    return {{"part", part}, {"controller", ControllerClassName(sub ? sub : tm)}};
+}
+
+inline constexpr const char* kTransformIgnoredAdvice =
+    "Edit the controller's targets or values instead, or use assign_controller to give the track "
+    "a keyframable controller.";
 
 // MAXScript expression for a node already resolved here. getAnimByHandle
 // reaches it by its animatable handle, so the script never looks the node up
