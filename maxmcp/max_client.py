@@ -129,6 +129,12 @@ class TargetUnavailable(ConnectionError):
         super().__init__(message)
 
 
+# A call that raised one of these may still be running in Max, or its target is
+# gone. Tools pass them through unchanged so their code and hint reach the agent,
+# instead of reporting an ordinary failure that invites a retry or a fallback.
+CALL_STATE_ERRORS = (DialogBlocked, RequestOutcomeUnknown, TargetUnavailable)
+
+
 # Win32 constants for named pipe
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _GENERIC_READ = 0x80000000

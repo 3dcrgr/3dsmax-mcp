@@ -7,7 +7,7 @@ from ..helpers.maxscript import safe_string
 
 from ..server import client, mcp
 from ..coerce import StrList, FloatList, IntList, DictList
-from ._tyflow_core import ledger_update
+from ._tyflow_core import MAXSCRIPT_ERROR, ledger_update
 
 
 SHAPE_3D_IDS: dict[str, int] = {
@@ -78,6 +78,8 @@ fn findOperatorSubAnim eventSub operatorName =
 
 
 def _load_json(raw: str, fallback: Any) -> Any:
+    if isinstance(raw, str) and raw.startswith(MAXSCRIPT_ERROR):
+        return {"error": "MAXScript error: " + raw[len(MAXSCRIPT_ERROR):].strip()}
     try:
         return json.loads(raw)
     except Exception:
@@ -85,11 +87,23 @@ def _load_json(raw: str, fallback: Any) -> Any:
 
 
 def _send_json(maxscript: str, fallback: Any) -> Any:
-    try:
-        response = client.send_command(maxscript)
-    except Exception as exc:
-        return {"error": str(exc)}
+    # Transport and call-state exceptions propagate: the envelope keeps their
+    # code (BLOCKED_BY_DIALOG, MAX_BUSY, TARGET_UNAVAILABLE) and hint.
+    response = client.send_command(maxscript)
     return _load_json(response.get("result", ""), fallback)
+
+
+def _batch_outcome(payload: Any, issues: list[str], *, applied: bool, nothing: str) -> Any:
+    """Mark a result whose request applied only in part, or not at all."""
+    if not isinstance(payload, dict) or "error" in payload or not issues:
+        return payload
+    if not applied:
+        payload["error"] = f"{nothing}: {'; '.join(issues)}"
+        payload["details"] = {key: value for key, value in payload.items() if key != "error"}
+        return payload
+    payload["status"] = "partial"
+    payload["warnings"] = list(payload.get("warnings") or []) + issues
+    return payload
 
 
 def _mxs_string_array(items: list[str]) -> str:
@@ -235,14 +249,22 @@ def create_tyflow(
         for prop_name, prop_value in props.items():
             prop = safe_string(prop_name)
             expr = _mxs_value(prop_value)
-            assign_lines.append(f'try ({var}.{prop} = {expr}) catch (totalErrors += 1)')
-        assign_script = "\n".join(assign_lines)
+            assign_lines.append(
+                f'try ({var}.{prop} = {expr}) catch (append opErrors "Could not set {op_name}.{prop}")'
+            )
+        assign_script = "\n    ".join(assign_lines)
         op_blocks.append(
             f"""
-local {var} = ev.addOperator "{op_type}" {op_pos}
-try ({var}.Operator.setName "{op_name}") catch ()
-{assign_script}
-operatorCount += 1
+local {var} = undefined
+try ({var} = ev.addOperator "{op_type}" {op_pos}) catch ()
+if {var} == undefined then (
+    append failedOps "{op_name}"
+    append opErrors "Could not add {op_type} operator {op_name}"
+) else (
+    try ({var}.Operator.setName "{op_name}") catch (append opErrors "Could not name {op_type} operator {op_name}")
+    {assign_script}
+    operatorCount += 1
+)
 """
         )
 
@@ -260,19 +282,26 @@ if tyFlow == undefined then (
         ev.setName "{safe_string(event_name)}"
         ev.setPosition [{int(ev_pos[0])},{int(ev_pos[1])}]
         local operatorCount = 0
-        local totalErrors = 0
+        local opErrors = #()
+        local failedOps = #()
         {"".join(op_blocks)}
-        "{{\\"name\\":\\"" + flow.name + "\\",\\"event\\":\\"" + ev.getName() + "\\",\\"operatorCount\\":" + (operatorCount as string) + ",\\"errorCount\\":" + (totalErrors as string) + "}}"
+        "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"event\\":\\"" + (esc (ev.getName())) + "\\",\\"operatorCount\\":" + (operatorCount as string) + ",\\"errorCount\\":" + (opErrors.count as string) + ",\\"errors\\":" + (jsonStringArray opErrors) + ",\\"failedOperators\\":" + (jsonStringArray failedOps) + "}}"
     )
 )
 )"""
     payload = _send_json(maxscript, {"error": "Could not parse create_tyflow response."})
     if isinstance(payload, dict) and "name" in payload and "error" not in payload:
+        # The flow exists even when operators or values were refused, so this
+        # is a partial result, never an error.
+        _batch_outcome(payload, [str(e) for e in payload.get("errors") or []],
+                       applied=True, nothing="")
+        failed_ops = {str(n) for n in payload.get("failedOperators") or []}
         record_ops: dict[str, str] = {}
         for idx, op in enumerate(op_defs, start=1):
             op_type = str(op.get("type", "Birth"))
             op_name = str(op.get("name", op.get("type", f"Operator{idx}")))
-            record_ops[f"{event_name}/{op_name}"] = op_type
+            if op_name not in failed_ops:
+                record_ops[f"{event_name}/{op_name}"] = op_type
         payload.update(ledger_update(str(payload["name"]), record_ops=record_ops))
     if select_created and isinstance(payload, dict) and "name" in payload and "error" not in payload:
         payload["selectResult"] = select_objects(names=[str(payload["name"])])
@@ -428,13 +457,12 @@ if flow == undefined then (
     out
 )
 )"""
-    try:
-        response = client.send_command(maxscript)
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
+    response = client.send_command(maxscript)
     raw = str(response.get("result", ""))
     if raw.startswith("__ERROR__|"):
         return json.dumps({"error": raw.split("|", 1)[1]})
+    if raw.startswith(MAXSCRIPT_ERROR):
+        return raw
 
     def _decode_token(value: str) -> str:
         return value.replace("<pipe>", "|")
@@ -608,6 +636,10 @@ if flow == undefined then (
 )"""
     payload = _send_json(maxscript, {"error": "Could not parse modify_tyflow_operator response."})
     if isinstance(payload, dict) and "error" not in payload:
+        _batch_outcome(payload, [str(e) for e in payload.get("errors") or []],
+                       applied=bool(payload.get("applied")),
+                       nothing=f"No property was set on {operator_name}")
+    if isinstance(payload, dict) and "error" not in payload:
         payload.update(ledger_update(name))
     return json.dumps(payload)
 
@@ -639,11 +671,13 @@ if flow == undefined then (
         "{{\\"error\\":\\"Event not found: {safe_string(event_name)}\\"}}"
     ) else (
         local shapeOp = findOperatorSubAnim ev "{safe_string(operator_name)}"
+        local created = false
         if shapeOp == undefined and {str(bool(create_if_missing)).lower()} then (
             local evI = undefined
             try (evI = ev.Event) catch ()
             if evI != undefined then (
                 shapeOp = evI.addOperator "Shape" -1
+                if shapeOp != undefined do created = true
                 try (shapeOp.Operator.setName "{safe_string(operator_name)}") catch ()
             )
         )
@@ -656,16 +690,23 @@ if flow == undefined then (
             try (shapeOp.type_3d_ID_tab = #({shape_id}); append applied "type_3d_ID_tab") catch (append errors "type_3d_ID_tab")
             try (shapeOp.frequency_tab = #({float(frequency)}); append applied "frequency_tab") catch (append errors "frequency_tab")
             try (shapeOp.scaleVal_tab = #({float(scale)}); append applied "scaleVal_tab") catch (append errors "scaleVal_tab")
-            "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"shape\\":\\"{safe_string(key)}\\",\\"shapeId\\":{shape_id},\\"applied\\":" + (jsonStringArray applied) + ",\\"errors\\":" + (jsonStringArray errors) + "}}"
+            "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"shape\\":\\"{safe_string(key)}\\",\\"shapeId\\":{shape_id},\\"created\\":" + (created as string) + ",\\"applied\\":" + (jsonStringArray applied) + ",\\"errors\\":" + (jsonStringArray errors) + "}}"
         )
     )
 )
 )"""
     payload = _send_json(maxscript, {"error": "Could not parse set_tyflow_shape response."})
     if isinstance(payload, dict) and "error" not in payload:
-        payload.update(
-            ledger_update(name, record_ops={f"{event_name}/{operator_name}": "Shape"})
-        )
+        created = bool(payload.get("created"))
+        _batch_outcome(payload, [f"Could not set {e}" for e in payload.get("errors") or []],
+                       applied=bool(payload.get("applied")),
+                       nothing=(f"Created Shape operator {operator_name}, but no shape value was set"
+                                if created else f"No shape value was set on {operator_name}"))
+        # A created operator changed the flow even when its values were refused.
+        if created or "error" not in payload:
+            payload.update(
+                ledger_update(name, record_ops={f"{event_name}/{operator_name}": "Shape"})
+            )
     return json.dumps(payload)
 
 
@@ -683,31 +724,36 @@ def add_tyflow_collision(
 {HELPERS}
 local flow = getNodeByName "{safe_string(name)}"
 local names = {requested}
+local nodes = #()
+local missing = #()
+for n in names do (
+    local node = getNodeByName n
+    if node == undefined then append missing n else append nodes node
+)
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
+) else if names.count > 0 and nodes.count == 0 then (
+    -- Writing an empty list would clear the operator's existing colliders.
+    "{{\\"error\\":\\"No collider name matched an object; nothing was changed\\",\\"details\\":{{\\"missing\\":" + (jsonStringArray missing) + "}}}}"
 ) else (
     local ev = findEventSubAnim flow "{safe_string(event_name)}"
     if ev == undefined then (
         "{{\\"error\\":\\"Event not found: {safe_string(event_name)}\\"}}"
     ) else (
         local collOp = findOperatorSubAnim ev "{safe_string(operator_name)}"
+        local created = false
         if collOp == undefined and {str(bool(create_if_missing)).lower()} then (
             local evI = undefined
             try (evI = ev.Event) catch ()
             if evI != undefined then (
                 collOp = evI.addOperator "Collision" -1
+                if collOp != undefined do created = true
                 try (collOp.Operator.setName "{safe_string(operator_name)}") catch ()
             )
         )
         if collOp == undefined then (
             "{{\\"error\\":\\"Collision operator not found\\"}}"
         ) else (
-            local nodes = #()
-            local missing = #()
-            for n in names do (
-                local node = getNodeByName n
-                if node == undefined then append missing n else append nodes node
-            )
             local applied = #()
             local errors = #()
             local props = #("colliderList", "objectList", "objects", "nodes")
@@ -717,16 +763,29 @@ if flow == undefined then (
                     try (setProperty collOp pSym nodes; append applied pName) catch (append errors ("Could not set " + pName))
                 )
             )
-            "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"operator\\":\\"{safe_string(operator_name)}\\",\\"requested\\":" + (jsonStringArray names) + ",\\"missing\\":" + (jsonStringArray missing) + ",\\"applied\\":" + (jsonStringArray applied) + ",\\"errors\\":" + (jsonStringArray errors) + "}}"
+            "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"operator\\":\\"{safe_string(operator_name)}\\",\\"created\\":" + (created as string) + ",\\"requested\\":" + (jsonStringArray names) + ",\\"missing\\":" + (jsonStringArray missing) + ",\\"applied\\":" + (jsonStringArray applied) + ",\\"errors\\":" + (jsonStringArray errors) + "}}"
         )
     )
 )
     )"""
     payload = _send_json(maxscript, {"error": "Could not parse add_tyflow_collision response."})
     if isinstance(payload, dict) and "error" not in payload:
-        payload.update(
-            ledger_update(name, record_ops={f"{event_name}/{operator_name}": "Collision"})
-        )
+        created = bool(payload.get("created"))
+        missing = [str(n) for n in payload.get("missing") or []]
+        errors = [str(e) for e in payload.get("errors") or []]
+        issues = list(errors)
+        if not payload.get("applied") and not errors:
+            issues.append("the Collision operator has none of colliderList, objectList, objects or nodes")
+        if missing:
+            issues.append(f"{len(missing)} collider name(s) matched no object and were skipped: {', '.join(missing)}")
+        _batch_outcome(payload, issues, applied=bool(payload.get("applied")),
+                       nothing=(f"Created Collision operator {operator_name}, but no collider was set"
+                                if created else f"No collider was set on {operator_name}"))
+        # A created operator changed the flow even when no collider was set.
+        if created or "error" not in payload:
+            payload.update(
+                ledger_update(name, record_ops={f"{event_name}/{operator_name}": "Collision"})
+            )
     return json.dumps(payload)
 
 
@@ -749,21 +808,30 @@ if flow == undefined then (
     local bo = flow.baseobject
     local applied = #()
     local errors = #()
+    local unsupported = #()
     fn setIf propName propValue = (
         local pSym = execute ("#" + propName)
         if isProperty bo pSym then (
             try (setProperty bo pSym propValue; append applied propName) catch (append errors ("Could not set " + propName))
-        )
+        ) else append unsupported propName
     )
     setIf "physXGravityEnabled" {str(bool(enabled)).lower()}
     setIf "physXGravityValue" {float(gravity)}
     setIf "physXSubsteps" {int(substeps)}
     setIf "physXPosIterations" {int(pos_iterations)}
     setIf "physXVelIterations" {int(vel_iterations)}
-    "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"applied\\":" + (jsonStringArray applied) + ",\\"errors\\":" + (jsonStringArray errors) + "}}"
+    "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"applied\\":" + (jsonStringArray applied) + ",\\"errors\\":" + (jsonStringArray errors) + ",\\"unsupported\\":" + (jsonStringArray unsupported) + "}}"
 )
 )"""
-    return json.dumps(_send_json(maxscript, {"error": "Could not parse set_tyflow_physx response."}))
+    payload = _send_json(maxscript, {"error": "Could not parse set_tyflow_physx response."})
+    if isinstance(payload, dict) and "error" not in payload:
+        issues = [str(e) for e in payload.get("errors") or []]
+        unsupported = [str(p) for p in payload.get("unsupported") or []]
+        if unsupported:
+            issues.append(f"{name} has no {', '.join(unsupported)} property, so they were skipped")
+        _batch_outcome(payload, issues, applied=bool(payload.get("applied")),
+                       nothing=f"No PhysX setting was changed on {name}")
+    return json.dumps(payload)
 
 
 @mcp.tool()
@@ -902,10 +970,22 @@ if targets.count == 0 then (
     "{{\\"error\\":\\"No tyFlow objects found\\"}}"
 ) else (
     local resetNames = #()
+    local failures = #()
     for n in targets do (
-        try (n.reset_simulation(); append resetNames n.name) catch ()
+        local done = false
+        local failure = ""
+        try (n.reset_simulation(); done = true) catch (failure = getCurrentException())
+        -- Fall back to the tyFlow interface form that the patch tools use.
+        if not done do (try (n.tyFlow.reset_simulation(); done = true) catch ())
+        if done then append resetNames n.name else append failures (n.name + ": " + (failure as string))
     )
-    "{{\\"count\\":" + (resetNames.count as string) + ",\\"names\\":" + (jsonStringArray resetNames) + "}}"
+    "{{\\"count\\":" + (resetNames.count as string) + ",\\"names\\":" + (jsonStringArray resetNames) + ",\\"failed\\":" + (jsonStringArray failures) + "}}"
 )
 )"""
-    return json.dumps(_send_json(maxscript, {"error": "Could not parse reset_tyflow_simulation response."}))
+    payload = _send_json(maxscript, {"error": "Could not parse reset_tyflow_simulation response."})
+    if isinstance(payload, dict) and "error" not in payload:
+        failures = [str(f) for f in payload.get("failed") or []]
+        _batch_outcome(payload, [f"Could not reset {f}" for f in failures],
+                       applied=bool(payload.get("count")),
+                       nothing="No tyFlow simulation was reset")
+    return json.dumps(payload)

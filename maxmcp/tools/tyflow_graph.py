@@ -17,6 +17,7 @@ from ..helpers.maxscript import safe_string
 from ..coerce import DictList
 from ..server import client, mcp
 from ._tyflow_core import (
+    MAXSCRIPT_ERROR,
     canon_name,
     graph_payload,
     ledger_update,
@@ -27,6 +28,8 @@ from ._tyflow_core import (
 
 
 def _load_json(raw: str, fallback: Any) -> Any:
+    if raw.startswith(MAXSCRIPT_ERROR):
+        return {"error": "MAXScript error: " + raw[len(MAXSCRIPT_ERROR):].strip()}
     try:
         return json.loads(raw)
     except (ValueError, TypeError):
@@ -34,10 +37,8 @@ def _load_json(raw: str, fallback: Any) -> Any:
 
 
 def _send_json(maxscript: str, fallback: Any) -> Any:
-    try:
-        response = client.send_command(maxscript)
-    except Exception as exc:
-        return {"error": str(exc)}
+    # Transport and call-state exceptions propagate with their code and hint.
+    response = client.send_command(maxscript)
     return _load_json(str(response.get("result", "")), fallback)
 
 
