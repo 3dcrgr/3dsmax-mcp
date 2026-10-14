@@ -96,6 +96,7 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "forest_items",
             "forest_edit_items",
             "forest_set_mode",
+            "forest_instances",
             "forest_validate",
             "forest_inspect", "forest_effects", "forest_settings", "forest_effect_library", "forest_effect_parameters", "forest_effect_curves",
             "itoo_api_inventory", "itoo_catalog",
@@ -105,6 +106,7 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "Create with scatter_forest_pack or forest_from_library; both return the real item count.",
             "Run forest_validate when a forest shows 0 items; read items with forest_items.",
             "Edit items with forest_edit_items; it needs custom edit mode (allow_custom_edit or forest_set_mode).",
+            "Turn a forest into real scene nodes with forest_instances (Forest Tools Instantiate has no MAXScript); delete them again with action=delete.",
             "Before rendering in Chaos Vantage, run itoo_vantage_check (read-only): Forest Color slot 1, opacity, CPU-only features, caps.",
         ],
         "gotchas": [

@@ -663,6 +663,201 @@ def forest_edit_items(name: str, edits: DictList, allow_custom_edit: bool = Fals
 
 
 # --------------------------------------------------------------------------------------------
+# forest_instances
+# --------------------------------------------------------------------------------------------
+
+MAX_INSTANCES = 10000
+INSTANCE_TAG = "mcp_forest_instance"
+INSTANCE_MODES = {"instance": "instance", "copy": "copy", "reference": "reference"}
+SKIP_REASONS = {0: "DISABLED_ITEM", 1: "BILLBOARD", 2: "SOURCE_MISSING"}
+
+# Builds the forest, reads every item and creates its node in the same call: item order changes on
+# every rebuild, so transforms are never taken from an earlier read. The loop runs over a count
+# checked against the cap first, so it always ends.
+_INSTANCES_BODY = r'''
+local nd = fpForest "@@NAME@@"
+fpGuard nd
+if nd.distmode == @@REFERENCE@@ do throw "REFERENCE_MODE_UNSUPPORTED: Reference-mode forests take their items from other objects; instance those instead"
+local tag = "fp" + (((getHandleByAnim nd) as integer64) as string)
+local ss = stringStream ""
+format "FPOK\n" to:ss
+if @@CREATE@@ then (
+    local t = nd.trees
+    t.update()
+    local n = t.count()
+    if n == 0 do throw "EMPTY_FOREST: the forest has no items to instance"
+    local vmax = if isProperty nd #vmaxitems then nd.vmaxitems else 0
+    if vmax > 0 and n >= vmax do throw ("VIEWPORT_LIMIT: the viewport build holds " + (n as string) + " items, the Max Items Viewport cap (vmaxitems " + (vmax as string) + "), so Forest Pack may have thinned it; raise vmaxitems with forest_settings first")
+    if n > @@MAX@@ do throw ("ITEM_LIMIT: the forest has " + (n as string) + " items; max_items is @@MAX@@")
+    local nl = nd.namelist as array, cl = nd.cobjlist as array, gl = nd.geomlist as array
+    local nT = nl.count
+    local src = #(), offInv = #(), reason = #()
+    for g = 1 to nT do (
+        local s = if g <= cl.count then cl[g] else undefined
+        local kind = if g <= gl.count then gl[g] else 0
+        if kind == 2 and isValidNode s and not (isGroupHead s) then (
+            append src s; append offInv (inverse (fpOffTM s)); append reason ""
+        ) else (
+            append src undefined; append offInv undefined
+            append reason (if kind == 2 and isValidNode s then "GROUP_SOURCE" else if kind == 0 then "DISABLED_ITEM" else if kind == 1 then "BILLBOARD" else "SOURCE_MISSING")
+        )
+    )
+    -- Every check runs before anything is created, so a failure here leaves the scene untouched.
+    -- Forest Color varies the tint per item; instances share their source material, so that variation
+    -- is lost. Bounded walk of the material trees (no getClassInstances: it needs one concrete class).
+    local fc = 0, seen = #(), guard = 0
+    local stack = for s in src where s != undefined collect s.material
+    append stack nd.material
+    while stack.count > 0 and guard < 5000 do (
+        guard += 1
+        local m = stack[stack.count]
+        deleteItem stack stack.count
+        if m != undefined and (findItem seen m) == 0 do (
+            append seen m
+            if matchPattern ((classOf m) as string) pattern:"*Forest*Color*" do fc += 1
+            if isKindOf m Material do (for k = 1 to getNumSubMtls m do append stack (getSubMtl m k))
+            for k = 1 to getNumSubTexmaps m do append stack (getSubTexmap m k)
+        )
+    )
+    local effects = 0
+    if isProperty nd.baseObject #efenablelist do (for flag in (nd.baseObject.efenablelist as array) where flag == true do effects += 1)
+    local skipped = for g = 1 to nT collect 0
+    local invalid = 0, made = 0
+    local objTM = nd.objectTransform
+    local layerName = fpDec "@@LAYER@@"
+    -- A prefix no existing node uses, so a second run never repeats the first run's names.
+    local prefix = nd.name + "_inst", run = 1, taken = true
+    while taken and run < 1000 do (
+        local hits = for o in objects where matchPattern o.name pattern:(prefix + "_*") collect o
+        taken = hits.count > 0
+        if taken do (
+            run += 1
+            prefix = nd.name + "_inst" + (run as string)
+        )
+    )
+    undo "MCP Forest instances" on (
+        with redraw off (
+            local lay = LayerManager.getLayerFromName layerName
+            if lay == undefined do lay = LayerManager.newLayerFromName layerName
+            for i = 0 to n - 1 do (
+                local g = t.getGeomID i
+                if g < 1 or g > nT then invalid += 1
+                else if src[g] == undefined then skipped[g] += 1
+                else (
+                    local tm = (offInv[g] * (t.getFullTransform i)) * objTM
+                    local c = @@MAKE@@ src[g]
+                    c.parent = undefined
+                    if isGroupMember c do setGroupMember c false
+                    c.isHidden = false
+                    c.isFrozen = false
+                    c.transform = tm
+                    c.name = prefix + "_" + (formattedPrint (i + 1) format:"05d")
+                    lay.addNode c
+                    setUserProp c "@@TAG@@" tag
+                    made += 1
+                )
+            )
+            if @@DISABLE@@ do nd.disabled = true
+        )
+    )
+    format "H|%|%|%|%|%|%\n" made n invalid (fpEnc layerName) (fpEnc prefix) (sliderTime.frame as integer) to:ss
+    for g = 1 to nT where skipped[g] > 0 do format "S|%|%|%|%\n" g reason[g] skipped[g] (fpEnc (nl[g] as string)) to:ss
+    if fc > 0 do format "W|FOREST_COLOR_TINT_LOST\n" to:ss
+    if effects > 0 do format "W|EFFECTS_SNAPSHOT\n" to:ss
+) else (
+    local mine = for o in objects where ((getUserProp o "@@TAG@@") as string) == tag collect o
+    if @@DELETE@@ and mine.count > 0 do (undo "MCP Forest instances delete" on (delete mine))
+    format "C|%|%\n" mine.count (fpB @@DELETE@@) to:ss
+)
+format "D|%\n" (fpB nd.disabled) to:ss
+ss as string
+'''
+
+INSTANCE_WARNINGS = {
+    "FOREST_COLOR_TINT_LOST": "Forest Color is in the forest's or a source's material: it varies the tint per item, "
+                              "but instances share their source material, so they all get the base tint.",
+    "EFFECTS_SNAPSHOT": "Forest Effects are enabled: the instances are a snapshot of the current frame and of the "
+                        "effects' current result; they don't follow later changes or animation.",
+}
+
+
+@mcp.tool()
+def forest_instances(
+    name: str,
+    action: str = "create",
+    mode: str = "instance",
+    layer: str = "",
+    max_items: int = 1000,
+    disable_source: bool = False,
+    confirm_delete: bool = False,
+) -> dict[str, Any]:
+    """Turn a Forest Pack scatter into real scene nodes, like Forest Tools' Instantiate (which has no MAXScript).
+
+    action: create, count or delete. create builds the forest and, in the same call, creates one node per item
+    from its source object (mode: instance, copy or reference) with the exact item transform that
+    forest_items reports, on a layer (default "<forest>_instances", created when missing), in one undo step.
+    Nodes are named "<forest>_inst_NNNNN", unparented, ungrouped, unhidden and unfrozen, and tagged for this
+    forest. Billboard items, disabled items, group-head sources and missing sources are skipped and counted.
+    disable_source=true sets the forest's Disabled switch in the same undo step.
+
+    Refused before anything is created: Reference-mode forests (REFERENCE_MODE_UNSUPPORTED), an empty forest,
+    a viewport build at the Max Items Viewport cap (VIEWPORT_LIMIT: Forest Pack may have thinned it), and more
+    items than max_items (1..10000, ITEM_LIMIT). Instances are a snapshot of the current frame: they don't follow
+    Forest Effects or animation. Forest Color tint variation isn't preserved (FOREST_COLOR_TINT_LOST is
+    reported when Forest Color is found in the materials). Edge mode and other render-time behaviour aren't
+    checked. count reports how many tagged instances of this forest exist; delete removes exactly those, in
+    one undo step, and needs confirm_delete=true.
+    """
+    fh.node_name(name, "name")
+    if action not in ("create", "count", "delete"):
+        raise ValueError("action must be create, count or delete")
+    if mode not in INSTANCE_MODES:
+        raise ValueError("mode must be instance, copy or reference")
+    max_items = fh.integer(max_items, "max_items", 1, MAX_INSTANCES)
+    disable_source = _bool(disable_source, "disable_source")
+    confirm_delete = _bool(confirm_delete, "confirm_delete")
+    if not isinstance(layer, str) or "\x00" in layer or len(layer) > 256:
+        raise ValueError("layer must be a string without NUL, up to 256 characters")
+    if action == "delete" and not confirm_delete:
+        raise ValueError("delete requires confirm_delete=true")
+    if action != "create" and (disable_source or layer or mode != "instance" or max_items != 1000):
+        raise ValueError("mode, layer, max_items and disable_source apply to create only")
+    body = (_INSTANCES_BODY
+            .replace("@@CREATE@@", _mxs_bool(action == "create"))
+            .replace("@@DELETE@@", _mxs_bool(action == "delete"))
+            .replace("@@MAKE@@", INSTANCE_MODES[mode])
+            .replace("@@DISABLE@@", _mxs_bool(disable_source))
+            .replace("@@MAX@@", str(max_items))
+            .replace("@@TAG@@", INSTANCE_TAG)
+            .replace("@@REFERENCE@@", str(fh.REFERENCE_MODE))
+            .replace("@@LAYER@@", fh.b64(layer or f"{name}_instances"))
+            .replace("@@NAME@@", fh.b64(name)))
+    timeout = min(600.0, 60.0 + max_items * 0.05) if action == "create" else None
+    rows = [line.split("|") for line in _send(body, timeout=timeout)]
+    result: dict[str, Any] = {"forest": name, "action": action}
+    for row in rows:
+        if row[0] == "H":
+            made, items, invalid = int(row[1]), int(row[2]), int(row[3])
+            result.update(created=made, items=items, invalid_items=invalid, layer=fh.unb64(row[4]),
+                          name_prefix=fh.unb64(row[5]), frame=int(row[6]), mode=mode, skipped=[], warnings=[],
+                          undoable=True, remove_with={"tool": "forest_instances", "action": "delete",
+                                                       "confirm_delete": True})
+        elif row[0] == "S":
+            result["skipped"].append({"geom_id": int(row[1]), "reason": row[2], "count": int(row[3]),
+                                      "item_name": fh.unb64(row[4])})
+        elif row[0] == "W":
+            result["warnings"].append({"code": row[1], "message": INSTANCE_WARNINGS[row[1]]})
+        elif row[0] == "C":
+            result.update(instances=int(row[1]), deleted=int(row[1]) if row[2] == "1" else 0,
+                          undoable=row[2] == "1")
+        elif row[0] == "D":
+            result["source_disabled"] = row[1] == "1"
+    if action == "create" and "created" not in result:
+        raise ForestError("INVALID_READBACK", "the instance report was incomplete")
+    return result
+
+
+# --------------------------------------------------------------------------------------------
 # forest_set_mode
 # --------------------------------------------------------------------------------------------
 

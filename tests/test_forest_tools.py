@@ -203,7 +203,7 @@ class ImportTargetTests(unittest.TestCase):
 
 class RegistrationTests(unittest.TestCase):
     NEW = {"forest_items", "forest_edit_items", "forest_set_mode", "forest_library", "forest_from_library",
-           "forest_validate"}
+           "forest_validate", "forest_instances"}
 
     def test_registration(self):
         from maxmcp import server
@@ -217,7 +217,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(sum("scattering" in s.modules for s in TOOLSET_SPECS), 1)
         self.assertTrue({"forest_items", "forest_library"} <= server._READ_ONLY_TOOLS)
         self.assertTrue({"forest_items", "forest_library"} <= server._IDEMPOTENT_TOOLS)
-        self.assertTrue({"forest_edit_items", "forest_set_mode"} <= server._DESTRUCTIVE_TOOLS)
+        self.assertTrue({"forest_edit_items", "forest_set_mode", "forest_instances"} <= server._DESTRUCTIVE_TOOLS)
         self.assertFalse({"forest_edit_items", "forest_set_mode", "forest_from_library", "forest_validate"}
                          & server._READ_ONLY_TOOLS)
         self.assertTrue(self.NEW | {"scatter_forest_pack"} <= SKIP_DEFAULT)
@@ -1993,6 +1993,70 @@ class ScatterTests(unittest.TestCase):
         self.assertIn(b64("C:\\x"), script)
         self.assertIn(b64("Lawn\n2"), script)
         self.assertNotIn('Plane "A"', script)
+
+
+class ForestInstancesTests(unittest.TestCase):
+    def run_tool(self, response, *args, **kw):
+        fake = FakeClient(response)
+        with patch.object(forest, "client", fake):
+            out = forest.forest_instances("Forest001", *args, **kw)
+        return out, fake.scripts[0], fake.kwargs[0]
+
+    def test_create_script_and_report(self):
+        report = ok("H|240|250|0|" + b64("Forest001_instances") + "|" + b64("Forest001_inst") + "|0",
+                    "S|2|BILLBOARD|10|" + b64("Pine billboard"), "W|FOREST_COLOR_TINT_LOST", "D|0")
+        out, script, kwargs = self.run_tool(report, max_items=300)
+        check_script(self, script)
+        self.assertIn("fpGuard nd", script)
+        self.assertIn("if n > 300 do throw", script)
+        self.assertIn("local c = instance src[g]", script)
+        self.assertIn("c.parent = undefined", script)
+        self.assertIn("setGroupMember c false", script)
+        self.assertIn('undo "MCP Forest instances" on', script)
+        # transforms are taken in the same call that builds the forest, never from an earlier read
+        self.assertLess(script.find("t.update()"), script.find("t.getFullTransform i"))
+        self.assertGreater(kwargs["timeout"], 60)
+        self.assertEqual(out["created"], 240)
+        self.assertEqual(out["layer"], "Forest001_instances")
+        self.assertEqual(out["skipped"], [{"geom_id": 2, "reason": "BILLBOARD", "count": 10, "item_name": "Pine billboard"}])
+        self.assertEqual(out["warnings"][0]["code"], "FOREST_COLOR_TINT_LOST")
+        self.assertTrue(out["undoable"])
+        self.assertFalse(out["source_disabled"])
+
+    def test_modes_layer_and_disable(self):
+        report = ok("H|1|1|0|" + b64("Trees") + "|" + b64("F_inst") + "|0", "D|1")
+        for mode in ("copy", "reference"):
+            with self.subTest(mode=mode):
+                out, script, _ = self.run_tool(report, mode=mode, layer="Trees", disable_source=True)
+                self.assertIn(f"local c = {mode} src[g]", script)
+                self.assertIn(f'fpDec "{b64("Trees")}"', script)
+                self.assertIn("if true do nd.disabled = true", script)
+                self.assertTrue(out["source_disabled"])
+
+    def test_count_and_delete(self):
+        out, script, _ = self.run_tool(ok("C|12|0", "D|0"), action="count")
+        check_script(self, script)
+        self.assertEqual(out["instances"], 12)
+        self.assertNotIn("t.update()", script.split("else (")[-1])
+        out, script, _ = self.run_tool(ok("C|12|1", "D|0"), action="delete", confirm_delete=True)
+        self.assertIn('undo "MCP Forest instances delete" on (delete mine)', script)
+        self.assertEqual(out["deleted"], 12)
+
+    def test_refusals_before_max(self):
+        bad = ({"action": "explode"}, {"mode": "clone"}, {"max_items": 0}, {"max_items": 10001},
+               {"action": "delete"}, {"action": "count", "layer": "x"}, {"disable_source": 1}, {"layer": "a\x00b"})
+        for kw in bad:
+            fake = FakeClient()
+            with self.subTest(kw=kw), patch.object(forest, "client", fake), self.assertRaises(ValueError):
+                forest.forest_instances("Forest001", **kw)
+            self.assertEqual(fake.scripts, [])
+
+    def test_max_refusal_codes(self):
+        for code in ("REFERENCE_MODE_UNSUPPORTED", "EMPTY_FOREST", "VIEWPORT_LIMIT", "ITEM_LIMIT"):
+            fake = FakeClient({"ok": True, "result": f"FPERR|-- Runtime error: {code}: refused"})
+            with self.subTest(code=code), patch.object(forest, "client", fake),                     self.assertRaises(forest.ForestError) as raised:
+                forest.forest_instances("Forest001")
+            self.assertEqual(raised.exception.code, code)
 
 
 if __name__ == "__main__":

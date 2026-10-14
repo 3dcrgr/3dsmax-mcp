@@ -96,6 +96,7 @@ _DESTRUCTIVE_TOOLS = {
     "forest_set_mode",
     "pulze_set",
     "pulze_restore",
+    "forest_instances",
     "scene_patch",
     "scene_qa",
     "delete_objects",

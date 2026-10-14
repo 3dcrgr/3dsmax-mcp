@@ -90,7 +90,7 @@ that current documentation omits. Remaining gaps are explicit:
 |---|---|
 | Forest effect parameters | Numeric/object/spline/texture and verified scalar-controller bindings/imports are implemented. Other controller subtypes and curves need further probes. Controller time sampling remains unresolved. |
 | Forest effect library | Search/read, ordering and numeric/reference/texture/scalar-controller load/export are implemented. Other controller subtypes and curve import/export remain; add is parameter-free code only. |
-| Forest Tools instances | No public native Instantiate method appeared in ForestPack/trees interfaces. Geometry fallback can be built from `forest_items`; billboard, Forest Color and edge behavior need preservation checks. |
+| Forest Tools instances | Covered by `forest_instances` (2026-10-14): no public native Instantiate exists, so it builds nodes from the item transforms. Billboards are skipped, Forest Color tint loss is reported, Edge mode isn't checked. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
 | Catalog writes/evaluation | `setMacro`, `evalMacro`, browser open/close/refresh/overlay are not exposed as general commands. Evaluation can run scripts; writes persist catalog state. Stored macro reads are implemented. |
 | Compatibility internals | Forest `resetCreatedVersion` and raw setCreatedVersion/upgradeFromVersion remain unwrapped. They change legacy behavior, not ordinary object settings. RailClone's documented reset is wrapped. |
