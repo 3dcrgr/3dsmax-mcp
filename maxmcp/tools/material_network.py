@@ -204,11 +204,13 @@ def replicate_material(
 
     validation_errors = _validate_replicate_payload(payload)
     if validation_errors and not preview:
+        # "error" makes the envelope report the refusal; nothing was changed.
         return json.dumps(
             {
                 "ok": False,
                 "preview": False,
                 "status": "blocked",
+                "error": "replicate_material was blocked; nothing was changed: " + "; ".join(validation_errors),
                 "errors": validation_errors,
             },
             separators=(",", ":"),

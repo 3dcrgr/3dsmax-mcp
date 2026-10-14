@@ -11,6 +11,13 @@
 using json = nlohmann::json;
 using namespace HandlerHelpers;
 
+// Texture map property values are MAXScript literal text; JSON numbers and
+// booleans print as the same literal.
+static std::string MaxScriptLiteralText(const json& value) {
+    if (value.type() == json::value_t::string) return value.get<std::string>();
+    return value.dump();
+}
+
 // ── Helper: navigate to target material (with sub-material support) ──
 static Mtl* GetTargetMaterial(INode* node, int subMatIndex) {
     Mtl* mtl = node->GetMtl();
@@ -162,7 +169,13 @@ std::string NativeHandlers::AssignMaterial(const std::string& params, MCPBridgeG
             std::string nameParam = matName.empty() ? "" : " name:\"" + JsonEscape(matName) + "\"";
             std::string script = "(" + matClass + nameParam + " " + matParams + ")";
             try {
-                RunMAXScript("global __mcp_tmp_mtl = " + script);
+                // Clear the global first: an undefined class token evaluates to
+                // undefined without an error, and assigning that (or a material
+                // left over from an earlier call) would clear or replace the
+                // targets' materials while reporting a new one.
+                RunMAXScriptChecked("global __mcp_tmp_mtl = undefined; __mcp_tmp_mtl = " + script);
+                if (RunMAXScriptChecked("(superClassOf __mcp_tmp_mtl == material) as string") != "true")
+                    throw std::runtime_error("the expression did not create a material");
                 // Now assign via MAXScript too since we can't get the Mtl* back easily
                 int assignCount = 0;
                 json notFound = json::array();
@@ -171,10 +184,9 @@ std::string NativeHandlers::AssignMaterial(const std::string& params, MCPBridgeG
                 for (unsigned long long handle : handles) {
                     INode* node = FindNodeByHandle(handle);
                     if (node && seen.insert(node).second) {
-                        std::string nodeName = WideToUtf8(node->GetName());
-                        std::string assignScript = "(getNodeByName \"" + JsonEscape(nodeName) +
-                            "\").material = __mcp_tmp_mtl";
-                        RunMAXScript(assignScript);
+                        std::string assignScript = "(getAnimByHandle " + std::to_string(NodeHandle(node)) +
+                            ").material = __mcp_tmp_mtl";
+                        RunMAXScriptChecked(assignScript);
                         assigned.push_back(NodeIdentityJson(node));
                         assignCount++;
                     } else if (!node) {
@@ -197,17 +209,16 @@ std::string NativeHandlers::AssignMaterial(const std::string& params, MCPBridgeG
                     }
                     INode* node = matches[0];
                     if (node && seen.insert(node).second) {
-                        std::string nodeName = WideToUtf8(node->GetName());
-                        std::string assignScript = "(getNodeByName \"" + JsonEscape(nodeName) +
-                            "\").material = __mcp_tmp_mtl";
-                        RunMAXScript(assignScript);
+                        std::string assignScript = "(getAnimByHandle " + std::to_string(NodeHandle(node)) +
+                            ").material = __mcp_tmp_mtl";
+                        RunMAXScriptChecked(assignScript);
                         assigned.push_back(NodeIdentityJson(node));
                         assignCount++;
                     }
                 }
                 // Get the material name back
-                std::string mtlName = RunMAXScript("__mcp_tmp_mtl.name");
-                std::string mtlClass = RunMAXScript("(classOf __mcp_tmp_mtl) as string");
+                std::string mtlName = RunMAXScriptChecked("__mcp_tmp_mtl.name");
+                std::string mtlClass = RunMAXScriptChecked("(classOf __mcp_tmp_mtl) as string");
                 ip->RedrawViews(t);
 
                 json result;
@@ -228,7 +239,7 @@ std::string NativeHandlers::AssignMaterial(const std::string& params, MCPBridgeG
                 if (!structured.is_discarded() && structured.is_object() && structured.contains("code")) {
                     throw;
                 }
-                throw std::runtime_error("Unknown material class: " + matClass);
+                throw std::runtime_error("Unknown material class: " + matClass + " (" + message + ")");
             }
         }
 
@@ -366,13 +377,19 @@ std::string NativeHandlers::SetMaterialProperty(const std::string& params, MCPBr
         // have no SDK accessor. We use a single targeted RunMAXScript call.
         std::string matExpr;
         if (subMatIndex > 0)
-            matExpr = "(getNodeByName \"" + JsonEscape(name) + "\").material[" + std::to_string(subMatIndex) + "]";
+            matExpr = "(getAnimByHandle " + std::to_string(NodeHandle(node)) + ").material[" + std::to_string(subMatIndex) + "]";
         else
-            matExpr = "(getNodeByName \"" + JsonEscape(name) + "\").material";
+            matExpr = "(getAnimByHandle " + std::to_string(NodeHandle(node)) + ").material";
 
-        std::string script = "try (" + matExpr + "." + prop + " = " + value +
-                             "; \"Set " + JsonEscape(prop) + "\") catch (\"Error: \" + getCurrentException())";
-        std::string result = RunMAXScript(script);
+        // A rejected assignment throws, so the dispatcher reports it and cancels
+        // its hold instead of returning the MAXScript error text as a success.
+        std::string script = matExpr + "." + prop + " = " + value + "; \"Set " + JsonEscape(prop) + "\"";
+        std::string result;
+        try {
+            result = RunMAXScriptChecked(script);
+        } catch (const std::exception& error) {
+            throw std::runtime_error("Error setting " + prop + ": " + error.what());
+        }
         ip->RedrawViews(t);
         return propertyResult(result);
     });
@@ -407,9 +424,9 @@ std::string NativeHandlers::SetMaterialProperties(const std::string& params, MCP
         // Build MAXScript mat expression for fallback
         std::string matExpr;
         if (subMatIndex > 0)
-            matExpr = "(getNodeByName \"" + JsonEscape(name) + "\").material[" + std::to_string(subMatIndex) + "]";
+            matExpr = "(getAnimByHandle " + std::to_string(NodeHandle(node)) + ").material[" + std::to_string(subMatIndex) + "]";
         else
-            matExpr = "(getNodeByName \"" + JsonEscape(name) + "\").material";
+            matExpr = "(getAnimByHandle " + std::to_string(NodeHandle(node)) + ").material";
 
         for (auto& [prop, value] : properties) {
             // Try pure SDK IParamBlock2 first
@@ -421,11 +438,19 @@ std::string NativeHandlers::SetMaterialProperties(const std::string& params, MCP
             // Fallback for texture map / reference assignments
             try {
                 std::string script = matExpr + "." + prop + " = " + value;
-                RunMAXScript(script);
+                RunMAXScriptChecked(script);
                 okList.push_back(prop);
+            } catch (const std::exception& error) {
+                errList.push_back(prop + ": failed to set (" + error.what() + ")");
             } catch (...) {
                 errList.push_back(prop + ": failed to set");
             }
+        }
+
+        if (okList.empty()) {
+            throw std::runtime_error(StructuredErrorPayload(
+                "BAD_PARAM", "No material property was set on " + WideToUtf8(mtl->GetName().data()),
+                {{"errors", errList}}));
         }
 
         mtl->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
@@ -441,6 +466,11 @@ std::string NativeHandlers::SetMaterialProperties(const std::string& params, MCP
         };
         result["propertiesSet"] = okList;
         result["errors"] = errList;
+        if (!errList.empty()) {
+            result["status"] = "partial";
+            result["warnings"] = json::array({std::to_string(errList.size()) + " of " +
+                std::to_string(properties.size()) + " material properties were not set; see errors."});
+        }
         return result.dump();
     });
 }
@@ -1059,14 +1089,24 @@ std::string NativeHandlers::CreateTextureMap(const std::string& params, MCPBridg
             }
         }
 
-        RunMAXScript(script);
+        // An unknown class token evaluates to undefined without an error, so
+        // confirm the global now holds a texture map before reporting it.
+        try {
+            RunMAXScriptChecked(script);
+        } catch (const std::exception& error) {
+            throw std::runtime_error("Could not create " + mapClass + ": " + error.what());
+        }
+        if (RunMAXScriptChecked("(superClassOf " + globalVar + " == textureMap) as string") != "true")
+            throw std::runtime_error(StructuredErrorPayload(
+                "BAD_PARAM", "Unknown texture map class: " + mapClass,
+                {{"message", "map_class must name a texture map class, for example Bitmaptexture or Noise."}}));
 
         // Set properties
         json setProps = json::array();
         json errors = json::array();
         for (auto& [key, val] : properties.items()) {
             std::string propScript = "try (" + globalVar + "." + key + " = " +
-                                     val.get<std::string>() + "; true) catch (false)";
+                                     MaxScriptLiteralText(val) + "; true) catch (false)";
             std::string r = RunMAXScript(propScript);
             if (r == "true") {
                 setProps.push_back(key);
@@ -1081,7 +1121,11 @@ std::string NativeHandlers::CreateTextureMap(const std::string& params, MCPBridg
         result["map_class"] = mapClass;
         if (!mapName.empty()) result["map_name"] = mapName;
         if (!setProps.empty()) result["set_properties"] = setProps;
-        if (!errors.empty()) result["errors"] = errors;
+        if (!errors.empty()) {
+            result["errors"] = errors;
+            result["warnings"] = json::array({"The map was created, but " + std::to_string(errors.size()) +
+                " propert(ies) were not set: " + JoinNames(errors)});
+        }
         return result.dump();
     });
 }
@@ -1095,13 +1139,21 @@ std::string NativeHandlers::SetTextureMapProperties(const std::string& params, M
 
         if (globalVar.empty())
             throw std::runtime_error("global_var is required");
+        if (!properties.is_object() || properties.empty())
+            throw std::runtime_error("properties must name at least one property to set");
+        // An undefined global makes every assignment fail; report that directly.
+        if (RunMAXScriptChecked("(globalVars.isGlobal #" + globalVar + " and " + globalVar +
+                                " != undefined) as string") != "true")
+            throw std::runtime_error(StructuredErrorPayload(
+                "NOT_FOUND", "MAXScript global is undefined: " + globalVar,
+                {{"message", "Pass the global_var returned by create_texture_map."}}));
 
         json setProps = json::array();
         json errors = json::array();
 
         for (auto& [key, val] : properties.items()) {
             std::string script = "try (" + globalVar + "." + key + " = " +
-                                 val.get<std::string>() + "; true) catch (false)";
+                                 MaxScriptLiteralText(val) + "; true) catch (false)";
             std::string r = RunMAXScript(script);
             if (r == "true") {
                 setProps.push_back(key);
@@ -1109,12 +1161,20 @@ std::string NativeHandlers::SetTextureMapProperties(const std::string& params, M
                 errors.push_back(key);
             }
         }
+        if (setProps.empty())
+            throw std::runtime_error(StructuredErrorPayload(
+                "BAD_PARAM", "No property was set on " + globalVar,
+                {{"errors", errors}}));
 
         json result;
-        result["status"] = "ok";
+        result["status"] = errors.empty() ? "ok" : "partial";
         result["global_var"] = globalVar;
         result["set_properties"] = setProps;
-        if (!errors.empty()) result["errors"] = errors;
+        if (!errors.empty()) {
+            result["errors"] = errors;
+            result["warnings"] = json::array({std::to_string(errors.size()) +
+                " propert(ies) were not set: " + JoinNames(errors)});
+        }
         return result.dump();
     });
 }
@@ -1148,23 +1208,39 @@ std::string NativeHandlers::SetSubMaterial(const std::string& params, MCPBridgeG
             Mtl* srcMtl = parentMtl->GetSubMtl(sourceIndex - 1);
             parentMtl->SetSubMtl(subIdx - 1, srcMtl);
         } else if (!matClass.empty()) {
-            // Create new material at slot via MAXScript
-            std::string script = "global __mcp_sub_mtl = " + matClass + "()";
+            // Create new material at slot via MAXScript. Reset the global first:
+            // an unknown class token evaluates to undefined without an error and
+            // would otherwise reuse an older material.
+            std::string script = "global __mcp_sub_mtl = undefined; __mcp_sub_mtl = " + matClass + "()";
             if (!matName.empty()) {
-                script = "global __mcp_sub_mtl = " + matClass + " name:\"" +
+                script = "global __mcp_sub_mtl = undefined; __mcp_sub_mtl = " + matClass + " name:\"" +
                          JsonEscape(matName) + "\"";
             }
             if (!msParams.empty()) {
-                script = "global __mcp_sub_mtl = " + matClass + " " + msParams;
+                script = "global __mcp_sub_mtl = undefined; __mcp_sub_mtl = " + matClass + " " + msParams;
                 if (!matName.empty()) script += " name:\"" + JsonEscape(matName) + "\"";
             }
-            RunMAXScript(script);
+            try {
+                RunMAXScriptChecked(script);
+            } catch (const std::exception& error) {
+                throw std::runtime_error("Could not create " + matClass + ": " + error.what());
+            }
+            if (RunMAXScriptChecked("(superClassOf __mcp_sub_mtl == material) as string") != "true")
+                throw std::runtime_error(StructuredErrorPayload(
+                    "BAD_PARAM", "Unknown material class: " + matClass));
 
-            // Now get the created material and assign to slot
+            // Now get the created material and assign to slot. materialList is
+            // the Multi/Sub-Object slot array; other parents reject it.
             std::string assignScript =
-                "(getNodeByName \"" + JsonEscape(name) + "\").material.materialList[" +
+                "(getAnimByHandle " + std::to_string(NodeHandle(node)) + ").material.materialList[" +
                 std::to_string(subIdx) + "] = __mcp_sub_mtl; __mcp_sub_mtl.name";
-            std::string resultName = RunMAXScript(assignScript);
+            std::string resultName;
+            try {
+                resultName = RunMAXScriptChecked(assignScript);
+            } catch (const std::exception& error) {
+                throw std::runtime_error("Could not assign sub-material " + std::to_string(subIdx) +
+                    " on " + name + ": " + error.what());
+            }
 
             json result;
             result["status"] = "assigned";

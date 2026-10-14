@@ -840,11 +840,15 @@ std::string NativeHandlers::WriteOSLShader(const std::string& params, MCPBridgeG
             globalVar + ".OSLPath = @\"" + escapedPath + "\"\r\n"
             "\"ok\"\r\n"
             ")";
-        RunMAXScript(createScript);
+        try {
+            RunMAXScriptChecked(createScript);
+        } catch (const std::exception& error) {
+            throw std::runtime_error("Could not create the OSLMap: " + std::string(error.what()));
+        }
 
         // Step 2b: Verify compilation succeeded
         std::string verifyScript = globalVar + ".OSLShaderName";
-        std::string compiledName = RunMAXScript(verifyScript);
+        std::string compiledName = RunMAXScriptChecked(verifyScript);
         bool compiled = (compiledName != "Example" && !compiledName.empty());
 
         // Step 3: Set custom properties (OSLMap lowercases param names)
@@ -876,10 +880,16 @@ std::string NativeHandlers::WriteOSLShader(const std::string& params, MCPBridgeG
         if (!okList.empty()) result["set"] = okList;
         if (!errList.empty()) result["errors"] = errList;
 
+        json warnings = json::array();
+        if (!errList.empty())
+            warnings.push_back(std::to_string(errList.size()) + " shader parameter(s) were not set; see errors.");
         if (!compiled) {
+            result["status"] = "compile_failed";
             result["message"] = "WARNING: OSL shader failed to compile (still 'Example'). "
                 "Check: shader function name must match shader_name='" + shaderName + "', "
                 "verify OSL syntax is valid. File written to " + oslPathUtf8;
+            warnings.insert(warnings.begin(), "The OSL code did not compile; " + globalVar +
+                " still runs the default Example shader.");
         } else {
             result["message"] = "OSL shader '" + compiledName + "' compiled OK | Global: " + globalVar;
             if (!okList.empty()) {
@@ -887,6 +897,7 @@ std::string NativeHandlers::WriteOSLShader(const std::string& params, MCPBridgeG
                     " | Set " + std::to_string(okList.size()) + " properties";
             }
         }
+        if (!warnings.empty()) result["warnings"] = warnings;
         return result.dump();
     });
 }

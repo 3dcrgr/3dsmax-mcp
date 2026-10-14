@@ -267,18 +267,18 @@ def set_material_property(
         if obj == undefined then (
             "Object not found: {safe}"
         ) else if obj.material == undefined then (
-            "No material assigned to {safe}"
+            "Error: No material assigned to {safe}"
         ) else (
             mat = {mat_expr}
             if mat == undefined then (
-                "Sub-material index {sub_material_index} not found on {safe}"
+                "Error: Sub-material index {sub_material_index} not found on {safe}"
             ) else (
                 try (
                     mat.{safe_prop} = {safe_value(value)}
                     readback = (getproperty mat #{safe_prop}) as string
                     "Set " + mat.name + ".{safe_prop} = " + readback
                 ) catch (
-                    "Error setting {safe_prop}: " + (getCurrentException())
+                    "Error: setting {safe_prop} failed: " + (getCurrentException())
                 )
             )
         )
@@ -332,11 +332,11 @@ def set_material_properties(
         if obj == undefined then (
             "Object not found: {safe}"
         ) else if obj.material == undefined then (
-            "No material assigned to {safe}"
+            "Error: No material assigned to {safe}"
         ) else (
             mat = {mat_expr}
             if mat == undefined then (
-                "Sub-material index {sub_material_index} not found on {safe}"
+                "Error: Sub-material index {sub_material_index} not found on {safe}"
             ) else (
                 okList = #()
                 errList = #()
@@ -784,12 +784,12 @@ def set_sub_material(
         maxscript = f"""(
             obj = getNodeByName "{safe}"
             if obj == undefined then "Object not found: {safe}"
-            else if obj.material == undefined then "No material on {safe}"
-            else if (classof obj.material) != Multimaterial then "Material is not Multimaterial"
+            else if obj.material == undefined then "Error: No material on {safe}"
+            else if (classof obj.material) != Multimaterial then "Error: Material is not Multimaterial"
             else (
                 try (
                     srcMat = obj.material.materialList[{source_index}]
-                    if srcMat == undefined then "Source slot {source_index} is empty"
+                    if srcMat == undefined then "Error: Source slot {source_index} is empty"
                     else (
                         obj.material.materialList[{sub_material_index}] = srcMat
                         "Sub[{sub_material_index}] = Sub[{source_index}] (" + srcMat.name + ") — shared reference"
@@ -802,8 +802,8 @@ def set_sub_material(
         maxscript = f"""(
             obj = getNodeByName "{safe}"
             if obj == undefined then "Object not found: {safe}"
-            else if obj.material == undefined then "No material on {safe}"
-            else if (classof obj.material) != Multimaterial then "Material is not Multimaterial"
+            else if obj.material == undefined then "Error: No material on {safe}"
+            else if (classof obj.material) != Multimaterial then "Error: Material is not Multimaterial"
             else (
                 try (
                     newMat = {material_class}{name_param} {params}
@@ -841,6 +841,10 @@ def write_osl_shader(
         raw = response.get("result", "")
         try:
             data = json.loads(raw)
+            # Keep the full payload when the shader did not compile or a
+            # parameter was not set, so the envelope surfaces its warnings.
+            if data.get("warnings"):
+                return raw
             return data.get("message", raw)
         except Exception:
             return raw

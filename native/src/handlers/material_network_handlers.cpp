@@ -1353,6 +1353,11 @@ std::string NativeHandlers::ReplicateMaterialApply(const std::string& params, MC
             result["ok"] = false;
             result["preview"] = false;
             result["status"] = "blocked";
+            // "error" makes the envelope report the refusal instead of success;
+            // the plan's errors travel in details.
+            result["error"] = "replicate_material was blocked by its preflight plan; nothing was changed. "
+                "Fix the listed errors or pass allow_missing=true.";
+            result["details"] = {{"errors", plan["errors"]}};
             result["errors"] = plan["errors"];
             result["plan"] = plan;
             return result.dump();
@@ -1401,6 +1406,12 @@ std::string NativeHandlers::ReplicateMaterialApply(const std::string& params, MC
                 node->SetMtl(targetMaterial);
                 assigned.push_back(target);
             }
+            // With every target missing the new material would have no owner;
+            // the throw cancels the dispatcher's hold and leaves the scene as it was.
+            if (assigned.empty())
+                throw std::runtime_error(StructuredErrorPayload(
+                    "NOT_FOUND", "None of the target objects exist; no material was assigned.",
+                    {{"missingTargets", missingTargets}}));
         } else if (cloned && ip->GetSceneMtls()) {
             ip->GetSceneMtls()->Add(targetMaterial);
         }
@@ -1441,7 +1452,11 @@ std::string NativeHandlers::ReplicateMaterialApply(const std::string& params, MC
         result["materialName"] = BaseName(targetMaterial);
         result["cloned"] = cloned;
         result["assignedTo"] = assigned;
-        if (!missingTargets.empty()) result["missingTargets"] = missingTargets;
+        if (!missingTargets.empty()) {
+            result["missingTargets"] = missingTargets;
+            result["warnings"] = json::array({std::to_string(missingTargets.size()) +
+                " target object(s) do not exist and were not assigned: " + JoinNames(missingTargets)});
+        }
         result["remappedFiles"] = changed.size();
         result["remapped"] = changed;
         result["verification"] = verification;
