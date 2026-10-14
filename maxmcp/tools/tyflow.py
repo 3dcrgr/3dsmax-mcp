@@ -49,6 +49,11 @@ fn jsonStringArray arr =
     s
 )
 
+fn mcpIsTyFlow node =
+(
+    (classof node.baseobject as string) == "tyFlow" or (classof node as string) == "tyFlow"
+)
+
 fn mcpTyChildByName parent childName =
 (
     -- tyFlow dispatch exposes spaced names underscored (Send Out -> .Send_Out):
@@ -249,6 +254,10 @@ def create_tyflow(
         op_name = safe_string(str(op.get("name", op.get("type", f"Operator{idx}"))))
         op_pos = int(op.get("position", idx - 1))
         var = f"op{idx}"
+        # Some operators (Shape) expose no Operator interface to MAXScript and
+        # keep their type name; that is only a failure for a custom name.
+        naming_failure = ("()" if op_name == op_type
+                          else f'append opErrors "Could not name {op_type} operator {op_name}"')
         props = op.get("properties", {})
         if not isinstance(props, dict):
             props = {}
@@ -268,7 +277,7 @@ if {var} == undefined then (
     append failedOps "{op_name}"
     append opErrors "Could not add {op_type} operator {op_name}"
 ) else (
-    try ({var}.Operator.setName "{op_name}") catch (append opErrors "Could not name {op_type} operator {op_name}")
+    try ({var}.Operator.setName "{op_name}") catch ({naming_failure})
     {assign_script}
     operatorCount += 1
 )
@@ -382,12 +391,16 @@ fn propLinesFor targetObj lineTag maxProps maxChars =
 local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
+) else if not (mcpIsTyFlow flow) then (
+    "__ERROR__|Not a tyFlow object: {safe_string(name)}"
 ) else (
     local bo = flow.baseobject
-    local particleCount = 0
-    try (particleCount = flow.numParticles()) catch ()
+    local particleCount = "unreadable"
+    local particleError = ""
+    try (particleCount = flow.numParticles()) catch (particleError = getCurrentException())
 
     local out = "FLOW|" + (clean flow.name) + "|" + (clean ((classof bo) as string)) + "|" + (particleCount as string) + "\\n"
+    if particleError != "" do out += "WARN|PARTICLES_UNREADABLE|" + (clean particleError) + "\\n"
     if {str(bool(include_flow_properties)).lower()} then (
         local fpLines = propLinesFor bo "FP" {max_flow_props} 300
         out += fpLines
@@ -497,8 +510,9 @@ if flow == undefined then (
             result["class"] = _decode_token(parts[2])
             try:
                 result["particleCount"] = int(parts[3])
-            except Exception:
-                result["particleCount"] = 0
+            except ValueError:
+                # numParticles failed; a WARN line carries the reason.
+                result["particleCount"] = None
         elif tag == "META" and len(parts) >= 3:
             if parts[1] == "eventSubAnimCount":
                 try:
@@ -898,14 +912,23 @@ def get_tyflow_particle_count(name: str, frame: int | None = None, update: bool 
 local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
+) else if not (mcpIsTyFlow flow) then (
+    "{{\\"error\\":\\"Not a tyFlow object: {safe_string(name)}\\"}}"
 ) else (
+    local updateError = ""
     if {str(bool(update)).lower()} then (
         sliderTime = {frame_expr}
-        try (flow.updateParticles {frame_expr}) catch ()
+        try (flow.updateParticles {frame_expr}) catch (updateError = getCurrentException())
     )
-    local n = 0
-    try (n = flow.numParticles()) catch ()
-    "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"particleCount\\":" + (n as string) + "}}"
+    local n = undefined
+    local readError = ""
+    try (n = flow.numParticles()) catch (readError = getCurrentException())
+    if n == undefined then (
+        "{{\\"error\\":\\"Could not read particles from " + (esc flow.name) + ": " + (esc readError) + "\\"}}"
+    ) else (
+        local warn = if updateError == "" then "" else ",\\"warnings\\":[\\"Particles were not updated to the frame; the count may be stale: " + (esc updateError) + "\\"]"
+        "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"particleCount\\":" + (n as string) + warn + "}}"
+    )
 )
 )"""
     return json.dumps(_send_json(maxscript, {"error": "Could not parse get_tyflow_particle_count response."}))
@@ -929,19 +952,26 @@ def get_tyflow_particles(
 local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
+) else if not (mcpIsTyFlow flow) then (
+    "{{\\"error\\":\\"Not a tyFlow object: {safe_string(name)}\\"}}"
 ) else (
+    local warnings = #()
     sliderTime = {frame_expr}
-    try (flow.updateParticles {frame_expr}) catch ()
-    local total = 0
-    try (total = flow.numParticles()) catch ()
+    try (flow.updateParticles {frame_expr}) catch (append warnings ("Particles were not updated to the frame; the data may be stale: " + getCurrentException()))
+    local total = undefined
+    local readError = ""
+    try (total = flow.numParticles()) catch (readError = getCurrentException())
+    if total == undefined then (
+        "{{\\"error\\":\\"Could not read particles from " + (esc flow.name) + ": " + (esc readError) + "\\"}}"
+    ) else (
     local takeCount = total
     if takeCount > {int(max_particles)} do takeCount = {int(max_particles)}
     local pos = #()
     local vel = #()
     local age = #()
-    if {str(bool(include_position)).lower()} then (try (pos = flow.getAllParticlePositions()) catch ())
-    if {str(bool(include_velocity)).lower()} then (try (vel = flow.getAllParticleVelocities()) catch ())
-    if {str(bool(include_age)).lower()} then (try (age = flow.getAllParticleAges()) catch ())
+    if {str(bool(include_position)).lower()} then (try (pos = flow.getAllParticlePositions()) catch (append warnings ("Positions could not be read: " + getCurrentException())))
+    if {str(bool(include_velocity)).lower()} then (try (vel = flow.getAllParticleVelocities()) catch (append warnings ("Velocities could not be read: " + getCurrentException())))
+    if {str(bool(include_age)).lower()} then (try (age = flow.getAllParticleAges()) catch (append warnings ("Ages could not be read: " + getCurrentException())))
 
     local rows = #()
     for i = 1 to takeCount do (
@@ -964,7 +994,9 @@ if flow == undefined then (
         payload += rows[i]
     )
     payload += "]"
-    "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"total\\":" + (total as string) + ",\\"returned\\":" + (takeCount as string) + ",\\"particles\\":" + payload + "}}"
+    local warn = if warnings.count == 0 then "" else ",\\"warnings\\":" + (jsonStringArray warnings)
+    "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"total\\":" + (total as string) + ",\\"returned\\":" + (takeCount as string) + ",\\"particles\\":" + payload + warn + "}}"
+    )
 )
 )"""
     return json.dumps(_send_json(maxscript, {"error": "Could not parse get_tyflow_particles response."}))
