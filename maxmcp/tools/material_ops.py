@@ -13,7 +13,15 @@ from pathlib import Path
 from typing import Optional
 from ..server import mcp, client
 from ..coerce import IntList, StrList
-from ..helpers.maxscript import safe_string, safe_value
+from ..helpers.maxscript import (
+    NODE_LOOKUP_FNS,
+    node_by_name,
+    node_by_name_expr,
+    report_ambiguous,
+    safe_string,
+    safe_value,
+    split_ambiguous_reply,
+)
 from ..helpers.material_assign import existing_material_script, existing_material_result
 from ..helpers.native_compat import is_missing_native_route_error
 from ..helpers.material_tripback import (
@@ -150,19 +158,24 @@ def _build_shared_pbr_maxscript(
     ))
     lines.append(f'summary = mat.name + " (" + ((classOf mat) as string) + ")"')
     if assign_to:
+        # Names that match no object or several objects are skipped and reported.
         names_arr = "#(" + ", ".join(f'"{safe_string(n)}"' for n in assign_to) + ")"
+        lines.append(NODE_LOOKUP_FNS)
         lines.extend([
             f"nameList = {names_arr}",
             "assignCount = 0",
             'unassigned = ""',
-            "for n in nameList do (obj = getNodeByName n; if obj != undefined then (obj.material = mat; assignCount += 1) else unassigned += \"|\" + n)",
+            "assignMissing = #()",
+            "assignShared = #()",
+            "for n in nameList do (obj = mcpBatchNode n assignMissing assignShared; if obj != undefined do (obj.material = mat; assignCount += 1))",
+            'for n in assignMissing do unassigned += "|" + n',
             'summary += " | Assigned to " + (assignCount as string) + " object(s)"',
         ])
     lines.extend([
         'summary += " | Channels: " + channelList',
         'if skippedList != "" do summary += " | Skipped: " + skippedList',
         f'if unassigned != "" do summary += "{_UNASSIGNED_MARKER}" + unassigned' if assign_to else "",
-        "summary",
+        "summary + (mcpAmbiguousReply assignShared)" if assign_to else "summary",
     ])
     return "(\n    " + "\n    ".join(lines) + "\n)"
 
@@ -210,19 +223,18 @@ def assign_material(
 
     maxscript = f"""(
         try (
-            mat = {material_class}{name_param} {params}
             nameList = {name_arr}
-            assignCount = 0
+            targets = #()
             notFound = #()
+            -- Every name resolves before the material is created, so a shared
+            -- name fails the call without a partial assignment.
             for n in nameList do (
-                obj = getNodeByName n
-                if obj != undefined then (
-                    obj.material = mat
-                    assignCount += 1
-                ) else (
-                    append notFound n
-                )
+                obj = {node_by_name_expr("n", missing_ok=True)}
+                if obj != undefined then appendIfUnique targets obj else append notFound n
             )
+            mat = {material_class}{name_param} {params}
+            for obj in targets do obj.material = mat
+            assignCount = targets.count
             msg = "Created " + (classof mat) as string + " \\\"" + mat.name + "\\\" and assigned to " + (assignCount as string) + " object(s)"
             if notFound.count > 0 do msg += " | Not found: " + (notFound as string)
             msg
@@ -269,7 +281,7 @@ def set_material_property(
         mat_label = "material"
 
     maxscript = f"""(
-        obj = getNodeByName "{safe}"
+        obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "Object not found: {safe}"
         ) else if obj.material == undefined then (
@@ -334,7 +346,7 @@ def set_material_properties(
     set_block = "\n            ".join(set_lines)
 
     maxscript = f"""(
-        obj = getNodeByName "{safe}"
+        obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "Object not found: {safe}"
         ) else if obj.material == undefined then (
@@ -461,7 +473,7 @@ def get_material_slots(
             else "other"
         )
 
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "{{\\"error\\":\\"Object not found: {safe}\\"}}"
         ) else if obj.material == undefined then (
@@ -788,7 +800,7 @@ def set_sub_material(
     if source_index > 0:
         # Reference from another slot
         maxscript = f"""(
-            obj = getNodeByName "{safe}"
+            obj = {node_by_name(name, missing_ok=True)}
             if obj == undefined then "Object not found: {safe}"
             else if obj.material == undefined then "Error: No material on {safe}"
             else if (classof obj.material) != Multimaterial then "Error: Material is not Multimaterial"
@@ -806,7 +818,7 @@ def set_sub_material(
     else:
         # Create new material at slot
         maxscript = f"""(
-            obj = getNodeByName "{safe}"
+            obj = {node_by_name(name, missing_ok=True)}
             if obj == undefined then "Object not found: {safe}"
             else if obj.material == undefined then "Error: No material on {safe}"
             else if (classof obj.material) != Multimaterial then "Error: Material is not Multimaterial"
@@ -966,12 +978,14 @@ def create_material_from_textures(
 
     # -- Step 6: Send to Max --
     response = client.send_command(maxscript)
-    message, _, unassigned = str(response.get("result", "")).partition(_UNASSIGNED_MARKER)
+    reply, ambiguous = split_ambiguous_reply(str(response.get("result", "")))
+    message, _, unassigned = reply.partition(_UNASSIGNED_MARKER)
     extra: dict = {}
     if unassigned:
         missing = [n for n in unassigned.split("|") if n]
         extra = {"not_found": missing, "warnings": [
             f"assign_to skipped {len(missing)} name(s) that match no object: {', '.join(missing)}"]}
+    report_ambiguous(extra, ambiguous)
     return wrap_material_tool_result(
         message,
         material_class=material_class,
@@ -1587,4 +1601,11 @@ def create_shell_material(
 )"""
 
     response = client.send_command(maxscript)
-    return response.get("result", "{}")
+    result = response.get("result", "{}")
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if isinstance(payload, dict) and payload.get("ambiguous"):
+        return report_ambiguous(payload, payload["ambiguous"])
+    return result
