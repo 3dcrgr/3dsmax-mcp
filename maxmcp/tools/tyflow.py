@@ -3,7 +3,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import (
+    NODE_LOOKUP_FNS,
+    ambiguous_names_warning,
+    name_in_use,
+    name_literal,
+    node_by_name,
+    safe_string,
+)
 
 from ..server import client, mcp
 from ..coerce import StrList, FloatList, IntList, DictList
@@ -273,7 +280,7 @@ if {var} == undefined then (
 if tyFlow == undefined then (
     "{{\\"error\\":\\"tyFlow plugin is not available\\"}}"
 ) else (
-    if "{safe_string(name)}" != "" and (getNodeByName "{safe_string(name)}") != undefined then (
+    if "{safe_string(name)}" != "" and {name_in_use(name_literal(name))} then (
         "{{\\"error\\":\\"Object already exists: {safe_string(name)}\\"}}"
     ) else (
         local flow = if "{safe_string(name)}" == "" then tyFlow pos:[{float(pos[0])},{float(pos[1])},{float(pos[2])}] else tyFlow name:"{safe_string(name)}" pos:[{float(pos[0])},{float(pos[1])},{float(pos[2])}]
@@ -372,7 +379,7 @@ fn propLinesFor targetObj lineTag maxProps maxChars =
     out
 )
 
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
@@ -581,7 +588,7 @@ def add_tyflow_event(name: str, event_name: str, event_position: IntList | None 
 
     maxscript = f"""(
 {HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
 ) else (
@@ -614,7 +621,7 @@ def modify_tyflow_operator(
     req = _mxs_string_array(names)
     maxscript = f"""(
 {HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
 ) else (
@@ -662,7 +669,7 @@ def set_tyflow_shape(
     shape_id = SHAPE_3D_IDS[key]
     maxscript = f"""(
 {HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
 ) else (
@@ -722,18 +729,22 @@ def add_tyflow_collision(
     requested = _mxs_string_array(collider_names)
     maxscript = f"""(
 {HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+{NODE_LOOKUP_FNS}
+local flow = {node_by_name(name, missing_ok=True)}
 local names = {requested}
 local nodes = #()
 local missing = #()
+local ambiguous = #()
+-- Collider names that match no object or several objects are skipped.
 for n in names do (
-    local node = getNodeByName n
-    if node == undefined then append missing n else append nodes node
+    local node = mcpBatchNode n missing ambiguous
+    if node != undefined do append nodes node
 )
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
 ) else if names.count > 0 and nodes.count == 0 then (
     -- Writing an empty list would clear the operator's existing colliders.
+    if ambiguous.count > 0 do mcpThrowUnresolved missing ambiguous "nothing was changed"
     "{{\\"error\\":\\"No collider name matched an object; nothing was changed\\",\\"details\\":{{\\"missing\\":" + (jsonStringArray missing) + "}}}}"
 ) else (
     local ev = findEventSubAnim flow "{safe_string(event_name)}"
@@ -763,7 +774,7 @@ if flow == undefined then (
                     try (setProperty collOp pSym nodes; append applied pName) catch (append errors ("Could not set " + pName))
                 )
             )
-            "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"operator\\":\\"{safe_string(operator_name)}\\",\\"created\\":" + (created as string) + ",\\"requested\\":" + (jsonStringArray names) + ",\\"missing\\":" + (jsonStringArray missing) + ",\\"applied\\":" + (jsonStringArray applied) + ",\\"errors\\":" + (jsonStringArray errors) + "}}"
+            "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"operator\\":\\"{safe_string(operator_name)}\\",\\"created\\":" + (created as string) + ",\\"requested\\":" + (jsonStringArray names) + ",\\"missing\\":" + (jsonStringArray missing) + ",\\"ambiguous\\":" + (mcpAmbiguousJson ambiguous) + ",\\"applied\\":" + (jsonStringArray applied) + ",\\"errors\\":" + (jsonStringArray errors) + "}}"
         )
     )
 )
@@ -772,12 +783,17 @@ if flow == undefined then (
     if isinstance(payload, dict) and "error" not in payload:
         created = bool(payload.get("created"))
         missing = [str(n) for n in payload.get("missing") or []]
+        ambiguous = payload.get("ambiguous") or []
         errors = [str(e) for e in payload.get("errors") or []]
         issues = list(errors)
         if not payload.get("applied") and not errors:
             issues.append("the Collision operator has none of colliderList, objectList, objects or nodes")
         if missing:
             issues.append(f"{len(missing)} collider name(s) matched no object and were skipped: {', '.join(missing)}")
+        if ambiguous:
+            issues.append(ambiguous_names_warning(ambiguous))
+        else:
+            payload.pop("ambiguous", None)
         _batch_outcome(payload, issues, applied=bool(payload.get("applied")),
                        nothing=(f"Created Collision operator {operator_name}, but no collider was set"
                                 if created else f"No collider was set on {operator_name}"))
@@ -801,7 +817,7 @@ def set_tyflow_physx(
     """Set object-level PhysX settings from tyFlow object properties."""
     maxscript = f"""(
 {HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
 ) else (
@@ -839,7 +855,7 @@ def remove_tyflow_element(name: str, event_name: str, operator_name: str = "") -
     """Remove operator from an event, or remove event when operator_name is empty."""
     maxscript = f"""(
 {HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
 ) else (
@@ -879,7 +895,7 @@ def get_tyflow_particle_count(name: str, frame: int | None = None, update: bool 
     frame_expr = "currentTime" if frame is None else f"{int(frame)}f"
     maxscript = f"""(
 {HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
 ) else (
@@ -910,7 +926,7 @@ def get_tyflow_particles(
     frame_expr = "currentTime" if frame is None else f"{int(frame)}f"
     maxscript = f"""(
 {HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
 ) else (
@@ -961,7 +977,7 @@ def reset_tyflow_simulation(name: str = "") -> str:
 {HELPERS}
 local targets = #()
 if "{safe_string(name)}" != "" then (
-    local node = getNodeByName "{safe_string(name)}"
+    local node = {node_by_name(name, missing_ok=True)}
     if node != undefined then append targets node
 ) else (
     for o in objects where ((classof o.baseobject as string) == "tyFlow" or (classof o as string) == "tyFlow") do append targets o

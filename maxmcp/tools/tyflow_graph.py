@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name, safe_string
 
 from ..coerce import DictList
 from ..server import client, mcp
@@ -109,7 +109,7 @@ def _run_connect_maxscript(
         action = "if err == \"\" do (try (realOp.connect realTarget; ok = true) catch (err = getCurrentException()))"
     maxscript = f"""(
 {HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "{{\\"error\\":\\"Object not found: {safe_string(name)}\\"}}"
 ) else (

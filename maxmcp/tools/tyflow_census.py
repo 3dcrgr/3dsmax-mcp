@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name, safe_string
 
 from ..coerce import IntList
 from ..server import client, mcp
@@ -127,7 +127,7 @@ def tyflow_event_census(
 
     maxscript = f"""(
 {CORE_HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
@@ -302,7 +302,7 @@ def capture_tyflow_editor(
             "    try (flow.tyFlow.editor_resetZoom()) catch ()"
         )
     maxscript = f"""(
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (

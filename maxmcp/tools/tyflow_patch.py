@@ -17,7 +17,7 @@ import json
 import threading
 from typing import Any
 
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, node_by_name, safe_string
 
 from ..coerce import DictList, IntList
 from ..max_client import CALL_STATE_ERRORS
@@ -428,7 +428,7 @@ def _run_operations(name: str, operations: list[dict[str, Any]]) -> list[dict[st
 {HELPERS}
 {CORE_HELPERS}
 {PATCH_HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
@@ -562,13 +562,13 @@ def _run_simple(maxscript: str) -> tuple[str, str | None]:
 
 def _create_checkpoint(name: str) -> tuple[str, str | None]:
     maxscript = f"""(
-local flow = getNodeByName "{safe_string(name)}"
+{NODE_LOOKUP_FNS}
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
     local ckptName = "zzz_mcp_ckpt_" + flow.name
-    local stale = getNodeByName ckptName
-    if stale != undefined do (try (delete stale) catch ())
+    for stale in (mcpNamedNodes ckptName) do (try (delete stale) catch ())
     local nn = #()
     local okClone = false
     try (okClone = maxOps.cloneNodes flow cloneType:#copy newNodes:&nn) catch ()
@@ -592,11 +592,11 @@ if flow == undefined then (
 
 def _rollback_checkpoint(name: str, ckpt_name: str) -> str | None:
     maxscript = f"""(
-local ckpt = getNodeByName "{safe_string(ckpt_name)}"
+local ckpt = {node_by_name(ckpt_name, missing_ok=True)}
 if ckpt == undefined then (
     "__ERROR__|Checkpoint missing: {safe_string(ckpt_name)}"
 ) else (
-    local broken = getNodeByName "{safe_string(name)}"
+    local broken = {node_by_name(name, missing_ok=True)}
     if broken != undefined do (try (delete broken) catch ())
     ckpt.name = "{safe_string(name)}"
     unhide ckpt
@@ -611,7 +611,7 @@ if ckpt == undefined then (
 def _drop_checkpoint(ckpt_name: str) -> str | None:
     """Delete the checkpoint clone; return why it may still be in the scene."""
     maxscript = f"""(
-local ckpt = getNodeByName "{safe_string(ckpt_name)}"
+local ckpt = {node_by_name(ckpt_name, missing_ok=True)}
 if ckpt != undefined do (try (delete ckpt) catch ())
 try (windows.processPostedMessages()) catch ()
 if isValidNode ckpt then "__ERROR__|delete was refused" else "OK"
@@ -628,7 +628,7 @@ def _run_verification(
 ) -> dict[str, Any]:
     frame_list = ", ".join(str(int(frame)) for frame in frames)
     maxscript = f"""(
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (

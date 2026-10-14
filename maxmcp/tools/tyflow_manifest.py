@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, safe_string
 from ..helpers.tyflow_catalog import EXECUTABLE_OPERATOR_NAMES, TYFLOW_OPERATOR_NAMES
 
 from ..coerce import StrList
@@ -76,11 +76,15 @@ def _probe_batch(names: list[str]) -> dict[str, Any] | list[dict[str, Any]]:
     array_literal = "#(" + ", ".join(f'"{safe_string(item)}"' for item in names) + ")"
     maxscript = f"""(
 {CORE_HELPERS}
+{NODE_LOOKUP_FNS}
 if tyFlow == undefined then (
     "__ERROR__|tyFlow plugin is not available"
 ) else (
     local out = stringstream ""
-    local flow = getNodeByName "{_PROBE_FLOW}"
+    -- Batches reuse the scratch flow; several left by an interrupted run are replaced.
+    local flow = undefined
+    local probeFlows = mcpNamedNodes "{_PROBE_FLOW}"
+    if probeFlows.count == 1 then flow = probeFlows[1] else (for f in probeFlows do (try (delete f) catch ()))
     if flow == undefined do flow = tyFlow name:"{_PROBE_FLOW}" pos:[0,0,-100000]
     local eh = flow.tyFlow.addEvent()
     local ev = eh.Event
@@ -153,9 +157,10 @@ if tyFlow == undefined then (
 def _cleanup_probe_flow() -> str | None:
     """Delete the scratch flow; return why it may still be in the scene."""
     maxscript = f"""(
-local flow = getNodeByName "{_PROBE_FLOW}"
-if flow != undefined do (try (delete flow) catch ())
-if isValidNode flow then "LEFT" else "OK"
+{NODE_LOOKUP_FNS}
+local flows = mcpNamedNodes "{_PROBE_FLOW}"
+for flow in flows do (try (delete flow) catch ())
+if (for flow in flows where isValidNode flow collect flow).count > 0 then "LEFT" else "OK"
 )"""
     try:
         raw = str(client.send_command(maxscript).get("result", "")).strip()

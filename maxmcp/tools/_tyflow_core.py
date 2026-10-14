@@ -15,7 +15,7 @@ import hashlib
 import json
 from typing import Any
 
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name, safe_string
 
 
 def _client():
@@ -181,7 +181,7 @@ def read_graph(
     max_props = max(1, int(max_properties_per_operator))
     maxscript = f"""(
 {CORE_HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
@@ -389,7 +389,7 @@ def graph_payload(
 def write_ledger_appdata(name: str, ledger: dict[str, Any]) -> dict[str, Any]:
     """Write the ledger dict verbatim to appdata on the flow node."""
     maxscript = f"""(
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
