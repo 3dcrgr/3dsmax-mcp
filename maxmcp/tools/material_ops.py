@@ -119,6 +119,10 @@ def _truncate_slots(payload: dict, key: str, max_per_group: int, out: dict, trun
         trunc[key] = len(items)
 
 
+# Separates the summary from the assign_to names that matched no object.
+_UNASSIGNED_MARKER = "__mcp_unassigned__"
+
+
 def _build_shared_pbr_maxscript(
     matched: dict[str, Path],
     material_name: str,
@@ -150,12 +154,14 @@ def _build_shared_pbr_maxscript(
         lines.extend([
             f"nameList = {names_arr}",
             "assignCount = 0",
-            "for n in nameList do (obj = getNodeByName n; if obj != undefined then (obj.material = mat; assignCount += 1))",
+            'unassigned = ""',
+            "for n in nameList do (obj = getNodeByName n; if obj != undefined then (obj.material = mat; assignCount += 1) else unassigned += \"|\" + n)",
             'summary += " | Assigned to " + (assignCount as string) + " object(s)"',
         ])
     lines.extend([
         'summary += " | Channels: " + channelList',
         'if skippedList != "" do summary += " | Skipped: " + skippedList',
+        f'if unassigned != "" do summary += "{_UNASSIGNED_MARKER}" + unassigned' if assign_to else "",
         "summary",
     ])
     return "(\n    " + "\n    ".join(lines) + "\n)"
@@ -960,12 +966,18 @@ def create_material_from_textures(
 
     # -- Step 6: Send to Max --
     response = client.send_command(maxscript)
-    raw = response.get("result", "")
+    message, _, unassigned = str(response.get("result", "")).partition(_UNASSIGNED_MARKER)
+    extra: dict = {}
+    if unassigned:
+        missing = [n for n in unassigned.split("|") if n]
+        extra = {"not_found": missing, "warnings": [
+            f"assign_to skipped {len(missing)} name(s) that match no object: {', '.join(missing)}"]}
     return wrap_material_tool_result(
-        str(raw),
+        message,
         material_class=material_class,
         renderer=renderer,
         tool="create_material_from_textures",
+        **extra,
     )
 
 
