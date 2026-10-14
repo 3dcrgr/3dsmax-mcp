@@ -14,7 +14,7 @@ from ..helpers.maxscript import (
 
 from ..server import client, mcp
 from ..coerce import StrList, FloatList, IntList, DictList
-from ._tyflow_core import MAXSCRIPT_ERROR, ledger_update
+from ._tyflow_core import MAXSCRIPT_ERROR, ledger_update, merge_ledger
 
 
 SHAPE_3D_IDS: dict[str, int] = {
@@ -318,7 +318,7 @@ if tyFlow == undefined then (
             op_name = str(op.get("name", op.get("type", f"Operator{idx}")))
             if op_name not in failed_ops:
                 record_ops[f"{event_name}/{op_name}"] = op_type
-        payload.update(ledger_update(str(payload["name"]), record_ops=record_ops))
+        merge_ledger(payload, ledger_update(str(payload["name"]), record_ops=record_ops))
     if select_created and isinstance(payload, dict) and "name" in payload and "error" not in payload:
         payload["selectResult"] = select_objects(names=[str(payload["name"])])
     return json.dumps(payload)
@@ -615,7 +615,7 @@ if flow == undefined then (
 )"""
     payload = _send_json(maxscript, {"error": "Could not parse add_tyflow_event response."})
     if isinstance(payload, dict) and "error" not in payload:
-        payload.update(ledger_update(name))
+        merge_ledger(payload, ledger_update(name))
     return json.dumps(payload)
 
 
@@ -661,7 +661,7 @@ if flow == undefined then (
                        applied=bool(payload.get("applied")),
                        nothing=f"No property was set on {operator_name}")
     if isinstance(payload, dict) and "error" not in payload:
-        payload.update(ledger_update(name))
+        merge_ledger(payload, ledger_update(name))
     return json.dumps(payload)
 
 
@@ -725,8 +725,8 @@ if flow == undefined then (
                                 if created else f"No shape value was set on {operator_name}"))
         # A created operator changed the flow even when its values were refused.
         if created or "error" not in payload:
-            payload.update(
-                ledger_update(name, record_ops={f"{event_name}/{operator_name}": "Shape"})
+            merge_ledger(
+                payload, ledger_update(name, record_ops={f"{event_name}/{operator_name}": "Shape"})
             )
     return json.dumps(payload)
 
@@ -813,8 +813,8 @@ if flow == undefined then (
                                 if created else f"No collider was set on {operator_name}"))
         # A created operator changed the flow even when no collider was set.
         if created or "error" not in payload:
-            payload.update(
-                ledger_update(name, record_ops={f"{event_name}/{operator_name}": "Collision"})
+            merge_ledger(
+                payload, ledger_update(name, record_ops={f"{event_name}/{operator_name}": "Collision"})
             )
     return json.dumps(payload)
 
@@ -897,9 +897,9 @@ if flow == undefined then (
     payload = _send_json(maxscript, {"error": "Could not parse remove_tyflow_element response."})
     if isinstance(payload, dict) and "error" not in payload:
         if payload.get("removed") == "event":
-            payload.update(ledger_update(name, remove_event=event_name))
+            merge_ledger(payload, ledger_update(name, remove_event=event_name))
         elif payload.get("removed") == "operator":
-            payload.update(ledger_update(name, remove_operator=(event_name, operator_name)))
+            merge_ledger(payload, ledger_update(name, remove_operator=(event_name, operator_name)))
     return json.dumps(payload)
 
 

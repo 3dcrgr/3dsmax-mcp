@@ -21,6 +21,7 @@ from ._tyflow_core import (
     canon_name,
     graph_payload,
     ledger_update,
+    merge_ledger,
     parse_ledger,
     read_graph,
     store_ledger,
@@ -181,7 +182,8 @@ def connect_tyflow_operator(
         "connected": True,
         "created_send_out": created,
     }
-    payload.update(
+    merge_ledger(
+        payload,
         ledger_update(
             name,
             replace_edge=(from_event, from_operator, to_event),
@@ -203,7 +205,7 @@ def disconnect_tyflow_operator(name: str, from_event: str, from_operator: str) -
         "from_operator": from_operator,
         "disconnected": True,
     }
-    payload.update(_rewrite_ledger_edges(name, from_event, from_operator, None))
+    merge_ledger(payload, _rewrite_ledger_edges(name, from_event, from_operator, None))
     return json.dumps(payload)
 
 

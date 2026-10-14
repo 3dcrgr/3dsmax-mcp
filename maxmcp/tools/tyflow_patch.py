@@ -27,7 +27,6 @@ from ._tyflow_core import (
     MAXSCRIPT_ERROR,
     canon_name,
     graph_payload,
-    ledger_update,
     parse_ledger,
     read_graph,
     store_ledger,
@@ -780,11 +779,16 @@ def tyflow_apply_patch(
                     payload["rolled_back"] = True
                 # Ledger appdata was never touched on this path; the restored
                 # structure matches the pre-patch hash, so it stays fresh.
-            elif ckpt_name:
-                payload["checkpoint"] = ckpt_name
-                payload["ledger"] = ledger_update(name)
             else:
-                payload["ledger"] = ledger_update(name)
+                if ckpt_name:
+                    payload["checkpoint"] = ckpt_name
+                # The kept operations are recorded as a successful patch records them.
+                ledger_outcome = _apply_ledger_mutations(
+                    name, _ledger_mutations(operations, op_results)
+                )
+                payload.update(ledger_outcome)
+                if "ledgerHash" in ledger_outcome:
+                    payload["graph_hash"] = ledger_outcome["ledgerHash"]
             return json.dumps(_failed_patch_outcome(payload, rollback_on_failure))
 
         warnings = _property_error_warnings(op_results)
@@ -798,6 +802,8 @@ def tyflow_apply_patch(
         payload.update(ledger_outcome)
         if "ledgerHash" in ledger_outcome:
             payload["graph_hash"] = ledger_outcome["ledgerHash"]
+        if ledger_outcome.get("ledgerWarning"):
+            warnings.append(ledger_outcome["ledgerWarning"])
         if warnings:
             payload["status"] = "partial"
             payload["warnings"] = warnings
@@ -841,6 +847,8 @@ def _failed_patch_outcome(payload: dict[str, Any], rollback_on_failure: bool) ->
         if payload.get("checkpoint"):
             payload["warnings"].append(
                 f"Checkpoint clone {payload['checkpoint']} remains hidden in the scene.")
+        if payload.get("ledgerWarning"):
+            payload["warnings"].append(payload["ledgerWarning"])
         return payload
     else:
         message = "tyFlow patch failed; every operation reported an error"

@@ -465,6 +465,14 @@ def ledger_update(
         return {"ledgerWarning": f"Ledger not updated: {exc}"}
 
 
+def merge_ledger(payload: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
+    """Merge a ledger outcome into a tool reply; a stale ledger is also a warning."""
+    payload.update(outcome)
+    if outcome.get("ledgerWarning"):
+        payload.setdefault("warnings", []).append(outcome["ledgerWarning"])
+    return payload
+
+
 def _ledger_update(
     name: str,
     *,
