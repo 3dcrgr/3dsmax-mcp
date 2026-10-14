@@ -3,6 +3,7 @@ import re
 
 from ..server import mcp, client
 from ..coerce import FloatList, IntList, StrList
+from ..max_client import MaxBridgeError
 from ..helpers.maxscript import safe_string
 from ..helpers.spatial import (
     apply_pos_mode_fix_maxscript,
@@ -25,7 +26,9 @@ def _orientation_payload_for_name(name: str) -> dict | None:
             return None
         payload = _json.loads(raw) if isinstance(raw, str) else raw
         return payload if isinstance(payload, dict) else None
-    except (RuntimeError, _json.JSONDecodeError, TypeError):
+    except (MaxBridgeError, RuntimeError, _json.JSONDecodeError, TypeError):
+        # A name several objects share is refused natively: report no
+        # snapshot rather than failing a creation that already happened.
         return None
 
 
