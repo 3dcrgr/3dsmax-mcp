@@ -382,8 +382,12 @@ def _error_from_result(result: Any, raw: Any) -> dict[str, Any] | None:
                 hint=structured.get("hint"),
                 details=structured.get("details"),
             )
+        # Phrase checks are for plain-text results. A JSON object reports its
+        # own outcome; a partial success may quote "... not found: name".
         lowered = stripped.lower()
-        if lowered.startswith(_ERROR_PREFIXES) or any(s in lowered for s in _ERROR_SUBSTRINGS):
+        if structured is None and (
+            lowered.startswith(_ERROR_PREFIXES) or any(s in lowered for s in _ERROR_SUBSTRINGS)
+        ):
             return _normalize_error(error_type="ToolError", message=stripped)
     return None
 
