@@ -366,7 +366,7 @@ CURVE_WRITE_FLAGS = CURVE_BEZIER | CURVE_CORNER | CURVE_LOCKED_Y | CURVE_LOCKED_
 def curve_points(points: Any) -> list[tuple[float, float, float, float, float, float, int]]:
     """Normalise curve points to (px, py, inx, iny, outx, outy, flags) tuples.
 
-    Accepts [x, y] pairs (corner points), {"x", "y", "type": "corner"|"bezier", "in": [dx, dy],
+    Accepts [x, y] pairs (corner points), {"x", "y", "type": "corner"|"bezier"|"bezier_corner", "in": [dx, dy],
     "out": [dx, dy], "lock_x", "lock_y"} dicts, or the {"position", "in_tangent", "out_tangent",
     "flags"} rows that forest_effect_curves returns, so a read can be edited and written back.
     The first and last points are marked as endpoints; the editor's selection bit is dropped.
@@ -390,13 +390,13 @@ def curve_points(points: Any) -> list[tuple[float, float, float, float, float, f
             if set(point) - {"x", "y", "type", "in", "out", "lock_x", "lock_y"}:
                 raise ValueError("unknown curve point field")
             kind = point.get("type", "corner")
-            if kind not in ("corner", "bezier"):
-                raise ValueError("point type must be corner or bezier")
+            if kind not in ("corner", "bezier", "bezier_corner"):
+                raise ValueError("point type must be corner, bezier or bezier_corner")
             x, y = point.get("x"), point.get("y")
             tin, tout = point.get("in", (0.0, 0.0)), point.get("out", (0.0, 0.0))
             if kind == "corner" and ("in" in point or "out" in point):
                 raise ValueError("corner points take no tangents; use type bezier")
-            flags = CURVE_BEZIER if kind == "bezier" else CURVE_CORNER
+            flags = {"bezier": CURVE_BEZIER, "corner": CURVE_CORNER, "bezier_corner": CURVE_BEZIER | CURVE_CORNER}[kind]
             for key, bit in (("lock_x", CURVE_LOCKED_X), ("lock_y", CURVE_LOCKED_Y)):
                 if type(point.get(key, False)) is not bool:
                     raise ValueError(f"{key} must be boolean")
@@ -411,8 +411,8 @@ def curve_points(points: Any) -> list[tuple[float, float, float, float, float, f
             if type(value) not in (int, float) or not math.isfinite(value):
                 raise ValueError("curve coordinates and tangents must be finite numbers")
             values.append(float(value))
-        if flags & ~CURVE_WRITE_FLAGS or bool(flags & CURVE_BEZIER) == bool(flags & CURVE_CORNER):
-            raise ValueError("a point is exactly one of corner or bezier, with supported flags only")
+        if flags & ~CURVE_WRITE_FLAGS or not flags & (CURVE_BEZIER | CURVE_CORNER):
+            raise ValueError("a point is corner, bezier or bezier corner, with supported flags only")
         if values[2] > 0 or values[4] < 0:
             raise ValueError("in tangents point left (dx<=0) and out tangents right (dx>=0)")
         if out and values[0] <= out[-1][0]:
@@ -799,7 +799,7 @@ def forest_effect_curves(name: str, limit: int = 16, offset: int = 0,
     set_points writes one curve parameter, chosen by exact parameter ID or unique name
     (optionally scoped to an effect ID), and requires expected_effects from a current
     read. points: 2..256 points as [x, y] pairs (corner points), {x, y, type
-    corner|bezier, in [dx, dy], out [dx, dy], lock_x, lock_y} objects, or the point
+    corner|bezier|bezier_corner, in [dx, dy], out [dx, dy] relative to the point, lock_x, lock_y} objects, or the point
     rows inspect returns (so a read can be edited and written back). X must increase,
     start and end at the curve's X range, and every point stay inside its X/Y range
     (Forest's curves are 0..1). Animated curves are refused. The edit is staged on a
@@ -1027,8 +1027,8 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     tracks (native type 0); source controllers are sampled through an internal
     Float_Expression on the real parameter track and are never keyed/edited.
     Curve definitions import with Forest's flat default points, or with the points in the
-    definition's <curves><curve><point px py inx iny outx outy flags/> child (the format Forest
-    saves in efpacurve), using SDK allocation on the staged copy; existing static curve slots
+    definition's <curves><curve><point px py inx iny outx outy flags/> child (MCP-specific: the
+    XML Forest writes into efpacurve in scenes; Forest's own .eff loader is untested with it), using SDK allocation on the staged copy; existing static curve slots
     follow parameter IDs through removal. Animated curve reordering is refused. export writes
     each curve parameter's current points in that same format (exported_curves lists them).
     No source nodes are created or serialized.

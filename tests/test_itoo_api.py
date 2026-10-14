@@ -747,11 +747,14 @@ class ForestCurvePointTests(unittest.TestCase):
         self.assertEqual(pts[0], (0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2 | 256))
         self.assertEqual(pts[1][6], 1 | 4)
         self.assertEqual(pts[2][6], 2 | 256)  # selection bit dropped, endpoint kept
+        corner = api.curve_points([[0, 0], {"x": 0.5, "y": 0.5, "type": "bezier_corner", "in": [-0.1, 0.2], "out": [0.1, -0.2]}, [1, 1]])
+        self.assertEqual(corner[1][6], 1 | 2)
+        self.assertEqual(api.curve_points([[0, 0], {"position": [1, 1], "flags": 3 | 256}])[1][6], 3 | 256)
 
     def test_bad_points_refused_before_max(self):
         bad = ([[0, 0]], [[0, 0]] * 257, [[0, 0], [0, 1]], [[0, 0], [float("nan"), 1]],
                [[0, 0], {"x": 1, "y": 1, "in": [-0.1, 0]}], [[0, 0], {"x": 1, "y": 1, "type": "bezier", "out": [-1, 0]}],
-               [[0, 0], {"position": [1, 1], "flags": 3}], [[0, 0], {"x": 1, "y": 1, "zz": 1}], "0,0;1,1")
+               [[0, 0], {"position": [1, 1], "flags": 0}], [[0, 0], {"x": 1, "y": 1, "zz": 1}], "0,0;1,1")
         for points in bad:
             with self.subTest(points=str(points)[:40]), self.assertRaises(ValueError):
                 api.curve_points(points)

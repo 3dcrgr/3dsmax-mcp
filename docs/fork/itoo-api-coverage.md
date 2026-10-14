@@ -467,16 +467,21 @@ the bridge deploy that it needs.
   bits outside corner, bezier, the two locks, endpoint and no-X-constraint, X values that don't
   increase, endpoints off the control's X range, and values outside the X/Y range
   (`CURVE_VALUE_OUT_OF_RANGE`). Every point is read back natively, then again by the Python tool.
-- Points: `[x, y]` pairs (corner), `{x, y, type, in, out, lock_x, lock_y}` objects, or the rows that
+  After writing, the staged CurveControl notifies its dependents (only the staged base) so no cached
+  evaluation survives; whether the adopted Forest evaluates the new shape at once is part of the
+  live check.
+- Points: `[x, y]` pairs (corner), `{x, y, type corner|bezier|bezier_corner, in, out, lock_x, lock_y}`
+  objects (tangents relative to the point, per the SDK), or the rows that
   `inspect` returns. The first and last points are always endpoints; the editor's selection bit is
   dropped.
 - Persistence: Forest saves each slot into `efpacurve[r]` and rebuilds the slot from it on load
   (verified in #45), so edited points travel with the scene.
 - `.eff`: a curve definition may hold one `<curves><curve><point px py inx iny outx outy flags/>`
-  child, the exact format Forest writes into `efpacurve`. Load applies the points after the slots are
+  child. This is MCP-specific: it reuses the XML Forest writes into `efpacurve` inside scenes, and
+  shipped `.eff` files carry no points. Load applies the points after the slots are
   prepared and stores the definition without the child (Forest's stored effect XML never holds
   points). Export reads each curve parameter's points and writes that child (`exported_curves`).
-  iToo doesn't document curve data in `.eff` files, so whether Forest's own Import button reads
-  this child is untested.
+  iToo doesn't document curve data in `.eff` files, and Forest's own `.eff` loader is untested with
+  this child.
 - The effects token doesn't cover curve shapes (they live in the native slot, not in the `efpa*`
   arrays), so two concurrent curve edits aren't detected as stale.

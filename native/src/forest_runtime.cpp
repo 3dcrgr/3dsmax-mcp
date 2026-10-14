@@ -172,7 +172,8 @@ Value* SetCurvePoints(Value** args,int count) {
         for(int k=0;k<6;++k){v[k]=item->data[k]->to_float();if(!std::isfinite(v[k]))Refuse(L"BAD_PARAM: curve values must be finite");}
         const int flags=item->data[6]->to_int();
         if(flags&~allowed)Refuse(L"BAD_PARAM: unsupported curve point flags");
-        if(((flags&CURVEP_BEZIER)!=0)==((flags&CURVEP_CORNER)!=0))Refuse(L"BAD_PARAM: a point is either corner or bezier");
+        // SDK: bezier smooth = BEZIER, corner = CORNER, bezier corner = BEZIER|CORNER.
+        if(!(flags&(CURVEP_BEZIER|CURVEP_CORNER)))Refuse(L"BAD_PARAM: a point is corner, bezier or bezier corner");
         const bool end=j==0||j==input->size-1;
         if(((flags&CURVEP_ENDPOINT)!=0)!=end)Refuse(L"BAD_PARAM: only the first and last points are endpoints");
         if(v[0]<xr.x-eps||v[0]>xr.y+eps||v[1]<yr.x-eps||v[1]>yr.y+eps)
@@ -193,6 +194,9 @@ Value* SetCurvePoints(Value** args,int count) {
         if(off(got.p,want.p)||off(got.in,want.in)||off(got.out,want.out)||(got.flags&allowed)!=want.flags)
             Refuse(L"INVALID_READBACK: curve point did not persist as written");
     }
+    // SetPoint ran with notify=FALSE: invalidate any cached evaluation on the staged copy
+    // (its only dependents are the staged Forest base; nothing in the scene is notified).
+    static_cast<ReferenceTarget*>(candidate)->NotifyDependents(FOREVER,PART_ALL,REFMSG_CHANGE);
     return Integer::intern((int)points.size());
 }
 Value* BindFloat(Value** args,int count) {
