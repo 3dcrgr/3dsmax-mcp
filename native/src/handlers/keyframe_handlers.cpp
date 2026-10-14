@@ -97,35 +97,30 @@ static Control* ControlFromAnimatable(Animatable* anim) {
     return nullptr;
 }
 
-static void CollectNodesForRequest(const json& p, Interface* ip, std::vector<INode*>& out,
-                                   json& notFound) {
+static NamedNodes CollectNodesForRequest(const json& p, Interface* ip) {
+    auto names = p.value("names", std::vector<std::string>{});
+    if (!names.empty()) return ResolveNodesByNames(names);
+
+    NamedNodes request;
+    std::vector<INode*>& out = request.nodes;
     std::unordered_set<INode*> seen;
     auto push = [&](INode* node) {
         if (node && seen.insert(node).second) out.push_back(node);
     };
-
-    auto names = p.value("names", std::vector<std::string>{});
-    if (!names.empty()) {
-        for (const auto& name : names) {
-            INode* node = FindNodeByName(name);
-            if (!node) notFound.push_back(name);
-            push(node);
-        }
-        return;
-    }
 
     std::string target = LowerCopy(p.value("target", "selection"));
     if (target == "all" || target == "scene") {
         std::vector<INode*> nodes;
         CollectNodes(ip->GetRootNode(), nodes);
         for (INode* node : nodes) push(node);
-        return;
+        return request;
     }
 
     const int selCount = ip->GetSelNodeCount();
     for (int i = 0; i < selCount; ++i) {
         push(ip->GetSelNode(i));
     }
+    return request;
 }
 
 struct TrackRef {
@@ -1552,20 +1547,23 @@ std::string NativeHandlers::KeyframeTracks(const std::string& params, MCPBridgeG
             return ManageTimeline(p, ip).dump();
         }
 
-        std::vector<INode*> nodes;
-        json notFoundNames = json::array();
-        CollectNodesForRequest(p, ip, nodes, notFoundNames);
+        const NamedNodes requested = CollectNodesForRequest(p, ip);
+        std::vector<INode*> nodes = requested.nodes;
         if (nodes.empty()) {
+            if (requested.Unresolved()) ThrowUnresolvedNames(requested, "no keyframe track was read or changed.");
             throw std::runtime_error("No target nodes found. Pass names, target='all', or select objects in 3ds Max.");
         }
-        // Names that matched nothing are reported, never silently dropped.
+        // Names that matched nothing, or several objects, are reported, never
+        // silently dropped.
         auto withMissingNames = [&](json result) {
+            const json& notFoundNames = requested.notFound;
             if (!notFoundNames.empty()) {
                 result["notFound"] = notFoundNames;
                 result["status"] = "partial";
                 result["warnings"].push_back(std::to_string(notFoundNames.size()) +
                     " requested name(s) matched no object and were skipped: " + JoinNames(notFoundNames));
             }
+            AddAmbiguousNamesWarning(result, requested.ambiguous);
             return result;
         };
 

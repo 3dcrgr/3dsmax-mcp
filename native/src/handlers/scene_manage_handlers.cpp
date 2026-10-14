@@ -23,23 +23,20 @@ std::string NativeHandlers::SetParent(const std::string& params, MCPBridgeGUP* g
         // Find parent node (nullptr = unparent to scene root)
         INode* parentNode = nullptr;
         if (!parentName.empty()) {
-            parentNode = FindNodeByName(parentName);
+            parentNode = FindUniqueNodeByName(parentName);
             if (!parentNode) throw std::runtime_error("Parent not found: " + parentName);
         }
 
         json done = json::array();
-        json notFound = json::array();
         json rejected = json::array();
 
         // Resolve every child before the first edit. A parent cannot become a
         // child of itself or of one of its own descendants.
+        const NamedNodes resolved = ResolveNodesByNames(children);
+        const json& notFound = resolved.notFound;
         std::vector<std::pair<std::string, INode*>> targets;
-        for (const auto& childName : children) {
-            INode* child = FindNodeByName(childName);
-            if (!child) {
-                notFound.push_back(childName);
-                continue;
-            }
+        for (INode* child : resolved.nodes) {
+            const std::string childName = WideToUtf8(child->GetName());
             bool cycle = false;
             for (INode* cursor = parentNode; cursor && !cursor->IsRootNode(); cursor = cursor->GetParentNode()) {
                 if (cursor == child) { cycle = true; break; }
@@ -52,9 +49,9 @@ std::string NativeHandlers::SetParent(const std::string& params, MCPBridgeGUP* g
         }
         if (targets.empty()) {
             throw std::runtime_error(StructuredErrorPayload(
-                notFound.empty() ? "HIERARCHY_CYCLE" : "NOT_FOUND",
+                resolved.Unresolved() ? UnresolvedNamesCode(resolved) : "HIERARCHY_CYCLE",
                 "No requested child could be parented; the hierarchy was not changed.",
-                {{"notFound", notFound}, {"rejected", rejected}}));
+                UnresolvedNamesHint(resolved, {{"rejected", rejected}})));
         }
 
         INode* newParent = parentNode ? parentNode : ip->GetRootNode();
@@ -94,6 +91,7 @@ std::string NativeHandlers::SetParent(const std::string& params, MCPBridgeGUP* g
             result["status"] = "partial";
             result["warnings"] = warnings;
         }
+        AddAmbiguousNamesWarning(result, resolved.ambiguous);
         return result.dump();
     });
 }
@@ -108,10 +106,12 @@ std::string NativeHandlers::BatchRenameObjects(const std::string& params, MCPBri
 
         json renamed = json::array();
         json notFound = json::array();
+        json ambiguous = json::array();
         json invalid = json::array();
         json duplicates = json::array();
 
-        // Entries apply in order, so a swap through a temporary name works.
+        // Entries apply in order, so a swap through a temporary name works:
+        // each old name is looked up when its entry applies.
         std::vector<INode*> renamedNodes;
         for (size_t i = 0; i < renames.size(); ++i) {
             const json& r = renames[i];
@@ -122,11 +122,16 @@ std::string NativeHandlers::BatchRenameObjects(const std::string& params, MCPBri
                 continue;
             }
 
-            INode* node = FindNodeByName(oldName);
-            if (!node) {
+            const std::vector<INode*> matches = CollectNodesByExactName(oldName);
+            if (matches.empty()) {
                 notFound.push_back(oldName);
                 continue;
             }
+            if (matches.size() > 1) {
+                ambiguous.push_back(AmbiguousNameJson(oldName, matches));
+                continue;
+            }
+            INode* node = matches.front();
 
             std::wstring wNewName = Utf8ToWide(newName);
             node->SetName(wNewName.c_str());
@@ -134,12 +139,19 @@ std::string NativeHandlers::BatchRenameObjects(const std::string& params, MCPBri
             renamedNodes.push_back(node);
         }
         if (renamed.empty()) {
+            json hint = {{"notFound", notFound}, {"invalidEntries", invalid}};
+            if (!ambiguous.empty()) {
+                hint["ambiguous"] = ambiguous;
+                hint["message"] = kUniqueNamesAdvice;
+            }
             throw std::runtime_error(StructuredErrorPayload(
-                notFound.empty() ? "BAD_PARAM" : "NOT_FOUND",
-                "No rename could be applied; every entry was missing old_name/new_name or matched no object.",
-                {{"notFound", notFound}, {"invalidEntries", invalid}}));
+                !notFound.empty() ? "NOT_FOUND" : !ambiguous.empty() ? "AMBIGUOUS" : "BAD_PARAM",
+                "No rename could be applied; every entry was missing old_name/new_name, matched no object "
+                "or named several objects.",
+                hint));
         }
-        // Max allows duplicate object names; name lookups then pick either object.
+        // Max allows duplicate object names; tools that take names then
+        // refuse them as ambiguous.
         for (INode* node : renamedNodes) {
             const std::string current = WideToUtf8(node->GetName());
             if (CollectNodesByExactName(current).size() > 1 &&
@@ -171,6 +183,7 @@ std::string NativeHandlers::BatchRenameObjects(const std::string& params, MCPBri
             result["status"] = "partial";
             result["warnings"] = warnings;
         }
+        AddAmbiguousNamesWarning(result, ambiguous);
         return result.dump();
     });
 }

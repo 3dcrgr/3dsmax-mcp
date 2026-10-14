@@ -732,21 +732,12 @@ std::string NativeHandlers::SelectObjects(const std::string& params, MCPBridgeGU
         }
 
         if (!names.empty()) {
-            // Resolve every name first: a request that names only missing
-            // objects fails and leaves the current selection untouched.
-            std::vector<INode*> found;
-            json notFound = json::array();
-            for (const auto& name : names) {
-                INode* node = FindNodeByName(name);
-                if (node) found.push_back(node);
-                else notFound.push_back(name);
-            }
-            if (found.empty()) {
-                throw std::runtime_error(StructuredErrorPayload(
-                    "NOT_FOUND",
-                    "No object matched the requested names; the selection was not changed.",
-                    {{"notFound", notFound}}));
-            }
+            // Resolve every name first: a request that names only missing or
+            // shared names fails and leaves the current selection untouched.
+            const NamedNodes resolved = ResolveNodesByNames(names);
+            const std::vector<INode*>& found = resolved.nodes;
+            const json& notFound = resolved.notFound;
+            if (found.empty()) ThrowUnresolvedNames(resolved, "the selection was not changed.");
             ip->ClearNodeSelection(FALSE);
             for (INode* node : found) ip->SelectNode(node, FALSE);
             ip->RedrawViews(ip->GetTime());
@@ -756,9 +747,10 @@ std::string NativeHandlers::SelectObjects(const std::string& params, MCPBridgeGU
             result["notFound"] = notFound;
             if (!notFound.empty()) {
                 result["status"] = "partial";
-                result["warnings"] = json::array({std::to_string(notFound.size()) +
-                    " requested name(s) matched no object and were not selected: " + JoinNames(notFound)});
+                result["warnings"].push_back(std::to_string(notFound.size()) +
+                    " requested name(s) matched no object and were not selected: " + JoinNames(notFound));
             }
+            AddAmbiguousNamesWarning(result, resolved.ambiguous);
             return result.dump();
         }
 
@@ -820,19 +812,12 @@ std::string NativeHandlers::SetVisibility(const std::string& params, MCPBridgeGU
 
         // Collect target nodes
         std::vector<INode*> targets;
-        json notFound = json::array();
+        NamedNodes resolved;
+        const json& notFound = resolved.notFound;
         if (!names.empty()) {
-            for (const auto& name : names) {
-                INode* node = FindNodeByName(name);
-                if (node) targets.push_back(node);
-                else notFound.push_back(name);
-            }
-            if (targets.empty()) {
-                throw std::runtime_error(StructuredErrorPayload(
-                    "NOT_FOUND",
-                    "No object matched the requested names; visibility was not changed.",
-                    {{"notFound", notFound}}));
-            }
+            resolved = ResolveNodesByNames(names);
+            if (resolved.nodes.empty()) ThrowUnresolvedNames(resolved, "visibility was not changed.");
+            targets = resolved.nodes;
         } else {
             targets = CollectNodesByPattern(pattern);
         }
@@ -862,13 +847,14 @@ std::string NativeHandlers::SetVisibility(const std::string& params, MCPBridgeGU
         if (!names.empty()) result["notFound"] = notFound;
         if (!notFound.empty()) {
             result["status"] = "partial";
-            result["warnings"] = json::array({std::to_string(notFound.size()) +
-                " requested name(s) matched no object and were skipped: " + JoinNames(notFound)});
+            result["warnings"].push_back(std::to_string(notFound.size()) +
+                " requested name(s) matched no object and were skipped: " + JoinNames(notFound));
         } else if (count == 0) {
             result["status"] = "no_match";
             result["warnings"] = json::array({"No object matches pattern \"" + pattern +
                 "\", so nothing was changed."});
         }
+        AddAmbiguousNamesWarning(result, resolved.ambiguous);
         return result.dump();
     });
 }

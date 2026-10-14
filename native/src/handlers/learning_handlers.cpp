@@ -80,7 +80,7 @@ std::string NativeHandlers::WalkReferences(const std::string& params, MCPBridgeG
         std::string objName = p["name"].get<std::string>();
         int maxDepth = (std::min)(p.value("max_depth", 4), 8);
 
-        INode* node = FindNodeByName(objName);
+        INode* node = FindUniqueNodeByName(objName);
         if (!node) throw std::runtime_error("Object not found: " + objName);
 
         std::set<ReferenceTarget*> visited;

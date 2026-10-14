@@ -1,5 +1,7 @@
 #pragma once
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 #include <functional>
@@ -217,13 +219,6 @@ inline std::vector<INode*> CollectNodesByExactName(const std::string& name) {
     return matched;
 }
 
-// ── Node lookup by name ─────────────────────────────────────────
-inline INode* FindNodeByName(const std::string& name) {
-    Interface* ip = GetCOREInterface();
-    std::wstring wname = Utf8ToWide(name);
-    return ip->GetINodeByName(wname.c_str());
-}
-
 inline unsigned long long PayloadHandleValue(const json& payload, const std::string& key = "handle") {
     auto it = payload.find(key);
     if (it == payload.end() || it->is_null()) return 0ULL;
@@ -268,6 +263,45 @@ inline std::string StructuredErrorPayload(
     return payload.dump();
 }
 
+// ── Node lookup by name ─────────────────────────────────────────
+// Max lets several objects share a name (imported "Object001", repeated
+// furniture), and Interface::GetINodeByName then returns either one. A name
+// therefore resolves only when exactly one object carries it; a shared name
+// fails with every candidate's identity instead of acting on a guess.
+inline constexpr const char* kPassHandleAdvice = "Pass handle to disambiguate this object name.";
+inline constexpr const char* kUniqueNamesAdvice =
+    "This tool takes object names only. Give the objects unique names first "
+    "(set_object_property with handle and property \"name\", or scene_patch rename), then retry.";
+
+inline json NameCandidatesJson(const std::vector<INode*>& matches) {
+    json candidates = json::array();
+    for (INode* node : matches) candidates.push_back(NodeIdentityJson(node));
+    return candidates;
+}
+
+[[noreturn]] inline void ThrowAmbiguousName(
+    const std::string& name, const std::vector<INode*>& matches, const char* advice) {
+    throw std::runtime_error(StructuredErrorPayload(
+        "AMBIGUOUS",
+        "Ambiguous object name: " + name,
+        {{"message", advice}, {"candidates", NameCandidatesJson(matches)}}));
+}
+
+// The one object with this exact name, or nullptr when none has it; the
+// caller reports a missing name in its own words.
+inline INode* FindUniqueNodeByName(const std::string& name, const char* advice = kUniqueNamesAdvice) {
+    const std::vector<INode*> matches = CollectNodesByExactName(name);
+    if (matches.size() > 1) ThrowAmbiguousName(name, matches, advice);
+    return matches.empty() ? nullptr : matches.front();
+}
+
+// MAXScript expression for a node already resolved here. getAnimByHandle
+// reaches it by its animatable handle, so the script never looks the node up
+// by name again.
+inline std::string NodeScriptRef(INode* node) {
+    return "(getAnimByHandle " + std::to_string(NodeHandle(node)) + ")";
+}
+
 inline INode* ResolveNodeFromPayload(
     const json& payload,
     const std::string& nameKey = "name",
@@ -287,25 +321,11 @@ inline INode* ResolveNodeFromPayload(
         throw std::runtime_error(nameKey + " or " + handleKey + " is required");
     }
 
-    std::vector<INode*> matches = CollectNodesByExactName(name);
-    if (matches.empty()) {
+    INode* node = FindUniqueNodeByName(name, kPassHandleAdvice);
+    if (!node) {
         throw std::runtime_error("Object not found: " + name);
     }
-    if (matches.size() > 1) {
-        json candidates = json::array();
-        for (INode* node : matches) {
-            candidates.push_back(NodeIdentityJson(node));
-        }
-        json hint = {
-            {"message", "Pass handle to disambiguate this object name."},
-            {"candidates", candidates},
-        };
-        throw std::runtime_error(StructuredErrorPayload(
-            "AMBIGUOUS",
-            "Ambiguous object name: " + name,
-            hint));
-    }
-    return matches[0];
+    return node;
 }
 
 // MAXScript-level wrap that captures runtime exceptions (parse errors still
@@ -322,10 +342,91 @@ inline std::string JoinNames(const json& names, size_t limit = 10) {
         if (shown == limit) { out += ", ..."; break; }
         if (shown++) out += ", ";
         if (entry.type() == json::value_t::string) out += entry.get<std::string>();
+        else if (entry.is_object() && entry.contains("name") &&
+                 entry["name"].type() == json::value_t::string) out += entry["name"].get<std::string>();
         else if (entry.is_object() && entry.contains("handle")) out += "handle " + entry["handle"].dump();
         else out += entry.dump();
     }
     return out;
+}
+
+// ── Batch name resolution ───────────────────────────────────────
+// A batch edit applies each requested name to the one object carrying it.
+// A name several objects share is applied to none of them: like a missing
+// name, it is skipped and reported, with its candidates.
+struct NamedNodes {
+    std::vector<INode*> nodes;        // request order, each node once
+    json notFound = json::array();    // names no object carries
+    json ambiguous = json::array();   // {name, candidates} per shared name
+    bool Unresolved() const { return !notFound.empty() || !ambiguous.empty(); }
+};
+
+inline json AmbiguousNameJson(const std::string& name, const std::vector<INode*>& matches) {
+    return {{"name", name}, {"candidates", NameCandidatesJson(matches)}};
+}
+
+inline NamedNodes ResolveNodesByNames(const std::vector<std::string>& names) {
+    // One scene walk serves the whole list.
+    std::unordered_map<std::string, std::vector<INode*>> byName;
+    for (const auto& name : names) byName.emplace(name, std::vector<INode*>{});
+    std::vector<INode*> all;
+    CollectNodes(GetCOREInterface()->GetRootNode(), all);
+    for (INode* node : all) {
+        auto it = byName.find(WideToUtf8(node->GetName()));
+        if (it != byName.end()) it->second.push_back(node);
+    }
+
+    NamedNodes out;
+    std::unordered_set<INode*> seen;
+    std::unordered_set<std::string> reported;
+    for (const auto& name : names) {
+        const std::vector<INode*>& matches = byName[name];
+        if (matches.empty()) {
+            out.notFound.push_back(name);
+        } else if (matches.size() > 1) {
+            if (reported.insert(name).second) out.ambiguous.push_back(AmbiguousNameJson(name, matches));
+        } else if (seen.insert(matches.front()).second) {
+            out.nodes.push_back(matches.front());
+        }
+    }
+    return out;
+}
+
+// Error code for a batch that applied nothing because of its names.
+inline const char* UnresolvedNamesCode(const NamedNodes& resolved) {
+    return resolved.notFound.empty() && !resolved.ambiguous.empty() ? "AMBIGUOUS" : "NOT_FOUND";
+}
+
+inline json UnresolvedNamesHint(const NamedNodes& resolved, json hint = json::object()) {
+    hint["notFound"] = resolved.notFound;
+    if (!resolved.ambiguous.empty()) {
+        hint["ambiguous"] = resolved.ambiguous;
+        hint["message"] = kUniqueNamesAdvice;
+    }
+    return hint;
+}
+
+// Fails a batch in which no requested name matched exactly one object.
+// consequence says what was left unchanged.
+[[noreturn]] inline void ThrowUnresolvedNames(
+    const NamedNodes& resolved, const std::string& consequence, const json& hint = json::object()) {
+    const char* reason = resolved.ambiguous.empty()
+        ? "No object matched the requested names; "
+        : resolved.notFound.empty()
+            ? "Each requested name is shared by several objects; "
+            : "No requested name matched exactly one object; ";
+    throw std::runtime_error(StructuredErrorPayload(
+        UnresolvedNamesCode(resolved), reason + consequence, UnresolvedNamesHint(resolved, hint)));
+}
+
+// Marks a batch result partial for the shared names it skipped.
+inline void AddAmbiguousNamesWarning(json& result, const json& ambiguous) {
+    if (ambiguous.empty()) return;
+    result["ambiguous"] = ambiguous;
+    result["status"] = "partial";
+    result["warnings"].push_back(std::to_string(ambiguous.size()) +
+        " requested name(s) are shared by several objects and were skipped: " + JoinNames(ambiguous) +
+        ". See ambiguous for each object's handle.");
 }
 
 inline std::wstring WrapForErrorCapture(const std::wstring& wcmd) {

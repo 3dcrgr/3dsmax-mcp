@@ -111,7 +111,7 @@ static json DescribeInterface(FPInterface* fpi) {
 // PB1 doesn't store names for non-animatable params. Use getPropNames
 // via MAXScript on the actual instance to get the full name list.
 // msRef is a MAXScript expression that evaluates to the object
-// (e.g. "(getNodeByName \"Rect\").modifiers[1]")
+// (e.g. "(getAnimByHandle 1234).modifiers[1]")
 static std::vector<std::string> GetPB1PropNames(const std::string& msRef) {
     std::vector<std::string> names;
     if (msRef.empty()) return names;
@@ -144,8 +144,8 @@ static std::vector<std::string> GetPB1PropNames(const std::string& msRef) {
 // Returns a JSON array of PB1 blocks with their params and live values.
 // Uses MAXScript getPropNames as fallback for non-animatable param names.
 // msRef: MAXScript expression to reference this object for getPropNames fallback
-//        e.g. "(getNodeByName \"Box001\").baseObject" or
-//             "(getNodeByName \"Rect001\").modifiers[1]"
+//        e.g. "(getAnimByHandle 1234).baseObject" or
+//             "(getAnimByHandle 1234).modifiers[1]"
 static json ReadPB1Params(Animatable* anim, TimeValue t, const std::string& msRef = "") {
     json pb1Blocks = json::array();
     if (!anim) return pb1Blocks;
@@ -480,7 +480,7 @@ std::string NativeHandlers::IntrospectInstance(const std::string& params, MCPBri
         bool includeSubAnims = p.value("include_subanims", false);
         int subAnimDepth = p.value("subanim_depth", 3);
 
-        INode* node = FindNodeByName(objName);
+        INode* node = FindUniqueNodeByName(objName);
         if (!node)
             throw std::runtime_error("Object not found: " + objName);
 
@@ -612,7 +612,7 @@ std::string NativeHandlers::IntrospectInstance(const std::string& params, MCPBri
         }
 
         // Legacy PB1 params (older plugins that don't use PB2)
-        std::string baseRef = "(getNodeByName \"" + JsonEscape(objName) + "\").baseObject";
+        std::string baseRef = NodeScriptRef(node) + ".baseObject";
         json pb1 = ReadPB1Params(obj, t, baseRef);
         if (!pb1.empty()) {
             result["pb1ParamBlocks"] = pb1;
@@ -666,8 +666,8 @@ std::string NativeHandlers::IntrospectInstance(const std::string& params, MCPBri
                 }
 
                 // Legacy PB1 on modifier
-                std::string modRef = "(getNodeByName \"" + JsonEscape(objName) +
-                    "\").modifiers[" + std::to_string(m + 1) + "]"; // 1-based in MAXScript
+                std::string modRef = NodeScriptRef(node) +
+                    ".modifiers[" + std::to_string(m + 1) + "]"; // 1-based in MAXScript
                 json modPB1 = ReadPB1Params(mod, t, modRef);
                 if (!modPB1.empty()) {
                     modj["pb1ParamBlocks"] = modPB1;

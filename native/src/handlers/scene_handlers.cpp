@@ -426,7 +426,7 @@ std::string NativeHandlers::GetHierarchy(const std::string& params, MCPBridgeGUP
         Interface* ip = GetCOREInterface();
         TimeValue t = ip->GetTime();
 
-        INode* node = FindNodeByName(name);
+        INode* node = FindUniqueNodeByName(name);
         if (!node) {
             throw std::runtime_error("Object not found: " + name);
         }

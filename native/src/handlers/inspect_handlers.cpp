@@ -159,7 +159,7 @@ std::string NativeHandlers::InspectObject(const std::string& params, MCPBridgeGU
         std::string name = p.value("name", "");
         if (name.empty()) throw std::runtime_error("name is required");
 
-        INode* node = FindNodeByName(name);
+        INode* node = FindUniqueNodeByName(name);
         if (!node) throw std::runtime_error("Object not found: " + name);
 
         Interface* ip = GetCOREInterface();
@@ -312,7 +312,7 @@ std::string NativeHandlers::InspectProperties(const std::string& params, MCPBrid
 
         if (name.empty()) throw std::runtime_error("name is required");
 
-        INode* node = FindNodeByName(name);
+        INode* node = FindUniqueNodeByName(name);
         if (!node) throw std::runtime_error("Object not found: " + name);
 
         Interface* ip = GetCOREInterface();
@@ -550,7 +550,7 @@ std::string NativeHandlers::GetInstances(const std::string& params, MCPBridgeGUP
         std::string name = p.value("name", "");
         if (name.empty()) throw std::runtime_error("name is required");
 
-        INode* node = FindNodeByName(name);
+        INode* node = FindUniqueNodeByName(name);
         if (!node) throw std::runtime_error("Object not found: " + name);
 
         INodeTab instTab;
@@ -580,7 +580,7 @@ std::string NativeHandlers::GetDependencies(const std::string& params, MCPBridge
         if (name.empty()) throw std::runtime_error("name is required");
         std::transform(direction.begin(), direction.end(), direction.begin(), ::tolower);
 
-        INode* node = FindNodeByName(name);
+        INode* node = FindUniqueNodeByName(name);
         if (!node) throw std::runtime_error("Object not found: " + name);
 
         json result;
@@ -915,7 +915,7 @@ std::string NativeHandlers::GetMaterialSlots(const std::string& params, MCPBridg
 
         if (name.empty()) throw std::runtime_error("name is required");
 
-        INode* node = FindNodeByName(name);
+        INode* node = FindUniqueNodeByName(name);
         if (!node) throw std::runtime_error("Object not found: " + name);
 
         Mtl* mtl = node->GetMtl();

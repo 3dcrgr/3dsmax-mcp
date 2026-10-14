@@ -22,33 +22,33 @@ static DWORD LayerColorFromPayload(const json& value) {
 
 // Resolves object names for an organization edit. Every name is looked up
 // before the first change; the caller reports the unresolved ones.
-static std::vector<INode*> ResolveNamedNodes(const json& names, json& notFound) {
-    std::vector<INode*> nodes;
+static NamedNodes ResolveNamedNodes(const json& names) {
     if (names.type() != json::value_t::array)
         throw std::runtime_error("names must be an array of object names");
-    for (const auto& nameVal : names) {
-        const std::string name = nameVal.get<std::string>();
-        INode* node = FindNodeByName(name);
-        if (!node) {
-            notFound.push_back(name);
-        } else if (std::find(nodes.begin(), nodes.end(), node) == nodes.end()) {
-            nodes.push_back(node);
-        }
+    std::vector<std::string> requested;
+    for (const auto& nameVal : names) requested.push_back(nameVal.get<std::string>());
+    return ResolveNodesByNames(requested);
+}
+
+// The group a group action names. Only group heads qualify, so a member that
+// shares its group's name does not make the group ambiguous; two groups with
+// one name do.
+static INode* FindGroupHead(const std::string& name) {
+    std::vector<INode*> heads;
+    for (INode* node : CollectNodesByExactName(name))
+        if (node->IsGroupHead()) heads.push_back(node);
+    if (heads.size() > 1) ThrowAmbiguousName(name, heads, kUniqueNamesAdvice);
+    return heads.empty() ? nullptr : heads.front();
+}
+
+static void AddUnresolvedNamesWarnings(json& result, const NamedNodes& resolved) {
+    result["notFound"] = resolved.notFound;
+    if (!resolved.notFound.empty()) {
+        result["status"] = "partial";
+        result["warnings"].push_back(std::to_string(resolved.notFound.size()) +
+            " requested name(s) matched no object and were skipped: " + JoinNames(resolved.notFound));
     }
-    return nodes;
-}
-
-[[noreturn]] static void ThrowNoNamedNodes(const json& notFound, const std::string& what) {
-    throw std::runtime_error(StructuredErrorPayload(
-        "NOT_FOUND", "No object matched the requested names; " + what,
-        {{"notFound", notFound}}));
-}
-
-static void AddMissingNamesWarning(json& result, const json& notFound) {
-    if (notFound.empty()) return;
-    result["status"] = "partial";
-    result["warnings"].push_back(std::to_string(notFound.size()) +
-        " requested name(s) matched no object and were skipped: " + JoinNames(notFound));
+    AddAmbiguousNamesWarning(result, resolved.ambiguous);
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -285,12 +285,11 @@ std::string NativeHandlers::ManageLayers(const std::string& params, MCPBridgeGUP
                 throw std::runtime_error("Layer not found: " + p["layer"].get<std::string>());
 
             json moved = json::array();
-            json notFound = json::array();
             json failed = json::array();
-            const std::vector<INode*> nodes = ResolveNamedNodes(p["names"], notFound);
-            if (nodes.empty()) ThrowNoNamedNodes(notFound, "no object was moved to a layer.");
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            if (resolved.nodes.empty()) ThrowUnresolvedNames(resolved, "no object was moved to a layer.");
 
-            for (INode* node : nodes) {
+            for (INode* node : resolved.nodes) {
                 const std::string name = WideToUtf8(node->GetName());
                 // AddToLayer reports false for a node it did not move.
                 if (layer->AddToLayer(node) || NodeLayerName(node) == WideToUtf8(layer->GetName().data()))
@@ -302,8 +301,7 @@ std::string NativeHandlers::ManageLayers(const std::string& params, MCPBridgeGUP
             json result;
             result["layer"] = p["layer"].get<std::string>();
             result["moved"] = moved;
-            result["notFound"] = notFound;
-            AddMissingNamesWarning(result, notFound);
+            AddUnresolvedNamesWarnings(result, resolved);
             if (!failed.empty()) {
                 if (moved.empty())
                     throw std::runtime_error("Max did not move any object to layer " +
@@ -404,19 +402,10 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
                 throw std::runtime_error("names (array of object names) is required for create");
 
             INodeTab nodes;
-            json notFound = json::array();
-            for (auto& nameVal : p["names"]) {
-                std::string name = nameVal.get<std::string>();
-                INode* node = FindNodeByName(name);
-                if (node) {
-                    nodes.AppendNode(node);
-                } else {
-                    notFound.push_back(name);
-                }
-            }
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) nodes.AppendNode(node);
 
-            if (nodes.Count() == 0)
-                throw std::runtime_error("No valid objects found to group");
+            if (nodes.Count() == 0) ThrowUnresolvedNames(resolved, "no group was created.");
 
             MSTR groupName;
             if (p.contains("name")) {
@@ -431,8 +420,7 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             json result;
             result["group"] = WideToUtf8(groupHead->GetName());
             result["memberCount"] = nodes.Count();
-            result["notFound"] = notFound;
-            AddMissingNamesWarning(result, notFound);
+            AddUnresolvedNamesWarnings(result, resolved);
             return result.dump();
         }
 
@@ -441,11 +429,11 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             if (!p.contains("name"))
                 throw std::runtime_error("name is required for ungroup");
 
-            INode* node = FindNodeByName(p["name"].get<std::string>());
+            const std::string name = p["name"].get<std::string>();
+            INode* node = FindGroupHead(name);
             if (!node)
-                throw std::runtime_error("Object not found: " + p["name"].get<std::string>());
-            if (!node->IsGroupHead())
-                throw std::runtime_error("Object is not a group head: " + p["name"].get<std::string>());
+                throw std::runtime_error((CollectNodesByExactName(name).empty()
+                    ? "Object not found: " : "Object is not a group head: ") + name);
 
             INodeTab nodes;
             nodes.AppendNode(node);
@@ -461,8 +449,8 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             if (!p.contains("name"))
                 throw std::runtime_error("name is required for open");
 
-            INode* node = FindNodeByName(p["name"].get<std::string>());
-            if (!node || !node->IsGroupHead())
+            INode* node = FindGroupHead(p["name"].get<std::string>());
+            if (!node)
                 throw std::runtime_error("Group not found: " + p["name"].get<std::string>());
 
             INodeTab nodes;
@@ -479,8 +467,8 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             if (!p.contains("name"))
                 throw std::runtime_error("name is required for close");
 
-            INode* node = FindNodeByName(p["name"].get<std::string>());
-            if (!node || !node->IsGroupHead())
+            INode* node = FindGroupHead(p["name"].get<std::string>());
+            if (!node)
                 throw std::runtime_error("Group not found: " + p["name"].get<std::string>());
 
             INodeTab nodes;
@@ -497,14 +485,14 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             if (!p.contains("group") || !p.contains("names"))
                 throw std::runtime_error("group and names are required for attach");
 
-            INode* groupHead = FindNodeByName(p["group"].get<std::string>());
-            if (!groupHead || !groupHead->IsGroupHead())
+            INode* groupHead = FindGroupHead(p["group"].get<std::string>());
+            if (!groupHead)
                 throw std::runtime_error("Group not found: " + p["group"].get<std::string>());
 
             INodeTab nodes;
-            json notFound = json::array();
-            for (INode* node : ResolveNamedNodes(p["names"], notFound)) nodes.AppendNode(node);
-            if (nodes.Count() == 0) ThrowNoNamedNodes(notFound, "nothing was attached to the group.");
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) nodes.AppendNode(node);
+            if (nodes.Count() == 0) ThrowUnresolvedNames(resolved, "nothing was attached to the group.");
 
             if (!ip->AttachNodesToGroup(nodes, *groupHead))
                 throw std::runtime_error("Max could not attach the objects to group " +
@@ -528,8 +516,7 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             json result;
             result["group"] = p["group"].get<std::string>();
             result["attached"] = attached;
-            result["notFound"] = notFound;
-            AddMissingNamesWarning(result, notFound);
+            AddUnresolvedNamesWarnings(result, resolved);
             if (!failed.empty()) {
                 result["failed"] = failed;
                 result["status"] = "partial";
@@ -545,7 +532,6 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
                 throw std::runtime_error("names is required for detach");
 
             INodeTab nodes;
-            json notFound = json::array();
             json notGroupMembers = json::array();
             json autoOpenedGroups = json::array();
             std::vector<INode*> groupsToReclose;
@@ -573,33 +559,30 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
                 autoOpenedGroups.push_back(WideToUtf8(groupHead->GetName()));
             };
 
-            for (auto& nameVal : p["names"]) {
-                std::string name = nameVal.get<std::string>();
-                INode* node = FindNodeByName(name);
-                if (node) {
-                    if (!node->IsGroupMember()) {
-                        notGroupMembers.push_back(name);
-                        continue;
-                    }
-
-                    INode* parent = node->GetParentNode();
-                    if (parent && parent->IsGroupHead()) {
-                        ensureGroupOpen(parent);
-                    }
-
-                    nodes.AppendNode(node);
-                } else {
-                    notFound.push_back(name);
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) {
+                if (!node->IsGroupMember()) {
+                    notGroupMembers.push_back(WideToUtf8(node->GetName()));
+                    continue;
                 }
+
+                INode* parent = node->GetParentNode();
+                if (parent && parent->IsGroupHead()) {
+                    ensureGroupOpen(parent);
+                }
+
+                nodes.AppendNode(node);
             }
 
             const int requestedDetach = nodes.Count();
             if (requestedDetach == 0) {
                 // Nothing was opened above: only group members queue a group to reopen.
+                const json hint = {{"notGroupMembers", notGroupMembers}};
+                if (notGroupMembers.empty()) ThrowUnresolvedNames(resolved, "nothing was detached.", hint);
                 throw std::runtime_error(StructuredErrorPayload(
-                    notGroupMembers.empty() ? "NOT_FOUND" : "BAD_PARAM",
+                    "BAD_PARAM",
                     "None of the requested objects is a group member; nothing was detached.",
-                    {{"notFound", notFound}, {"notGroupMembers", notGroupMembers}}));
+                    UnresolvedNamesHint(resolved, hint)));
             }
             ip->DetachNodesFromGroup(nodes);
 
@@ -623,7 +606,6 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             json result;
             result["detached"] = detachedCount;
             result["requested"] = requestedDetach;
-            result["notFound"] = notFound;
             result["notGroupMembers"] = notGroupMembers;
             result["autoOpenedGroups"] = autoOpenedGroups;
             result["failedDetach"] = failedDetach;
@@ -631,7 +613,7 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
                 throw std::runtime_error(StructuredErrorPayload(
                     "BAD_PARAM", "Max did not detach any of the requested group members.",
                     {{"failedDetach", failedDetach}}));
-            AddMissingNamesWarning(result, notFound);
+            AddUnresolvedNamesWarnings(result, resolved);
             if (!notGroupMembers.empty()) {
                 result["status"] = "partial";
                 result["warnings"].push_back(std::to_string(notGroupMembers.size()) +
@@ -700,9 +682,9 @@ std::string NativeHandlers::ManageSelectionSets(const std::string& params, MCPBr
             MSTR mname(wname.c_str());
 
             Tab<INode*> nodes;
-            json notFound = json::array();
-            for (INode* node : ResolveNamedNodes(p["names"], notFound)) nodes.Append(1, &node);
-            if (nodes.Count() == 0) ThrowNoNamedNodes(notFound, "the selection set was not created.");
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) nodes.Append(1, &node);
+            if (nodes.Count() == 0) ThrowUnresolvedNames(resolved, "the selection set was not created.");
 
             if (!mgr->AddNewNamedSelSet(nodes, mname))
                 throw std::runtime_error("Failed to create selection set: " + setName);
@@ -710,8 +692,7 @@ std::string NativeHandlers::ManageSelectionSets(const std::string& params, MCPBr
             json result;
             result["created"] = setName;
             result["memberCount"] = nodes.Count();
-            result["notFound"] = notFound;
-            AddMissingNamesWarning(result, notFound);
+            AddUnresolvedNamesWarnings(result, resolved);
             return result.dump();
         }
 
@@ -781,9 +762,9 @@ std::string NativeHandlers::ManageSelectionSets(const std::string& params, MCPBr
             MSTR mname(wname.c_str());
 
             Tab<INode*> nodes;
-            json notFound = json::array();
-            for (INode* node : ResolveNamedNodes(p["names"], notFound)) nodes.Append(1, &node);
-            if (nodes.Count() == 0) ThrowNoNamedNodes(notFound, "the selection set was not replaced.");
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) nodes.Append(1, &node);
+            if (nodes.Count() == 0) ThrowUnresolvedNames(resolved, "the selection set was not replaced.");
 
             if (!mgr->ReplaceNamedSelSet(nodes, mname))
                 throw std::runtime_error("Failed to replace selection set: " + setName);
@@ -791,8 +772,7 @@ std::string NativeHandlers::ManageSelectionSets(const std::string& params, MCPBr
             json result;
             result["replaced"] = setName;
             result["memberCount"] = nodes.Count();
-            result["notFound"] = notFound;
-            AddMissingNamesWarning(result, notFound);
+            AddUnresolvedNamesWarnings(result, resolved);
             return result.dump();
         }
 

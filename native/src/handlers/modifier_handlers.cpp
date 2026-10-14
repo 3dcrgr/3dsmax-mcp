@@ -435,18 +435,16 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
         TimeValue t = ip->GetTime();
 
         std::vector<INode*> targets;
-        json notFound = json::array();
+        NamedNodes resolved;
+        const json& notFound = resolved.notFound;
         // Objects named by the caller (or selected) are expected to change; a
         // scene-wide modifier_class sweep naturally passes over most objects.
         const bool explicitScope = PayloadHandleValue(p) != 0ULL || !names.empty() || selectionOnly;
         if (PayloadHandleValue(p) != 0ULL) {
             targets.push_back(ResolveNodeFromPayload(p));
         } else if (!names.empty()) {
-            for (const auto& n : names) {
-                INode* node = FindNodeByName(n);
-                if (node) targets.push_back(node);
-                else notFound.push_back(n);
-            }
+            resolved = ResolveNodesByNames(names);
+            targets = resolved.nodes;
         } else if (selectionOnly) {
             int selCount = ip->GetSelNodeCount();
             for (int i = 0; i < selCount; i++) {
@@ -460,10 +458,7 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
         }
 
         if (targets.empty()) {
-            if (!notFound.empty())
-                throw std::runtime_error(StructuredErrorPayload(
-                    "NOT_FOUND", "No object matched the requested names; no modifier was updated.",
-                    {{"notFound", notFound}}));
+            if (resolved.Unresolved()) ThrowUnresolvedNames(resolved, "no modifier was updated.");
             throw std::runtime_error("No target objects found");
         }
 
@@ -561,6 +556,7 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
         if (modCount == 0) {
             json hint = {{"message", "Check object names, modifier target, property name and value literal."}};
             if (!notFound.empty()) hint["notFound"] = notFound;
+            if (!resolved.ambiguous.empty()) hint["ambiguous"] = resolved.ambiguous;
             if (!skipped.empty()) hint["skipped"] = skipped;
             if (rejectedValues) hint["rejectedValues"] = rejectedValues;
             throw std::runtime_error(StructuredErrorPayload(
@@ -595,6 +591,7 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
             out["status"] = "partial";
             out["warnings"] = warnings;
         }
+        AddAmbiguousNamesWarning(out, resolved.ambiguous);
         return out.dump();
     });
 }
