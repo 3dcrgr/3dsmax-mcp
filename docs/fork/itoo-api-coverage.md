@@ -454,8 +454,18 @@ and output after reload. The subsequent public implementation passed deployed an
 
 ## Forest Effect curve points — 2026-10-14 (#44)
 
-Status: implemented and unit-tested; the live check on a scratch Max 2027 is pending, and so is
-the bridge deploy that it needs.
+Status: implemented, deployed (bridge `04815449…`, from `538a241`) and verified live on a scratch
+Max 2027 on 2026-10-14 by an independent session (MCP issue fixes; evidence in the dev folder's
+`docs\livetests-2027\runs-1014-curve-points\`, confirmation in `MCP_SOLVED.md`):
+- a changed curve evaluates at once (interior 0.9 gave Z=90; a five-point curve gave Z=70);
+- bezier tangents are relative to their point (measured 0.5331/0.6116/0.7194/0.8494 at
+  x=0.6/0.7/0.8/0.9, as predicted); a bezier-corner point (flags 3) persists and evaluates the same;
+- save and reload give identical points and build; export then load gives identical points on new
+  slots, and removing the loaded effect restores everything;
+- every refusal leaves the curve and build unchanged; the primitive on the live, attached Forest
+  gives `STAGING_REQUIRED`; #45 shipped-effect loads are unchanged; no crash.
+
+Not tested: undo (max undo isn't run through the MCP), the animated-curve refusal, and Forest's own `.eff` loader.
 
 - `forest_effect_curves(action="set_points", parameter=, points=, expected_effects=)` writes one
   curve parameter. The curve slot is the parameter's global row (`curve_index`), verified live in
@@ -468,8 +478,7 @@ the bridge deploy that it needs.
   increase, endpoints off the control's X range, and values outside the X/Y range
   (`CURVE_VALUE_OUT_OF_RANGE`). Every point is read back natively, then again by the Python tool.
   After writing, the staged CurveControl notifies its dependents (only the staged base) so no cached
-  evaluation survives; whether the adopted Forest evaluates the new shape at once is part of the
-  live check.
+  evaluation survives; the adopted Forest evaluates the new shape at once (verified live).
 - Points: `[x, y]` pairs (corner), `{x, y, type corner|bezier|bezier_corner, in, out, lock_x, lock_y}`
   objects (tangents relative to the point, per the SDK), or the rows that
   `inspect` returns. The first and last points are always endpoints; the editor's selection bit is

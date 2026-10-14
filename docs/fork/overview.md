@@ -17,7 +17,7 @@ Verified and deployed improvements are published on the fork's default branch, `
 
 ## At a glance
 
-Forest Effects supports guarded ordering, numeric parameters, object, spline, existing texture-map, and scalar `FloatController` bindings. Scalar bindings use a source-linked expression driver on Forest's animated real parameter track; `forest_effect_parameters(action="repair_animation")` migrates earlier bindings that sampled frame zero. `.eff` import requires explicit scene bindings; export writes portable definitions with required bindings listed for the next import. Curve definitions allocate native slots on the staged copy before commit, with neutral flat y=1 points and parameter-ID preservation during removal. `forest_effect_curves(action="set_points")` edits one curve parameter's points in a staged undo step, `.eff` load accepts curve points and export writes them, in an MCP-specific `<curves><curve><point …/>` child (the XML Forest writes into `efpacurve` in scenes; Forest's own `.eff` loader is untested with it). Unit-tested; live check pending. Animated curves are refused. Stored effect code has no public compile-success signal. See [iToo coverage](itoo-api-coverage.md).
+Forest Effects supports guarded ordering, numeric parameters, object, spline, existing texture-map, and scalar `FloatController` bindings. Scalar bindings use a source-linked expression driver on Forest's animated real parameter track; `forest_effect_parameters(action="repair_animation")` migrates earlier bindings that sampled frame zero. `.eff` import requires explicit scene bindings; export writes portable definitions with required bindings listed for the next import. Curve definitions allocate native slots on the staged copy before commit, with neutral flat y=1 points and parameter-ID preservation during removal. `forest_effect_curves(action="set_points")` edits one curve parameter's points in a staged undo step, `.eff` load accepts curve points and export writes them, in an MCP-specific `<curves><curve><point …/>` child (the XML Forest writes into `efpacurve` in scenes; Forest's own `.eff` loader is untested with it). Verified live on Max 2027 on 2026-10-14 by an independent session; not tested: undo (max undo isn't run through the MCP), the animated-curve refusal, and Forest's own `.eff` loader. Animated curves are refused. Stored effect code has no public compile-success signal. See [iToo coverage](itoo-api-coverage.md).
 
 - **209 tools:** all 179 of upstream's, plus 30 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
@@ -167,7 +167,7 @@ The installer's runtime ignores `PYTHONPATH`, hence the `sys.path` line. See [Ad
 
 | Max | Bridge in `native/bin/` |
 |---|---|
-| 2027 | Fork build, with every native fix, including the V-Ray GPU preview (sha256 `b95802e2…`) |
+| 2027 | Fork build, with every native fix, including the V-Ray GPU preview (sha256 `04815449…`) |
 | 2026 | Fork build with every native fix except the V-Ray GPU preview (sha256 `d5cd6ba5…`) |
 | 2023–2025 | Upstream's 1.7.5 builds |
 
