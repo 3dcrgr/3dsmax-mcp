@@ -131,7 +131,7 @@ def remove_modifier(name: str = "", modifier: str = "", handle: int = 0) -> str:
             if found then
                 "Removed modifier \\\"" + "{safe_mod}" + "\\\" from " + obj.name
             else
-                "Modifier \\\"" + "{safe_mod}" + "\\\" not found on " + obj.name
+                "Error: Modifier \\\"" + "{safe_mod}" + "\\\" not found on " + obj.name
         ) else (
             "Object not found: {safe}"
         )
@@ -190,7 +190,9 @@ def set_modifier_state(
         ops.append(f"mod.enabledInRenders = {'true' if enabled_in_renders else 'false'}")
 
     if not ops:
-        return "No state changes specified."
+        return _json.dumps({
+            "error": "No state changes specified: pass enabled, enabled_in_views or enabled_in_renders.",
+        })
 
     ops_str = "\n                ".join(ops)
     maxscript = f"""(
@@ -204,7 +206,7 @@ def set_modifier_state(
                 " views=" + (mod.enabledInViews as string) + \
                 " renders=" + (mod.enabledInRenders as string)
             ) else (
-                "Modifier not found on " + obj.name
+                "Error: Modifier not found on " + obj.name
             )
         ) else (
             "Object not found: {safe}"
@@ -245,7 +247,7 @@ def collapse_modifier_stack(
                     if not {str(dry_run).lower()} do maxOps.CollapseNodeTo obj {to_index} off
                     (if {str(dry_run).lower()} then "Would collapse " else "Collapsed ") + obj.name + " to modifier index {to_index}"
                 ) else (
-                    "Index {to_index} out of range (stack has " + (obj.modifiers.count as string) + " modifiers)"
+                    "Error: Index {to_index} out of range (stack has " + (obj.modifiers.count as string) + " modifiers)"
                 )
             ) else (
                 "Object not found: {safe}"
@@ -291,7 +293,7 @@ def make_modifier_unique(name: str = "", modifier_index: int = 0, handle: int = 
                 InstanceMgr.makemodifiersunique obj mod #individual
                 "Made modifier " + mod.name + " unique on " + obj.name
             ) else (
-                "Index {modifier_index} out of range"
+                "Error: Index {modifier_index} out of range"
             )
         ) else (
             "Object not found: {safe}"

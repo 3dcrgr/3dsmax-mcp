@@ -228,7 +228,9 @@ std::string NativeHandlers::SetModifierState(const std::string& params, MCPBridg
             changed = true;
         }
 
-        if (!changed) return "No state changes specified.";
+        if (!changed)
+            throw std::runtime_error(
+                "No state changes specified: pass enabled, enabled_in_views or enabled_in_renders.");
 
         GetCOREInterface()->RedrawViews(GetCOREInterface()->GetTime());
 
@@ -268,6 +270,7 @@ std::string NativeHandlers::CollapseModifierStack(const std::string& params, MCP
             result["status"] = "no_stack";
             result["message"] = "No modifier stack to collapse on " + name;
             result["stack"] = json::array();
+            result["warnings"] = json::array({name + " has no modifiers, so nothing was collapsed."});
             return result.dump();
         }
 
@@ -301,7 +304,7 @@ std::string NativeHandlers::CollapseModifierStack(const std::string& params, MCP
             // For partial collapse, use RunMAXScript as it maps to maxOps.CollapseNodeTo
             std::string script = "maxOps.CollapseNodeTo (getNodeByName \"" +
                 JsonEscape(name) + "\") " + std::to_string(toIndex) + " off";
-            RunMAXScript(script);
+            RunMAXScriptChecked(script);
             ip->RedrawViews(t);
             json result = NodeIdentityJson(node);
             result["message"] = "Collapsed " + WideToUtf8(node->GetName()) + " to modifier index " + std::to_string(toIndex);
@@ -325,13 +328,13 @@ std::string NativeHandlers::CollapseModifierStack(const std::string& params, MCP
                 // Use the simple approach
                 std::string script = "maxOps.CollapseNode (getNodeByName \"" +
                     JsonEscape(name) + "\") off";
-                RunMAXScript(script);
+                RunMAXScriptChecked(script);
             }
         } else {
             // Fallback for non-mesh objects
             std::string script = "maxOps.CollapseNode (getNodeByName \"" +
                 JsonEscape(name) + "\") off";
-            RunMAXScript(script);
+            RunMAXScriptChecked(script);
         }
 
         ip->RedrawViews(t);
@@ -435,12 +438,17 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
         TimeValue t = ip->GetTime();
 
         std::vector<INode*> targets;
+        json notFound = json::array();
+        // Objects named by the caller (or selected) are expected to change; a
+        // scene-wide modifier_class sweep naturally passes over most objects.
+        const bool explicitScope = PayloadHandleValue(p) != 0ULL || !names.empty() || selectionOnly;
         if (PayloadHandleValue(p) != 0ULL) {
             targets.push_back(ResolveNodeFromPayload(p));
         } else if (!names.empty()) {
             for (const auto& n : names) {
                 INode* node = FindNodeByName(n);
                 if (node) targets.push_back(node);
+                else notFound.push_back(n);
             }
         } else if (selectionOnly) {
             int selCount = ip->GetSelNodeCount();
@@ -454,11 +462,19 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
             CollectNodes(root, targets);
         }
 
-        if (targets.empty()) throw std::runtime_error("No target objects found");
+        if (targets.empty()) {
+            if (!notFound.empty())
+                throw std::runtime_error(StructuredErrorPayload(
+                    "NOT_FOUND", "No object matched the requested names; no modifier was updated.",
+                    {{"notFound", notFound}}));
+            throw std::runtime_error("No target objects found");
+        }
 
         std::wstring wModClass = modClassName.empty() ? L"" : Utf8ToWide(modClassName);
         json hits = json::array();
+        json skipped = json::array();
         int modCount = 0;
+        int rejectedValues = 0;
 
         // Parameter setters can throw; always restore viewport redraw on exit.
         struct RedrawScope {
@@ -470,11 +486,22 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
         RedrawScope redraw(ip);
 
         for (INode* node : targets) {
+            const std::string nodeName = WideToUtf8(node->GetName());
+            auto skip = [&](const std::string& reason) {
+                if (explicitScope)
+                    skipped.push_back({{"object", nodeName}, {"handle", NodeHandle(node)}, {"reason", reason}});
+            };
+
             Object* objRef = node->GetObjectRef();
-            if (!objRef || objRef->SuperClassID() != GEN_DERIVOB_CLASS_ID) continue;
+            if (!objRef || objRef->SuperClassID() != GEN_DERIVOB_CLASS_ID) {
+                skip("no modifier stack");
+                continue;
+            }
 
             IDerivedObject* dobj = (IDerivedObject*)objRef;
-            const std::string nodeName = WideToUtf8(node->GetName());
+            const int hitsBefore = modCount;
+            bool rejected = false;
+            bool classMatched = false;
 
             auto tryModifier = [&](Modifier* mod, int idx) {
                 if (!mod) return;
@@ -482,7 +509,12 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
                     const MCHAR* cn = mod->ClassName().data();
                     if (_wcsicmp(cn, wModClass.c_str()) != 0) return;
                 }
-                if (!ModifierHelpers::SetParameter(mod, propName, propValue, t)) return;
+                classMatched = true;
+                if (!ModifierHelpers::SetParameter(mod, propName, propValue, t)) {
+                    rejected = true;
+                    rejectedValues++;
+                    return;
+                }
 
                 mod->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
                 modCount++;
@@ -495,29 +527,48 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
                 });
             };
 
+            std::string missReason;
             if (modIndex > 0) {
                 int idx = modIndex - 1;
                 if (idx < dobj->NumModifiers()) {
                     tryModifier(dobj->GetModifier(idx), idx);
+                } else {
+                    missReason = "no modifier at index " + std::to_string(modIndex);
                 }
             } else if (!modName.empty()) {
                 int idx = FindModifierIndex(node, modName);
                 if (idx >= 0) {
                     tryModifier(dobj->GetModifier(idx), idx);
+                } else {
+                    missReason = "no modifier named \"" + modName + "\"";
                 }
             } else {
                 for (int m = 0; m < dobj->NumModifiers(); m++) {
                     tryModifier(dobj->GetModifier(m), m);
                 }
             }
+
+            if (modCount > hitsBefore) continue;
+            if (!missReason.empty()) skip(missReason);
+            else if (rejected) skip("the value was not accepted for " + propName);
+            else if (!classMatched)
+                skip(modIndex > 0 || !modName.empty()
+                    ? "the requested modifier is not a " + modClassName
+                    : "no " + modClassName + " modifier");
         }
 
         }
         ip->RedrawViews(t);
 
         if (modCount == 0) {
-            throw std::runtime_error(
-                "No modifiers updated — check object names, modifier target, and property name");
+            json hint = {{"message", "Check object names, modifier target, property name and value literal."}};
+            if (!notFound.empty()) hint["notFound"] = notFound;
+            if (!skipped.empty()) hint["skipped"] = skipped;
+            if (rejectedValues) hint["rejectedValues"] = rejectedValues;
+            throw std::runtime_error(StructuredErrorPayload(
+                "BAD_PARAM",
+                "No modifiers updated — check object names, modifier target, and property name",
+                hint));
         }
 
         json out = {
@@ -526,6 +577,26 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
             {"value", propValue},
             {"hits", hits},
         };
+        json warnings = json::array();
+        if (!notFound.empty()) {
+            out["notFound"] = notFound;
+            warnings.push_back(std::to_string(notFound.size()) +
+                " requested name(s) matched no object: " + JoinNames(notFound));
+        }
+        if (!skipped.empty()) {
+            out["skipped"] = skipped;
+            warnings.push_back(std::to_string(skipped.size()) +
+                " scoped object(s) were not updated; see skipped for the reason.");
+        }
+        if (rejectedValues) {
+            out["rejectedValues"] = rejectedValues;
+            warnings.push_back(std::to_string(rejectedValues) +
+                " matching modifier(s) did not accept the value for " + propName + ".");
+        }
+        if (!warnings.empty()) {
+            out["status"] = "partial";
+            out["warnings"] = warnings;
+        }
         return out.dump();
     });
 }
