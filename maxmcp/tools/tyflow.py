@@ -561,7 +561,7 @@ if flow == undefined then (
     local ev = evRef.Event
     ev.setName "{safe_string(event_name)}"
     ev.setPosition [{int(pos[0])},{int(pos[1])}]
-    "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"event\\":\\"" + (esc ev.getName()) + "\\"}}"
+    "{{\\"name\\":\\"" + (esc flow.name) + "\\",\\"event\\":\\"" + (esc (ev.getName())) +"\\"}}"
 )
 )"""
     payload = _send_json(maxscript, {"error": "Could not parse add_tyflow_event response."})
