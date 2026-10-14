@@ -111,6 +111,7 @@ set(MCP_CORE_SOURCES
     src/handlers/object_handlers.cpp
     src/handlers/orientation_handlers.cpp
     src/handlers/modifier_handlers.cpp
+    src/handlers/mesh_handlers.cpp
     src/handlers/mcg_handlers.cpp
     src/handlers/inspect_handlers.cpp
     src/handlers/scene_manage_handlers.cpp

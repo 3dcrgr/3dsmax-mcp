@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <initializer_list>
 #include <optional>
 #include <unordered_set>
 #include <shlobj.h>
@@ -144,6 +145,7 @@ static bool IsMutatingNativeHandler(const std::string& cmd_type) {
         "native:scene_patch",
         "native:plugin_patch",
         "native:scene_qa_fix",
+        "native:mesh_script",
     };
     return kMutating.count(cmd_type) > 0;
 }
@@ -290,14 +292,31 @@ static bool ContainsBlockedCommand(const std::string& cmd) {
     return false;
 }
 
+static void RejectBlockedScript(const std::string& script) {
+    if (IsSafeModeEnabled() && ContainsBlockedCommand(script)) {
+        throw std::runtime_error("Blocked by safe mode: command contains a restricted function. Set safe_mode=false in %LOCALAPPDATA%\\3dsmax-mcp\\mcp_config.ini to disable.");
+    }
+}
+
+// Native payloads that carry MAXScript get the maxscript route's screen. The
+// decoded strings are checked: JSON escapes can spell a blocked name.
+static void RejectBlockedPayloadScripts(const std::string& command, std::initializer_list<const char*> keys) {
+    if (!IsSafeModeEnabled()) return;
+    json payload = json::parse(command, nullptr, false);
+    if (!payload.is_object()) return;
+    for (const char* key : keys) {
+        auto it = payload.find(key);
+        if (it != payload.end() && it->type() == json::value_t::string)
+            RejectBlockedScript(it->get<std::string>());
+    }
+}
+
 // ── MAXScript handler ───────────────────────────────────────────
 static std::string HandleMaxScript(
     const std::string& command,
     bool quiet) {
 
-    if (IsSafeModeEnabled() && ContainsBlockedCommand(command)) {
-        throw std::runtime_error("Blocked by safe mode: command contains a restricted function. Set safe_mode=false in %LOCALAPPDATA%\\3dsmax-mcp\\mcp_config.ini to disable.");
-    }
+    RejectBlockedScript(command);
 
     // MAXScript runs on Max's main thread only, whatever the thread mode.
     return McpHost::RunOnMainThread([&command, quiet]() -> std::string {
@@ -427,6 +446,9 @@ std::string CommandDispatcher::Dispatch(
             result = NativeHandlers::SceneQAScan(command, gup);
         } else if (cmd_type == "native:scene_qa_fix") {
             result = NativeHandlers::SceneQAFix(command, gup);
+        } else if (cmd_type == "native:mesh_script") {
+            RejectBlockedPayloadScripts(command, {"resolve", "script", "finish"});
+            result = NativeHandlers::MeshScript(command, gup);
         // Phase 1: Object operations
         } else if (cmd_type == "native:get_object_properties") {
             result = NativeHandlers::GetObjectProperties(command, gup);
@@ -645,7 +667,9 @@ std::string CommandDispatcher::Dispatch(
         std::string result;
         // scene_patch owns a strict hold so it can reject an already-open user
         // transaction and report rollback only after Cancel() has completed.
-        const bool handlerOwnsTransaction = cmd_type == "native:scene_patch" || cmd_type == "native:plugin_patch";
+        // mesh_script opens its labeled hold for edits only; reads open none.
+        const bool handlerOwnsTransaction = cmd_type == "native:scene_patch" ||
+            cmd_type == "native:plugin_patch" || cmd_type == "native:mesh_script";
         const bool transact =
             IsMutatingNativeHandler(cmd_type) &&
             !CommandDispatcher::Detail::RequestIsDryRunOrPreview(cmd_type, command) &&
