@@ -113,8 +113,8 @@ static void LogBridge(const std::wstring& message, int type = SYSLOG_INFO) {
 }
 
 static void SetNativePipeRunningFlag(bool running) {
-    // Shell code passes its own dialog check; RunMAXScript's default reaches
-    // DialogWatch through the core's host binding.
+    // Shell code passes its own dialog check; the one-argument RunMAXScript
+    // reaches the main thread and DialogWatch through the core's host binding.
     HandlerHelpers::RunMAXScript(std::string("global MCP_NativePipeRunning; MCP_NativePipeRunning = ") +
         (running ? "true" : "false"), &DialogWatch::ThrowIfDismissed);
 }

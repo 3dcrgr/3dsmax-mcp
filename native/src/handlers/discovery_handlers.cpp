@@ -245,15 +245,12 @@ std::string NativeHandlers::IntrospectInterface(const std::string& params, MCPBr
             std::string script = "(local iface = " + ifaceName +
                 "; if (classOf iface) == Interface then iface else undefined)";
             try {
-                std::wstring wscript = Utf8ToWide(script);
-                FPValue fpv;
-                if (ExecuteMAXScriptScript(wscript.c_str(),
-                        MAXScript::ScriptSource::NonEmbedded, TRUE, &fpv)) {
+                EvaluateMAXScript(Utf8ToWide(script), [&](FPValue& fpv) {
                     if (fpv.type == TYPE_INTERFACE && fpv.fpi != nullptr) {
                         iface = fpv.fpi;
                         desc = iface->GetDesc();
                     }
-                }
+                });
             } catch (...) {}
         }
 
@@ -319,10 +316,7 @@ std::string NativeHandlers::IntrospectInterface(const std::string& params, MCPBr
                         WideToUtf8(prop->internal_name.data()) : "";
                     if (!propName.empty()) {
                         std::string script = "try (" + ifaceName + "." + propName + ") catch (undefined)";
-                        std::wstring wscript = Utf8ToWide(script);
-                        FPValue val;
-                        if (ExecuteMAXScriptScript(wscript.c_str(),
-                                MAXScript::ScriptSource::NonEmbedded, TRUE, &val)) {
+                        EvaluateMAXScript(Utf8ToWide(script), [&](FPValue& val) {
                             switch (val.type) {
                             case TYPE_INT: propJ["value"] = val.i; break;
                             case TYPE_FLOAT: propJ["value"] = val.f; break;
@@ -334,7 +328,7 @@ std::string NativeHandlers::IntrospectInterface(const std::string& params, MCPBr
                                 if (val.tstr) propJ["value"] = WideToUtf8(val.tstr->data()); break;
                             default: break;
                             }
-                        }
+                        });
                     }
                 } catch (...) {}
             }
@@ -391,19 +385,17 @@ static FPInterface* FindFPInterfaceByName(const std::string& name) {
     }
 
     // Fallback: resolve via MAXScript (for global/static interfaces)
+    FPInterface* found = nullptr;
     try {
         std::string script = "(local iface = " + name +
             "; if (classOf iface) == Interface then iface else undefined)";
-        std::wstring wscript = Utf8ToWide(script);
-        FPValue fpv;
-        if (ExecuteMAXScriptScript(wscript.c_str(),
-                MAXScript::ScriptSource::NonEmbedded, TRUE, &fpv)) {
+        EvaluateMAXScript(Utf8ToWide(script), [&](FPValue& fpv) {
             if (fpv.type == TYPE_INTERFACE && fpv.fpi != nullptr)
-                return fpv.fpi;
-        }
+                found = fpv.fpi;
+        });
     } catch (...) {}
 
-    return nullptr;
+    return found;
 }
 
 // ── native:invoke_interface ─────────────────────────────────────

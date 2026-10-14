@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <functional>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 #include <max.h>
@@ -28,10 +29,21 @@ class MCPBridgeGUP;
 // it. Core code reaches the shell's DialogWatch through the host API
 // (core_bridge.cpp); shell code passes DialogWatch::ThrowIfDismissed itself.
 namespace McpHost::DialogWatch { void ThrowIfDismissed(); }
+// Runs work on Max's main thread, also from a direct handler (core_bridge.cpp).
+namespace McpHost { std::string RunOnMainThread(const std::function<std::string()>& work); }
 
 namespace HandlerHelpers {
 
 using json = nlohmann::json;
+
+// MAXScript's evaluator, value heap and class registry belong to Max's main
+// thread, and TempQuietMode switches a process-wide mode. Script work on any
+// other thread is a bridge defect: fail it before it touches MAXScript.
+inline void RequireMaxScriptThread() {
+    if (GetCurrentThreadId() == GetCOREInterface15()->GetMainThreadID()) return;
+    throw std::runtime_error(json{{"type", "NativeError"}, {"code", "INTERNAL_ERROR"}, {"retryable", false},
+        {"message", "Internal bridge error: MAXScript was called off 3ds Max's main thread; the script did not run"}}.dump());
+}
 
 // ── UTF-8 <-> Wide conversion ───────────────────────────────────
 inline std::string WideToUtf8(const wchar_t* w) {
@@ -109,6 +121,7 @@ inline std::string ScriptClassName(Animatable* value) {
 inline std::string MaxScriptVisibleClassName(
     SClass_ID superClassId,
     const Class_ID& classId) {
+    RequireMaxScriptThread();
     ScopedMaxScriptEvaluationContext evaluationContext;
     Class_ID lookupId = classId;
     MAXClass* maxClass = MAXClass::lookup_class(
@@ -313,9 +326,12 @@ inline std::wstring WrapForErrorCapture(const std::wstring& wcmd) {
 }
 
 // ── MAXScript execution (for hybrid handlers) ───────────────────
+// Evaluates on the calling thread, which must be Max's main thread. Shell code
+// runs there already and passes its own dialog check.
 inline std::string RunMAXScript(
     const std::string& script,
-    void (*throwIfDialogDismissed)() = &McpHost::DialogWatch::ThrowIfDismissed) {
+    void (*throwIfDialogDismissed)()) {
+    RequireMaxScriptThread();
     // Tool scripts are batch work: prompts take their defaults.
     TempQuietMode quiet;
     std::wstring wcmd = WrapForErrorCapture(Utf8ToWide(script));
@@ -366,6 +382,29 @@ inline std::string RunMAXScript(
     // Never re-evaluate the script to stringify the result: scripts with side
     // effects (e.g. "max undo") would run twice.
     return "OK";
+}
+
+// Core code. A direct handler runs on a pipe thread, where ExecuteSync stays
+// inline: evaluation and result conversion are sent to Max's main thread.
+inline std::string RunMAXScript(const std::string& script) {
+    return McpHost::RunOnMainThread([&script] {
+        return RunMAXScript(script, &McpHost::DialogWatch::ThrowIfDismissed);
+    });
+}
+
+// Core code that reads the FPValue itself: no error wrapper, quiet mode or
+// dialog check. `read` runs on Max's main thread right after evaluation, while
+// the result is valid. False when the script failed.
+inline bool EvaluateMAXScript(const std::wstring& script, const std::function<void(FPValue&)>& read) {
+    bool ok = false;
+    McpHost::RunOnMainThread([&] {
+        RequireMaxScriptThread();
+        FPValue fpv;
+        ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::NonEmbedded, TRUE, &fpv) != FALSE;
+        if (ok) read(fpv);
+        return std::string();
+    });
+    return ok;
 }
 
 // ── JSON escape utility ─────────────────────────────────────────

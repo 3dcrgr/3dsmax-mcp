@@ -66,6 +66,23 @@ namespace McpHost {
 
 void Bind(const McpHostApi* host) { g_host.store(host); }
 
+std::string RunOnMainThread(const std::function<std::string()>& work) {
+    const McpHostApi& host = Host();
+    if (host.isMainThread(host.ctx)) return work();
+    // The pipe thread only waits here; restore its mode on every exit.
+    struct LeaveDirectMode {
+        const McpHostApi& host;
+        const bool direct = host.getDirectMode(host.ctx) != 0;
+        explicit LeaveDirectMode(const McpHostApi& h) : host(h) {
+            if (direct) host.setDirectMode(host.ctx, 0);
+        }
+        ~LeaveDirectMode() {
+            if (direct) host.setDirectMode(host.ctx, 1);
+        }
+    } leave(host);
+    return HostExecutor().ExecuteSync(work);
+}
+
 // ── SceneJournal ─────────────────────────────────────────────────
 namespace SceneJournal {
 

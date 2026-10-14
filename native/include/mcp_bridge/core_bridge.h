@@ -42,6 +42,12 @@ namespace McpHost {
 // Binds the shell's services (McpCoreApi::initialize, test harnesses); nullptr unbinds.
 void Bind(const McpHostApi* host);
 
+// Runs `work` on Max's main thread: inline there, otherwise through the shell's
+// executor. A direct handler's ExecuteSync runs inline on its pipe thread, so
+// direct mode is left on this thread while the work waits. For work that must
+// never leave the main thread: MAXScript (HandlerHelpers::RunMAXScript).
+std::string RunOnMainThread(const std::function<std::string()>& work);
+
 namespace SceneJournal {
 void Reset();
 unsigned long long Epoch();

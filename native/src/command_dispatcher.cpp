@@ -41,6 +41,10 @@ static bool IsSafeModeEnabled() {
 // Mutation handlers (create/delete/transform/assign) and MAXScript
 // execution always marshal to the main thread, including reads that run
 // any MAXScript (introspect_instance, get_wired_params, state sets).
+// The MAXScript paths themselves (RunMAXScript, EvaluateMAXScript,
+// HandleMaxScript, the PB1 modifier reads of inspect_properties) reach the
+// main thread through McpHost::RunOnMainThread: script reached from a direct
+// handler waits for the main thread instead of running on this one.
 // ping and native:max_dialogs never reach the core: the shell answers them
 // (core_control.cpp). watch_scene's reads run direct; the handler marshals its
 // start and stop, which register with Max, to the main thread itself.
@@ -289,14 +293,15 @@ static bool ContainsBlockedCommand(const std::string& cmd) {
 // ── MAXScript handler ───────────────────────────────────────────
 static std::string HandleMaxScript(
     const std::string& command,
-    MCPBridgeGUP* gup,
     bool quiet) {
 
     if (IsSafeModeEnabled() && ContainsBlockedCommand(command)) {
         throw std::runtime_error("Blocked by safe mode: command contains a restricted function. Set safe_mode=false in %LOCALAPPDATA%\\3dsmax-mcp\\mcp_config.ini to disable.");
     }
 
-    return gup->GetExecutor().ExecuteSync([&command, quiet]() -> std::string {
+    // MAXScript runs on Max's main thread only, whatever the thread mode.
+    return McpHost::RunOnMainThread([&command, quiet]() -> std::string {
+        HandlerHelpers::RequireMaxScriptThread();
         // Quiet mode lets prompts take their defaults, as batch scripts expect.
         // quiet=false leaves Max's mode alone so prompts reach the agent as
         // blocking dialogs. quietErrors keeps errors textual either way.
@@ -398,7 +403,7 @@ std::string CommandDispatcher::Dispatch(
             if (command.empty()) {
                 throw std::runtime_error("Empty MAXScript command");
             }
-            result = HandleMaxScript(command, gup, req.value("quiet", true));
+            result = HandleMaxScript(command, req.value("quiet", true));
         // Native handlers
         } else if (cmd_type == "native:scene_info") {
             result = NativeHandlers::SceneInfo(command, gup);

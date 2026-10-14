@@ -382,6 +382,7 @@ bool UsesPhotometricNodeMaker(ClassDesc* cd) {
         id==LS_SPHERE_LIGHT_ID||id==LS_CYLINDER_LIGHT_ID;
 }
 INode* CreatePhotometricNode(ClassDesc* cd) {
+    RequireMaxScriptThread();
     init_thread_locals();
     one_value_local(created);
     auto classID=cd->ClassID();

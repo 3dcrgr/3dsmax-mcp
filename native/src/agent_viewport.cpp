@@ -25,7 +25,8 @@ using json = nlohmann::json;
 using namespace HandlerHelpers;
 namespace AgentViewport {
 namespace {
-// Shell code: RunMAXScript's default dialog check is the core's host binding.
+// Shell code evaluates here, with the shell's dialog check. The one-argument
+// HandlerHelpers::RunMAXScript is the core's, through its host binding.
 std::string RunMAXScript(const std::string& script) {
     return HandlerHelpers::RunMAXScript(script, &DialogWatch::ThrowIfDismissed);
 }

@@ -119,16 +119,13 @@ static std::vector<std::string> GetPB1PropNames(const std::string& msRef) {
         std::string script = "(local obj = " + msRef +
             "; local props = getPropNames obj; local r = \"\"; "
             "for p in props do (r += (p as string) + \"\\n\"); r)";
-        std::wstring wcmd = Utf8ToWide(script);
-        FPValue fpv;
-        if (ExecuteMAXScriptScript(wcmd.c_str(),
-                MAXScript::ScriptSource::NonEmbedded, TRUE, &fpv)) {
-            std::string result;
-            if (fpv.type == TYPE_STRING || fpv.type == TYPE_FILENAME)
-                result = WideToUtf8(fpv.s);
-            else if (fpv.type == TYPE_TSTR)
-                result = WideToUtf8(fpv.tstr->data());
-
+        std::string result;
+        if (EvaluateMAXScript(Utf8ToWide(script), [&](FPValue& fpv) {
+                if (fpv.type == TYPE_STRING || fpv.type == TYPE_FILENAME)
+                    result = WideToUtf8(fpv.s);
+                else if (fpv.type == TYPE_TSTR)
+                    result = WideToUtf8(fpv.tstr->data());
+            })) {
             size_t pos = 0;
             while (pos < result.size()) {
                 size_t nl = result.find('\n', pos);

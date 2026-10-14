@@ -294,6 +294,12 @@ if(MCP_BUILD_TRANSACTION_POLICY_TESTS)
     target_include_directories(shutdown_tests PRIVATE include third_party)
     target_compile_definitions(shutdown_tests PRIVATE NOMINMAX _UNICODE UNICODE)
     add_test(NAME shutdown COMMAND shutdown_tests)
+    # MAXScript from a direct handler still reaches the executor's thread.
+    add_executable(core_bridge_tests tests/core_bridge_tests.cpp src/core_bridge.cpp
+        src/main_thread_executor.cpp src/dialog_watch.cpp)
+    target_include_directories(core_bridge_tests PRIVATE include third_party)
+    target_compile_definitions(core_bridge_tests PRIVATE NOMINMAX _UNICODE UNICODE)
+    add_test(NAME core_bridge COMMAND core_bridge_tests)
 
     # Core lifecycle: drain gate, swap sequence, version gate, shell control
     # protocol, envelope and source resolution, with fake cores in process.
