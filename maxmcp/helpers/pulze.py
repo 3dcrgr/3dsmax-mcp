@@ -38,7 +38,7 @@ import uuid
 from typing import Any
 
 from ..max_client import MaxClient
-from .maxscript import safe_string
+from .maxscript import NODE_LOOKUP_FNS, safe_string
 
 CA_NAME = "SceneManager_Attributes"
 DATA_PROP = "SceneManager_Dat"
@@ -285,7 +285,8 @@ def select_setup(setups: list[dict[str, Any]], edit: dict[str, Any]) -> int:
 def resolve_camera(client: MaxClient, name: str) -> int:
     """Scene Manager resolves a setup camera by node handle, so the name must be unique."""
     answer = _send(client, f'''(
-    local hits = getNodeByName "{safe_string(name)}" exact:true all:true
+    {NODE_LOOKUP_FNS}
+    local hits = mcpNamedNodes "{safe_string(name)}"
     if hits.count == 0 then "__MISSING__"
     else if hits.count > 1 then ("__AMBIGUOUS__|" + hits.count as string)
     else if (superClassOf hits[1] != camera) then "__NOT_A_CAMERA__"

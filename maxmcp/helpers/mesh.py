@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import math
-from .maxscript import safe_string
+from .maxscript import node_by_name, safe_string
 
 
 def vector(value, label, size=3):
@@ -37,8 +37,7 @@ def target_script(name: str, handle: int):
         if name:
             code += f'if obj.name != "{safe_string(name)}" do throw "Node handle/name mismatch"\n'
     elif name:
-        code += f'local matches = getNodeByName "{safe_string(name)}" exact:true all:true\n'
-        code += 'if matches.count != 1 do throw "Node name must resolve uniquely"\nobj = matches[1]\n'
+        code += f'obj = {node_by_name(name, "Node")}\n'
     else:
         code += 'if selection.count != 1 do throw "Select exactly one mesh or pass name/handle"\nobj = selection[1]\n'
     return code

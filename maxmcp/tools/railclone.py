@@ -6,6 +6,7 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
+from ..helpers.maxscript import NODE_LOOKUP_FNS
 from ..helpers.mesh import integer
 from ..server import client, mcp
 
@@ -71,7 +72,7 @@ def _target(name: str, handle: int) -> str:
         if name:
             code += 'if obj.name != wantedName do throw "NODE_REF_MISMATCH: handle and name disagree"\n'
     elif name:
-        code += 'local matches = getNodeByName wantedName exact:true all:true\n'
+        code += 'local matches = mcpNamedNodes wantedName\n'
         code += 'if matches.count == 0 do throw "NOT_FOUND: node not found"\n'
         code += 'if matches.count != 1 do throw "AMBIGUOUS: use a handle for duplicate node names"\nobj = matches[1]\n'
     else:
@@ -80,7 +81,7 @@ def _target(name: str, handle: int) -> str:
 
 
 def _run(body: str) -> dict[str, Any]:
-    response = client.send_command('(' + _FUNCTIONS + '\ntry (\n' + body +
+    response = client.send_command('(' + _FUNCTIONS + NODE_LOOKUP_FNS + '\ntry (\n' + body +
                                    '\n) catch ("RCERROR|" + (getCurrentException() as string))\n)')
     if response.get("error") or response.get("ok") is False:
         error = response.get("error") or {}

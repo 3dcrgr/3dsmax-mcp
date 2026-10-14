@@ -15,7 +15,7 @@ from typing import Any
 
 from ..server import client, mcp
 from ..coerce import DictList, DictValue
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import name_in_use, name_literal, safe_string
 from ..helpers.mesh import (MESH_FUNCTIONS, integer, point, resolve_script, run_mesh_script,
                             selection_script, target_script, vector)
 from .splines import _parse_p3
@@ -378,7 +378,7 @@ def _create_mesh(name: str, vertices: list[list[float]], faces: list[list[int]],
     # The bridge owns the "MCP create mesh" hold and cancels it on any failure.
     mesh = run_mesh_script(client, f'''(
         {MESH_FUNCTIONS}
-        if (getNodeByName "{safe_string(name)}" exact:true) != undefined do throw "A node with this name already exists"
+        if {name_in_use(name_literal(name))} do throw "A node with this name already exists"
         local obj = Editable_Mesh name:"{safe_string(name)}" pos:{point(center)}
         convertToPoly obj
         local mesh = obj.baseobject

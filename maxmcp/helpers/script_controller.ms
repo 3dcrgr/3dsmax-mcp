@@ -43,9 +43,8 @@ fn scNode spec = (
         if not isValidNode node do throw "Node handle no longer resolves"
         if spec[1] != "" and node.name != spec[1] do throw "Node handle/name mismatch"
     ) else (
-        local matches = getNodeByName spec[1] exact:true all:true
-        if matches.count != 1 do throw "Node name must resolve uniquely"
-        node = matches[1]
+        -- mcpUniqueNode comes from the lookup functions the request prepends.
+        node = mcpUniqueNode spec[1] "Node"
     )
     node
 )
@@ -276,6 +275,7 @@ fn scRun action target source bindings expected frames = (
         )
     ) catch (
         local message = getCurrentException() as string
+        if (stage == "target" or stage == "bindings") and (findString message "Ambiguous object name") != undefined do code = "AMBIGUOUS"
         if candidate != undefined do try (candidate.throwOnError = false) catch ()
         if ownsHold do (
             try (theHold.Cancel(); ownsHold = false) catch (message += "; rollback failed: " + (getCurrentException() as string))

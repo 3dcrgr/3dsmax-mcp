@@ -25,7 +25,7 @@ import base64
 import math
 from typing import Any
 
-from .maxscript import safe_string
+from .maxscript import node_by_name_expr, safe_string
 
 STATUSES = ("penetrating", "intersecting", "touching", "near_gap", "separate")
 SKIP_REASONS = ("not_mesh", "empty_mesh", "face_limit")
@@ -108,6 +108,7 @@ def build_script(names: list[str], against: list[str], tolerance: float, near_ga
     evaluated TriMeshes it snapshots are freed on every path.
     """
     return _SCRIPT_TEMPLATE % {
+        "resolve": node_by_name_expr("nm", "Node"),
         "names": _ms_array(names),
         "against": _ms_array(against),
         "tol": format(tolerance, ".9g"),
@@ -362,11 +363,7 @@ _SCRIPT_TEMPLATE = r'''(
     fn ccB64 s = (dotNetClass "System.Convert").ToBase64String ((dotNetClass "System.Text.Encoding").UTF8.GetBytes s)
     fn ccIsMesh n = isValidNode n and (isKindOf n GeometryClass) and not (isKindOf n TargetObject) and (canConvertTo n TriMeshGeometry)
     -- Missing and ambiguous names fail the call; nodes that are not meshes are skipped later.
-    fn ccResolve nm = (
-        local m = getNodeByName nm exact:true all:true
-        if m.count != 1 do throw ("Node name must resolve uniquely: " + nm)
-        m[1]
-    )
+    fn ccResolve nm = %(resolve)s
     fn ccSkipText skipN skipR = (
         local s = ""
         for k = 1 to (amin skipN.count 10) do s += (if k == 1 then "; skipped " else ", ") + skipN[k].name + " (" + skipR[k] + ")"
