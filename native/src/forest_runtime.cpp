@@ -16,10 +16,15 @@ Animatable* ForestOwner(Value* handle,bool detached) {
         Refuse(L"MAIN_THREAD_REQUIRED: Forest SDK preparation requires Max's main thread");
     auto* owner=Animatable::GetAnimByHandle((AnimHandle)handle->to_int64());
     if(!owner) Refuse(L"STALE_BINDING: Forest staging handle is unavailable");
-    MSTR className;
-    owner->GetClassName(className,false);
-    if(owner->SuperClassID()!=GEOMOBJECT_CLASS_ID || _wcsicmp(className.data(),L"Forest_Pro")!=0)
-        Refuse(L"NOT_FOREST: SDK preparation requires a Forest Pro base");
+    // Verified instance identity: plugin display names differ from the MAXScript constructor.
+    const auto classId=owner->ClassID();
+    if(owner->SuperClassID()!=GEOMOBJECT_CLASS_ID || classId!=Class_ID(0x79FE41C2,0x1D7B4FB1)) {
+        MSTR className,message;
+        owner->GetClassName(className,false);
+        message.printf(L"NOT_FOREST: expected Forest Pro 79FE41C2:1D7B4FB1, got %08X:%08X superclass %08X name %s",
+            classId.PartA(),classId.PartB(),(unsigned int)owner->SuperClassID(),className.data());
+        Refuse(message.data());
+    }
     if(!detached)return owner;
     std::vector<ReferenceTarget*> pending;
     auto* root=dynamic_cast<ReferenceTarget*>(owner);
