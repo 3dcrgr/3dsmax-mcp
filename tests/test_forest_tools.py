@@ -421,9 +421,11 @@ class HelperTests(unittest.TestCase):
 # forest_items
 # --------------------------------------------------------------------------------------------
 
-def items_report(mode=0, count=3, items=(), types=None, invalid=0, vmax=None):
+def items_report(mode=0, count=3, items=(), types=None, invalid=0, vmax=None,
+                 controller_count=0, frame=0):
     types = types or [(1, 2, "2", "1", "Box", "Box", "Box"), (2, 1, "2", "0", "Tea", "Tea", "")]
     lines = [f"H|{b64('Forest001')}|{mode}|{count}|{len(types)}|{invalid}|100" + ("" if vmax is None else f"|{vmax}")]
+    lines.append(f"K|{controller_count}|{frame}")
     for g, n, geom, src_ok, label, coname, src in types:
         lines.append(f"G|{g}|{n}|{geom}|{src_ok}|{b64(label)}|{b64(coname)}|{b64(src) if src else ''}")
     lines.extend(items)
@@ -451,6 +453,8 @@ class ForestItemsTests(unittest.TestCase):
         self.assertLess(script.index("nd.surfanim = true"), script.index("local n = t.count()"))
         self.assertIn("if true do line += \"|\" + (fpTM piv)", script)
         self.assertIn("if false do line += \"|\" + ((t.getSeed i) as string)", script)
+        self.assertIn("activeControllerParameters", script)
+        self.assertIn("sliderTime.frame as integer", script)
 
     def test_object_space_and_fields(self):
         _, script = self.run_items(items_report(), space="object", fields=["seed", "item_name"])
@@ -478,6 +482,21 @@ class ForestItemsTests(unittest.TestCase):
         self.assertEqual(out["item_types"][0]["geom_type"], 2)
         self.assertTrue(any("no valid source" in w for w in out["warnings"]))
         self.assertTrue(any("procedural" in w for w in out["warnings"]))
+
+    def test_warns_about_controller_animation_at_nonzero_frame(self):
+        out, _ = self.run_items(items_report(mode=1, count=1, controller_count=1, frame=10))
+        warnings = [w for w in out["warnings"] if w.startswith("CONTROLLER_ANIMATION_UNVERIFIED:")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("1 enabled controller-bound effect parameter", warnings[0])
+        self.assertIn("frame 10", warnings[0])
+        self.assertIn("may not reflect the current frame", warnings[0])
+
+    def test_no_controller_animation_warning_at_frame_zero_or_without_binding(self):
+        frame_zero, _ = self.run_items(items_report(mode=1, count=1, controller_count=1, frame=0))
+        no_controller, _ = self.run_items(items_report(mode=1, count=1, controller_count=0, frame=10))
+        for result in (frame_zero, no_controller):
+            self.assertFalse(any(w.startswith("CONTROLLER_ANIMATION_UNVERIFIED:")
+                                 for w in result["warnings"]))
 
     def test_all_fields_order(self):
         response = items_report(mode=1, count=1, items=["T|0|1|1|1,2,3|1,0,0,0,1,0,0,0,1,1,2,3|45|1,1,2|20,50|777"])

@@ -69,6 +69,19 @@ def _viewport_notes(count: int | None, vmax: float | None) -> list[tuple[str, st
 _ITEMS_BODY = r'''
 local nd = fpForest "@@NAME@@"
 fpGuard nd
+local effectBase = nd.baseObject, activeEffectIds = #(), activeControllerParameters = 0
+if isProperty effectBase #efidlist and isProperty effectBase #efenablelist do (
+    local ids = effectBase.efidlist as array, enabled = effectBase.efenablelist as array
+    for j = 1 to (amin #(ids.count, enabled.count)) where enabled[j] do append activeEffectIds ids[j]
+)
+if isProperty effectBase #efpatype and isProperty effectBase #efpaeffid and isProperty effectBase #efpacontref do (
+    local types = effectBase.efpatype as array, owners = effectBase.efpaeffid as array
+    local controllers = effectBase.efpacontref as array
+    for j = 1 to (amin #(types.count, owners.count, controllers.count)) where (
+        types[j] == 2 and controllers[j] != undefined and (findItem activeEffectIds owners[j]) > 0
+    ) do activeControllerParameters += 1
+)
+local currentFrame = sliderTime.frame as integer
 local t = nd.trees
 if @@REFRESH@@ do (
     with undo off (
@@ -96,6 +109,7 @@ for i = 0 to n - 1 do (
 local ss = stringStream ""
 format "FPOK\n" to:ss
 format "H|%|%|%|%|%|%|%\n" (fpEnc nd.name) (nd.mode as string) n nT invalid (fpF (units.decodeValue "1m")) (fpPropV nd #vmaxitems) to:ss
+format "K|%|%\n" activeControllerParameters currentFrame to:ss
 for g = 1 to nT do (
     local src = if g <= cl.count then cl[g] else undefined
     format "G|%|%|%|%|%|%|%\n" g hist[g] (if g <= gl.count then fpVal gl[g] else "-") (fpB srcOk[g]) (fpEnc (nl[g] as string)) (if g <= cn.count then fpEnc (cn[g] as string) else "") (if isValidNode src then fpEnc src.name else "") to:ss
@@ -178,6 +192,11 @@ def forest_items(
     The items are the viewport build: over Max items Viewport (vmaxitems) Forest Pack thins it, so count can be
     lower than what renders (VIEWPORT_LIMIT_POSSIBLE).
 
+    When the Forest has enabled controller-bound effect parameters and the current
+    frame is nonzero, a CONTROLLER_ANIMATION_UNVERIFIED warning is returned. The
+    plugin's animated controller sampling has not been validated and may return
+    item transforms that do not reflect the current frame.
+
     A forest in Reference mode (distmode 2) also returns reference, read only: use_railclone_items
     (distrefusercitems), match_by_name (distrefmatchname) and nodes, each with name, handle and railclone; a
     RailClone adds exported_segments (segments with Export to Forest), transform_exports (Transforms with it in
@@ -198,6 +217,10 @@ def forest_items(
         raise ForestError("INVALID_READBACK", "forest_items got no header line")
     mode, count, invalid = int(head[2]), int(head[3]), int(head[5])
     types = _type_rows(report)
+    controller_state = next((line.split("|")[1:] for line in report if line.startswith("K|")), ["0", "0"])
+    if len(controller_state) != 2:
+        raise ForestError("INVALID_READBACK", "forest_items got an invalid controller state row")
+    active_controller_parameters, current_frame = (int(value) for value in controller_state)
     present = [f for f in _MAX_FIELDS if f in wanted]
     items: list[dict[str, Any]] = []
     no_source = 0
@@ -239,6 +262,12 @@ def forest_items(
     if no_source:
         warnings.append(f"{no_source} returned items have no valid source object; their transform is the raw "
                         "item TM (getFullTransform * objectTransform), not an instance-ready pivot")
+    if active_controller_parameters > 0 and current_frame != 0:
+        warnings.append(
+            "CONTROLLER_ANIMATION_UNVERIFIED: this Forest has "
+            f"{active_controller_parameters} enabled controller-bound effect parameter(s) at frame {current_frame}; "
+            "animated controller evaluation is unverified and item transforms may not reflect the current frame"
+        )
     if mode == 0:
         warnings.append("procedural mode: indices are valid until the forest rebuilds")
         warnings += [f"{code}: {detail}" for code, detail in
