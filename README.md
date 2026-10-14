@@ -17,7 +17,7 @@ Verified and deployed improvements are published on the fork's default branch, `
 
 ## At a glance
 
-Forest Effects supports guarded ordering, numeric parameters, object, spline, existing texture-map, and verified scalar `FloatController` bindings. Controller bindings are not verified for animated evaluation across frames; `forest_items` warns at nonzero frames when enabled controller bindings are present. `.eff` import requires explicit scene bindings; export writes definitions with required bindings listed for the next import. `forest_effect_curves` inspects native CurveControl points and metadata read-only; curve editing, persistence, parameter mapping, and `.eff` curve serialization remain unsupported. Stored effect code has no public compile-success signal. See [iToo coverage](docs/fork/itoo-api-coverage.md).
+Forest Effects supports guarded ordering, numeric parameters, object, spline, existing texture-map, and verified scalar `FloatController` bindings. Controller bindings are not verified for animated evaluation across frames; `forest_items` warns at nonzero frames when enabled controller bindings are present. `.eff` import requires explicit scene bindings; export writes definitions with required bindings listed for the next import. Curve parameter imports are refused with `CURVE_WRITES_UNSUPPORTED` after raw curve-row insertion crashed scratch Max; `forest_effect_curves` remains read-only, and curve editing, persistence, parameter mapping, and `.eff` curve serialization are unsupported. Stored effect code has no public compile-success signal. See [iToo coverage](docs/fork/itoo-api-coverage.md).
 
 - **209 tools:** all 179 of upstream's, plus 30 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
