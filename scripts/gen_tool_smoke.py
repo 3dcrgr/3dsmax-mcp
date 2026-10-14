@@ -110,7 +110,10 @@ CUSTOM: dict[str, dict] = {
     "scene_qa": {"max_issues": 20},
     "discover_plugin_classes": {"limit": 10},
     "list_plugin_classes": {"limit": 10},
-    "introspect_class": {"class_name": "Box"},
+    "introspect_class": {"class_name": "Teapot"},  # Box is ambiguous across superclasses
+    "resolve_node_refs": {"refs": [{"name": SMOKE_TARGET}]},
+    "scene_patch": {"operations": [{"target": {"name": SMOKE_TARGET}, "op": "set_flags", "hidden": False}],
+                    "dry_run": True},
     "map_class_relationships": {"limit": 5},
     "get_object_properties": {"name": SMOKE_TARGET},
     "inspect_object": {"name": SMOKE_TARGET},
@@ -192,6 +195,7 @@ CUSTOM: dict[str, dict] = {
 }
 
 MUTATE_TOOLS = {
+    "undo_last",  # Undoes whatever ran last: the fixture, or the user's own edit.
     "script_controller",
     "create_lights",
     "edit_lights",
@@ -380,6 +384,7 @@ def main() -> int:
             "input": payload,
             "tier": tier,
             "flags": 0,
+            "command": cmd_type,  # query_scene is a Python tool: run its native command directly
         })
 
     # Stable run order: read → fixture → mutate
@@ -398,6 +403,7 @@ def main() -> int:
     lines.append("    const char* inputJson;")
     lines.append("    uint8_t tier;")
     lines.append("    uint8_t flags;")
+    lines.append("    const char* command;  // Native command for a case with no registry entry")
     lines.append("};")
     lines.append("")
     lines.append(f"static constexpr const char* kSmokeTargetToken = \"{SMOKE_TARGET}\";")
@@ -407,7 +413,8 @@ def main() -> int:
     for c in cases:
         inp = json.dumps(c["input"], separators=(",", ":"))
         lines.append(
-            f'    {{"{c_escape(c["tool"])}", "{c_escape(inp)}", {c["tier"]}, {c["flags"]}}},'
+            f'    {{"{c_escape(c["tool"])}", "{c_escape(inp)}", {c["tier"]}, {c["flags"]}, '
+            f'"{c_escape(c.get("command", ""))}"}},'
         )
     lines.append("};")
     lines.append("static const size_t kSmokeCaseCount = sizeof(kSmokeCases) / sizeof(kSmokeCases[0]);")

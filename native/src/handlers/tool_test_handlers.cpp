@@ -34,6 +34,8 @@ struct SmokeCase {
 
     uint8_t flags;
 
+    const char* command;  // Native command for a case with no registry entry
+
 };
 
 static constexpr const char* kSmokeTargetToken = "MCP_SmokeTarget";
@@ -266,11 +268,15 @@ static void SceneHold(MCPBridgeGUP* gup) {
 
 
 
-static void SceneFetch(MCPBridgeGUP* gup) {
+// Restores the harness's own hold. manage_scene's fetch asks "About to Fetch.
+// OK?", which would leave the run waiting on a dialog.
+static void SceneFetch(MCPBridgeGUP*) {
 
     try {
 
-        NativeToolRegistry::ExecuteTool("manage_scene", json{{"action", "fetch"}}, gup);
+        HandlerHelpers::RunMAXScriptChecked("fetchMaxFile quiet:true");
+
+        NativeHandlers::ResetSceneDeltaSessions();
 
     } catch (...) {
 
@@ -476,7 +482,11 @@ static std::string RunToolSmokeImpl(const std::string& params, MCPBridgeGUP* gup
 
         try {
 
-            raw = NativeToolRegistry::ExecuteTool(sc.tool, input, gup);
+            raw = sc.command && *sc.command
+
+                ? NativeToolRegistry::ExecuteCommand(sc.command, input, gup, sc.tool)
+
+                : NativeToolRegistry::ExecuteTool(sc.tool, input, gup);
 
         } catch (const std::exception& e) {
 

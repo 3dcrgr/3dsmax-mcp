@@ -23,11 +23,18 @@ std::string NativeToolRegistry::ExecuteTool(
     if (!tool) {
         return json{{"error", "Unknown tool: " + toolName}}.dump();
     }
+    return ExecuteCommand(tool->cmdType, input, gup, toolName);
+}
+
+std::string NativeToolRegistry::ExecuteCommand(
+    const std::string& cmdType,
+    const json& input,
+    MCPBridgeGUP* gup,
+    const std::string& label) {
 
     // Build command payload:
     //   maxscript: command = raw code string (input["code"])
     //   native:*:  command = input.dump() — handler parses JSON
-    std::string cmdType = tool->cmdType;
     std::string command;
     if (cmdType == "maxscript") {
         command = input.value("code", "");
@@ -38,7 +45,7 @@ std::string NativeToolRegistry::ExecuteTool(
     json req;
     req["type"] = cmdType;
     req["command"] = command;
-    req["requestId"] = std::string("invoke-") + toolName;
+    req["requestId"] = std::string("invoke-") + label;
     if (cmdType == "maxscript" && input.contains("quiet") && input["quiet"].is_boolean())
         req["quiet"] = input["quiet"];
 
