@@ -635,9 +635,13 @@ class ControllerParameterTests(unittest.TestCase):
             result=api.forest_effect_parameters('forest',action='repair_animation',expected_effects=TOKEN)
         self.assertTrue(result['controller_animation_verified'])
         self.assertTrue(result['undoable'])
-        self.assertIn('iaMarkControllerProxy staged 1',send.call_args.args[0])
-        self.assertIn('iaPrepareControllerProxies staged',send.call_args.args[0])
-        self.assertNotIn('with animate on',send.call_args.args[0])
+        script=send.call_args.args[0]
+        self.assertIn('iaMarkControllerProxy staged 1',script)
+        self.assertIn('iaPrepareControllerProxies staged',script)
+        self.assertIn('fn iaFindParameter doc id',script)
+        self.assertIn('SelectSingleNode',script)
+        self.assertNotIn('for p in doc.SelectNodes',script)
+        self.assertNotIn('with animate on',script)
 
     def test_repair_requires_fresh_token_and_scalar_parameters(self):
         with self.assertRaises(ValueError):

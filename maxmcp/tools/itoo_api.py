@@ -255,17 +255,19 @@ fn iaControllerIdentity base i = (
         (if ctrl==undefined then "0" else rcH ctrl)+":"+(rcEncode ((classOf ctrl) as string))
     )
 )
+fn iaFindParameter doc id = (
+    local wanted=toLower id
+    if (findString wanted "'") != undefined do throw "PARAMETER_ID_INVALID: quote in parameter id"
+    doc.SelectSingleNode ("/effect/parameter[translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='"+wanted+"']")
+)
 fn iaControllerProxy base i = (
     if base.efpatype[i]!=0 then false else (
         local ei=findItem (base.efidlist as array) base.efpaeffid[i]
         if ei==0 then false else (
             local doc=dotNetObject "System.Xml.XmlDocument"
             doc.XmlResolver=undefined; doc.LoadXml base.efxmllist[ei]
-            local found=false
-            for p in doc.SelectNodes "/effect/parameter" where (toLower (p.GetAttribute "id"))==(toLower base.efpaid[i]) do (
-                found=(p.GetAttribute "mcp_controller_proxy")=="1"
-            )
-            found
+            local found=iaFindParameter doc base.efpaid[i]
+            found!=undefined and (found.GetAttribute "mcp_controller_proxy")=="1"
         )
     )
 )
@@ -281,8 +283,7 @@ fn iaMarkControllerProxy staged i = (
     if ei==0 do throw "ORPHAN_EFFECT_PARAMETER: controller has no effect"
     local doc=dotNetObject "System.Xml.XmlDocument"
     doc.XmlResolver=undefined; doc.LoadXml staged.efxmllist[ei]
-    local found=undefined
-    for p in doc.SelectNodes "/effect/parameter" where (toLower (p.GetAttribute "id"))==(toLower staged.efpaid[i]) do found=p
+    local found=iaFindParameter doc staged.efpaid[i]
     if found==undefined do throw "PARAMETER_SCHEMA_MISMATCH: controller XML definition missing"
     found.SetAttribute "type" "numerical"; found.SetAttribute "numtype" "real"
     found.SetAttribute "limits" "0"; found.SetAttribute "default" "0"
