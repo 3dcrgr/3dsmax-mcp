@@ -74,7 +74,6 @@ SKIP_DEFAULT = {
     "capture_multi_view",
     "capture_screen",
     "create_tyflow",
-    "create_tyflow_preset",
     "get_tyflow_info",
     "list_tyflow_operator_types",
     "modify_tyflow_operator",

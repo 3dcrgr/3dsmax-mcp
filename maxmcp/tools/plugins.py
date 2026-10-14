@@ -70,7 +70,6 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "get_tyflow_particle_count",
             "get_tyflow_particles",
             "reset_tyflow_simulation",
-            "create_tyflow_preset",
         ],
         "recipes": [
             "For existing flows, start with get_tyflow_info (enable include_flow_properties/include_event_properties/include_operator_properties as needed), then mutate.",

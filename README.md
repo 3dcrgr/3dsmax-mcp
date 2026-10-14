@@ -347,8 +347,7 @@ and existing procedural skies use the provider's dome or environment binding.
 | Tool | Description |
 |------|-------------|
 | `list_tyflow_operator_types` | Available operator names for this install |
-| `create_tyflow` | Create tyFlow with events and operators |
-| `create_tyflow_preset` | Presets: rain, snow, fountain, burst, debris |
+| `create_tyflow` | Create tyFlow with an event and operators, or a preset: rain, snow, fountain, burst, debris |
 | `get_tyflow_info` | Deep flow/event/operator readback |
 | `harvest_tyflow_manifest` | Probe and cache the installed tyFlow operator surface by tyFlow version |
 | `list_tyflow_operators` | Query the cached tyFlow operator manifest without touching Max |

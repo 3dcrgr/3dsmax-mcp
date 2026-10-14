@@ -200,17 +200,73 @@ if tyFlow == undefined then (
     return json.dumps(_send_json(maxscript, {"error": "Could not parse operator probe response."}))
 
 
+TYFLOW_PRESETS: tuple[str, ...] = ("rain", "snow", "fountain", "burst", "debris")
+
+
+def _preset_operators(key: str, amount: int, speed: float) -> list[dict[str, Any]]:
+    """Operator list for one of TYFLOW_PRESETS."""
+    if key == "snow":
+        shape, force_z, speed_v = "quad", -50.0, max(5.0, speed * 0.2)
+    elif key == "rain":
+        shape, force_z, speed_v = "sphere", -300.0, max(50.0, speed * 1.5)
+    elif key == "fountain":
+        shape, force_z, speed_v = "sphere", -150.0, max(80.0, speed * 1.2)
+    elif key == "burst":
+        shape, force_z, speed_v = "sphere", -30.0, max(100.0, speed * 2.0)
+    else:
+        shape, force_z, speed_v = "box", -980.0, max(30.0, speed)
+
+    return [
+        {"type": "Birth", "name": "Birth", "position": 0, "properties": {"birthMode": 0, "birthTotal": int(amount)}},
+        {"type": "Speed", "name": "Speed", "position": 1, "properties": {"magnitude": float(speed_v), "directionMode": 3}},
+        {"type": "Force", "name": "Force", "position": 2, "properties": {"gravityStrength": float(force_z)}},
+        {
+            "type": "Shape",
+            "name": "Shape",
+            "position": 3,
+            "properties": {
+                "shape_type_tab": [1],
+                "type_3d_ID_tab": [SHAPE_3D_IDS[shape]],
+                "frequency_tab": [100.0],
+                "scaleVal_tab": [100.0],
+            },
+        },
+        {"type": "Display", "name": "Display", "position": 4, "properties": {"displayMode": 2}},
+    ]
+
+
 @mcp.tool()
 def create_tyflow(
     name: str = "",
     position: FloatList | None = None,
-    event_name: str = "Emit",
+    event_name: str = "",
     event_position: IntList | None = None,
     operators: DictList | None = None,
     select_created: bool = True,
+    preset: str = "",
+    amount: int = 100,
+    speed: float = 120.0,
 ) -> str:
-    """Create tyFlow with one event and a configurable operator list."""
+    """Create tyFlow with one event and a configurable operator list or a preset.
+
+    Without operators or preset, the event gets Birth, Shape (sphere) and Display.
+    preset: rain | snow | fountain | burst | debris adds Birth (amount particles),
+    Speed (scaled from speed), Force, Shape and Display; the flow defaults to
+    ty_<preset> and the event to the capitalized preset name. Pass operators or
+    preset, not both. event_name defaults to Emit otherwise.
+    """
     from .selection import select_objects
+
+    key = preset.strip().lower()
+    if key and key not in TYFLOW_PRESETS:
+        return json.dumps({"error": "Unsupported preset. Use rain|snow|fountain|burst|debris"})
+    if key and operators:
+        return json.dumps({"error": "Pass either operators or preset, not both"})
+    if key:
+        name = name or f"ty_{key}"
+        event_name = event_name or key.capitalize()
+        operators = _preset_operators(key, amount, speed)
+    event_name = event_name or "Emit"
 
     pos = position or [0.0, 0.0, 0.0]
     ev_pos = event_position or [0, 0]
@@ -1003,54 +1059,3 @@ if targets.count == 0 then (
 )
 )"""
     return json.dumps(_send_json(maxscript, {"error": "Could not parse reset_tyflow_simulation response."}))
-
-
-@mcp.tool()
-def create_tyflow_preset(
-    preset: str,
-    name: str = "",
-    position: FloatList | None = None,
-    amount: int = 100,
-    speed: float = 120.0,
-) -> str:
-    """Create common tyFlow presets: rain, snow, fountain, burst, debris."""
-    key = preset.strip().lower()
-    if key not in {"rain", "snow", "fountain", "burst", "debris"}:
-        return json.dumps({"error": "Unsupported preset. Use rain|snow|fountain|burst|debris"})
-
-    if key == "snow":
-        shape, force_z, speed_v = "quad", -50.0, max(5.0, speed * 0.2)
-    elif key == "rain":
-        shape, force_z, speed_v = "sphere", -300.0, max(50.0, speed * 1.5)
-    elif key == "fountain":
-        shape, force_z, speed_v = "sphere", -150.0, max(80.0, speed * 1.2)
-    elif key == "burst":
-        shape, force_z, speed_v = "sphere", -30.0, max(100.0, speed * 2.0)
-    else:
-        shape, force_z, speed_v = "box", -980.0, max(30.0, speed)
-
-    flow_name = name or f"ty_{key}"
-    return create_tyflow(
-        name=flow_name,
-        position=position or [0.0, 0.0, 0.0],
-        event_name=key.capitalize(),
-        event_position=[0, 0],
-        operators=[
-            {"type": "Birth", "name": "Birth", "position": 0, "properties": {"birthMode": 0, "birthTotal": int(amount)}},
-            {"type": "Speed", "name": "Speed", "position": 1, "properties": {"magnitude": float(speed_v), "directionMode": 3}},
-            {"type": "Force", "name": "Force", "position": 2, "properties": {"gravityStrength": float(force_z)}},
-            {
-                "type": "Shape",
-                "name": "Shape",
-                "position": 3,
-                "properties": {
-                    "shape_type_tab": [1],
-                    "type_3d_ID_tab": [SHAPE_3D_IDS[shape]],
-                    "frequency_tab": [100.0],
-                    "scaleVal_tab": [100.0],
-                },
-            },
-            {"type": "Display", "name": "Display", "position": 4, "properties": {"displayMode": 2}},
-        ],
-        select_created=True,
-    )
