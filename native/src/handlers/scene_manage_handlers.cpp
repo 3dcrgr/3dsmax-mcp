@@ -27,21 +27,42 @@ std::string NativeHandlers::SetParent(const std::string& params, MCPBridgeGUP* g
 
         json done = json::array();
         json notFound = json::array();
+        json rejected = json::array();
 
+        // Resolve every child before the first edit. A parent cannot become a
+        // child of itself or of one of its own descendants.
+        std::vector<std::pair<std::string, INode*>> targets;
         for (const auto& childName : children) {
             INode* child = FindNodeByName(childName);
             if (!child) {
                 notFound.push_back(childName);
                 continue;
             }
-            if (parentNode) {
-                parentNode->AttachChild(child, TRUE);
-            } else {
-                // Unparent: attach to scene root
-                ip->GetRootNode()->AttachChild(child, TRUE);
+            bool cycle = false;
+            for (INode* cursor = parentNode; cursor && !cursor->IsRootNode(); cursor = cursor->GetParentNode()) {
+                if (cursor == child) { cycle = true; break; }
             }
-            done.push_back(childName);
+            if (cycle) {
+                rejected.push_back({{"name", childName}, {"reason", "would create a hierarchy cycle"}});
+                continue;
+            }
+            targets.push_back({childName, child});
         }
+        if (targets.empty()) {
+            throw std::runtime_error(StructuredErrorPayload(
+                notFound.empty() ? "HIERARCHY_CYCLE" : "NOT_FOUND",
+                "No requested child could be parented; the hierarchy was not changed.",
+                {{"notFound", notFound}, {"rejected", rejected}}));
+        }
+
+        INode* newParent = parentNode ? parentNode : ip->GetRootNode();
+        for (const auto& [childName, child] : targets) {
+            newParent->AttachChild(child, TRUE);
+            if (child->GetParentNode() == newParent) done.push_back(childName);
+            else rejected.push_back({{"name", childName}, {"reason", "Max kept the previous parent"}});
+        }
+        if (done.empty())
+            throw std::runtime_error("Max did not reparent any of the requested children.");
 
         ip->RedrawViews(ip->GetTime());
 
@@ -51,10 +72,27 @@ std::string NativeHandlers::SetParent(const std::string& params, MCPBridgeGUP* g
         } else {
             msg = "Unparented " + std::to_string(done.size()) + " objects";
         }
+        json result;
+        result["parent"] = parentNode ? json(WideToUtf8(parentNode->GetName())) : json(nullptr);
+        result["done"] = done;
+        result["notFound"] = notFound;
+        json warnings = json::array();
         if (!notFound.empty()) {
-            msg += " | Not found: " + std::to_string(notFound.size());
+            msg += " | " + std::to_string(notFound.size()) + " not found";
+            warnings.push_back(std::to_string(notFound.size()) +
+                " requested child name(s) matched no object: " + JoinNames(notFound));
         }
-        return msg;
+        if (!rejected.empty()) {
+            result["rejected"] = rejected;
+            warnings.push_back(std::to_string(rejected.size()) +
+                " child(ren) kept their previous parent; see rejected for the reason.");
+        }
+        result["message"] = msg;
+        if (!warnings.empty()) {
+            result["status"] = "partial";
+            result["warnings"] = warnings;
+        }
+        return result.dump();
     });
 }
 
@@ -68,11 +106,19 @@ std::string NativeHandlers::BatchRenameObjects(const std::string& params, MCPBri
 
         json renamed = json::array();
         json notFound = json::array();
+        json invalid = json::array();
+        json duplicates = json::array();
 
-        for (const auto& r : renames) {
-            std::string oldName = r.value("old_name", "");
-            std::string newName = r.value("new_name", "");
-            if (oldName.empty() || newName.empty()) continue;
+        // Entries apply in order, so a swap through a temporary name works.
+        std::vector<INode*> renamedNodes;
+        for (size_t i = 0; i < renames.size(); ++i) {
+            const json& r = renames[i];
+            std::string oldName = r.is_object() ? r.value("old_name", "") : "";
+            std::string newName = r.is_object() ? r.value("new_name", "") : "";
+            if (oldName.empty() || newName.empty()) {
+                invalid.push_back(i);
+                continue;
+            }
 
             INode* node = FindNodeByName(oldName);
             if (!node) {
@@ -82,15 +128,48 @@ std::string NativeHandlers::BatchRenameObjects(const std::string& params, MCPBri
 
             std::wstring wNewName = Utf8ToWide(newName);
             node->SetName(wNewName.c_str());
-            renamed.push_back(oldName + " -> " + newName);
+            renamed.push_back(oldName + " -> " + WideToUtf8(node->GetName()));
+            renamedNodes.push_back(node);
+        }
+        if (renamed.empty()) {
+            throw std::runtime_error(StructuredErrorPayload(
+                notFound.empty() ? "BAD_PARAM" : "NOT_FOUND",
+                "No rename could be applied; every entry was missing old_name/new_name or matched no object.",
+                {{"notFound", notFound}, {"invalidEntries", invalid}}));
+        }
+        // Max allows duplicate object names; name lookups then pick either object.
+        for (INode* node : renamedNodes) {
+            const std::string current = WideToUtf8(node->GetName());
+            if (CollectNodesByExactName(current).size() > 1 &&
+                std::find(duplicates.begin(), duplicates.end(), current) == duplicates.end())
+                duplicates.push_back(current);
         }
 
         std::string msg = "Renamed: " + std::to_string(renamed.size());
+        json result;
+        result["renamed"] = renamed;
+        result["notFound"] = notFound;
+        json warnings = json::array();
         if (!notFound.empty()) {
-            msg += " | Not found:";
-            for (const auto& nf : notFound) msg += " " + nf.get<std::string>();
+            msg += " | " + std::to_string(notFound.size()) + " not found";
+            warnings.push_back(std::to_string(notFound.size()) +
+                " old name(s) matched no object: " + JoinNames(notFound));
         }
-        return msg;
+        if (!invalid.empty()) {
+            result["invalidEntries"] = invalid;
+            warnings.push_back(std::to_string(invalid.size()) +
+                " entr(ies) lacked old_name or new_name and were skipped.");
+        }
+        if (!duplicates.empty()) {
+            result["duplicateNames"] = duplicates;
+            warnings.push_back("These names are now shared by more than one object: " + JoinNames(duplicates));
+        }
+        result["message"] = msg;
+        if (!warnings.empty()) {
+            result["status"] = "partial";
+            result["warnings"] = warnings;
+        }
+        return result.dump();
     });
 }
 
@@ -118,11 +197,14 @@ std::string NativeHandlers::ManageScene(const std::string& params, MCPBridgeGUP*
             return "Scene reset to empty";
         }
         if (action == "save") {
-            const MCHAR* filePath = ip->GetCurFilePath().data();
+            const MSTR currentPath = ip->GetCurFilePath();
+            const MCHAR* filePath = currentPath.data();
             if (!filePath || !*filePath) {
-                return "No file path set — use File > Save As first";
+                throw std::runtime_error(
+                    "Scene was not saved: it has no file path yet. Use File > Save As first.");
             }
-            ip->SaveToFile(filePath);
+            if (!ip->SaveToFile(filePath))
+                throw std::runtime_error("3ds Max failed to save " + WideToUtf8(filePath));
             return "Saved: " + WideToUtf8(filePath);
         }
         if (action == "info") {
@@ -164,7 +246,7 @@ std::string NativeHandlers::ManageScene(const std::string& params, MCPBridgeGUP*
 // ── native:undo_last ────────────────────────────────────────────
 std::string NativeHandlers::UndoLast(const std::string& params, MCPBridgeGUP* gup) {
     return gup->GetExecutor().ExecuteSync([]() -> std::string {
-        RunMAXScript("max undo");
+        RunMAXScriptChecked("max undo");
         json result;
         result["undone"] = true;
         result["message"] = "Undid last scene operation";
