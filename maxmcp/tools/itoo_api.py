@@ -237,13 +237,18 @@ fn iaEffectsProps base = (
     )
     props
 )
+fn iaEffectValue v = (
+    if v!=undefined and isKindOf v TextureMap then (
+        "t"+(rcH v)+":"+(rcEncode v.name)+":"+(rcEncode ((classOf v) as string))
+    ) else rcV v
+)
 fn iaEffectsToken obj base = (
     local ss=stringStream ""
     format "%|%|" (rcH obj) (rcH base) to:ss
     for p in iaEffectsProps base do (
         format "%|" p to:ss
         local a=getProperty base p
-        for v in a do format "%|" (rcV v) to:ss
+        for v in a do format "%|" (iaEffectValue v) to:ss
     )
     rcHash (ss as string)
 )
@@ -254,7 +259,7 @@ fn iaEffectsReport obj base = (
     for p in iaEffectsProps base do (
         local a=getProperty base p
         rcRow ss #("A", p as string, a.count as string)
-        for i=1 to a.count do rcRow ss #("V", p as string, i as string, rcV a[i])
+        for i=1 to a.count do rcRow ss #("V", p as string, i as string, iaEffectValue a[i])
     )
     format "END\n" to:ss
     ss as string
@@ -283,9 +288,9 @@ def parameter_definitions(document: ET.Element, allow_references: bool = False) 
     rows, names, ids = [], set(), set()
     for definition in definitions:
         kind, name = definition.get("numtype"), definition.get("name", "")
-        reference = definition.get("type") in ("node", "spline")
+        reference = definition.get("type") in ("node", "spline", "texture")
         if not ((reference and allow_references) or (definition.get("type") == "numerical" and kind in NUMERIC_KINDS)):
-            raise ValueError("PARAMETER_TYPE_UNSUPPORTED: only measured numeric/node/spline parameters are supported")
+            raise ValueError("PARAMETER_TYPE_UNSUPPORTED: only measured numeric/node/spline/texture parameters are supported")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) or name.lower() in names:
             raise ValueError("parameter names must be unique identifiers")
         ident = "{" + str(uuid.UUID(definition.get("id", ""))) + "}"
@@ -318,7 +323,7 @@ def numeric_definitions(document: ET.Element) -> list[dict[str, Any]]:
 
 def bind_definitions(rows: list[dict[str, Any]], bindings: dict[str, Any] | None) -> None:
     """Require an explicit binding, including explicit null, for every reference."""
-    refs = [r for r in rows if r["kind"] in ("node", "spline")]
+    refs = [r for r in rows if r["kind"] in ("node", "spline", "texture")]
     if bindings is None:
         bindings = {}
     if not isinstance(bindings, dict):
@@ -338,12 +343,33 @@ def bind_definitions(rows: list[dict[str, Any]], bindings: dict[str, Any] | None
         if row["id"] in touched:
             raise ValueError("duplicate reference binding")
         touched.add(row["id"])
-        row["binding_literal"] = reference_literal(value)
+        row["binding_literal"] = texture_literal(value) if row["kind"] == "texture" else reference_literal(value)
     if len(touched) != len(refs):
-        raise ValueError("REFERENCE_BINDINGS_REQUIRED: explicitly bind every node/spline parameter, or use null")
+        raise ValueError("REFERENCE_BINDINGS_REQUIRED: explicitly bind every node/spline/texture parameter, or use null")
 
 
-REFERENCE_KINDS = {1: ("node", "efpainode"), 5: ("spline", "efpaspline")}
+REFERENCE_KINDS = {1: ("node", "efpainode"), 5: ("spline", "efpaspline"), 3: ("texture", "efpatexmap")}
+
+
+def effect_value(value: str) -> Any:
+    if value.startswith("t"):
+        handle, name, cls = value[1:].split(":", 2)
+        return {"handle": int(handle), "name": rc._unb64(name), "class": rc._unb64(cls)}
+    return rc._dv(value)
+
+
+def texture_literal(value: Any) -> str:
+    if value is None:
+        return "undefined"
+    if not isinstance(value, dict) or set(value) != {"name", "handle", "class"}:
+        raise ValueError("texture binding requires {name, handle, class} identity or null")
+    handle = value["handle"]
+    if isinstance(handle, bool) or not isinstance(handle, int) or not 0 < handle < 2**63:
+        raise ValueError("texture handle must be a positive integer")
+    for key in ("name", "class"):
+        if not isinstance(value[key], str) or not value[key] or len(value[key]) > 1024 or "\x00" in value[key]:
+            raise ValueError("texture name/class must be nonempty bounded strings")
+    return f'(iaEffectMap "{rc._b64(value["name"])}" {handle} "{rc._b64(value["class"])}")'
 
 
 def reference_literal(value: Any) -> str:
@@ -364,6 +390,13 @@ def reference_literal(value: Any) -> str:
 
 
 _REFERENCE_LIB = '''
+fn iaEffectMap text handle cls = (
+    local m=getAnimByHandle handle
+    if m==undefined do throw "STALE_MAP_REFERENCE: map no longer exists"
+    if not isKindOf m TextureMap do throw "NOT_TEXTURE_MAP: binding requires a texture map"
+    if m.name!=(rcDecode text) or ((classOf m) as string)!=(rcDecode cls) do throw "STALE_MAP_REFERENCE: refresh map identity"
+    m
+)
 fn iaEffectNode text handle = (
     local wanted=rcDecode text
     if handle!=0 then (
@@ -428,6 +461,8 @@ def parameter_rows(state: dict[str, Any], effect: str = "") -> list[dict[str, An
             if value is not None and (not isinstance(value, dict) or not isinstance(value.get("handle"), int)
                                       or not isinstance(value.get("name"), str)):
                 raise RailCloneError("INVALID_REFERENCE", "native reference is not a scene node")
+            if kind == "texture" and value is not None and not isinstance(value.get("class"), str):
+                raise RailCloneError("INVALID_REFERENCE", "native texture identity is incomplete")
             row.update(kind=kind, value=value, bound=value is not None, writable=True)
         rows.append(row)
     return rows
@@ -438,7 +473,7 @@ def append_numeric_parameters(rows: list[dict[str, Any]], owner: str) -> str:
         return ""
     script = 'local pc=staged.efpaid.count\n'
     for i, row in enumerate(rows):
-        if row["kind"] in ("node", "spline"):
+        if row["kind"] in ("node", "spline", "texture"):
             var = f'import_reference_{i}'
             script += f'local {var}={row["binding_literal"]}\n'
             script += f'if {var}!=undefined and ({var}==obj or (refs.dependencyLoopTest {var} obj) or (refs.dependencyLoopTest {var} base)) do throw "DEPENDENCY_CYCLE: source depends on target"\n'
@@ -452,15 +487,15 @@ if next_{prop}.count==0 do next_{prop}=for j=1 to pc collect {default}
 if next_{prop}.count!=pc do throw "EFFECT_PARAMETER_LIST_MISMATCH: {prop}"
 '''
         for i, row in enumerate(rows):
-            reference = row["kind"] in ("node", "spline")
+            reference = row["kind"] in ("node", "spline", "texture")
             subtype, prefix, typ = (0, "", "") if reference else NUMERIC_KINDS[row["kind"]]
             string_fields = {"efpaid": row["id"], "efpaeffid": owner,
                              "efpaname": row["name"], "efpadesc": row["description"]}
             if prop in string_fields:
                 value = f'(rcDecode "{rc._b64(string_fields[prop])}")'
             elif reference and prop == "efpatype":
-                value = "1" if row["kind"] == "node" else "5"
-            elif reference and prop == ("efpainode" if row["kind"] == "node" else "efpaspline"):
+                value = str({"node": 1, "spline": 5, "texture": 3}[row["kind"]])
+            elif reference and prop == {"node": "efpainode", "spline": "efpaspline", "texture": "efpatexmap"}[row["kind"]]:
                 value = f'import_reference_{i}'
             elif prop == "efpanumtype":
                 value = str(subtype)
@@ -487,7 +522,9 @@ def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect
     values use the effect's declared range, not an assumed 0..100 cap. Object and
     spline bindings accept exact unique node names, {name, handle} identities, or
     null to clear. Spline bindings require shapes; cycles and stale identities are
-    refused. Controller, texture and curve writes are refused. XML/native schema must agree.
+    refused. Texture bindings require {name, handle, class} identities or null;
+    handles resolve existing texture maps only and never create a map. Controller
+    and curve writes are refused. XML/native schema must agree.
     Does not build or compile-check; verify using forest_items(refresh_surfaces=true).
     """
     if action not in ("inspect", "set"):
@@ -516,7 +553,7 @@ def forest_effect_parameters(name: str, effect: str = "", action: str = "inspect
                 raise ValueError("PARAMETER_TYPE_UNSUPPORTED: this parameter type is not supported")
             if row["native_type"] in REFERENCE_KINDS:
                 kind, prop = REFERENCE_KINDS[row["native_type"]]
-                literal = reference_literal(value)
+                literal = texture_literal(value) if kind == "texture" else reference_literal(value)
                 var = f'next_reference_{row["index"]}'
                 writes.append(f'local {var}={literal}')
                 writes.append(f'if {var}!=undefined and ({var}==obj or (refs.dependencyLoopTest {var} obj) or (refs.dependencyLoopTest {var} base)) do throw "DEPENDENCY_CYCLE: source depends on the target"')
@@ -578,13 +615,15 @@ def forest_effects(name: str, action: str = "list", effect: str = "", code: str 
     move uses a 1-based destination position and reorders all six effect rows,
     preserving parameter associations by ID. load appends a .eff
     definition, preserving metadata; expected_file_hash must match a library read.
-    Numeric parameters and node/spline references are initialized with fresh IDs.
+    Numeric parameters and node/spline/texture references are initialized with fresh IDs.
     load requires bindings for every reference by exact parameter ID or name;
     values accept exact unique names, {name, handle} identities or explicit null.
+    Texture values require {name, handle, class} identities or explicit null;
+    existing maps are reused, not recreated or serialized into the preset.
     export of references requires export_reference_definitions=true: the file
     contains definitions only, not scene bindings. required_bindings lists the
-    parameters that must be bound explicitly on the next load. Controller,
-    texture and curve files are refused. No source nodes are created or serialized.
+    parameters that must be bound explicitly on the next load. Controller
+    and curve files are refused. No source nodes are created or serialized.
     export writes an effect with current numeric values as defaults to a new absolute .eff path; existing
     files are never overwritten. Export does not edit Max and is not undoable.
     """
@@ -746,7 +785,7 @@ base=obj.baseObject
         elif row[0] == "A":
             result["arrays"][row[1]] = {"count": int(row[2]), "values": []}
         elif row[0] == "V":
-            result["arrays"][row[1]]["values"].append(rc._dv(row[3]))
+            result["arrays"][row[1]]["values"].append(effect_value(row[3]))
     arrays = {p: a["values"] for p, a in result["arrays"].items()}
     for i, ident in enumerate(arrays.get("efidlist", [])):
         e = {"id": ident, "index": i + 1}
@@ -777,7 +816,7 @@ base=obj.baseObject
                 if len(matches) != 1 or not matches[0]["writable"]:
                     raise ValueError("PARAMETER_TYPE_UNSUPPORTED: parameter cannot be exported")
                 row = matches[0]
-                if row["kind"] in ("node", "spline"):
+                if row["kind"] in ("node", "spline", "texture"):
                     if not export_reference_definitions:
                         raise ValueError("REFERENCE_EXPORT_CONFIRMATION_REQUIRED: definitions omit scene bindings; set export_reference_definitions=true")
                     result.setdefault("required_bindings", []).append({"id": row["id"], "name": row["name"], "kind": row["kind"]})

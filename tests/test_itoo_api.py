@@ -524,5 +524,45 @@ class ReferenceParameterTests(unittest.TestCase):
         with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
 
 
+class TextureParameterTests(unittest.TestCase):
+    def state(self):
+        s=ReferenceParameterTests().state('texture')
+        s['arrays']['efpatexmap']['values'][0]={'name':'Checker A','handle':123,'class':'Checker'}
+        return s
+
+    def test_texture_identity_readback(self):
+        row=api.parameter_rows(self.state())[0]
+        self.assertEqual(row['kind'],'texture');self.assertTrue(row['writable'])
+        self.assertEqual(api.effect_value('t123:'+api.rc._b64('Checker A')+':'+api.rc._b64('Checker')),row['value'])
+        self.assertIn('iaEffectValue v',api._EFFECT_LIB)
+        self.assertIn('"t"+(rcH v)',api._EFFECT_LIB)
+
+    def test_texture_identity_validation(self):
+        self.assertEqual(api.texture_literal(None),'undefined')
+        for value in ('Checker A',{}, {'name':'A','handle':True,'class':'Checker'},{'name':'A','handle':1,'class':''}):
+            with self.subTest(value=value),self.assertRaises(ValueError):api.texture_literal(value)
+
+    def test_guarded_texture_write(self):
+        with patch.object(api,'forest_effects',return_value=self.state()),patch.object(api.rc,'_send',return_value='PARAMETERS_WRITTEN') as send:
+            api.forest_effect_parameters('forest',action='set',values={'Source':{'name':'Checker A','handle':123,'class':'Checker'}},expected_effects=TOKEN)
+        script=send.call_args.args[0]
+        for text in ('NOT_TEXTURE_MAP','STALE_MAP_REFERENCE','refs.dependencyLoopTest next_reference_1 obj','staged.efpatexmap[1]=next_reference_1','theHold.Cancel()'):
+            self.assertIn(text,script)
+
+    def test_texture_import_storage(self):
+        rows=api.parameter_definitions(api.parse_effect_xml(self.state()['effects'][0]['xml']),allow_references=True)
+        api.bind_definitions(rows,{'Source':{'name':'Checker A','handle':123,'class':'Checker'}})
+        script=api.append_numeric_parameters(rows,'owner')
+        self.assertIn('append next_efpatype 3',script)
+        self.assertIn('append next_efpatexmap import_reference_0',script)
+        self.assertNotIn('append next_efpaspline import_reference_0',script)
+
+    def test_texture_schema_and_class_required(self):
+        state=self.state();del state['arrays']['efpatexmap']['values'][0]['class']
+        with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
+        state=self.state();state['effects'][0]['xml']=state['effects'][0]['xml'].replace('type="texture"','type="controller"')
+        with self.assertRaises(api.RailCloneError):api.parameter_rows(state)
+
+
 if __name__ == "__main__":
     unittest.main()

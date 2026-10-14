@@ -87,7 +87,7 @@ that current documentation omits. Remaining gaps are explicit:
 
 | Area | Remaining work / reason |
 |---|---|
-| Forest effect parameters | Numeric/object/spline writes and import initialization are implemented; reference definition export requires explicit rebinding. Controller/texture/curve writes and initialization need further live probes. |
+| Forest effect parameters | Numeric/object/spline/texture writes and import initialization are implemented; reference definition export requires explicit rebinding. Controller/curve writes and initialization need further live probes. |
 | Forest effect library | Search/read, ordering and numeric load/export are implemented. Reference/controller/texture/curve import/export remains; add is parameter-free code only. |
 | Forest Tools instances | No public native Instantiate method appeared in ForestPack/trees interfaces. Geometry fallback can be built from `forest_items`; billboard, Forest Color and edge behavior need preservation checks. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
@@ -280,3 +280,25 @@ Scratch PID 32800 started in 43.458 seconds; 181 samples, 1.951 seconds total
 sampler suspension. It saved its own fixture and quit normally in 5.202 seconds,
 with the client retained. Observer recorded exit code 0 and PID disappearance.
 Evidence: diagnostics/itoo-reference-files-20261013/ on the shared repository.
+
+## Forest Effects texture map bindings — 2026-10-14
+
+API-only probes measured texture parameter type 3, XML type `texture`, storage
+`efpatexmap`. `evaluateTexture` returned normalized RGB in the measured Checker
+fixture: red 0.25 and 0.75 produced Z=25 and Z=75 when multiplied by 100.
+`forest_effect_parameters` reads and edits existing map bindings. Canonical
+identity is `{name, handle, class}`; the handle is resolved by `getAnimByHandle`.
+Null explicitly clears a binding. Maps are reused, never recreated or edited.
+
+`forest_effects` loads texture definitions with explicit bindings and exports
+definitions with the existing opt-in and `required_bindings` contract. All 26
+parameter arrays are initialized before effect XML. Wrong resource types, stale
+names/classes/handles and dependency cycles are refused before adoption.
+Effect state tokens now include texture handle/name/class so distinct maps are
+not conflated by their display string. Tokens cover binding identity, not map
+content: editing a referenced map is a separate operation.
+
+Live tests verify 25→75→25, null clearing, invalid identities without state
+changes, export/reimport with identical complete transforms, and removal that
+preserves the original parameter row. Controller and curve definitions remain
+unsupported. No computer-use calls were used in this phase.
