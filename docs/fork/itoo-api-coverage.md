@@ -87,8 +87,8 @@ that current documentation omits. Remaining gaps are explicit:
 
 | Area | Remaining work / reason |
 |---|---|
-| Forest effect parameters | Numeric/object/spline/texture writes and import initialization are implemented; reference definition export requires explicit rebinding. Controller/curve writes and initialization need further live probes. |
-| Forest effect library | Search/read, ordering and numeric/reference/texture load/export are implemented. Controller/curve import/export remains; add is parameter-free code only. |
+| Forest effect parameters | Numeric/object/spline/texture and verified scalar-controller bindings/imports are implemented. Other controller subtypes and curves need further probes. Controller time sampling remains unresolved. |
+| Forest effect library | Search/read, ordering and numeric/reference/texture/scalar-controller load/export are implemented. Other controller subtypes and curve import/export remain; add is parameter-free code only. |
 | Forest Tools instances | No public native Instantiate method appeared in ForestPack/trees interfaces. Geometry fallback can be built from `forest_items`; billboard, Forest Color and edge behavior need preservation checks. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
 | Catalog writes/evaluation | `setMacro`, `evalMacro`, browser open/close/refresh/overlay are not exposed as general commands. Evaluation can run scripts; writes persist catalog state. Stored macro reads are implemented. |
@@ -348,3 +348,17 @@ null clearing, portable round trips and replacing the source controller passed.
 binding did not change this. The cause is unresolved; do not claim animated
 output works. Responses explicitly say `controller_animation_verified=false`.
 Storage/binding checks and scalar output checks do not establish time evaluation.
+
+The separate `max.time` probe returned 1600 ticks at frame 10, while the controller
+parameter returned 31.5 rather than its source's 47.5. This narrows the problem to
+controller parameter sampling, not all Forest effect time evaluation.
+
+Validation: 71 focused feature tests, 1,080 isolated tests, and 1,096 integrated
+tests (5 skipped). Fresh installed JSON-RPC verifies Z=29.5 then restoration to
+31.5 and exact source identity, plus portable import/export. Tool count remains
+208. Installed integrated module SHA256:
+`c59c877222a83bd635cc11edf0ea4ad2fd21baf03e6053b12eb74895a2c2f685`.
+
+Scratch PID 30044 startup 40.175 seconds; 165 samples, 1.844 seconds total sampler
+suspension. Saved own fixture, normal shutdown 5.547 seconds with client retained;
+observer exit code 0 and PID gone. Evidence: diagnostics/itoo-controllers-20261014/.
