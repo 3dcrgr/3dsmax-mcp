@@ -14,7 +14,7 @@ on RailClone 7.3.5.687 / Forest Pack 9.4.3.766. Official references:
 [Forest Tools](https://docs.itoosoft.com/forestpack/instantiating-and-exporting/forest-tools).
 Live results override older documentation where they differ.
 
-## Twelve added tools
+## Thirteen added tools
 
 | Tool | Actions or API coverage |
 |---|---|
@@ -27,13 +27,14 @@ Live results override older documentation where they differ.
 | `forest_inspect` | Settings, geometry/surface/area/effect/parameter arrays, bounded readback, `getSelected`; no build |
 | `forest_effects` | List/get/add, change code, toggle, move, mixed numeric/object/spline import with explicit bindings, definitions export, remove with parameter-row cleanup; token guard and staged undo |
 | `forest_effect_parameters` | Inspect parameters; edit numeric values and object/spline bindings with schema, bounds, identity and dependency checks |
+| `forest_effect_curves` | Read SDK CurveControl points, tangents, flags and ranges with ownership checks and bounded pagination; no editor or rebuild |
 | `railclone_settings` | Token-guarded global/display/instancing settings; explicit confirmation before leaving manual-update mode |
 | `forest_settings` | Token-guarded density tile dimensions, direction, seed, caps, update and transform/effect flags; reports Forest X/Y/Z translation extents read-only |
 | `forest_effect_library` | Search/read default, user or custom .eff libraries; metadata, parameter definitions and hashes, code opt-in |
 
 Tools are registered in the full profile and the progressive `itoo_api` toolset.
-The full server exposes 208 tools; the playground hides the existing
-`inspect_modifier_properties` compatibility alias and shows 207.
+The full server exposes 209 tools; the playground hides the existing
+`inspect_modifier_properties` compatibility alias and shows 208.
 
 ## Existing dedicated commands
 
@@ -362,3 +363,46 @@ tests (5 skipped). Fresh installed JSON-RPC verifies Z=29.5 then restoration to
 Scratch PID 30044 startup 40.175 seconds; 165 samples, 1.844 seconds total sampler
 suspension. Saved own fixture, normal shutdown 5.547 seconds with client retained;
 observer exit code 0 and PID gone. Evidence: diagnostics/itoo-controllers-20261014/.
+
+## Native curve inspection and time-sampling follow-up — 2026-10-14
+
+`Effect_Curves` is an SDK CurveControl with no MAXScript properties or methods.
+The new `forest_effect_curves` tool uses ICurveCtl/ICurve directly through the
+native main-thread inspector. It returns points, tangent coordinates, raw flags,
+out-of-range type, X/Y ranges and current time. Curve indices are zero-based;
+pagination and point truncation are explicit. No UI, build, curve edits or curve
+parameter-to-index mapping are performed.
+
+The backend checks the exact CurveControl class ID and verifies bounded reference
+ownership under the freshly resolved Forest base. It refuses stale base bindings,
+foreign controls, invalid limits and nonfinite point coordinates. Old native
+bridges return BRIDGE_CAPABILITY_MISSING through the Python wrapper.
+
+An optional private SDK fixture seeded two runtime curves for testing; it is not
+part of the production tool or installer. The user approved one temporary scratch
+launch with Python enabled. Safe-mode config was restored before fixture execution;
+the launcher initially misread the fast-ping response and delayed that restoration.
+The helper now reads regular response meta.safeMode. The authorized instance is
+closed; a later normal instance verified native safeMode=true and curve inspection
+without Python. Inspection left getSaveRequired=false.
+
+Tests verify empty controls, actual runtime points/tangents, ranges, paging, limits
+and ownership refusal. After saving/reloading the synthetic fixture, the second
+curve reset from three points to two and Y range returned to 0..1. The inspector
+correctly reads the resulting data. This is not a verified curve editing/persistence
+route; do not claim efpacurve serialization or CurveControl-to-parameter mapping.
+
+75 focused feature tests, 1,084 isolated tests and 1,100 integrated tests (5 skipped)
+pass. Fresh installed JSON-RPC sees 209 tools and reads populated curves in normal
+safe mode. Native SHA256: 2f033113935c1bcdb690d487dca9941221d00e87bc6dd58dde46402c078dcb24.
+The reviewed manifest supersedes the prior shutdown-safe bridge; both installed
+copies match. Python itoo_api SHA256: f1143f49e0c4e5958b27fc4ec8a6c040be54b32885c4a2a7874748ca3419920c.
+
+Controller issue 43 still reproduces after scene reload. A direct controller with
+index -1 also returned zero; no unsupported controller subtype is promoted.
+
+Measured scratch starts: 42.223, 37.943, 35.906, 34.036 and 35.884 seconds.
+Normal exits with retained clients: 4.615, 4.734, 4.192, 4.133 and 4.273 seconds.
+Each observer exit has code 0 and PID disappearance. Evidence is stored under
+diagnostics/itoo-controller-time-20261014/; timing variability is not an isolated
+removable-plugin cost measurement.
