@@ -621,7 +621,7 @@ std::string SceneQAImpl(const std::string& params, bool allowMutation) {
     after["scope"] = payload.value("scope", "scene");
     after["action"] = "scan";
 
-    return json({
+    json result = {
         {"action", "fix"},
         {"dry_run", false},
         {"scene_seq_before", seqBefore},
@@ -632,7 +632,12 @@ std::string SceneQAImpl(const std::string& params, bool allowMutation) {
         {"before", before},
         {"after", after},
         {"mesh_checks_included", false},
-    }).dump();
+    };
+    if (applied.empty()) {
+        result["status"] = "noop";
+        result["warnings"] = json::array({"No repair was needed: no object in scope had the requested issues."});
+    }
+    return result.dump();
 }
 
 } // namespace
