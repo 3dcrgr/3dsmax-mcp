@@ -76,6 +76,10 @@ _ERROR_PREFIXES = (
     "maxscript error",
 )
 _ERROR_SUBSTRINGS = (" not found:",)
+# The bridge returns an uncaught MAXScript exception as this sentinel-prefixed
+# string with success=true. A tool that passes it through changed nothing it
+# reported, so the envelope treats it as an error.
+_MAXSCRIPT_ERROR_SENTINEL = "__MCP_MS_ERR__:"
 _RETRYABLE_CODES = {
     ErrorCode.BRIDGE_DOWN,
     ErrorCode.RENDER_BUSY,
@@ -360,6 +364,9 @@ def _error_from_result(result: Any, raw: Any) -> dict[str, Any] | None:
             )
     if isinstance(raw, str):
         stripped = raw.strip()
+        if stripped.startswith(_MAXSCRIPT_ERROR_SENTINEL):
+            message = stripped[len(_MAXSCRIPT_ERROR_SENTINEL):].strip() or "MAXScript error"
+            return _normalize_error(error_type="MAXScriptError", message=message)
         structured = parse_error_payload(stripped)
         structured_status = str(structured.get("status", "")).lower() if structured else ""
         if structured and (
