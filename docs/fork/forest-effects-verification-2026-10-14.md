@@ -49,6 +49,21 @@ Durable local evidence is under `%LOCALAPPDATA%/3dsmax-mcp/diagnostics/issue43-4
 
 Official deployment backups and `rollback.ps1` scripts are under `%LOCALAPPDATA%/3dsmax-mcp/backups/public-candidate-v4-20261014-native/` and `...-python/`. Rollback requires Max closed and a fresh Python server afterward. Earlier backups retain the pre-fix installation.
 
+## Independent follow-up at `2ef2ddd`
+
+A separate verification session used disposable Max 2027 PID 56480 with safe mode enabled and installed files matching the published commit. Its ten logical #43 checks passed, including following a changed source key, rebinding to another animated source (5/15/25 at frames 0/5/10), unbinding to zero, and portable controller export without the internal proxy attribute. An initial rebind harness parsing error was corrected and the dedicated rebind receipt passed.
+
+Additional #45 checks verified shipped ScaleByAge and DensityByAltitude curve-slot initialization, middle-effect removal, effect movement without row changes, save/reload, custom-schema refusal, and removal of a malformed effect followed by a successful build. Two builds while ScaleByAge was loaded returned zero items. A curve-free constant scale assignment reproduced this fixture behavior; multiplying the current scale by one retained four items. These two outputs are not recorded as successful scatter-output checks, and no crash occurred.
+
+The shared `MCP_SOLVED.md` records the full independent results, focused iToo 83 tests and integrated 1,109 tests with 5 skips, normal shutdown and unchanged fixtures. Receipts are under `D:/Software/Dev/mcp/3dsmax/scratch-issue45/`:
+
+| Receipt | SHA256 |
+| --- | --- |
+| `v43-results.json` | `E64EC0DE62AFD430B7C9B318C048090F8B31869AA5AF6D388B1F5F7AC387E5B4` |
+| `v43-rebind-results.json` | `CB5898AD3A08D9F89BD0CB23ADBA7611F892D821C8D3A5C1530512B10D0D0C84` |
+| `v45-results.json` | `C60885DD1DB46DBCE7BED2B71D8D28AE363E13B210FF7C44001703CD42B64C48` |
+| `v45-scale-diag.json` | `67B1F7D09DD36551DE397D4462238B50262CF19A9B2BA3511BD9EF340F5376B1` |
+
 ## Remaining scope
 
-Custom curve point editing/export (#44), animated curve reindexing, other Max native versions, and a rebuilt Setup/release distribution remain pending. Additional null/rebind/export/undo-specific live coverage is not claimed by these regressions. There is no public effect compile-success signal.
+Custom curve point editing/export (#44), animated curve reindexing, other Max native versions, and a rebuilt Setup/release distribution remain pending. Max undo/redo and the Forest UI curve editor were not tested. There is no public effect compile-success signal.
