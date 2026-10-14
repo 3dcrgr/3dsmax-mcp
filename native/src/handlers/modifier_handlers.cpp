@@ -505,10 +505,11 @@ std::string NativeHandlers::SetModifierProperty(const std::string& params, MCPBr
 
             auto tryModifier = [&](Modifier* mod, int idx) {
                 if (!mod) return;
-                if (!modClassName.empty()) {
-                    const MCHAR* cn = mod->ClassName().data();
-                    if (_wcsicmp(cn, wModClass.c_str()) != 0) return;
-                }
+                // Agents know the MAXScript class (Bend); the SDK name can differ (BendMod).
+                if (!modClassName.empty() &&
+                    _wcsicmp(mod->ClassName().data(), wModClass.c_str()) != 0 &&
+                    _stricmp(MaxScriptVisibleClassName(mod).c_str(), modClassName.c_str()) != 0)
+                    return;
                 classMatched = true;
                 if (!ModifierHelpers::SetParameter(mod, propName, propValue, t)) {
                     rejected = true;
