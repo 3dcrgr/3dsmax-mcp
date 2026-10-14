@@ -2,7 +2,9 @@
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/core_bridge.h"
 
+#include <notify.h>
 #include <triobj.h>
+#include <vector>
 
 using json = nlohmann::json;
 using namespace HandlerHelpers;
@@ -244,12 +246,41 @@ std::string NativeHandlers::ManageScene(const std::string& params, MCPBridgeGUP*
 }
 
 // ── native:undo_last ────────────────────────────────────────────
+// Max broadcasts NOTIFY_SCENE_UNDO with the entry's name for every undo it
+// performs; "max undo" with an empty undo stack broadcasts nothing.
+static void RecordUndo(void* param, NotifyInfo* info) {
+    auto* undone = static_cast<std::vector<std::string>*>(param);
+#if MAX_SDK_VERSION >= 2027
+    const MCHAR* entry = info ? GetNotifyParam<NOTIFY_SCENE_UNDO>(info) : nullptr;
+#else
+    const MCHAR* entry = info ? static_cast<const MCHAR*>(info->callParam) : nullptr;
+#endif
+    undone->push_back(entry ? WideToUtf8(entry) : std::string());
+}
+
 std::string NativeHandlers::UndoLast(const std::string& params, MCPBridgeGUP* gup) {
     return gup->GetExecutor().ExecuteSync([]() -> std::string {
-        RunMAXScriptChecked("max undo");
+        std::vector<std::string> undone;
+        RegisterNotification(RecordUndo, &undone, NOTIFY_SCENE_UNDO);
+        try {
+            RunMAXScriptChecked("max undo");
+        } catch (...) {
+            UnRegisterNotification(RecordUndo, &undone, NOTIFY_SCENE_UNDO);
+            throw;
+        }
+        UnRegisterNotification(RecordUndo, &undone, NOTIFY_SCENE_UNDO);
+
         json result;
-        result["undone"] = true;
-        result["message"] = "Undid last scene operation";
+        result["undone"] = !undone.empty();
+        if (undone.empty()) {
+            result["status"] = "nothing_to_undo";
+            result["message"] = "Nothing was undone: the undo stack is empty";
+            result["warnings"] = json::array({result["message"]});
+        } else {
+            result["entry"] = undone.back();
+            result["message"] = undone.back().empty() ? "Undid the last scene operation"
+                                                      : "Undid \"" + undone.back() + "\"";
+        }
         return result.dump();
     });
 }
