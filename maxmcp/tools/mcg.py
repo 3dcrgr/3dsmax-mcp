@@ -283,6 +283,9 @@ def _exception_error(exc: BaseException, *, details: dict[str, Any] | None = Non
 
 
 def _exception_code(exc: BaseException) -> str:
+    explicit = getattr(exc, "code", None)
+    if isinstance(explicit, str) and explicit:
+        return explicit  # MaxBusyError / MaxNotRespondingError carry their own code
     bridge_response = getattr(exc, "bridge_response", {})
     response_error = bridge_response.get("error", "") if isinstance(bridge_response, Mapping) else ""
     candidates: list[Any] = [getattr(exc, "bridge_message", ""), response_error, str(exc)]

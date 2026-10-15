@@ -12,9 +12,11 @@ from functools import wraps
 from inspect import Parameter, Signature, signature
 from itertools import count
 from pathlib import Path
-from typing import Any, Callable, get_type_hints
+from typing import Annotated, Any, Callable, get_type_hints
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+from .max_client import expect_pid
 
 from .helpers.error_hints import (
     extract_tool_hint,
@@ -30,6 +32,9 @@ class ErrorCode(str, Enum):
     BRIDGE_DOWN = "BRIDGE_DOWN"
     RENDER_BUSY = "RENDER_BUSY"
     USER_BUSY = "USER_BUSY"
+    MAX_BUSY = "MAX_BUSY"
+    MAX_NOT_RESPONDING = "MAX_NOT_RESPONDING"
+    IMPORT_SETTLING = "IMPORT_SETTLING"
     SAFE_MODE = "SAFE_MODE"
     BAD_PARAM = "BAD_PARAM"
     BAD_NODE_REF = "BAD_NODE_REF"
@@ -40,6 +45,9 @@ class ErrorCode(str, Enum):
     HIERARCHY_CYCLE = "HIERARCHY_CYCLE"
     DUPLICATE_NAME = "DUPLICATE_NAME"
     PATCH_APPLY_FAILED = "PATCH_APPLY_FAILED"
+    MAXSCRIPT_INTERRUPTED = "MAXSCRIPT_INTERRUPTED"
+    REQUEST_OUTCOME_UNKNOWN = "REQUEST_OUTCOME_UNKNOWN"
+    BRIDGE_OUTDATED = "BRIDGE_OUTDATED"
     TRANSFORM_IGNORED = "TRANSFORM_IGNORED"
     CORE_STATIC = "CORE_STATIC"
     CORE_BUSY = "CORE_BUSY"
@@ -83,6 +91,8 @@ _ERROR_SUBSTRINGS = (" not found:",)
 _MAXSCRIPT_ERROR_SENTINEL = "__MCP_MS_ERR__:"
 _RETRYABLE_CODES = {
     ErrorCode.BRIDGE_DOWN,
+    ErrorCode.MAX_BUSY,
+    ErrorCode.IMPORT_SETTLING,
     ErrorCode.RENDER_BUSY,
     ErrorCode.USER_BUSY,
     ErrorCode.SCENE_CONFLICT,
@@ -109,7 +119,7 @@ def _slim_transport(transport: dict[str, Any] | None) -> dict[str, Any] | None:
         slim["transport"] = transport["transport"]
     if transport.get("fallback_error"):
         slim["fallback_error"] = transport["fallback_error"]
-    for key in ("target_pid", "target_pipe", "target_source", "pinned"):
+    for key in ("target_pid", "target_pipe", "target_source", "pinned", "selection_generation"):
         if key in transport:
             slim[key] = transport[key]
     return slim or None
@@ -295,6 +305,12 @@ def _classify_error_code(message: str, error_type: str = "") -> ErrorCode:
     lowered = f"{error_type} {message}".lower()
     if "safe mode" in lowered:
         return ErrorCode.SAFE_MODE
+    if "maxscript did not complete" in lowered:
+        return ErrorCode.MAXSCRIPT_INTERRUPTED
+    if "is not responding" in lowered:
+        return ErrorCode.MAX_NOT_RESPONDING
+    if "busy with another request" in lowered:
+        return ErrorCode.MAX_BUSY
     if (
         "named pipe" in lowered
         or "connection refused" in lowered
@@ -424,6 +440,7 @@ def _error_from_exception(exc: BaseException) -> dict[str, Any]:
         error_type=exc.__class__.__name__, message=str(exc),
         code=getattr(exc, "code", None),
         retryable=getattr(exc, "retryable", None),
+        details=getattr(exc, "details", None) or None,
     )
 
 
@@ -529,13 +546,56 @@ def _add_dialog_warning(envelope: dict[str, Any], transport: dict[str, Any] | No
     return envelope
 
 
+_QUIET_OVERRIDE_WARNINGS = {
+    "file_command": (
+        "Quiet mode was off for this script because it mentions a scene reset/open/fetch/quit command, "
+        "so its prompts were shown; a save prompt returns BLOCKED_BY_DIALOG."),
+    "file_command_quiet_ignored": (
+        "quiet=True was not applied because the script mentions a scene reset/open/fetch/quit command, "
+        "so its prompts were shown. Pass allow_discard=True with quiet=True only when the user "
+        "agreed to discard unsaved changes."),
+}
+
+
+def _add_quiet_override_warning(envelope: dict[str, Any], transport: dict[str, Any] | None) -> dict[str, Any]:
+    """Tell the caller that a script ran with Max's quiet mode off (meta.quietOverride)."""
+    override = (transport or {}).get("quiet_override")
+    if not override:
+        return envelope
+    envelope.setdefault("warnings", []).append(_QUIET_OVERRIDE_WARNINGS.get(
+        str(override), f"Quiet mode was off for this script ({override}), so its prompts were shown."))
+    return envelope
+
+
+EXPECTED_PID_PARAM = "expected_pid"
+_EXPECTED_PID_TYPE = Annotated[int | None, Field(description=(
+    "Optional. Refuse (nothing sent) unless this call reaches the 3ds Max with this PID. The Max selection "
+    "belongs to the MCP server process and other sessions may share it."))]
+
+
+def _add_target_warning(envelope: dict[str, Any], transport: dict[str, Any] | None) -> dict[str, Any]:
+    """Tell the caller that its default Max exited and the call went to the new default."""
+    moved = (transport or {}).get("retargeted_from")
+    if not isinstance(moved, dict):
+        return envelope
+    envelope.setdefault("warnings", []).append(
+        f"The default 3ds Max target (PID {moved.get('pid')}) has exited, so this call went to the current default "
+        f"(PID {(transport or {}).get('target_pid')}). Check that it is the Max you meant.")
+    return envelope
+
+
 def make_structured_tool(
     fn: Callable[..., Any],
     *,
     transport_provider: Callable[[], dict[str, Any] | None] | None = None,
     before_call: Callable[[], None] | None = None,
+    pid_guard: bool = False,
 ) -> Callable[..., dict[str, Any]]:
-    """Return a wrapper that preserves input schema and advertises ToolEnvelope output."""
+    """Return a wrapper that preserves input schema and advertises ToolEnvelope output.
+
+    pid_guard adds an optional expected_pid argument: every bridge call the tool makes on
+    its thread is refused unless it reaches that Max.
+    """
 
     fn_signature: Signature = signature(fn)
     try:
@@ -549,6 +609,12 @@ def make_structured_tool(
             resolved_params.append(param.replace(annotation=resolved_annotations[param.name]))
         else:
             resolved_params.append(param)
+    pid_guard = pid_guard and EXPECTED_PID_PARAM not in fn_signature.parameters
+    if pid_guard:
+        guard = Parameter(EXPECTED_PID_PARAM, Parameter.KEYWORD_ONLY, default=None, annotation=_EXPECTED_PID_TYPE)
+        at = next((i for i, p in enumerate(resolved_params) if p.kind is Parameter.VAR_KEYWORD), len(resolved_params))
+        resolved_params.insert(at, guard)
+        resolved_annotations[EXPECTED_PID_PARAM] = _EXPECTED_PID_TYPE
 
     # Advertise the envelope shape to MCP clients, not the inner tool return type.
     fn_signature = fn_signature.replace(
@@ -564,28 +630,30 @@ def make_structured_tool(
         if before_call:
             before_call()
         started_at = time.perf_counter()
+        expected_pid = kwargs.pop(EXPECTED_PID_PARAM, None) if pid_guard else None
         script = _script_from_call(tool_name, args, kwargs)
         try:
-            raw = fn(*args, **kwargs)
+            with expect_pid(expected_pid):
+                raw = fn(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             transport = transport_provider() if transport_provider else None
-            return _add_dialog_warning(envelope_result(
+            return _add_target_warning(_add_quiet_override_warning(_add_dialog_warning(envelope_result(
                 raw,
                 elapsed_ms=elapsed_ms,
                 transport=transport,
                 tool_name=tool_name,
                 script=script,
-            ), transport, tool_name)
+            ), transport, tool_name), transport), transport)
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             transport = transport_provider() if transport_provider else None
-            return _add_dialog_warning(envelope_exception(
+            return _add_target_warning(_add_quiet_override_warning(_add_dialog_warning(envelope_exception(
                 exc,
                 elapsed_ms=elapsed_ms,
                 transport=transport,
                 tool_name=tool_name,
                 script=script,
-            ), transport, tool_name)
+            ), transport, tool_name), transport), transport)
 
     wrapped.__signature__ = fn_signature  # type: ignore[attr-defined]
     wrapped.__annotations__ = resolved_annotations
