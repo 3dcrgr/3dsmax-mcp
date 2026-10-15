@@ -48,6 +48,7 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 ### Materials
 - Create and assign: `assign_material`, `create_material_from_textures`, `smart_import`, `palette_laydown`. They default to OpenPBR; pass `material_class` for another renderer. Share an existing material with `assign_material(names=[...], source_name=...)`.
 - Edit: `set_material_property`, `set_material_properties`, `set_sub_material`, `create_texture_map`, `set_texture_map_properties`. Switch pipelines with `create_shell_material`, `replace_material` and `batch_replace_materials`.
+- `replace_material` applies `source_material` wherever `target_material` is used. `source_from` picks where the source is found, e.g. `"material_editor"` for a re-imported Cosmos copy. On `no_match`, check the direction before retrying; on `blocked`, do not swap the arguments.
 - Audit: `get_material_slots` (prefer `slot_scope="map"`), `get_materials`, and `material_roles` (follow `next_offset`; check `complete` and `truncated`).
 - OSL: `write_osl_shader`, then `introspect_osl` before wiring. The shader name must match `shader_name`; OSLMap lowercases parameter names.
 - `material_class` is the material's own class name: `PhysicalMaterial`, not `Physical` (the camera).

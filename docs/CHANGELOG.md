@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- `replace_material` and `batch_replace_materials` take `include_sub_materials` (default true; false replaces objects' own materials only) and `source_from`, which limits the source search to one place: `node`, `sub_material`, `material_editor`, `scene_materials` or `material_library`. The source can now also come from the scene materials or the current material library, and the reply reports where it was found (`source_found_in`). A batch entry can carry its own `source_from`, and a native batch reports `total_replaced_slots`. The MAXScript fallback supports both options; a native bridge older than this release ignores them, and the reply then warns that `source_from` or `include_sub_materials=false` may not have applied.
+- `replace_material` with `preview=true` lists the target's matches even when the source doesn't exist yet (`source_exists: false`, with a warning). Results explain the argument direction (source = the material to apply): `no_match` and `no_objects` warn that the arguments may be reversed, and `blocked` says they are not. A batch preview without the native bridge marks entries whose real run can differ with `depends_on_entries`.
+- Material graphs (`inspect_material_network`, `material_roles`) read Autodesk Bitmap paths from Revit/ATF materials, resolving relative paths through the 3ds Max search paths. A hidden VRayBitmap parameter is no longer reported as a second texture file, which raised a false `FILE_MISSING`. Both need the native bridge from this release.
+- `material_roles` reports file-bearing maps whose path can't be read with `FILE_PATH_UNREADABLE` and `complete: false`, and maps with no file assigned with `FILE_NOT_ASSIGNED` (native bridge from this release; an older bridge reports them as `FILE_PATH_UNREADABLE`).
+
 ## [1.7.6] — 2026-10-14
 
 - Faster mesh tools: `inspect_mesh` on a 288k-face mesh takes about 11 ms instead of 4.7 s (72k faces: 7 ms instead of 1 s), whatever the `limit`. `inspect_mesh`, `mesh_edit`, `create_mesh`, `pick_component` and `loft_mesh` get `mesh_token` from the native bridge, which hashes the Editable Poly base cage in the same main-thread step as the tool's script, instead of formatting every vertex, edge and face in MAXScript for a SHA-256. Tokens from earlier versions no longer match; inspect again. `mesh_edit` and `create_mesh` started inside another 3ds Max undo operation fail with `USER_BUSY` (retryable). These tools require the native bridge.
