@@ -328,16 +328,25 @@ select (for o in objects where not o.isHiddenInVpt collect o)
 
 ## Batch File Processing
 
+`quiet:true` and `#noPrompt` suppress the "save changes?" prompt, so `loadMaxFile` and
+`resetMaxFile` with them discard the open scene's unsaved changes, and `saveMaxFile`
+overwrites every file in the folder. Run this only when the user asked for it and agreed
+to both. The guard below stops instead of discarding the user's scene.
+
 ```maxscript
 thePath = getSavePath caption:"Select Folder"
 if thePath != undefined do (
-    theFiles = getFiles (thePath + "\\*.max")
-    for f in theFiles do (
-        loadMaxFile f useFileUnits:true quiet:true
-        -- do work here
-        saveMaxFile f
+    if getSaveRequired() then
+        format "The open scene has unsaved changes: save it or ask the user first.\n"
+    else (
+        theFiles = getFiles (thePath + "\\*.max")
+        for f in theFiles do (
+            loadMaxFile f useFileUnits:true quiet:true  -- the previous file was saved below
+            -- do work here
+            saveMaxFile f  -- overwrites the original file
+        )
+        resetMaxFile #noPrompt
     )
-    resetMaxFile #noPrompt
 )
 ```
 
@@ -427,4 +436,4 @@ for i = 1 to 1000 while found do
 - **`at time` is read-only without `animate on`.** Setting properties inside `at time` without `animate on` sets the value at the current time, not at the specified time.
 - **Assemblies cannot be unloaded** once loaded via `dotNet.loadAssembly`.
 - **Callbacks registered with functions cannot be persisted.** Only string-based callbacks support `persistent:true`.
-- **Always use `#noPrompt` with `resetMaxFile`** in batch scripts to avoid blocking save dialogs.
+- **`resetMaxFile #noPrompt` discards the open scene's unsaved changes.** Use it only in a batch the user asked for, after the `getSaveRequired()` check in the batch example above. Otherwise leave it out: the save prompt then comes back as `BLOCKED_BY_DIALOG` (see SKILL.md).

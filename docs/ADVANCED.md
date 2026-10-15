@@ -189,11 +189,36 @@ What it does **not** cover:
 - Native handlers run unfiltered: `delete_objects`, `manage_scene`, `render_scene`, `merge_from_file`, `write_osl_shader`, viewport capture (disk writes), etc.
 - The named pipe uses default ACLs — any process running as your user can connect on a typical dev machine.
 
+### Quiet mode and the save prompt
+
+Tool scripts run in Max's quiet mode, so prompts take their default answer. For the "save changes?" prompt of a reset, open, fetch or quit, that default discards unsaved work. A script that mentions `resetMaxFile`, `loadMaxFile`, `fetchMaxFile`, `quitMax`, `checkForSave`, `max reset file`, `max file new`, `max file open`, `max fetch` or the Interface's `FileReset`, `FileFetch` or `LoadFromFile` therefore runs with quiet mode off, and the prompt reaches the agent as `BLOCKED_BY_DIALOG`. The match is plain text (comments and strings included); a false positive only leaves a prompt visible. `execute_maxscript(quiet=True)` on such a script is sent as `quiet=False` unless `allow_discard=True` is passed too. Replies say when quiet mode was off for this reason (`transport.quiet_override` and a warning). A command reached indirectly (`fileIn`, `macros.run`) is not seen: pass `quiet=False` for such scripts. The bridge applies the same rule to scripts sent without `quiet`; an older bridge still runs them quiet. `manage_scene` fetch and reset always keep their prompt.
+
 ## Multi-instance Max
 
 Each 3ds Max window registers its own native pipe. With one Max running, clients connect automatically. With several open, run **MCP Claim This Max** in the target window so clients route to that instance until another is claimed.
 
+The selected target belongs to the MCP server process, not to a chat session. When a client app routes several sessions to one server process, they share it: one session's `select_max_instance` or `release_max_instance` moves the others. Every tool except the four routing tools takes an optional `expected_pid`; a call whose target is another Max fails with `TARGET_MISMATCH` and nothing is sent. `selection_generation` in every reply's transport changes on each select, release or re-resolve.
+
+A target the server picked by itself (the default or a claimed Max) re-resolves to the current default once its Max has exited, and the reply warns. It does so only when the new default is unambiguous (at most one other Max, or one claimed); otherwise the call is refused until you select one. A target selected explicitly or pinned with `MCP_MAX_PIPE`/`MCP_MAX_PID` keeps failing with `TARGET_UNAVAILABLE` until you select or release.
+
 TCP fallback is opt-in via the **MCP Start** macroscript. `tcp_idle_poll_interval_ms` controls idle polling frequency for the fallback listener (default is sparse to reduce viewport stutter).
+
+## Busy or hung 3ds Max
+
+Over the named pipe, the client tells a busy Max from a hung one instead of waiting out a bare timeout:
+
+- One request at a time goes to each Max. A call that can't take the pipe within 10 s fails with `MAX_BUSY`, `request_sent: false`, retryable: nothing reached Max.
+- Once a request is sent, the client keeps waiting while Max is busy or responsive (long renders and imports included) and gives up only when Max has exited or its main thread has stayed blocked. That gives `MAX_NOT_RESPONDING` with window and CPU evidence. Until it recovers, further calls to that Max fail fast with the same code, nothing sent.
+- `MAX_BUSY` therefore has two meanings. Before sending: nothing ran, retry later. After the reply deadline (about 130 s; applied only when Max's process can't be found to diagnose): the call was sent, keeps running in Max and is not retryable; `max_dialogs(action="inspect")` reports its result in `blocked_calls`. `request_sent` and `retryable` tell them apart.
+- A request whose reply was lost after it was sent (the pipe closed, a mismatched reply) fails with `REQUEST_OUTCOME_UNKNOWN`. The client never replays a request that may have run.
+- `IMPORT_SETTLING`: a native import left Max not responding; other calls wait, nothing sent, for 15 minutes at most.
+- A call held by a modal dialog returns `BLOCKED_BY_DIALOG` while Max's main thread keeps pumping; once it stops, the call is diagnosed like any other.
+
+`get_bridge_status` uses the bridge's `health` command, which a pipe thread answers without touching Max's main thread, so it works while Max is hung. It reports whether the main thread is idle, busy with this server's request, another MCP client's, or work outside the bridge, plus queued work, connected clients and open dialogs. With an older bridge it falls back to `ping`.
+
+`capture_hang_diagnostics` reads the native thread stacks of a hung Max from the OS, without sending anything to it, and names what blocks the main thread. Each thread is suspended for a few milliseconds while its stack is read. Captures are saved under `%LOCALAPPDATA%\3dsmax-mcp\diagnostics\` (the newest 20 are kept).
+
+The stdio server exits when its client process exits, and always after its stdin closes, so a crashed client doesn't leave a server holding a connection to Max. `MAXMCP_PARENT_WATCHDOG=0` turns off the client-process check.
 
 ## Agent skill
 
@@ -234,7 +259,7 @@ For native handler work the bridge can run as a permanent shell plus a core DLL 
 | Static (default, shipped) | `OFF` | `mcp_bridge.gup` with the core linked in | `CORE_STATIC` |
 | Hot (development only) | `ON` | shell `mcp_bridge.gup` plus `core\mcp_core.dll` | `reload_native_core` |
 
-The **shell** holds everything 3ds Max keeps a pointer into: plugin registration, the named pipe, the main-thread executor, the dialog monitor and its Qt reader, the scene journal and `scene_delta` cursors, GDI+, the agent viewport, `render_start`'s armed job and render notifications, and undo records. It answers `ping`, `native:max_dialogs` and `native:core` itself, so health checks, dialog recovery and core control keep working while the core is missing or being replaced. The **core** is command dispatch, the handlers and the generated native tool registry. The two sides meet only through versioned C tables (`native/include/mcp_bridge/core_api.h`, `host_api.h`); `native/CMakeLists.txt` lists each side's sources. Stateless shared code (`spatial_snapshot.cpp`) is linked into both, so a reload updates only the core's copy.
+The **shell** holds everything 3ds Max keeps a pointer into: plugin registration, the named pipe, the main-thread executor, the dialog monitor and its Qt reader, the scene journal and `scene_delta` cursors, GDI+, the agent viewport, `render_start`'s armed job and render notifications, and undo records. It answers `ping`, `health`, `native:max_dialogs` and `native:core` itself, so health checks, dialog recovery and core control keep working while the core is missing or being replaced. The **core** is command dispatch, the handlers and the generated native tool registry. The two sides meet only through versioned C tables (`native/include/mcp_bridge/core_api.h`, `host_api.h`); `native/CMakeLists.txt` lists each side's sources. Stateless shared code (`spatial_snapshot.cpp`) is linked into both, so a reload updates only the core's copy.
 
 ### Building the hot layout
 
@@ -258,7 +283,7 @@ The first source that is set wins, even when its file does not exist, so a typo 
 3. The first non-blank line of `mcp_core.path` next to the `.gup` (UTF-8 with or without BOM, or UTF-16LE with BOM; surrounding quotes ignored).
 4. `<folder of the .gup>\core\mcp_core.dll`.
 
-The shell copies the DLL, and its `.pdb` when present, to `%TEMP%\3dsmax-mcp\core\mcp_core-<pid>-<tick>.dll` and maps the copy, so a build can overwrite the original while Max runs; copies no process maps any more are swept on later loads. Before binding a core it compares the core API version, host API version, Max SDK version, MSVC version and iterator debug level with its own. If loading fails at startup, `ping`, `max_dialogs` and `native:core` still answer, status reports `last_error`, every other request fails with "the native core is not loaded", and a later reload can still load a core.
+The shell copies the DLL, and its `.pdb` when present, to `%TEMP%\3dsmax-mcp\core\mcp_core-<pid>-<tick>.dll` and maps the copy, so a build can overwrite the original while Max runs; copies no process maps any more are swept on later loads. Before binding a core it compares the core API version, host API version, Max SDK version, MSVC version and iterator debug level with its own. If loading fails at startup, `ping`, `health`, `max_dialogs` and `native:core` still answer, status reports `last_error`, every other request fails with "the native core is not loaded", and a later reload can still load a core.
 
 ### Control protocol
 
@@ -303,6 +328,7 @@ python scripts/run_live_tool_smoke.py --tier read
 |------|---------|
 | `maxmcp/server.py` | FastMCP entry, tool registration |
 | `maxmcp/tools/` | MCP tool implementations |
+| `maxmcp/diagnostics/` | Native stack capture for hung-Max diagnostics |
 | `native/` | C++ GUP bridge |
 | `maxscript/` | Listener + autostart |
 | `skills/3dsmax-mcp-dev/` | Agent skill source |
