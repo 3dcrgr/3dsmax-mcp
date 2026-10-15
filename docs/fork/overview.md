@@ -9,7 +9,7 @@
 
 This page was the fork's README until 2026-10-14. The repository README is now upstream's, with a short fork note, so the fork stays a set of changes to upstream rather than a separate project. [FORK.md](../FORK.md) lists every change and how it was verified.
 
-This is a fork of [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax-mcp), based on upstream **1.7.5** (`29aed53`).
+This is a fork of [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax-mcp), based on upstream **1.7.6** (`5a92193`, merged in `298a295`). Before that merge it was based on 1.7.5 (`29aed53`). The merge has passed the unit tests, the SDK-independent native tests and a Max 2027 build; it hasn't been tested live yet. Upstream 1.7.6 now has its own versions of some of the fixes below; [FORK.md](../FORK.md#what-upstream-176-now-covers) lists them.
 
 It carries fixes for problems found while using the MCP on production architectural visualization. The worst of them hung 3ds Max and lost unsaved work. It also adds tools for Chaos Vantage, RailClone, Forest Pack and props that float or sink.
 
@@ -19,14 +19,14 @@ Verified and deployed improvements are published on the fork's default branch, `
 
 Forest Effects supports guarded ordering, numeric parameters, object, spline, existing texture-map, and scalar `FloatController` bindings. Scalar bindings use a source-linked expression driver on Forest's animated real parameter track; `forest_effect_parameters(action="repair_animation")` migrates earlier bindings that sampled frame zero. `.eff` import requires explicit scene bindings; export writes portable definitions with required bindings listed for the next import. Curve definitions allocate native slots on the staged copy before commit, with neutral flat y=1 points and parameter-ID preservation during removal. `forest_effect_curves(action="set_points")` edits one curve parameter's points in a staged undo step, `.eff` load accepts curve points and export writes them, in an MCP-specific `<curves><curve><point …/>` child (the XML Forest writes into `efpacurve` in scenes; Forest's own `.eff` loader is untested with it). Verified live on Max 2027 on 2026-10-14 by an independent session; not tested: undo (max undo isn't run through the MCP), the animated-curve refusal, and Forest's own `.eff` loader. Animated curves are refused. Stored effect code has no public compile-success signal. See [iToo coverage](itoo-api-coverage.md).
 
-- **210 tools:** all 179 of upstream's, plus 31 new ones (marked ★ in the [catalog](#tools)).
+- **210 tools:** all 179 of upstream 1.7.6's, plus 31 new ones (marked ★ in the [catalog](#tools)).
 - **Tested in production on:**
   - 3ds Max 2027.2, and 3ds Max 2026 before that;
   - V-Ray 7 (GPU as the production renderer);
   - Chaos Cosmos and Chaos Vantage 3.4;
   - RailClone 7.3.5 and Forest Pack 9.4.3;
   - scenes linked from Revit.
-- **Native bridges:** fork builds for Max 2026 and 2027 in `native/bin/`. The 2023–2025 bridges are still upstream's; see [Native bridge](#native-bridge).
+- **Native bridges:** a fork build for Max 2027 only in `native/bin/`. The 2023–2026 bridges are upstream's 1.7.6 builds; see [Native bridge](#native-bridge).
 - **Same requirements as upstream:** Windows, 3ds Max 2023–2027, and an MCP client such as Claude Desktop, Claude Code, Codex or Cursor.
 
 [docs/FORK.md](../FORK.md) lists every change with how it was verified (live in Max, or unit-tested only). The pages under [docs/fork/](./) give the details.
@@ -40,7 +40,7 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
   - Calls fail fast with `MAX_BUSY` or `MAX_NOT_RESPONDING` and a process diagnosis: whether the main window responds, CPU use, whether it exited.
   - The client never replays a request that may already have run.
 - `get_bridge_status` answers from a pipe thread while Max's main thread is blocked. It reports what holds the main thread and which clients are connected.
-- Max no longer stalls on exit with queued requests or connected idle pipe clients: queued work fails and pending pipe reads/writes are cancelled and drained. The 2027 bridge passed scratch-Max quit checks with clients retained.
+- Max no longer stalls on exit with queued requests or connected idle pipe clients: queued work fails and pending pipe reads/writes are cancelled and drained. The 1.7.5-based 2027 bridge passed scratch-Max quit checks with clients retained. Upstream 1.7.6 fixed this too, and the merge uses its version.
 - Startup failures include native target and transport context. Exited instance registrations are cleaned conservatively, preserving live, uncertain and changed records.
 - An MCP server whose client crashed exits with it, instead of staying connected to Max.
 
@@ -72,15 +72,16 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
   - Its direction is documented, and `no_match` warns.
   - It matches Multi/Sub sub-material slots, and finds source materials outside the scene.
   - Batch entries apply in order.
+  - Upstream 1.7.6 now does the slots, Material Editor sources and batch order itself; the fork adds `source_from`, the scene materials and material library as sources, `include_sub_materials` and a preview without a source.
 - **`material_roles`:**
   - It reads texture paths of Revit materials (Autodesk Bitmap), which read as empty before.
   - It flags unreadable paths.
   - It gives one row per VRayBitmap slot.
 
 ### Modeling and scene
-- The curve tools accept Line objects as editable splines.
-- `contact_check` takes its thresholds in millimetres, skips non-mesh nodes with a warning, and works within a time budget (`time_budget_s`) on dense meshes.
-- Cloning a member of a closed group clones only that member, instead of the whole group stacked invisibly on the original. `scene_qa` reports such stacked duplicates.
+- The curve tools accept Line objects as editable splines (now upstream's fix, in 1.7.6).
+- `contact_check` takes its thresholds in millimetres, skips non-mesh nodes with a warning, and works within a work budget and a time budget (`time_budget_s`) on dense meshes. Upstream 1.7.6 has a simpler time budget; the merge keeps the fork's.
+- Cloning a member of a closed group clones only that member, instead of the whole group stacked invisibly on the original (upstream 1.7.6 refuses such a clone instead). `scene_qa` reports such stacked duplicates.
 
 ### Agent viewport
 - `agent_viewport` reclaims its own floating viewport after a restart, save or Hold/Fetch. It never takes an untagged panel.
@@ -133,7 +134,8 @@ Nothing of upstream's is removed: every upstream tool and feature is still here.
 - **Max targets:**
   - An explicit selection is never replaced silently.
   - A default target is only re-resolved after its Max exited, and only when that choice is unambiguous.
-- **The 2026 and 2027 bridges** in `native/bin/` are fork builds, not upstream's.
+- **The 2027 bridge** in `native/bin/` is a fork build, not upstream's.
+- **Since the 1.7.6 merge:** upstream's strict names, `replace_material` result fields and skip reasons, and a second meaning of `MAX_BUSY` (sent, not retryable) apply; see [FORK.md](../FORK.md#what-the-176-merge-changed).
 
 ## Install
 
@@ -167,9 +169,8 @@ The installer's runtime ignores `PYTHONPATH`, hence the `sys.path` line. See [Ad
 
 | Max | Bridge in `native/bin/` |
 |---|---|
-| 2027 | Fork build, with every native fix, including the V-Ray GPU preview (sha256 `04815449…`) |
-| 2026 | Fork build with every native fix except the V-Ray GPU preview (sha256 `d5cd6ba5…`) |
-| 2023–2025 | Upstream's 1.7.5 builds |
+| 2027 | Fork build from the 1.7.6 merge: upstream 1.7.6's shell and core with every native fix (hash in `native/bin/bridge_manifest.json`); not deployed or live-tested yet |
+| 2023–2026 | Upstream's 1.7.6 builds. The fork's 1.7.5-based 2026 build (`d5cd6ba5…`) was dropped in the merge |
 
 With an upstream bridge, the Python-side fixes work but the native ones are missing. For those, build the bridge for your version yourself: see [Building the native bridge](../FORK.md#building-the-native-bridge). It needs Visual Studio 2022 with the v143 14.38 toolset and the 3ds Max SDK. To replace only a bridge, close every 3ds Max first and keep a copy of the old file.
 
@@ -178,7 +179,7 @@ With an upstream bridge, the Python-side fixes work but the native ones are miss
 The ★ marks tools this fork adds. The others are upstream's, some fixed here, as described above.
 
 <details>
-<summary>Browse all 196 tools</summary>
+<summary>Browse all 210 tools</summary>
 
 ### Bridge & session
 
@@ -230,7 +231,6 @@ The ★ marks tools this fork adds. The others are upstream's, some fixed here, 
 | `set_modifier_property` | Set a modifier parameter on one or many objects |
 | `collapse_modifier_stack` | Collapse the stack |
 | `make_modifier_unique` | De-instance a shared modifier |
-| `inspect_modifier_properties` | Compatibility alias for `inspect_properties(target="modifier")` |
 
 ### Modeling
 
@@ -304,8 +304,7 @@ The ★ marks tools this fork adds. The others are upstream's, some fixed here, 
 | `inspect_plugin_constructor` | Creation notes for a plugin class |
 | `inspect_plugin_instance` | SDK schema v2: live values, linked maps and guarded edit tokens |
 | `plugin_patch` | Atomic typed PB2 edits with readback and stale/shared/animation guards |
-| `get_plugin_manifest` | Structured manifest (classes, workflows, gotchas) |
-| `refresh_plugin_manifest` | Rebuild manifest from live runtime |
+| `get_plugin_manifest` | Structured manifest (classes, workflows, gotchas), rebuilt from the live runtime on each call |
 | `introspect_class` | SDK parameter descriptors and published interface metadata |
 | `introspect_instance` | Deep SDK introspection with live values |
 
@@ -423,15 +422,13 @@ and existing procedural skies use the provider's dome or environment binding.
 
 | Tool | Description |
 |------|-------------|
-| `list_tyflow_operator_types` | Available operator names for this install |
-| `create_tyflow` | Create tyFlow with events and operators |
-| `create_tyflow_preset` | Presets: rain, snow, fountain, burst, debris |
+| `create_tyflow` | Create tyFlow with an event and operators, or a preset: rain, snow, fountain, burst, debris |
 | `get_tyflow_info` | Deep flow/event/operator readback |
 | `harvest_tyflow_manifest` | Probe and cache the installed tyFlow operator surface by tyFlow version |
-| `list_tyflow_operators` | Query the cached tyFlow operator manifest without touching Max |
+| `list_tyflow_operators` | Query the cached manifest, including per-type availability, without touching Max |
 | `get_tyflow_graph` | Read events, operators, properties, ledger edges, and wiring staleness |
 | `tyflow_apply_patch` | Apply a batch of tyFlow graph operations as one verified transaction |
-| `connect_tyflow_operator` | Connect or retarget a test/Send Out operator to an event |
+| `connect_tyflow_operator` | Connect or retarget a test/Send Out operator to an event, optionally creating the Send Out |
 | `disconnect_tyflow_operator` | Disconnect an operator output and remove its ledger edge |
 | `set_tyflow_wiring_ledger` | Reconcile recorded graph wiring after external or visual edits |
 | `tyflow_event_census` | Count particles per event at probe frames with temporary instrumentation |
@@ -441,7 +438,6 @@ and existing procedural skies use the provider's dome or environment binding.
 | `set_tyflow_physx` | Object-level PhysX settings |
 | `add_tyflow_collision` | Collision operator + collider list |
 | `add_tyflow_event` | Add an event |
-| `connect_tyflow_events` | Wire Send Out destinations |
 | `remove_tyflow_element` | Remove operator or event |
 | `get_tyflow_particle_count` | Particle count at a frame |
 | `get_tyflow_particles` | Particle data rows |
@@ -472,6 +468,33 @@ and existing procedural skies use the provider's dome or environment binding.
 | ★ `forest_from_library` | Place a library preset or 3D item on surfaces (clears the undo history; needs `allow_undo_flush`) |
 | ★ `forest_validate` | Check the item and area lists and the item count, including Reference-mode forests fed by a RailClone; `fix=true` pads short lists |
 
+### iToo API extensions
+
+| Tool | Description |
+|------|-------------|
+| ★ `itoo_api_inventory` | Installed RailClone and Forest Pack methods, signatures, versions and property types |
+| ★ `itoo_catalog` | Read stored catalog macros and the selected library browser item; never evaluates a macro |
+| ★ `railclone_slots` | Inspect and edit base and segment slots by ID or name, with guarded node bindings and segment settings |
+| ★ `railclone_metadata` | Style description, a confirmed created-version reset, staged base replacement in one undo step |
+| ★ `railclone_proxy` | Inspect and set RailClone proxy mode (disabled, embedded, external) |
+| ★ `railclone_instances` | Capped Instantiate, InstantiateEnable and confirmed InstantiateDelete |
+| ★ `railclone_settings` | Token-guarded global, display and instancing settings |
+| ★ `forest_inspect` | Forest settings and geometry, surface, area, effect and parameter lists, without a build |
+| ★ `forest_settings` | Token-guarded density tile, direction, seed, caps and update flags; translation extents read-only |
+| ★ `forest_effects` | List, add, edit, toggle, move, import and export Forest Effects, in staged undo steps |
+| ★ `forest_effect_parameters` | Inspect and edit effect parameters and their object, spline, map and controller bindings |
+| ★ `forest_effect_curves` | Read effect curve parameters; `set_points` writes one curve's points in one undo step |
+| ★ `forest_effect_library` | Search and read default, user or custom `.eff` libraries |
+
+### Pulze Scene Manager
+
+| Tool | Description |
+|------|-------------|
+| `pulze_inspect` | Read every Pulze setup: camera, resolution, frame range, output path and overrides |
+| `pulze_preflight` | Check Pulze setups for faults before a batch render |
+| `pulze_set` | Edit existing Pulze setups in one guarded, undoable write, with a backup |
+| `pulze_restore` | Put Pulze setups back from a `pulze_set` backup |
+
 ### Forest Pack / RailClone → Chaos Vantage
 
 | Tool | Description |
@@ -494,6 +517,7 @@ and existing procedural skies use the provider's dome or environment binding.
 | `execute_python` | Run Python with captured output, JSON results, tracebacks and undo rollback (requires safe mode off) |
 | `invoke_tool` | Call any registered tool from inside Max (testing) |
 | `run_tool_smoke` | Run generated live smoke cases against the native bridge inside Max |
+| `reload_native_core` | Report the native core's state, or reload a rebuilt core DLL into a running Max (development builds with `MCP_HOT_CORE` only) |
 | ★ `capture_hang_diagnostics` | Native thread stacks of a hung Max, read from the OS: what blocks the main thread |
 
 </details>
@@ -527,7 +551,7 @@ uv run python -m unittest discover -s tests
 ## Credits
 
 - **The project:** [cl0nazepamm](https://github.com/cl0nazepamm/3dsmax-mcp) and upstream's contributors.
-- **The executor shutdown drain and the process-exit check:** from [Geddart](https://github.com/Geddart/3dsmax-mcp)'s fork.
+- **The executor shutdown drain and the process-exit check:** from [Geddart](https://github.com/Geddart/3dsmax-mcp)'s fork. The 1.7.6 merge replaced the drain with upstream's own.
 - **The pipe-lock timeout idea:** from [stoxsss111](https://github.com/stoxsss111/3dsmax-mcp)'s fork.
 - **The orphaned-server watchdog idea:** from [kanzaka110](https://github.com/kanzaka110/3dsmax-mcp)'s fork.
 - **`material_roles`:** from [EdgecraftStudio](https://github.com/EdgecraftStudio/3dsmax-mcp) (upstream PR 29); the Autodesk Bitmap fix builds on it.

@@ -2,7 +2,9 @@
 
 Release notes for the [3dcrgr fork](https://github.com/3dcrgr/3dsmax-mcp) of [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax-mcp). It's upstream **1.7.5** plus fixes for problems found in production architectural visualization, and 28 new tools (207 total).
 
-The default branch contains verified deployed source updates through #34. A replacement Setup with reviewed bridge packaging has compiled and passed offline checks; its installation and release publication are pending. An older downloaded installer does not gain these guards from a source update. See [deployment details](docs/fork/hung-max.md) and [changelog](docs/CHANGELOG.md).
+These notes describe the 1.7.5-fork.1 release. The fork's source has since moved to upstream 1.7.6 (see [docs/FORK.md](docs/FORK.md#what-upstream-176-now-covers)); no 1.7.6-based release exists yet.
+
+At the time of this release, the default branch contained verified deployed source updates through #34. A replacement Setup with reviewed bridge packaging has compiled and passed offline checks; its installation and release publication are pending. An older downloaded installer does not gain these guards from a source update. See [deployment details](docs/fork/hung-max.md) and [changelog](docs/CHANGELOG.md).
 
 **Tested in production on:**
 - 3ds Max 2027.2, and 3ds Max 2026 before that;

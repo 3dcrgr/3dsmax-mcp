@@ -2,7 +2,7 @@
 
 Fork issues #1, #2, #7, #9, #10 and #13. Commits `25bb1fc`, `ed1fb1c`, `2853b1c` (#9), `c1e09a7` (#10), `c88975e` (#9, #10) and `3b3210d` (#13). Dialog handling came with the upstream 1.7.5 merge: `a07ef93`, `6e03f99`, `f70b0cc`, `34a7ce5` and `cb4d0ff`.
 
-All of this is in the Python server, so it works with any bridge, with three exceptions. The dialog checks need the dialog monitor of a 1.7.5 bridge; an older bridge skips them. Only the fork's bridge reports a hung main thread, so with upstream's a dialog always counts. The native half of `6e03f99` needs the fork's bridge; with upstream's, the client filters the same windows.
+All of this is in the Python server, so it works with any bridge, with three exceptions. The dialog checks need the dialog monitor of a 1.7.5 or later bridge; an older bridge skips them. Only the fork's bridge reports a hung main thread, so with upstream's a dialog always counts. The native half of `6e03f99` needs the fork's bridge; with upstream's, the client filters the same windows.
 
 ## What happened
 
@@ -161,8 +161,8 @@ The fork's monitor:
 With upstream's bridges, the client applies the same titles: replies don't list these windows, the automatic inspect doesn't run while one is open, and `cosmos_import`'s dialog checks ignore them. Only titles are matched, so a real message box titled exactly like one of these windows wouldn't be reported.
 
 **Status.** Unit tested in `native/tests/dialog_watch_tests.cpp`, which counts every message the monitor sends these windows, and on the client side in `tests/test_hang_diagnosis.py` and `tests/test_cosmos_import.py`.
-- It's in the fork's 2026 bridge in `native/bin` (`d5cd6ba5…`), which was never deployed.
-- It's also in the fork's 2027 bridge in `native/bin` (`04815449…`, built from `538a241`); a 2027 fork bridge has been deployed since 2026-10-11. With upstream's bridges (2023–2025), only the client-side filtering applies.
+- It's in every 2027 fork bridge: the deployed 1.7.5-based `04815449…` (built from `538a241`; a 2027 fork bridge has been deployed since 2026-10-11) and the 1.7.6 merge's build in `native/bin`, into which the merge ported the dialog monitor rules.
+- The fork's 1.7.5-based 2026 bridge (`d5cd6ba5…`) had it but was never deployed, and the 1.7.6 merge dropped it. With upstream's bridges (2023–2026 in `native/bin` since the merge), only the client-side filtering applies.
 - Not tested live with these windows. The 2026-10-11 checks on Max 2027 only showed that `max_dialogs` runs the fork's monitor.
 
 ## How it was verified
@@ -177,7 +177,7 @@ Live on 3ds Max 2026 with V-Ray 7 update 4 hotfix 2 (GPU production renderer), o
 - **`cosmos_search`:** answered with `renderer_source: "scene"`, because V-Ray and Corona both registered an importer for that Max.
 - **Import on a freshly started Max with no browser open:** the "Steel Blurry" re-import at 13:08 ran right after a Max restart. `cosmos_import` opened the browser on Max's main thread through the V-Ray "Chaos Cosmos browser" action, the Material Editor renderer wasn't swapped, and the import returned `imported` and `safe_to_edit: true` after about 17 s.
 
-No import has been run on Max 2027 yet. Since 2026-10-11, the server that drives Max 2027 runs this code from the fork's source, with the fork's 2027 bridge, but the live checks logged that day were read-only, and none was a Cosmos import.
+No import has been run on Max 2027 yet. Since 2026-10-11, the server that drives Max 2027 runs this code from the fork's source, with the fork's 2027 bridge, but the live checks logged that day were read-only, and none was a Cosmos import. The 1.7.6 merge didn't change the Cosmos code; it changed the client around it (upstream's reply deadline, see [hung-max.md](hung-max.md#client-side-a9d2a0d)), which has unit tests only.
 
 Unit tests are in `tests/test_cosmos_import.py`. They use fake windows to cover a hung browser, a missing browser, settle streaks, the guard expiring, and the Scanline fallback. They also cover the dialog cases above.
 

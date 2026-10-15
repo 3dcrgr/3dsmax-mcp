@@ -33,8 +33,9 @@ Live results override older documentation where they differ.
 | `forest_effect_library` | Search/read default, user or custom .eff libraries; metadata, parameter definitions and hashes, code opt-in |
 
 Tools are registered in the full profile and the progressive `itoo_api` toolset.
-The full server exposes 209 tools; the playground hides the existing
-`inspect_modifier_properties` compatibility alias and shows 208.
+The full server exposes 210 tools since the upstream 1.7.6 merge (179 of
+upstream's and 31 of the fork's). Upstream removed the Tool Playground and the
+`inspect_modifier_properties` alias in 1.7.6.
 
 ## Existing dedicated commands
 
@@ -90,7 +91,7 @@ that current documentation omits. Remaining gaps are explicit:
 |---|---|
 | Forest effect parameters | Numeric/object/spline/texture and verified scalar-controller bindings/imports are implemented. Other controller subtypes and curves need further probes. Controller time sampling remains unresolved. |
 | Forest effect library | Search/read, ordering and numeric/reference/texture/scalar-controller load/export are implemented. Other controller subtypes and curve import/export remain; add is parameter-free code only. |
-| Forest Tools instances | Covered by `forest_instances` (2026-10-14): no public native Instantiate exists, so it builds nodes from the item transforms. Billboards are skipped, Forest Color tint loss is reported, Edge mode isn't checked. |
+| Forest Tools instances | Covered by `forest_instances` (2026-10-14): no public native Instantiate exists, so it builds nodes from the item transforms. Billboards are skipped, Forest Color tint loss is reported, Edge mode isn't checked. Confirmed live by the MCP issue fixes session on the 1.7.5-based fork (36/36 checks, 2026-10-14); a rerun on the 1.7.6 merge is pending. |
 | `exportData` | RailClone selection-based XML+FBX and Forest scene-wide XML exports remain unwrapped. Field conventions differ between docs; exports can overwrite files and affect the entire scene. No .vrscene export was attempted. |
 | Catalog writes/evaluation | `setMacro`, `evalMacro`, browser open/close/refresh/overlay are not exposed as general commands. Evaluation can run scripts; writes persist catalog state. Stored macro reads are implemented. |
 | Compatibility internals | Forest `resetCreatedVersion` and raw setCreatedVersion/upgradeFromVersion remain unwrapped. They change legacy behavior, not ordinary object settings. RailClone's documented reset is wrapped. |
@@ -454,7 +455,8 @@ and output after reload. The subsequent public implementation passed deployed an
 
 ## Forest Effect curve points — 2026-10-14 (#44)
 
-Status: implemented, deployed (bridge `04815449…`, from `538a241`) and verified live on a scratch
+Status: implemented, deployed (the 1.7.5-based bridge `04815449…`, from `538a241`; the 1.7.6 merge
+ported the Forest runtime primitives into upstream's shell, not yet retested) and verified live on a scratch
 Max 2027 on 2026-10-14 by an independent session (MCP issue fixes; evidence in the dev folder's
 `docs\livetests-2027\runs-1014-curve-points\`, confirmation in `MCP_SOLVED.md`):
 - a changed curve evaluates at once (interior 0.9 gave Z=90; a five-point curve gave Z=70);

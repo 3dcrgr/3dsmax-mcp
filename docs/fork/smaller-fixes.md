@@ -2,11 +2,11 @@
 
 Problems that came up during the same production work. Most of them misled the agent or the user; #12 could have lost unsaved work.
 
-**Which bridge has the native fixes.** Some fixes below are in the native bridge, so they need a fork build of it. In `native/bin/`, the 2026 and 2027 bridges are. The 2026 one (sha256 `d5cd6ba5…`, built from the 1.7.5 merge) was never deployed: the production machine moved to 3ds Max 2027 on 2026-10-08. The 2027 one (`48c186df…`, built from `18611d7`, with every native fix on this branch) has run in production since 2026-10-11. The 2023, 2024 and 2025 bridges there are upstream's stock 1.7.5 builds. The Python fixes work with any bridge, and production runs this branch's Python from source.
+**Which bridge has the native fixes.** Some fixes below are in the native bridge, so they need a fork build of it. Since the 1.7.6 merge, only the 2027 bridge in `native/bin/` is one: the merge's own build (hash in `native/bin/bridge_manifest.json`), not deployed or live-tested yet. A 2027 fork bridge has run in production since 2026-10-11 (`48c186df…` first, `04815449…`, 1.7.5-based, since 2026-10-14). The 2023, 2024, 2025 and 2026 bridges there are upstream's stock 1.7.6 builds; the fork's 1.7.5-based 2026 build (`d5cd6ba5…`) was never deployed and was dropped in the merge. The Python fixes work with any bridge, and production runs the fork's Python from source.
 
 ## `execute_maxscript` reported interrupted scripts as parse errors
 
-Kept in the 1.7.5 merge: upstream has no such check.
+Kept in the 1.7.5 and 1.7.6 merges: upstream has no such check.
 
 Commit `011e547`.
 
@@ -26,7 +26,7 @@ Commit `011e547`.
 
 Tests: `tests/test_execute_failures.py`. They cover how the Python server classifies the bridge's messages, not the re-compile itself.
 
-**Status.** The check is in the native bridge, so it needs a fork bridge (see the top of this page). With a stock 1.7.5 bridge, an interrupted script gets the same reply as a syntax error: "MAXScript execution failed: <Max's error text>", with a code picked from keywords in that text, usually `BAD_PARAM`.
+**Status.** The check is in the native bridge, so it needs a fork bridge (see the top of this page). With a stock 1.7.5 or 1.7.6 bridge, an interrupted script gets the same reply as a syntax error: "MAXScript execution failed: <Max's error text>", with a code picked from keywords in that text, usually `BAD_PARAM`.
 - **Verified live on Max 2026** on 2026-10-01 with the fork's 1.7.3-based bridge: `(1 +` returned `BAD_PARAM` with the compiler's message. Quitting with `try (quitMax #noPrompt quiet:true) catch ()` was also run live: the bridge connection dropped and Max exited cleanly.
 - **Verified live on Max 2027** on 2026-10-11 with the fork's 2027 bridge (`48c186df…`): a failing script returned the parse-error detail.
 - **Not tested live yet:** a bare `quitMax #noPrompt`, which should give `MAXSCRIPT_INTERRUPTED`. Run it on a throwaway Max.
@@ -42,7 +42,7 @@ Fork issue #8. Commit `6552786`.
 
 **What changed.** `execute_maxscript`, and the native tools that run MAXScript internally, now run scripts with quiet errors. Compile errors and aborts go to Max's log, not the Listener, and the compile-only check behind the parse-error detail prints nothing either. The caller gets the same results as before: `BAD_PARAM` "MAXScript execution failed (parse error): <detail>", `MAXSCRIPT_INTERRUPTED`, and runtime errors with their message. A script's own output, such as `print`, still reaches the Listener.
 
-**Status.** This is in the native bridge. All of upstream's 1.7.5 bridges have the same change, and so do the fork's bridges built from the merge.
+**Status.** This is in the native bridge. All of upstream's 1.7.5 and 1.7.6 bridges have the same change, and so do the fork's bridges built since the 1.7.5 merge.
 - **Verified live on Max 2026** with the fork's 1.7.3-based bridge (sha256 `c621db10…`) on 2026-10-01: `(1 +` returned `BAD_PARAM` with the compiler's message and left the Listener unchanged, and `print "hello"; 42` returned `42` with only `"hello"` added to the Listener.
 - **Verified live on Max 2027** on 2026-10-11 with the fork's 2027 bridge (`48c186df…`): a failing script returned the parse detail and nothing reached the Listener.
 
@@ -50,7 +50,7 @@ Quiet errors are not upstream's quiet mode, which makes prompts take their defau
 
 ## Curve tools rejected Line objects
 
-Commit `1261998`.
+Commit `1261998`. Superseded by upstream 1.7.6, which made the same fix (its `editable_spline` check accepts Line objects, and `draw_spline` edits a Line in place). The 1.7.6 merge took upstream's code and dropped the fork's; `tests/test_curve_line_support.py` was adapted to it and passes.
 
 **What happened.** `inspect_curve` refused objects of class `line` with "Editable spline base required". A Line is an editable spline: it supports all the spline functions.
 
@@ -94,8 +94,8 @@ Fork issue #12. Commit `aa3d91d`.
 - **Limits:** the check reads only the submitted text. It doesn't see a command name built from pieces at runtime (`execute ("reset" + "MaxFile()")`), a file action run through `actionMan`, or commands inside scripts run with `fileIn`, `include`, `python.ExecuteFile` or `macros.run` (or startup and pipeline scripts called by name). Those run inside the quiet call, so their save prompts take the default answer. Agents should pass `quiet=False` when a script runs other scripts that may reset, open or quit. `#noPrompt` and `quiet:true` arguments in the script suppress the prompt whatever the bridge does, so the skill tells agents to add them only with the user's OK.
 
 **Status.** Unit tested (`native/tests/quiet_policy_tests.cpp`, `tests/test_execute_failures.py`, `tests/test_merge_review_safety.py`). Not tested live yet, on either Max version. The second merge review added `max fetch` and the Interface spellings to the list (`39c7e8e`), and the client-side `allow_discard` rule (`ec903a5`).
-- **With a fork bridge** (see the top of this page), the whole rule applies: the default quiet decision, `meta.quietOverride: "file_command"`, the native tools and `manage_scene`. On Max 2027 that's the bridge in `native/bin/`, the one running in production.
-- **With a stock bridge** (2023, 2024 and 2025), only the Python side works, and it only turns an explicit `quiet=True` into `quiet=False`. A script that mentions a file command and is sent with no explicit `quiet` still runs in quiet mode, so its save prompt takes the default answer. MAXScript that native tools run is always quiet there too. On a stock bridge, pass `quiet=False` for such scripts.
+- **With a fork bridge** (see the top of this page), the whole rule applies: the default quiet decision, `meta.quietOverride: "file_command"`, the native tools and `manage_scene`. On Max 2027 that's the merge's bridge in `native/bin/`, and the 1.7.5-based one running in production.
+- **With a stock bridge** (2023 to 2026 since the 1.7.6 merge), only the Python side works, and it only turns an explicit `quiet=True` into `quiet=False`. A script that mentions a file command and is sent with no explicit `quiet` still runs in quiet mode, so its save prompt takes the default answer. MAXScript that native tools run is always quiet there too. On a stock bridge, pass `quiet=False` for such scripts.
 - **The live check:** on a throwaway scene with unsaved changes, `resetMaxFile()` should return `BLOCKED_BY_DIALOG` with the save prompt, not reset.
 
 ## `contact_check` thresholds, non-mesh nodes and dense meshes (#14, #15)
@@ -108,12 +108,14 @@ Fork issues #14 and #15. Commit `02cb984`.
 
 **What changed.**
 - Explicit `tolerance` and `near_gap` are always millimetres (0 means the defaults, 0.1 mm and 10 mm), converted to scene units like the defaults. Results stay in scene units. Values are checked before anything is sent.
-- Nodes in `names` or `against` that can't become a mesh are skipped with a warning and listed in `skipped_nodes`. If none of the `names` nodes (or none of the `against` nodes) is a mesh, the call fails with a clear error.
+- Nodes in `names` or `against` that can't become a mesh are skipped with a warning and listed in `skipped_nodes`. If none of the `names` nodes (or none of the `against` nodes) is a mesh, the call fails with a clear error. Since the 1.7.6 merge, upstream's rules apply on top: names are strict (a missing or ambiguous name fails the call), empty meshes and meshes over `max_faces` are skipped too, every skipped node is also listed in upstream's `skipped` with its handle, class and reason, and its pairs go to `unchecked_pairs`.
 - After the bounding-box pass, the script estimates the work (vertices per candidate pair) and checks the cheapest pairs first, within `work_budget` (default 2,000,000). It checks a deadline, `time_budget_s`, between pairs and inside long vertex loops. The deadline defaults to 30 s and is at most 45 s, below the client timeout. It counts from when the request was built, so time spent queued counts too.
-- On the budget or the deadline it stops and returns partial results: `complete: false`, `pairs_total`, `pairs_checked`, `work_estimate`, `unchecked_pairs`, `heaviest_nodes`, `stop_reason` and `queue_wait_ms`. Check dense meshes (garlands, foliage, Mesher objects) separately.
+- On the budget or the deadline it stops and returns partial results: `complete: false`, `pairs_total`, `pairs_checked`, `work_estimate`, `unchecked_pairs`, `heaviest_nodes`, `stop_reason` and `queue_wait_ms`. Since the 1.7.6 merge the result also has upstream's `pairs_measured`, equal to `pairs_checked`. Check dense meshes (garlands, foliage, Mesher objects) separately.
 - The report header changed, so the parser and the script ship together. The skill explains units, skipping and the budget.
 
 **Status.** Unit tested in `tests/test_contact_check.py`. Python only, so it works with any bridge. Deployed on the 1.7.3-based fork on Max 2026 on 2026-10-05, and running on Max 2027 since 2026-10-11; not tested live yet on either. On the 1.7.5 merge, the 45 s cap stays below the client's reply deadline, and a request that waited too long in the queue is cancelled and never runs.
+
+Upstream 1.7.6 made its own version: `time_budget_s` (default 20 s, cheapest pairs first, `complete: false` when time runs out), skip reasons for non-mesh nodes in `skipped`, strict names, and whole-number `tolerance`/`near_gap` read correctly. The 1.7.6 merge keeps the fork's fuller behaviour (millimetre thresholds, the work budget, the 30 s default and 45 s cap counted from the send, `unchecked_pairs`, `skipped_nodes`) on upstream's strict names, skipped-node class, `pairs_measured` and empty-mesh reporting. `tests/test_contact_check.py` was updated for it and passes; not tested live after the merge.
 
 ## Cloning a closed-group member cloned the whole group (#16)
 
@@ -122,10 +124,12 @@ Fork issue #16. Commit `a83f57c`.
 **What happened.** `maxOps.cloneNodes` (and the SDK's `CloneNodes`, which `clone_objects` used) clones the *whole* group when given a member of a closed group. The copies sit exactly on the original, so nothing looks wrong. Cloning 16 props in a production scene left 1,646 duplicate objects.
 
 **What changed.**
-- `clone_objects` first runs one read-only check for requested names that are group members: `isGroupMember`, or a closed group head among the ancestors, nested and open groups included. Names match case-exactly; an ambiguous exact name is refused.
+- `clone_objects` first runs one read-only check for requested names that are group members: `isGroupMember`, or a closed group head among the ancestors, nested and open groups included. Names resolve like every other lookup since the 1.7.6 merge: an exact-case match first, otherwise a match that differs only in case; an ambiguous name is refused. (Before the merge they matched case-exactly only.)
 - Members are copied node by node (copy, instance or reference, as `mode` says), with their own children and links rebuilt. The top copy is detached (`.parent = undefined; setGroupMember c false`) and checked. It all happens in one undo step, with the same `offset`, `count` and naming as the normal path. If the scene gains more nodes than the script tracked, everything is rolled back.
 - Calls that name no group member take the existing paths. In a mixed call, non-members and group heads are cloned with `maxOps.cloneNodes` in the same undo step, so naming a group head still clones the group. `clone_whole_group=True` restores Max's behaviour. The result adds `group_members` (`name`, `group`, `open_group`), `detached_from_group` and warnings.
 - `scene_qa` has a new read-only check, `duplicate_group_heads`. It finds group heads with the same position, rotation and scale whose child lists match by class and name, ignoring case, trailing digits and the `_mcp` suffix. Near matches are reported as `name_match: "partial"`. It never deletes anything, in fix mode either.
 - **On the 1.7.5 merge** (`cb4d0ff`): if a dialog holds the read-only check that `clone_objects`, or `scene_qa` in fix mode, runs first, the call returns `BLOCKED_BY_DIALOG` with `retryable: true` and "Nothing was cloned" or "Nothing was changed". Repeat it once the dialog is answered. The queued check runs then too, harmlessly. `scene_qa` never sends its fix behind a check that couldn't run.
 
 **Status.** Unit tested in `tests/test_clone_groups.py` and `tests/test_scene_qa_groups.py`. Python only, so it works with any bridge. Deployed on the 1.7.3-based fork on Max 2026 on 2026-10-05, and running on Max 2027 since 2026-10-11; not tested live yet on either.
+
+Upstream 1.7.6 fixed the same problem differently: `clone_objects` refuses a member of a closed group and names the group. The 1.7.6 merge keeps the fork's behaviour (clone the member alone) on upstream's strict clone code; `tests/test_clone_groups.py` was updated for the strict names and passes.

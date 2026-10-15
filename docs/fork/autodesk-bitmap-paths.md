@@ -35,8 +35,8 @@ Python (`material_roles`):
 ## Which bridge has it
 
 Everything under "Native" above runs in the bridge:
-- In `native/bin/`, `mcp_bridge_2026.gup` (sha256 `d5cd6ba5…`, built from `ec903a5`) and `mcp_bridge_2027.gup` (sha256 `04815449…`, built from `538a241` with the Max 2027 SDK) are fork builds with this fix. The 2023, 2024 and 2025 files are upstream's 1.7.5 builds.
-- The 2027 one has run on the production machine since 2026-10-11.
+- In `native/bin/`, only `mcp_bridge_2027.gup` is a fork build with this fix: the 1.7.6 merge's build with the Max 2027 SDK (hash in `native/bin/bridge_manifest.json`), into which the merge ported the material path fixes. The 2023, 2024, 2025 and 2026 files are upstream's 1.7.6 builds, without it. The fork's 1.7.5-based 2026 build (`d5cd6ba5…`) had it, but was dropped in the merge.
+- A 2027 fork bridge with it has run on the production machine since 2026-10-11 (the 1.7.5-based `04815449…` since 2026-10-14).
 
 The Python checks work with any bridge. With an upstream bridge:
 - Autodesk Bitmap paths still read as empty, but each such map gives `FILE_PATH_UNREADABLE` and `complete: false`, so the audit no longer looks clean.
@@ -46,7 +46,7 @@ The Python checks work with any bridge. With an upstream bridge:
 
 ## How it was verified
 
-Live on 3ds Max 2026, 2026-10-01, with the 1.7.3-based fork's bridge. The material graph code hasn't changed since `1492831`, so the fork's 1.7.5-based bridges (the 2026 one in `native/bin/` and the deployed 2027 one) have the same code. The 2026 one hasn't run in Max.
+Live on 3ds Max 2026, 2026-10-01, with the 1.7.3-based fork's bridge. The material graph code hadn't changed since `1492831` up to the 1.7.5-based fork, so its bridges (the 2026 one, never run in Max, and the deployed 2027 one) have the same code. The 1.7.6 merge ported it onto upstream's material graph handler; that port has no live test yet.
 - **An Autodesk Bitmap on a Revit furniture fabric** now reports its path, from parameter `Parameters_Source`: `C:\Program Files (x86)\Common Files\Autodesk Shared\Materials\Textures\1\Mats\Furnishings.Fabrics.Linen.White.jpg`. It also reports `exists: false`, which is correct, because that texture library isn't installed on the machine. Checked at 10:46 and again at 11:06.
 - **Unset Autodesk Metal relief and cutout bitmaps** give `FILE_PATH_UNREADABLE`, and the audit reports `complete: false`.
 - **Cosmos VRayBitmaps:** the duplicate package-relative row first showed up in the 10:46 live check. `baafe0a`, deployed at 11:02 to remove it, didn't (checked at 11:06). At 11:20 the row was traced to the unnamed parameter. The fix (`1492831`) was deployed with the rebuilt bridge at 12:22. At 12:30 `material_roles` on the Cosmos material `Tiles_B_130cm` gave one row per VRayBitmap (`HDRIMapName`, `exists: true`), no package-relative rows, and `complete: true`.
@@ -57,4 +57,4 @@ Unit tests: `tests/test_material_roles_files.py`, for the Python warnings. The n
 
 ## Upstream status
 
-Not fixed upstream: v1.7.5 and upstream `master` (`29aed53`) don't have it. `material_roles` came from EdgecraftStudio's upstream PR 29, which was tested on Corona scenes, so this is a natural follow-up to raise with them.
+Not fixed upstream: v1.7.5 and v1.7.6 (`5a92193`) don't have it. `material_roles` came from EdgecraftStudio's upstream PR 29, which was tested on Corona scenes, so this is a natural follow-up to raise with them.
