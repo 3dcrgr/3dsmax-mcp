@@ -40,7 +40,7 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
   - Calls fail fast with `MAX_BUSY` or `MAX_NOT_RESPONDING` and a process diagnosis: whether the main window responds, CPU use, whether it exited.
   - The client never replays a request that may already have run.
 - `get_bridge_status` answers from a pipe thread while Max's main thread is blocked. It reports what holds the main thread and which clients are connected.
-- Max no longer stalls on exit with queued requests or connected idle pipe clients: queued work fails and pending pipe reads/writes are cancelled and drained. The 1.7.5-based 2027 bridge passed scratch-Max quit checks with clients retained. Upstream 1.7.6 fixed this too, and the merge uses its version.
+- Max no longer stalls on exit with queued requests or connected idle pipe clients: queued work fails and pending pipe reads/writes are cancelled and drained. The 1.7.5-based 2027 bridge passed scratch-Max quit checks with clients retained. Upstream 1.7.6 fixed this too, and the merge uses its version; the deployed merge quit in 5.3 s with a client retained (2026-10-15).
 - Startup failures include native target and transport context. Exited instance registrations are cleaned conservatively, preserving live, uncertain and changed records.
 - An MCP server whose client crashed exits with it, instead of staying connected to Max.
 
