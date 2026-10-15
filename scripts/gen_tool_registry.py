@@ -143,12 +143,18 @@ def first_doc_line(func: ast.FunctionDef) -> str:
 # a smaller exact-ID payload. Direct native probes cannot run that orchestration.
 SKIP_TOOL_NAMES = {
     "max_dialogs",  # Requires a pipe worker/control channel, never an in-Max probe.
+    # native:core is answered by the bridge shell over the control channel; the
+    # core's invoke_tool and smoke harness cannot route shell control types.
+    "reload_native_core",
     "script_controller",  # Python validation and shared MAXScript transaction.
     "plugin_patch",
     "lighting_capabilities", "create_lights", "inspect_lights", "edit_lights",
     "curve_model",
     "inspect_curve",
     "edit_curve",
+    # The native route only writes the evaluated mesh to Python's scratch file;
+    # the QA analysis runs in Python.
+    "geometry_qa",
     # Mixed Python orchestration: status is a local file read, start only arms
     # notifications, and cancel_capture uses a separate native route. Routing
     # every action to the first discovered send_command could send an abort

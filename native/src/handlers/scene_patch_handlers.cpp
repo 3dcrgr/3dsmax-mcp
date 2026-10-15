@@ -1,8 +1,7 @@
 #include "mcp_bridge/native_handlers.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/node_ref.h"
-#include "mcp_bridge/scene_journal.h"
 
 #include <hold.h>
 
@@ -47,6 +46,12 @@ struct PlannedOperation {
 struct ExpectedSequence {
     bool present = false;
     unsigned long long value = 0;
+};
+
+// Raised when every operation was ignored; the transaction is already
+// cancelled and the payload already structured.
+struct ScenePatchIgnored : std::runtime_error {
+    using std::runtime_error::runtime_error;
 };
 
 class ScenePatchTransaction {
@@ -124,7 +129,7 @@ std::string FoldName(const std::string& value) {
         {"expectedSceneSeq", expected},
         {"currentSceneSeq", current},
         {"changes", expected < current
-            ? SceneJournal::MutationChangesSince(expected, 32)
+            ? McpHost::SceneJournal::MutationChangesSince(expected, 32)
             : json::array()},
         {"next", "Refresh scene state and retry with currentSceneSeq."},
     };
@@ -226,37 +231,13 @@ NodeFlags ReadFlags(INode* node) {
     return flags;
 }
 
-void ApplyFlagsSnapshot(INode* node, const NodeFlags& flags) {
-    if (!node) return;
-    node->Hide(flags.hidden ? TRUE : FALSE);
-    node->Freeze(flags.frozen ? TRUE : FALSE);
-    node->SetRenderable(flags.renderable ? TRUE : FALSE);
-    node->SetCastShadows(flags.castShadows ? TRUE : FALSE);
-    node->SetRcvShadows(flags.receiveShadows ? TRUE : FALSE);
+// The undo record lives in the shell (undo_records.cpp): Max keeps it after
+// the request, so its vtable must not point into the core.
+unsigned FlagBits(const NodeFlags& flags) {
+    return (flags.hidden ? kMcpNodeHidden : 0u) | (flags.frozen ? kMcpNodeFrozen : 0u) |
+        (flags.renderable ? kMcpNodeRenderable : 0u) | (flags.castShadows ? kMcpNodeCastShadows : 0u) |
+        (flags.receiveShadows ? kMcpNodeReceiveShadows : 0u);
 }
-
-class NodeFlagsRestore final : public RestoreObj {
-public:
-    NodeFlagsRestore(INode* node, const NodeFlags& before, const NodeFlags& after)
-        : node_(node), before_(before), after_(after) {}
-
-    void Restore(int /*isUndo*/) override {
-        ApplyFlagsSnapshot(node_, before_);
-    }
-
-    void Redo() override {
-        ApplyFlagsSnapshot(node_, after_);
-    }
-
-    int Size() override {
-        return static_cast<int>(sizeof(*this));
-    }
-
-private:
-    INode* node_ = nullptr;
-    NodeFlags before_;
-    NodeFlags after_;
-};
 
 json NullableNodeRef(INode* node) {
     return node && !node->IsRootNode() ? NodeRefs::ToJson(node) : json(nullptr);
@@ -515,16 +496,28 @@ std::vector<PlannedOperation> BuildPlan(
     return plan;
 }
 
-void ApplyTransform(const PlannedOperation& item, TimeValue time) {
+// Constraint, script and expression controllers ignore Move, Rotate and Scale
+// without an error. Each requested part is compared with the node transform
+// before it; the parts that left it unchanged are returned.
+json ApplyTransform(const PlannedOperation& item, TimeValue time) {
     Matrix3 axis(TRUE);
     if (item.args.value("coordinate_system", "world") == "local") {
         axis = item.target->GetNodeTM(time);
         axis.NoTrans();
     }
 
+    json ignored = json::array();
+    const auto check = [&](const char* part, const Matrix3& before) {
+        if (SameTransform(before, item.target->GetNodeTM(time)))
+            ignored.push_back(IgnoredTransformPart(item.target, part));
+    };
     if (item.args.contains("move")) {
         const Point3 value = ParseVector3(item.args["move"], "move", item.index);
-        if (!IsZero(value)) item.target->Move(time, axis, value, TRUE, TRUE, PIV_NONE, TRUE);
+        if (!IsZero(value)) {
+            const Matrix3 before = item.target->GetNodeTM(time);
+            item.target->Move(time, axis, value, TRUE, TRUE, PIV_NONE, TRUE);
+            check("move", before);
+        }
     }
     if (item.args.contains("rotate")) {
         const Point3 degrees = ParseVector3(item.args["rotate"], "rotate", item.index);
@@ -532,26 +525,38 @@ void ApplyTransform(const PlannedOperation& item, TimeValue time) {
             const Quat x(AngAxis(Point3(1, 0, 0), DegToRad(degrees.x)));
             const Quat y(AngAxis(Point3(0, 1, 0), DegToRad(degrees.y)));
             const Quat z(AngAxis(Point3(0, 0, 1), DegToRad(degrees.z)));
+            const Matrix3 before = item.target->GetNodeTM(time);
             item.target->Rotate(time, axis, AngAxis(x * y * z), TRUE, TRUE, PIV_NONE, TRUE);
+            check("rotate", before);
         }
     }
     if (item.args.contains("scale")) {
         const Point3 value = ParseScale(item.args["scale"], item.index);
         if (!IsIdentityScale(value)) {
+            const Matrix3 before = item.target->GetNodeTM(time);
             item.target->Scale(time, axis, value, TRUE, TRUE, PIV_NONE, TRUE);
+            check("scale", before);
         }
     }
+    return ignored;
 }
 
-void ApplyOperation(const PlannedOperation& item, Interface* ip, TimeValue time) {
-    if (!item.changed) return;
+// Requested transform parts per operation, to tell a wholly ignored transform
+// from a partly applied one.
+size_t RequestedTransformParts(const PlannedOperation& item) {
+    size_t parts = 0;
+    if (item.args.contains("move") && !IsZero(ParseVector3(item.args["move"], "move", item.index))) ++parts;
+    if (item.args.contains("rotate") && !IsZero(ParseVector3(item.args["rotate"], "rotate", item.index))) ++parts;
+    if (item.args.contains("scale") && !IsIdentityScale(ParseScale(item.args["scale"], item.index))) ++parts;
+    return parts;
+}
+
+json ApplyOperation(const PlannedOperation& item, Interface* ip, TimeValue time) {
+    if (!item.changed) return json::array();
+    if (item.op == "transform") return ApplyTransform(item, time);
     if (item.op == "rename") {
         item.target->SetName(Utf8ToWide(item.args["name"].get<std::string>()).c_str());
-        return;
-    }
-    if (item.op == "transform") {
-        ApplyTransform(item, time);
-        return;
+        return json::array();
     }
     if (item.op == "set_flags") {
         const NodeFlags before = ReadFlags(item.target);
@@ -561,18 +566,18 @@ void ApplyOperation(const PlannedOperation& item, Interface* ip, TimeValue time)
         if (item.args.contains("renderable")) after.renderable = item.args["renderable"].get<bool>();
         if (item.args.contains("cast_shadows")) after.castShadows = item.args["cast_shadows"].get<bool>();
         if (item.args.contains("receive_shadows")) after.receiveShadows = item.args["receive_shadows"].get<bool>();
-        theHold.Put(new NodeFlagsRestore(item.target, before, after));
+        McpHost::UndoRecords::PutNodeFlagsRestore(item.target, FlagBits(before), FlagBits(after));
         if (item.args.contains("hidden")) item.target->Hide(item.args["hidden"].get<bool>());
         if (item.args.contains("frozen")) item.target->Freeze(item.args["frozen"].get<bool>());
         if (item.args.contains("renderable")) item.target->SetRenderable(item.args["renderable"].get<bool>());
         if (item.args.contains("cast_shadows")) item.target->SetCastShadows(item.args["cast_shadows"].get<bool>());
         if (item.args.contains("receive_shadows")) item.target->SetRcvShadows(item.args["receive_shadows"].get<bool>());
-        return;
+        return json::array();
     }
     if (item.op == "set_parent") {
         INode* parent = item.parent ? item.parent : ip->GetRootNode();
         parent->AttachChild(item.target, item.args.value("keep_transform", true) ? TRUE : FALSE);
-        return;
+        return json::array();
     }
     throw std::runtime_error("Unhandled preflighted operation: " + item.op);
 }
@@ -624,7 +629,7 @@ std::string NativeHandlers::ResolveNodeRefs(const std::string& params, MCPBridge
                 "BAD_PARAM", "refs exceeds the 256-item limit."));
         }
 
-        SceneJournal::FlushPending();
+        McpHost::SceneJournal::FlushPending();
         json resolved = json::array();
         for (size_t index = 0; index < payload["refs"].size(); ++index) {
             try {
@@ -645,9 +650,9 @@ std::string NativeHandlers::ResolveNodeRefs(const std::string& params, MCPBridge
 
         json result;
         result["refs"] = std::move(resolved);
-        result["sceneSeq"] = SceneJournal::CurrentMutationSeq();
-        result["activitySeq"] = SceneJournal::CurrentSeq();
-        result["journal"] = SceneJournal::IsRegistered();
+        result["sceneSeq"] = McpHost::SceneJournal::CurrentMutationSeq();
+        result["activitySeq"] = McpHost::SceneJournal::CurrentSeq();
+        result["journal"] = McpHost::SceneJournal::IsRegistered();
         return result.dump();
     });
 }
@@ -681,15 +686,15 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
         }
 
         const ExpectedSequence expected = ParseExpectedSequence(payload);
-        if (expected.present && !SceneJournal::IsRegistered()) {
+        if (expected.present && !McpHost::SceneJournal::IsRegistered()) {
             throw std::runtime_error(StructuredErrorPayload(
                 "SCENE_JOURNAL_UNAVAILABLE",
                 "expected_scene_seq requires the native scene journal."));
         }
 
-        SceneJournal::FlushPending();
-        const unsigned long long beforeActivitySeq = SceneJournal::CurrentSeq();
-        const unsigned long long beforeSeq = SceneJournal::CurrentMutationSeq();
+        McpHost::SceneJournal::FlushPending();
+        const unsigned long long beforeActivitySeq = McpHost::SceneJournal::CurrentSeq();
+        const unsigned long long beforeSeq = McpHost::SceneJournal::CurrentMutationSeq();
         if (expected.present && expected.value != beforeSeq) {
             ThrowSceneConflict(
                 expected.value, beforeSeq, "Scene changed since expected_scene_seq.");
@@ -701,15 +706,15 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
         std::vector<PlannedOperation> plan = BuildPlan(
             payload["operations"], ip, time, allNodes);
 
-        SceneJournal::FlushPending();
-        const unsigned long long readyActivitySeq = SceneJournal::CurrentSeq();
-        const unsigned long long readySeq = SceneJournal::CurrentMutationSeq();
+        McpHost::SceneJournal::FlushPending();
+        const unsigned long long readyActivitySeq = McpHost::SceneJournal::CurrentSeq();
+        const unsigned long long readySeq = McpHost::SceneJournal::CurrentMutationSeq();
         if (readySeq != beforeSeq) {
             ThrowSceneConflict(
                 beforeSeq, readySeq, "Scene changed while scene_patch was preflighting.");
         }
 
-        const size_t changedCount = ChangedCount(plan);
+        size_t changedCount = ChangedCount(plan);
         json result;
         result["dryRun"] = dryRun;
         result["status"] = dryRun ? "preflight" : (changedCount ? "applied" : "noop");
@@ -722,7 +727,7 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
             {"after", readyActivitySeq},
         };
         if (expected.present) result["sceneSeq"]["expected"] = expected.value;
-        result["journal"] = SceneJournal::IsRegistered();
+        result["journal"] = McpHost::SceneJournal::IsRegistered();
         result["counts"] = {
             {"operations", plan.size()},
             {"changed", changedCount},
@@ -730,6 +735,10 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
         };
         result["operations"] = BuildProofArray(plan, time, false);
         result["transaction"] = dryRun || changedCount == 0 ? "none" : "one_native_hold";
+        if (!dryRun && changedCount == 0) {
+            result["warnings"] = json::array(
+                {"No operation changed the scene: every target already matched the request."});
+        }
 
         if (dryRun || changedCount == 0) {
             result["touched"] = UniqueTouchedRefs(plan);
@@ -739,21 +748,59 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
         ScenePatchTransaction transaction(label);
         size_t applyingIndex = 0;
         try {
-            for (const auto& item : plan) {
+            std::unordered_map<size_t, json> ignored;
+            for (auto& item : plan) {
                 applyingIndex = item.index;
-                ApplyOperation(item, ip, time);
+                json parts = ApplyOperation(item, ip, time);
+                if (parts.empty()) continue;
+                if (parts.size() == RequestedTransformParts(item)) item.changed = false;
+                ignored[item.index] = std::move(parts);
+            }
+            McpHost::DialogWatch::ThrowIfDismissed();
+            changedCount = ChangedCount(plan);
+            json ignoredRows = json::array();
+            for (const auto& item : plan) {
+                const auto found = ignored.find(item.index);
+                if (found == ignored.end()) continue;
+                ignoredRows.push_back({{"index", item.index}, {"target", NodeRefs::ToJson(item.target)},
+                                       {"ignored", found->second}});
+            }
+            if (changedCount == 0) {
+                transaction.Cancel();
+                McpHost::SceneJournal::FlushPending();
+                throw ScenePatchIgnored(StructuredErrorPayload(
+                    "PATCH_APPLY_FAILED",
+                    "No operation took effect: the targets' transform controllers ignored the edit "
+                    "(constraint, script or expression controllers drive them). The scene is unchanged.",
+                    {{"ignored", ignoredRows},
+                     {"message", kTransformIgnoredAdvice}}));
             }
             ip->RedrawViews(time);
             result["operations"] = BuildProofArray(plan, time, true);
+            for (size_t i = 0; i < plan.size(); ++i) {
+                const auto found = ignored.find(plan[i].index);
+                if (found == ignored.end()) continue;
+                result["operations"][i]["changed"] = plan[i].changed;
+                result["operations"][i]["ignored"] = found->second;
+            }
+            if (!ignoredRows.empty()) {
+                result["status"] = "partial";
+                result["counts"]["changed"] = changedCount;
+                result["ignored"] = ignoredRows;
+                result["warnings"] = json::array({std::to_string(ignoredRows.size()) +
+                    " transform operation(s) were ignored in whole or part by the targets' transform "
+                    "controllers (constraint, script or expression); see ignored."});
+            }
             result["touched"] = UniqueTouchedRefs(plan);
-            DialogWatch::ThrowIfDismissed();
             transaction.Accept();
+        } catch (const ScenePatchIgnored&) {
+            throw;
         } catch (const std::exception& error) {
             try {
                 transaction.Cancel();
             } catch (...) {
             }
-            SceneJournal::FlushPending();
+            McpHost::SceneJournal::FlushPending();
             json cause = json::parse(error.what(), nullptr, false);
             if (cause.is_discarded()) cause = error.what();
             throw std::runtime_error(StructuredErrorPayload(
@@ -769,26 +816,26 @@ std::string NativeHandlers::ScenePatch(const std::string& params, MCPBridgeGUP* 
                 transaction.Cancel();
             } catch (...) {
             }
-            SceneJournal::FlushPending();
+            McpHost::SceneJournal::FlushPending();
             throw std::runtime_error(StructuredErrorPayload(
                 "PATCH_APPLY_FAILED",
                 "scene_patch failed and its native hold was cancelled.",
                 {{"operationIndex", applyingIndex}, {"rollback", "cancelled"}}));
         }
 
-        SceneJournal::FlushPending();
+        McpHost::SceneJournal::FlushPending();
         json handles = json::array();
         std::unordered_set<unsigned long long> seenHandles;
         for (const auto& item : plan) {
             const unsigned long long handle = NodeHandle(item.target);
             if (seenHandles.insert(handle).second) handles.push_back(handle);
         }
-        const unsigned long long afterSeq = SceneJournal::AppendSynthetic(
+        const unsigned long long afterSeq = McpHost::SceneJournal::AppendSynthetic(
             "scene_patch",
             {{"operationCount", plan.size()}, {"changedCount", changedCount}, {"handles", handles}});
         result["sceneSeq"]["after"] = afterSeq;
-        result["activitySeq"]["after"] = SceneJournal::CurrentSeq();
-        result["journalEventCount"] = SceneJournal::ChangesSince(beforeActivitySeq, 512).size();
+        result["activitySeq"]["after"] = McpHost::SceneJournal::CurrentSeq();
+        result["journalEventCount"] = McpHost::SceneJournal::ChangesSince(beforeActivitySeq, 512).size();
         result["undoLabel"] = label;
         return result.dump();
     });

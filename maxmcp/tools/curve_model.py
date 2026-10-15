@@ -11,7 +11,7 @@ from ..helpers.curves import build_model, keys
 from ..helpers.curve_runtime import CURVE_FUNCTIONS, FINGERPRINT, decode, run
 from ..helpers.loft import validate_parameters
 from ..helpers.mesh import MESH_FUNCTIONS, point, target_script, vector
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import name_in_use, name_literal, safe_string
 from ..server import mcp
 
 APPDATA_ID = 1129731140  # CVMD; independent of the legacy loft definition.
@@ -37,7 +37,7 @@ def encode(data):
 def functions():
     from .loft import LOFT_FUNCTIONS
     return MESH_FUNCTIONS+CURVE_FUNCTIONS+LOFT_FUNCTIONS+r'''
-fn cmToken obj = (if cvIsSpline obj.baseobject then cvToken obj else lfToken obj)
+fn cmToken obj = (if cvEditable obj then cvToken obj else lfToken obj)
 '''
 
 
@@ -212,7 +212,7 @@ def curve_model(
                 {functions()}
                 local holding = false
                 try (
-                    if (getNodeByName "{safe_string(name)}" exact:true) != undefined do throw "A node with this name already exists"
+                    if {name_in_use(name_literal(name))} do throw "A node with this name already exists"
                     if theHold.Holding() do throw "An undo transaction is active"
                     theHold.Begin(); holding = true
                     local obj = SplineShape name:"{safe_string(name)}" pos:{point(origin)}

@@ -1,6 +1,6 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 
 #include <iparamb2.h>
 #include <pbbitmap.h>
@@ -891,7 +891,31 @@ static Mtl* FindInSceneMtlLib(const std::string& name) {
 static MaterialResolve ResolveMaterial(const std::string& name, int subMaterialIndex) {
     if (name.empty()) throw std::runtime_error("name is required");
 
-    if (INode* node = FindNodeByName(name)) {
+    const std::vector<INode*> owners = CollectNodesByName(name);
+    if (owners.size() > 1) {
+        // Objects that share a name but carry one material still name that
+        // material; with different materials the name cannot choose one.
+        Mtl* shared = owners.front()->GetMtl();
+        bool sameMaterial = true;
+        for (INode* owner : owners) sameMaterial = sameMaterial && owner->GetMtl() == shared;
+        if (!sameMaterial) {
+            json candidates = json::array();
+            for (INode* owner : owners) {
+                json candidate = NodeIdentityJson(owner);
+                Mtl* mtl = owner->GetMtl();
+                candidate["material"] = mtl ? json(BaseName(mtl)) : json(nullptr);
+                candidates.push_back(candidate);
+            }
+            throw std::runtime_error(StructuredErrorPayload(
+                "AMBIGUOUS",
+                "Ambiguous object name: " + name,
+                {{"message", "Several objects with this name carry different materials. "
+                             "Pass the material name instead, or give the objects unique names."},
+                 {"candidates", candidates}}));
+        }
+    }
+
+    if (INode* node = owners.empty() ? nullptr : owners.front()) {
         Mtl* mtl = node->GetMtl();
         if (!mtl) throw std::runtime_error("No material assigned to " + name);
         if (subMaterialIndex > 0) {
@@ -1340,11 +1364,18 @@ static json BuildReplicationPlan(const json& request, Mtl* source, const std::st
         }
     }
 
+    // A target name several objects share cannot be assigned: apply would
+    // skip it like a missing target.
     json targetInfo = json::array();
     for (const auto& target : targets) {
+        const std::vector<INode*> matches = CollectNodesByName(target);
         json t;
         t["name"] = target;
-        t["exists"] = FindNodeByName(target) != nullptr;
+        t["exists"] = !matches.empty();
+        if (matches.size() > 1) {
+            t["ambiguous"] = true;
+            t["candidates"] = NameCandidatesJson(matches);
+        }
         targetInfo.push_back(t);
     }
 
@@ -1377,6 +1408,8 @@ static json BuildReplicationPlan(const json& request, Mtl* source, const std::st
     }
     for (const auto& t : targetInfo) {
         if (!t.value("exists", false)) errors.push_back("Target object not found: " + t.value("name", ""));
+        else if (t.value("ambiguous", false))
+            errors.push_back("Target object name is shared by several objects: " + t.value("name", ""));
     }
 
     json plan;
@@ -1575,6 +1608,11 @@ std::string NativeHandlers::ReplicateMaterialApply(const std::string& params, MC
             result["ok"] = false;
             result["preview"] = false;
             result["status"] = "blocked";
+            // "error" makes the envelope report the refusal instead of success;
+            // the plan's errors travel in details.
+            result["error"] = "replicate_material was blocked by its preflight plan; nothing was changed. "
+                "Fix the listed errors or pass allow_missing=true.";
+            result["details"] = {{"errors", plan["errors"]}};
             result["errors"] = plan["errors"];
             result["plan"] = plan;
             return result.dump();
@@ -1612,16 +1650,25 @@ std::string NativeHandlers::ReplicateMaterialApply(const std::string& params, MC
         }
 
         json assigned = json::array();
-        json missingTargets = json::array();
+        NamedNodes resolvedTargets;
+        const json& missingTargets = resolvedTargets.notFound;
         if (assign) {
-            for (const auto& target : targets) {
-                INode* node = FindNodeByName(target);
-                if (!node) {
-                    missingTargets.push_back(target);
-                    continue;
-                }
+            resolvedTargets = ResolveNodesByNames(targets);
+            for (INode* node : resolvedTargets.nodes) {
                 node->SetMtl(targetMaterial);
-                assigned.push_back(target);
+                assigned.push_back(WideToUtf8(node->GetName()));
+            }
+            // With every target unresolved the new material would have no owner;
+            // the throw cancels the dispatcher's hold and leaves the scene as it was.
+            if (assigned.empty()) {
+                json hint = UnresolvedNamesHint(resolvedTargets);
+                hint["missingTargets"] = missingTargets;
+                throw std::runtime_error(StructuredErrorPayload(
+                    UnresolvedNamesCode(resolvedTargets),
+                    resolvedTargets.ambiguous.empty()
+                        ? "None of the target objects exist; no material was assigned."
+                        : "No target name matched exactly one object; no material was assigned.",
+                    hint));
             }
         } else if (cloned && ip->GetSceneMtls()) {
             ip->GetSceneMtls()->Add(targetMaterial);
@@ -1656,15 +1703,20 @@ std::string NativeHandlers::ReplicateMaterialApply(const std::string& params, MC
         }
 
         json result;
-        result["ok"] = missingTargets.empty();
+        result["ok"] = !resolvedTargets.Unresolved();
         result["preview"] = false;
-        result["status"] = missingTargets.empty() ? "applied" : "partial";
+        result["status"] = resolvedTargets.Unresolved() ? "partial" : "applied";
         result["mode"] = mode;
         result["source"] = source;
         result["materialName"] = BaseName(targetMaterial);
         result["cloned"] = cloned;
         result["assignedTo"] = assigned;
-        if (!missingTargets.empty()) result["missingTargets"] = missingTargets;
+        if (!missingTargets.empty()) {
+            result["missingTargets"] = missingTargets;
+            result["warnings"].push_back(std::to_string(missingTargets.size()) +
+                " target object(s) do not exist and were not assigned: " + JoinNames(missingTargets));
+        }
+        AddAmbiguousNamesWarning(result, resolvedTargets.ambiguous);
         result["remappedFiles"] = changed.size();
         result["remapped"] = changed;
         result["verification"] = verification;

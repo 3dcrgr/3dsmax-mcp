@@ -1,7 +1,7 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/spatial_snapshot.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 
 #include <iparamb2.h>
 #include <istdplug.h>
@@ -211,8 +211,17 @@ std::string NativeHandlers::SetObjectProperty(const std::string& params, MCPBrid
             Point3 pt;
             if (ParsePoint3(value, pt)) {
                 Matrix3 tm = node->GetNodeTM(t);
+                const Matrix3 before = tm;
                 tm.SetTrans(pt);
                 node->SetNodeTM(t, tm);
+                if (!SameTransform(before, tm) && SameTransform(before, node->GetNodeTM(t))) {
+                    throw std::runtime_error(StructuredErrorPayload(
+                        "TRANSFORM_IGNORED",
+                        WideToUtf8(node->GetName()) + " did not move: its position controller ignored the edit "
+                        "(constraint, script or expression).",
+                        {{"ignored", json::array({IgnoredTransformPart(node, "move")})},
+                         {"message", kTransformIgnoredAdvice}}));
+                }
                 ip->RedrawViews(t);
                 return propertyResult("Set pos on " + WideToUtf8(node->GetName()));
             }
@@ -238,24 +247,35 @@ std::string NativeHandlers::SetObjectProperty(const std::string& params, MCPBrid
             return propertyResult("Set name on " + WideToUtf8(node->GetName()));
         }
 
+        const bool flagProperty = lprop == "ishidden" || lprop == "hidden" ||
+            lprop == "isfrozen" || lprop == "frozen" || lprop == "renderable";
+        bool flag = false;
+        if (flagProperty && !ParseBoolLiteral(value, flag))
+            throw std::runtime_error("Cannot parse boolean from: " + value + " (use true or false)");
+
         if (lprop == "ishidden" || lprop == "hidden") {
-            bool v = (value == "true" || value == "1" || value == "on");
-            node->Hide(v ? TRUE : FALSE);
+            node->Hide(flag ? TRUE : FALSE);
             ip->RedrawViews(t);
             return propertyResult("Set isHidden on " + WideToUtf8(node->GetName()));
         }
 
         if (lprop == "isfrozen" || lprop == "frozen") {
-            bool v = (value == "true" || value == "1" || value == "on");
-            node->Freeze(v ? TRUE : FALSE);
+            node->Freeze(flag ? TRUE : FALSE);
             ip->RedrawViews(t);
             return propertyResult("Set isFrozen on " + WideToUtf8(node->GetName()));
         }
 
         if (lprop == "renderable") {
-            bool v = (value == "true" || value == "1" || value == "on");
-            node->SetRenderable(v ? TRUE : FALSE);
+            node->SetRenderable(flag ? TRUE : FALSE);
             return propertyResult("Set renderable on " + WideToUtf8(node->GetName()));
+        }
+
+        if (lprop == "rotation" || lprop == "scale" || lprop == "transform") {
+            throw std::runtime_error(StructuredErrorPayload(
+                "BAD_PARAM",
+                "set_object_property sets the position but not " + prop +
+                    ". Use transform_object(rotate=[x,y,z] degrees, scale=[x,y,z]) or scene_patch transform; "
+                    "both apply relative to the current transform."));
         }
 
         // ── Base object IParamBlock2 properties ─────────────────
@@ -519,7 +539,7 @@ std::string NativeHandlers::CreateObject(const std::string& params, MCPBridgeGUP
                     ms += "createdNode." + key + " = " + val + "; ";
                 }
                 ms += "\"OK\")";
-                RunMAXScript(ms); // A rejected parameter must cancel the dispatcher-owned hold.
+                RunMAXScriptChecked(ms); // A rejected parameter must cancel the dispatcher-owned hold.
             }
         }
 
@@ -559,7 +579,7 @@ std::string NativeHandlers::DeleteObjects(const std::string& params, MCPBridgeGU
             }
         }
         for (const auto& name : names) {
-            std::vector<INode*> matches = CollectNodesByExactName(name);
+            std::vector<INode*> matches = CollectNodesByName(name);
             if (matches.empty()) {
                 notFound.push_back(name);
                 continue;
@@ -584,6 +604,13 @@ std::string NativeHandlers::DeleteObjects(const std::string& params, MCPBridgeGU
             }
         }
 
+        if (targets.empty()) {
+            throw std::runtime_error(StructuredErrorPayload(
+                "NOT_FOUND",
+                "No object matched the requested names or handles; nothing was deleted.",
+                {{"notFound", notFound}}));
+        }
+
         // Resolve and validate every selector before the first mutation. This
         // both deduplicates matching handle/name selectors and prevents an
         // ambiguous later name from leaving a partially deleted scene.
@@ -599,8 +626,11 @@ std::string NativeHandlers::DeleteObjects(const std::string& params, MCPBridgeGU
         result["message"] = std::string(dryRun ? "Would delete " : "Deleted ") +
             std::to_string(deleted.size()) + " objects";
         if (!notFound.empty()) {
+            result["status"] = "partial";
             result["message"] = result["message"].get<std::string>() +
-                " | Not found: " + std::to_string(notFound.size());
+                " | " + std::to_string(notFound.size()) + " not found";
+            result["warnings"] = json::array({std::to_string(notFound.size()) +
+                " requested object(s) matched nothing and were skipped: " + JoinNames(notFound)});
         }
         return result.dump();
     });
@@ -617,12 +647,23 @@ std::string NativeHandlers::TransformObject(const std::string& params, MCPBridge
         std::string coordSys = p.value("coordinate_system", "world");
 
         bool didSomething = false;
+        // Requested parts that change the transform, and those its
+        // controllers ignored.
+        int requested = 0;
+        json ignored = json::array();
+        const auto check = [&](const char* part, const Matrix3& before, bool nonTrivial) {
+            if (!nonTrivial) return;
+            ++requested;
+            if (SameTransform(before, node->GetNodeTM(t))) ignored.push_back(IgnoredTransformPart(node, part));
+        };
 
         // Move
         if (p.contains("move") && p["move"].type() == json::value_t::array && p["move"].size() == 3) {
             Point3 offset(p["move"][0].get<float>(), p["move"][1].get<float>(), p["move"][2].get<float>());
             Matrix3 tmAxis;  // identity by default in Max 2026
+            const Matrix3 before = node->GetNodeTM(t);
             node->Move(t, tmAxis, offset, TRUE, TRUE, PIV_NONE, TRUE);
+            check("move", before, offset != Point3(0, 0, 0));
             didSomething = true;
         }
 
@@ -646,7 +687,9 @@ std::string NativeHandlers::TransformObject(const std::string& params, MCPBridge
             Quat combined = qx * qy * qz;
             AngAxis finalAA(combined);
 
+            const Matrix3 before = node->GetNodeTM(t);
             node->Rotate(t, tmAxis, finalAA, TRUE, TRUE, PIV_NONE, TRUE);
+            check("rotate", before, rx != 0.0f || ry != 0.0f || rz != 0.0f);
             didSomething = true;
         }
 
@@ -663,7 +706,9 @@ std::string NativeHandlers::TransformObject(const std::string& params, MCPBridge
                 throw std::runtime_error("scale must be [s] or [x,y,z]");
             }
             Matrix3 tmAxis;
+            const Matrix3 before = node->GetNodeTM(t);
             node->Scale(t, tmAxis, scaleVal, TRUE, TRUE, PIV_NONE, TRUE);
+            check("scale", before, scaleVal != Point3(1, 1, 1));
             didSomething = true;
         }
 
@@ -671,14 +716,29 @@ std::string NativeHandlers::TransformObject(const std::string& params, MCPBridge
             json result = NodeIdentityJson(node);
             result["status"] = "noop";
             result["message"] = "No transform parameters provided.";
+            result["warnings"] = json::array({
+                "No move, rotate or scale was given, so the object was not transformed."});
             return result.dump();
         }
 
+        if (requested > 0 && static_cast<int>(ignored.size()) == requested) {
+            throw std::runtime_error(StructuredErrorPayload(
+                "TRANSFORM_IGNORED",
+                WideToUtf8(node->GetName()) + " did not move: its transform controllers ignored the edit "
+                "(constraint, script or expression).",
+                {{"ignored", ignored}, {"message", kTransformIgnoredAdvice}}));
+        }
         ip->RedrawViews(t);
 
         json result = SpatialSnapshot::BuildSpatialSnapshot(node, t);
         result["message"] = "Transformed " + WideToUtf8(node->GetName());
         result["coordinateSystem"] = coordSys;
+        if (!ignored.empty()) {
+            result["status"] = "partial";
+            result["ignored"] = ignored;
+            result["warnings"] = json::array({"Part of the transform was ignored by the object's transform "
+                                              "controllers (constraint, script or expression); see ignored."});
+        }
         return result.dump();
     });
 }
@@ -694,6 +754,14 @@ std::string NativeHandlers::SelectObjects(const std::string& params, MCPBridgeGU
         std::string pattern = p.value("pattern", "");
         std::string className = p.value("class_name", "");
 
+        auto selectionResult = [&](int selected, const std::string& message) {
+            json result;
+            result["selected"] = selected;
+            result["selectionCount"] = ip->GetSelNodeCount();
+            result["message"] = message;
+            return result;
+        };
+
         if (selectAll) {
             // Select all objects
             INode* root = ip->GetRootNode();
@@ -704,22 +772,31 @@ std::string NativeHandlers::SelectObjects(const std::string& params, MCPBridgeGU
                 ip->SelectNode(n, FALSE);
             }
             ip->RedrawViews(ip->GetTime());
-            return "Selected " + std::to_string(nodes.size()) + " objects";
+            return selectionResult(static_cast<int>(nodes.size()),
+                "Selected " + std::to_string(nodes.size()) + " objects").dump();
         }
 
         if (!names.empty()) {
+            // Resolve every name first: a request that names only missing or
+            // shared names fails and leaves the current selection untouched.
+            const NamedNodes resolved = ResolveNodesByNames(names);
+            const std::vector<INode*>& found = resolved.nodes;
+            const json& notFound = resolved.notFound;
+            if (found.empty()) ThrowUnresolvedNames(resolved, "the selection was not changed.");
             ip->ClearNodeSelection(FALSE);
-            int found = 0;
-            for (const auto& name : names) {
-                INode* node = FindNodeByName(name);
-                if (node) {
-                    ip->SelectNode(node, FALSE);
-                    found++;
-                }
-            }
+            for (INode* node : found) ip->SelectNode(node, FALSE);
             ip->RedrawViews(ip->GetTime());
-            return "Selected " + std::to_string(found) + " of " +
-                   std::to_string(names.size()) + " objects";
+            json result = selectionResult(static_cast<int>(found.size()),
+                "Selected " + std::to_string(found.size()) + " of " +
+                std::to_string(names.size()) + " objects");
+            result["notFound"] = notFound;
+            if (!notFound.empty()) {
+                result["status"] = "partial";
+                result["warnings"].push_back(std::to_string(notFound.size()) +
+                    " requested name(s) matched no object and were not selected: " + JoinNames(notFound));
+            }
+            AddAmbiguousNamesWarning(result, resolved.ambiguous);
+            return result.dump();
         }
 
         if (!pattern.empty() || !className.empty()) {
@@ -746,10 +823,18 @@ std::string NativeHandlers::SelectObjects(const std::string& params, MCPBridgeGU
             std::string desc = !pattern.empty()
                 ? ("matching \"" + pattern + "\"")
                 : ("of class " + className);
-            return "Selected " + std::to_string(found) + " objects " + desc;
+            json result = selectionResult(found, "Selected " + std::to_string(found) + " objects " + desc);
+            if (found == 0) {
+                // The selection is still cleared so a later selection_only edit
+                // cannot act on objects the caller did not ask for.
+                result["status"] = "no_match";
+                result["warnings"] = json::array({"No object " + desc +
+                    "; the selection is now empty."});
+            }
+            return result.dump();
         }
 
-        return "At least one parameter (names, pattern, class_name, or all) must be provided.";
+        throw std::runtime_error("At least one parameter (names, pattern, class_name, or all) must be provided.");
     });
 }
 
@@ -764,14 +849,20 @@ std::string NativeHandlers::SetVisibility(const std::string& params, MCPBridgeGU
         if (names.empty() && pattern.empty()) {
             throw std::runtime_error("At least one of names or pattern must be provided.");
         }
+        if (action != "hide" && action != "show" && action != "toggle" &&
+            action != "freeze" && action != "unfreeze") {
+            throw std::runtime_error("Unknown action: " + action +
+                ". Use hide, show, toggle, freeze, or unfreeze.");
+        }
 
         // Collect target nodes
         std::vector<INode*> targets;
+        NamedNodes resolved;
+        const json& notFound = resolved.notFound;
         if (!names.empty()) {
-            for (const auto& name : names) {
-                INode* node = FindNodeByName(name);
-                if (node) targets.push_back(node);
-            }
+            resolved = ResolveNodesByNames(names);
+            if (resolved.nodes.empty()) ThrowUnresolvedNames(resolved, "visibility was not changed.");
+            targets = resolved.nodes;
         } else {
             targets = CollectNodesByPattern(pattern);
         }
@@ -786,10 +877,8 @@ std::string NativeHandlers::SetVisibility(const std::string& params, MCPBridgeGU
                 node->Hide(!node->IsHidden());
             } else if (action == "freeze") {
                 node->Freeze(TRUE);
-            } else if (action == "unfreeze") {
-                node->Freeze(FALSE);
             } else {
-                throw std::runtime_error("Unknown action: " + action);
+                node->Freeze(FALSE);
             }
             count++;
         }
@@ -800,8 +889,31 @@ std::string NativeHandlers::SetVisibility(const std::string& params, MCPBridgeGU
         result["action"] = action;
         result["count"] = count;
         result["message"] = action + ": " + std::to_string(count) + " objects";
+        if (!names.empty()) result["notFound"] = notFound;
+        if (!notFound.empty()) {
+            result["status"] = "partial";
+            result["warnings"].push_back(std::to_string(notFound.size()) +
+                " requested name(s) matched no object and were skipped: " + JoinNames(notFound));
+        } else if (count == 0) {
+            result["status"] = "no_match";
+            result["warnings"] = json::array({"No object matches pattern \"" + pattern +
+                "\", so nothing was changed."});
+        }
+        AddAmbiguousNamesWarning(result, resolved.ambiguous);
         return result.dump();
     });
+}
+
+// Outermost closed group around a member. CloneNodes clones that whole group
+// in place of the member, stacked on the original.
+static INode* ClosedGroupAround(INode* node) {
+    INode* closed = nullptr;
+    if (!node->IsGroupMember()) return nullptr;
+    for (INode* p = node->GetParentNode(); p && !p->IsRootNode(); p = p->GetParentNode()) {
+        if (p->IsGroupHead() && !p->IsOpenGroupHead()) closed = p;
+        if (!p->IsGroupMember()) break;
+    }
+    return closed;
 }
 
 // ── native:clone_objects (Pure SDK) ─────────────────────────────
@@ -831,11 +943,15 @@ std::string NativeHandlers::CloneObjects(const std::string& params, MCPBridgeGUP
         std::set<INode*> seenSources;
         json notFound = json::array();
         for (const auto& name : names) {
-            const auto matches = CollectNodesByExactName(name);
+            const auto matches = CollectNodesByName(name);
             if (matches.size() > 1)
                 throw std::runtime_error("Clone source is ambiguous: " + name);
             INode* node = matches.empty() ? nullptr : matches.front();
             if (node) {
+                if (INode* group = ClosedGroupAround(node))
+                    throw std::runtime_error("Clone source '" + name + "' is in closed group '" +
+                        WideToUtf8(group->GetName()) + "'; Max would clone the whole group. Clone the group, "
+                        "or open it with manage_groups to clone the member alone.");
                 if (seenSources.insert(node).second) srcNodes.AppendNode(node);
             } else {
                 notFound.push_back(name);

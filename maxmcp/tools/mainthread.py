@@ -51,7 +51,8 @@ def max_dialogs(action: str = "inspect", dialog_id: str = "", expected_dialog: s
     inspect: every blocking dialog with title, text, buttons (label, kind,
     enabled, default, role, checked), fields, which MCP calls it interrupted
     (during_requests) and expected_dialog; blocked_calls with the status or
-    final result of interrupted calls; recent_actions.
+    final result of calls that returned BLOCKED_BY_DIALOG or MAX_BUSY;
+    recent_actions.
     respond: press one button. Pass dialog_id and expected_dialog from a fresh
     inspect and button as its label or index; a changed dialog is refused.
     Then waits up to wait_seconds for interrupted calls to finish and returns

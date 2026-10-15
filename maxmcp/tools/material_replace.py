@@ -1,8 +1,7 @@
-"""Batch material replacement tool for 3ds Max.
+"""Material replacement tools for 3ds Max.
 
-Replaces materials on objects by reassigning an existing source material
-wherever a target material is used: as an object's material and, optionally,
-inside Multi/Sub-Object (or any other) sub-material slots.  Useful for
+Reassigns an existing source material wherever a target material is used: on
+objects and in the sub-material slots of their material trees.  Useful for
 unifying split material assignments (e.g. after partial glTF conversion or a
 Revit import) or swapping materials across many objects at once.
 """
@@ -12,128 +11,12 @@ from ..server import mcp, client
 from ..coerce import DictList
 from ..helpers.maxscript import safe_string
 
-_SOURCE_PLACES = "an object, a sub-material, a Material Editor slot or a material library"
-# Search order for the source; source_from restricts the search to one of these.
+# Where the source can come from, in search order. source_from limits the
+# search to one of them. "object" (the found_in name) is accepted for "node"
+# and sent as "node", the value the native handler takes.
 _SOURCE_FROM = ("node", "sub_material", "material_editor", "scene_materials", "material_library")
-
-# Why a matching sub-material slot was left unchanged (skipped[].reason).
-_SKIP_REASONS = {
-    "parent_is_source": "the slot's parent is the source itself (a reference loop)",
-    "source_contains_parent": "the source contains the slot's parent (a reference loop)",
-    "reference_loop": "the source already references the slot's parent (a reference loop)",
-    "set_failed": "the parent material did not accept the assignment",
-}
-
-
-def _source_from_error(value) -> str | None:
-    if value in ("", None) or value in _SOURCE_FROM:
-        return None
-    return f"source_from must be one of {', '.join(_SOURCE_FROM)} (got {value!r})"
-
-
-def _source_from_ignored(source_from: str) -> str:
-    # An older native bridge does not know source_from and searches every place.
-    return (f"source_from='{source_from}' was not echoed back, so the bridge may have ignored it and used "
-            "the default search order; check source_found_in and update the native bridge.")
-
-
-def _no_match_warning(targets: list[str], include_sub_materials: bool = True) -> str:
-    names = ", ".join(f"'{t}'" for t in targets)
-    scope = "top-level or sub-material" if include_sub_materials else "top-level"
-    message = (
-        f"No object has a {scope} material named {names}. source = material to apply (on {_SOURCE_PLACES}), "
-        "target = material to replace; if reversed, swap them. To put a material on specific objects use "
-        "assign_material."
-    )
-    if not include_sub_materials:
-        message += " Sub-material slots were not searched (include_sub_materials=False)."
-    return message
-
-
-def _add_warning(result: dict, message: str) -> None:
-    warnings = result.get("warnings")
-    warnings = list(warnings) if isinstance(warnings, list) else ([warnings] if warnings else [])
-    warnings.append(message)
-    result["warnings"] = warnings
-
-
-def _match_counts(result: dict) -> tuple:
-    """(objects, sub-material slots) matched by a replace result; preview keys win."""
-    prefix = "affected" if "affected_count" in result else "replaced"
-    return result.get(f"{prefix}_count"), result.get(f"{prefix}_slot_count") or 0
-
-
-def _skipped(result: dict) -> list:
-    skipped = result.get("skipped")
-    return skipped if isinstance(skipped, list) else []
-
-
-def _blocked_warning(target: str) -> str:
-    return (f"Target '{target}' was found, but every match was left unchanged (see skipped[].reason), so "
-            "nothing was replaced. source and target are not reversed; do not swap them.")
-
-
-def _set_no_match(result: dict) -> bool:
-    """Mark a result with no replaced objects or slots; True if it became "no_match".
-
-    When matches were found but all of them were skipped (loop guard, set_failed),
-    the status is "blocked" instead: the target exists, so the swap hint must not
-    be given.
-    """
-    if "error" in result or str(result.get("status", "")).lower() in {
-            "error", "failed", "skipped", "no_match", "blocked"}:
-        return False
-    objects, slots = _match_counts(result)
-    if objects != 0 or slots:
-        return False
-    if _skipped(result):
-        result["status"] = "blocked"
-        return False
-    result["status"] = "no_match"
-    return True
-
-
-def _detail_warnings(result: dict, source: str) -> list[str]:
-    """Warnings for an ambiguous source name, a source equal to the target, and skipped slots."""
-    messages = []
-    target = result.get("target_material")
-    if result.get("source_ambiguous"):
-        if result.get("source_from"):
-            where = f"source_from={result.get('source_from')}"
-        else:
-            where = f"{result.get('source_found_in')} (order: {', '.join(_SOURCE_FROM)})"
-        messages.append(
-            f"{result.get('source_candidates')} different materials are named '{source}'; used the one found "
-            f"in {where}. Pass source_from to pick another place."
-        )
-    elif target is not None and target == source and not result.get("source_from"):
-        messages.append(
-            f"source and target are both named '{source}'; the source is the first one found "
-            f"({', '.join(_SOURCE_FROM)}) and objects already using it are left alone. To apply a re-imported "
-            "copy, pass source_from (e.g. source_from=\"material_editor\")."
-        )
-    skipped = _skipped(result)
-    if skipped:
-        by_reason: dict[str, int] = {}
-        for entry in skipped:
-            reason = str(entry.get("reason", "unknown")) if isinstance(entry, dict) else "unknown"
-            by_reason[reason] = by_reason.get(reason, 0) + 1
-        parts = [f"{count} {reason}: {_SKIP_REASONS.get(reason, 'see skipped[]')}"
-                 for reason, count in by_reason.items()]
-        messages.append(f"{len(skipped)} sub-material slot(s) skipped, left unchanged ({'; '.join(parts)}).")
-    if str(result.get("status", "")).lower() == "blocked" and target is not None:
-        messages.append(_blocked_warning(str(target)))
-    return messages
-
-
-def _postprocess(raw: str, transform) -> str:
-    try:
-        result = _json.loads(raw)
-    except (TypeError, ValueError):
-        return raw
-    if not isinstance(result, dict):
-        return raw
-    return _json.dumps(transform(result))
+_SOURCE_FROM_ALIASES = {"object": "node"}
+_SOURCE_PLACES = "an object, a sub-material, a Material Editor slot, the scene materials or the material library"
 
 
 @mcp.tool()
@@ -144,35 +27,32 @@ def replace_material(
     include_sub_materials: bool = True,
     source_from: str = "",
 ) -> str:
-    """Put source_material wherever target_material is used: on objects, and with
-    include_sub_materials also in Multi/Sub (or other) sub-material slots.
+    """Put source_material wherever target_material is used, on objects and in sub-material slots.
 
-    source = material to apply; target = material to remove/replace. The source is the
-    first material with that exact name found in this order: node, sub_material,
-    material_editor, scene_materials, material_library (source_found_in says which).
-    source_from = one of those places limits the search to it, e.g. "material_editor"
-    to apply a re-imported copy that shares its name with the material on objects.
-    preview lists affected_objects/affected_slots (slot_index is 1-based).
-    Zero matches -> status "no_match" + warning; matches that were all skipped
-    (skipped[].reason) -> status "blocked".
+    source = material to APPLY; target = material to REPLACE. Names match
+    exactly. Objects whose own material is the target are reassigned; with
+    include_sub_materials (default) a target in any sub-material slot of an
+    object's material tree (Multi/Sub, Blend, Shell...) is replaced in that
+    slot. The source is the first material with that name found in this order:
+    node (object materials), sub_material, material_editor, scene_materials,
+    material_library; source_from = one of those limits the search to it, e.g.
+    "material_editor" for a re-imported copy that shares its name with the
+    material on objects. A slot where the source would create a reference loop
+    is skipped with a reason.
+
+    Reports replaced_objects, replaced_slots (parent material, 1-based
+    slot_index, slot_name) and skipped. status: "replaced" when something
+    changed, "no_match" when no material has the target name (check the
+    direction), "no_objects" when it exists only in the Material Editor,
+    "blocked" when every match was skipped (not reversed: do not swap),
+    "unchanged" when every match already uses the source. preview=True returns
+    the same report with status "preview" and changes nothing; a preview whose
+    source is missing still lists the matches, with source_exists false.
     Example: source_material="Brick_A", target_material="Brick_B" -> every Brick_B use becomes Brick_A.
     """
-    error = _source_from_error(source_from)
+    source_from, error = _normalize_source_from(source_from)
     if error:
         return _json.dumps({"error": error, "status": "failed"})
-
-    def transform(result: dict) -> dict:
-        if source_from and "error" not in result and result.get("source_from") != source_from:
-            _add_warning(result, _source_from_ignored(source_from))
-        if preview and result.get("source_exists") is False:
-            _add_warning(result, f"Source material '{source_material}' was not found on "
-                                 f"{source_from or _SOURCE_PLACES}; a real run would fail.")
-        marked = _set_no_match(result)
-        for message in _detail_warnings(result, source_material):
-            _add_warning(result, message)
-        if marked:
-            _add_warning(result, _no_match_warning([target_material], include_sub_materials))
-        return result
 
     if client.native_available:
         request = {"source_material": source_material, "target_material": target_material,
@@ -181,215 +61,30 @@ def replace_material(
             request["source_from"] = source_from
         response = client.send_command(_json.dumps(request), cmd_type="native:replace_material")
         raw = response.get("result", "{}")
-    else:
-        raw = _replace_one_maxscript(source_material, target_material, preview, include_sub_materials, source_from)
-    return _postprocess(raw, transform)
+        try:
+            entry = _json.loads(raw)
+        except (TypeError, ValueError):
+            return raw
+        if not isinstance(entry, dict):
+            return raw
+        if "error" not in entry:
+            if source_from and entry.get("source_from") != source_from:
+                _add_warning(entry, _source_from_ignored(source_from))
+            if not include_sub_materials and entry.get("include_sub_materials") is not False:
+                _add_warning(entry, _subs_ignored())
+        _finish_entry(entry, source_material, target_material, source_from, preview)
+        if entry.get("status") == "no_match":
+            _add_warning(entry, _direction_warning([target_material]))
+        return _json.dumps(entry)
 
-
-# MAXScript fallback (no native bridge). Mirrors the native handler: source
-# lookup order, sub-material slot matching with a loop guard, same JSON keys.
-_REPLACE_MAXSCRIPT_BODY = r"""
-    fn mcpEsc v = (
-        local s = v as string
-        s = substituteString s "\\" "\\\\"
-        s = substituteString s "\"" "\\\""
-        s = substituteString s "\n" "\\n"
-        s = substituteString s "\r" "\\r"
-        s = substituteString s "\t" "\\t"
-        s
-    )
-    fn mcpStr v = ("\"" + (mcpEsc v) + "\"")
-    fn mcpArr items = (
-        local s = "["
-        for i = 1 to items.count do (
-            if i > 1 do s += ","
-            s += items[i]
-        )
-        s + "]"
-    )
-    fn mcpIsMtl m = (m != undefined and (try (superClassOf m == material) catch false))
-    fn mcpNamed m wanted = ((mcpIsMtl m) and (try (m.name == wanted) catch false))
-    fn mcpSubs m = (try (getNumSubMtls m) catch 0)
-    fn mcpSub m i = (try (getSubMtl m i) catch undefined)
-    fn mcpAddCand m wanted wh cands wheres = (
-        if (mcpNamed m wanted) and (findItem cands m) == 0 do (
-            append cands m
-            append wheres wh
-        )
-    )
-    fn mcpWalkSrc m wanted cands wheres seen = (
-        if (mcpIsMtl m) and (findItem seen m) == 0 do (
-            append seen m
-            for i = 1 to (mcpSubs m) do (
-                local sm = mcpSub m i
-                if sm != undefined do (
-                    mcpAddCand sm wanted "sub_material" cands wheres
-                    mcpWalkSrc sm wanted cands wheres seen
-                )
-            )
-        )
-    )
-    fn mcpWalkTgt m wanted src seen parents idxs = (
-        if (mcpIsMtl m) and (findItem seen m) == 0 do (
-            append seen m
-            for i = 1 to (mcpSubs m) do (
-                local sm = mcpSub m i
-                if sm != undefined do (
-                    if (mcpNamed sm wanted) then (
-                        if sm != src do (
-                            append parents m
-                            append idxs i
-                        )
-                    ) else mcpWalkTgt sm wanted src seen parents idxs
-                )
-            )
-        )
-    )
-    fn mcpContains root x seen = (
-        if root == x then true
-        else if root == undefined or (findItem seen root) != 0 then false
-        else (
-            append seen root
-            local found = false
-            for i = 1 to (mcpSubs root) while not found do (
-                if (mcpContains (mcpSub root i) x seen) do found = true
-            )
-            found
-        )
-    )
-    fn mcpLoopReason src parent = (
-        local seen = #()
-        if src == undefined then undefined
-        else if parent == src then "parent_is_source"
-        else if (mcpContains src parent seen) then "source_contains_parent"
-        else undefined
-    )
-    fn mcpSlotJson pName pClass i label reason = (
-        local s = "{\"parent_material\":" + (mcpStr pName)
-        s += ",\"parent_class\":" + (mcpStr pClass)
-        s += ",\"slot_index\":" + (i as string)
-        s += ",\"slot_name\":" + (mcpStr label)
-        if reason != undefined do s += ",\"reason\":" + (mcpStr reason)
-        s + "}"
-    )
-
-    -- Source: node materials, their sub-materials, medit slots, scene materials, current library.
-    -- srcFrom (non-empty) limits the search to one of those places.
-    local roots = #()
-    for o in objects do (
-        local m = try (o.material) catch undefined
-        if (mcpIsMtl m) do appendIfUnique roots m
-    )
-    local cands = #()
-    local wheres = #()
-    if srcFrom == "" or srcFrom == "node" do (
-        for m in roots do mcpAddCand m srcName "node" cands wheres
-    )
-    if srcFrom == "" or srcFrom == "sub_material" do (
-        local seenSrc = #()
-        for m in roots do mcpWalkSrc m srcName cands wheres seenSrc
-    )
-    if srcFrom == "" or srcFrom == "material_editor" do (
-        try (for i = 1 to meditMaterials.count do mcpAddCand meditMaterials[i] srcName "material_editor" cands wheres) catch ()
-    )
-    if srcFrom == "" or srcFrom == "scene_materials" do (
-        try (for m in sceneMaterials do mcpAddCand m srcName "scene_materials" cands wheres) catch ()
-    )
-    if srcFrom == "" or srcFrom == "material_library" do (
-        try (for m in currentMaterialLibrary do mcpAddCand m srcName "material_library" cands wheres) catch ()
-    )
-    local srcMat = if cands.count > 0 then cands[1] else undefined
-
-    -- Target: objects whose material is named tgtName, then sub-material slots.
-    local hitNodes = #()
-    for o in objects do (
-        local m = try (o.material) catch undefined
-        if (mcpNamed m tgtName) and m != srcMat do append hitNodes o
-    )
-    local slotParents = #()
-    local slotIdx = #()
-    if includeSubs do (
-        local seenTgt = #()
-        for m in roots where not (mcpNamed m tgtName) do mcpWalkTgt m tgtName srcMat seenTgt slotParents slotIdx
-    )
-
-    if (not isPreview) and srcMat == undefined then (
-        local msg = "Source material '" + srcName + "' not found "
-        if srcFrom == "" then (
-            msg += "(searched node materials, their sub-materials, "
-            msg += "Material Editor slots, scene materials and the current material library)"
-        ) else msg += "(searched only source_from=" + srcFrom + ")"
-        "{\"error\":" + (mcpStr msg) + ",\"status\":\"failed\"}"
-    ) else (
-        local slotJson = #()
-        local skipJson = #()
-        local nodeNames = #()
-        local slotInfo = for k = 1 to slotParents.count collect (
-            local p = slotParents[k]
-            #((try (p.name) catch ""), ((classOf p) as string), (try (getSubMtlSlotName p slotIdx[k]) catch ""))
-        )
-        if isPreview then (
-            for k = 1 to slotParents.count do (
-                local reason = mcpLoopReason srcMat slotParents[k]
-                local js = mcpSlotJson slotInfo[k][1] slotInfo[k][2] slotIdx[k] slotInfo[k][3] reason
-                if reason == undefined then append slotJson js else append skipJson js
-            )
-            for o in hitNodes do append nodeNames (mcpStr o.name)
-        ) else (
-            undo "MCP replace_material" on (
-                for k = 1 to slotParents.count do (
-                    local p = slotParents[k]
-                    local i = slotIdx[k]
-                    local reason = mcpLoopReason srcMat p
-                    if reason == undefined do (
-                        local ok = try (setSubMtl p i srcMat; (getSubMtl p i) == srcMat) catch false
-                        if not ok do reason = "set_failed"
-                    )
-                    local js = mcpSlotJson slotInfo[k][1] slotInfo[k][2] i slotInfo[k][3] reason
-                    if reason == undefined then append slotJson js else append skipJson js
-                )
-                for o in hitNodes do (
-                    o.material = srcMat
-                    append nodeNames (mcpStr o.name)
-                )
-            )
-        )
-        local verb = if isPreview then "affected" else "replaced"
-        local s = "{\"source_material\":" + (mcpStr srcName) + ",\"target_material\":" + (mcpStr tgtName)
-        if srcFrom != "" do s += ",\"source_from\":" + (mcpStr srcFrom)
-        s += ",\"source_exists\":" + (if srcMat != undefined then "true" else "false")
-        if srcMat != undefined do s += ",\"source_found_in\":" + (mcpStr wheres[1])
-        if cands.count > 1 do s += ",\"source_ambiguous\":true,\"source_candidates\":" + (cands.count as string)
-        s += ",\"include_sub_materials\":" + (if includeSubs then "true" else "false")
-        s += ",\"" + verb + "_count\":" + (hitNodes.count as string)
-        s += ",\"" + verb + "_objects\":" + (mcpArr nodeNames)
-        s += ",\"" + verb + "_slot_count\":" + (slotJson.count as string)
-        s += ",\"" + verb + "_slots\":" + (mcpArr slotJson)
-        s += ",\"skipped\":" + (mcpArr skipJson)
-        s += (if isPreview then ",\"preview\":true}" else ",\"status\":\"success\"}")
-        s
-    )
-"""
-
-
-def _replace_maxscript(source_material: str, target_material: str, preview: bool,
-                       include_sub_materials: bool, source_from: str = "") -> str:
-    header = (
-        f'    local srcName = "{safe_string(source_material)}"\n'
-        f'    local tgtName = "{safe_string(target_material)}"\n'
-        f'    local isPreview = {"true" if preview else "false"}\n'
-        f'    local includeSubs = {"true" if include_sub_materials else "false"}\n'
-        f'    local srcFrom = "{safe_string(source_from or "")}"\n'
-    )
-    return "(\n" + header + _REPLACE_MAXSCRIPT_BODY + ")"
-
-
-def _replace_one_maxscript(source_material: str, target_material: str, preview: bool,
-                           include_sub_materials: bool = True, source_from: str = "") -> str:
-    """Run one replacement through the MAXScript fallback and return the raw result string."""
-    script = _replace_maxscript(source_material, target_material, preview, include_sub_materials, source_from)
-    response = client.send_command(script)
-    return response.get("result", "{}")
+    entry = _run_fallback([(source_material, target_material, source_from)], preview,
+                          include_sub_materials, batch=False)[0]
+    if entry.get("status") == "error":
+        entry["status"] = "failed"
+    _finish_entry(entry, source_material, target_material, source_from, preview)
+    if entry.get("status") == "no_match":
+        _add_warning(entry, _direction_warning([target_material]))
+    return _json.dumps(entry)
 
 
 @mcp.tool()
@@ -400,82 +95,194 @@ def batch_replace_materials(
     include_sub_materials: bool = True,
     source_from: str = "",
 ) -> str:
-    """Run several replace_material swaps in order: replacements=[{"source": apply, "target": remove}, ...].
+    """Run several replace_material entries ({source, target}) as one undoable operation.
 
-    Same rules as replace_material (source lookup, sub-material slots, source_from as a
-    default or per entry). Entries apply in order and each sees the scene left by the
-    previous ones, so A->B then B->A does not swap (go through a temporary material).
-    Preview plans every entry against the current scene: an entry that reuses a name an
-    earlier entry applies or removes gets depends_on_entries plus a warning, because a
-    real run can differ from its preview. Zero-match entries get status "no_match" plus
-    one combined warning; entries whose matches were all skipped get "blocked".
+    source = material to apply, target = material to replace, as in
+    replace_material. Entries apply in order, and each one is evaluated against
+    the scene as the previous entries left it, so chains such as A->B then B->C
+    are deterministic and A->B then B->A does not swap (go through a temporary
+    material). Each result carries replace_material's fields and status;
+    preview/dry_run plans the same chain without changing the scene.
+    source_from applies to every entry unless an entry has its own source_from.
     """
     preview = preview or dry_run
     entries = list(replacements)
+    source_from, error = _normalize_source_from(source_from)
+    if error:
+        return _json.dumps({"error": f"source_from: {error}; nothing was changed", "status": "failed"})
     effective_from = []
     for index, entry in enumerate(entries, start=1):
-        has_own = isinstance(entry, dict) and entry.get("source_from") is not None
-        value = entry["source_from"] if has_own else source_from
-        error = _source_from_error(value)
-        if error:
-            label = f"replacements[{index}].source_from" if has_own else "source_from"
-            return _json.dumps({"error": f"{label}: {error}; nothing was changed", "status": "failed"})
-        effective_from.append(value or "")
-
-    def finish(result: dict) -> dict:
-        _mark_batch_dependencies(result, entries, preview)
-        _check_batch_source_from(result, effective_from)
-        return _mark_batch_no_match(result, include_sub_materials)
+        if isinstance(entry, dict) and entry.get("source_from") is not None:
+            own, error = _normalize_source_from(entry["source_from"])
+            if error:
+                return _json.dumps({"error": f"replacements[{index}].source_from: {error}; nothing was changed",
+                                    "status": "failed"})
+            effective_from.append(own)
+        else:
+            effective_from.append(source_from)
 
     if client.native_available:
-        request = {"replacements": entries, "preview": preview, "dry_run": dry_run,
+        sent = []
+        for entry, entry_from in zip(entries, effective_from):
+            if isinstance(entry, dict) and entry.get("source_from") is not None:
+                entry = dict(entry, source_from=entry_from)
+            sent.append(entry)
+        request = {"replacements": sent, "preview": preview, "dry_run": dry_run,
                    "include_sub_materials": include_sub_materials}
         if source_from:
             request["source_from"] = source_from
         response = client.send_command(_json.dumps(request), cmd_type="native:batch_replace_materials")
-        return _postprocess(response.get("result", "{}"), finish)
+        raw = response.get("result", "{}")
+        try:
+            result = _json.loads(raw)
+        except (TypeError, ValueError):
+            return raw
+        if not isinstance(result, dict) or not isinstance(result.get("results"), list):
+            return raw
+        ignored = ""
+        for entry, entry_from in zip(result["results"], effective_from):
+            if isinstance(entry, dict):
+                src, tgt = _entry_names(entry)
+                if entry_from and "error" not in entry and entry.get("source_from") != entry_from:
+                    ignored = ignored or entry_from
+                _finish_entry(entry, src, tgt, entry_from, preview)
+        if ignored:
+            _add_warning(result, _source_from_ignored(ignored))
+        if not include_sub_materials and result.get("include_sub_materials") is not False:
+            _add_warning(result, _subs_ignored())
+        _add_direction_warning(result)
+        return _json.dumps(result)
 
-    results = []
+    results: list[dict | None] = []
+    pairs: list[tuple[str, str, str]] = []
     for entry, entry_from in zip(entries, effective_from):
         src, tgt = _entry_names(entry)
         if not src or not tgt:
-            results.append({"source": src, "target": tgt, "status": "skipped", "error": "missing source or target"})
+            results.append({
+                "source_material": src,
+                "target_material": tgt,
+                "status": "error",
+                "error": "missing source or target",
+            })
             continue
-        raw = _replace_one_maxscript(src, tgt, preview, include_sub_materials, entry_from)
-        try:
-            r = _json.loads(raw)
-        except _json.JSONDecodeError:
-            results.append({"source": src, "target": tgt, "status": "error", "raw": raw})
-            continue
-        if isinstance(r, dict) and r.get("source_exists") is False:
-            # Match native batch: a missing source is an error entry, not counted.
-            r = {"source_material": src, "target_material": tgt, "source_exists": False, "status": "error",
-                 "error": "source material not found"}
-            if entry_from:
-                r["source_from"] = entry_from
-        results.append(r)
+        results.append(None)
+        pairs.append((src, tgt, entry_from))
 
-    counts = [_match_counts(r) for r in results if isinstance(r, dict)]
-    return _json.dumps(finish({
+    ran = iter(_run_fallback(pairs, preview, include_sub_materials, batch=True) if pairs else [])
+    results = [entry if entry is not None else next(ran) for entry in results]
+    for entry, entry_from in zip(results, effective_from):
+        _finish_entry(entry, entry["source_material"], entry["target_material"], entry_from, preview)
+
+    total_replaced = sum(r.get("replaced_count", 0) for r in results)
+    out = {
         "results": results,
-        "total_replaced": sum(objects or 0 for objects, _ in counts),
-        "total_replaced_slots": sum(slots or 0 for _, slots in counts),
+        "total_replaced": total_replaced,
+        "total_skipped": sum(r.get("skipped_count", 0) for r in results),
+        "error_count": sum(1 for r in results if r.get("status") == "error"),
+        "status": ("preview" if preview else "replaced") if total_replaced else "no_changes",
         "include_sub_materials": include_sub_materials,
         "preview": preview,
-    }))
+        "dry_run": dry_run,
+    }
+    if preview and len(pairs) > 1:
+        # The fallback cannot plan a chain: every entry is previewed against the
+        # current scene. Name the entries whose real run can differ.
+        if not _mark_batch_dependencies(out, entries):
+            _add_warning(out, "The MAXScript fallback previews each entry against the current scene; "
+                              "later entries do not see changes planned by earlier ones.")
+    _add_direction_warning(out)
+    return _json.dumps(out)
 
 
-def _entry_names(entry) -> tuple:
+# ── Shared post-processing (native and fallback) ────────────────────────────
+
+def _normalize_source_from(value) -> tuple[str, str | None]:
+    """(value to send, error). Empty means "search every place in order"."""
+    if value in ("", None):
+        return "", None
+    if isinstance(value, str):
+        value = _SOURCE_FROM_ALIASES.get(value, value)
+        if value in _SOURCE_FROM:
+            return value, None
+    return "", f"source_from must be one of {', '.join(_SOURCE_FROM)} (got {value!r})"
+
+
+def _add_warning(result: dict, message: str) -> None:
+    warnings = result.get("warnings")
+    warnings = list(warnings) if isinstance(warnings, list) else ([warnings] if warnings else [])
+    warnings.append(message)
+    result["warnings"] = warnings
+
+
+def _entry_names(entry) -> tuple[str, str]:
+    """(source, target) of a request entry ({source, target}) or a result entry (*_material)."""
     if not isinstance(entry, dict):
         return "", ""
-    return (entry.get("source", entry.get("source_material", "")),
-            entry.get("target", entry.get("target_material", "")))
+    names = []
+    for short, long in (("source", "source_material"), ("target", "target_material")):
+        value = entry.get(short)
+        names.append(value if isinstance(value, str) and value else (entry.get(long) or ""))
+    return names[0], names[1]
 
 
-def _is_error_entry(entry) -> bool:
-    return (not isinstance(entry, dict) or "error" in entry
-            or str(entry.get("status", "")).lower() in {"error", "failed", "skipped"})
+def _direction_warning(targets: list[str]) -> str:
+    names = ", ".join(f"'{t}'" for t in targets)
+    return (f"No material named {names} was found to replace. source = material to apply (on {_SOURCE_PLACES}), "
+            "target = material to replace; if reversed, swap them. To put a material on specific objects use "
+            "assign_material.")
 
+
+def _add_direction_warning(result: dict) -> None:
+    """One batch-level hint naming every no_match target."""
+    missed = [str(r.get("target_material", "")) for r in result.get("results") or []
+              if isinstance(r, dict) and r.get("status") == "no_match"]
+    if missed:
+        _add_warning(result, _direction_warning(missed))
+
+
+def _skip_summary(skipped: list) -> str:
+    by_reason: dict[str, int] = {}
+    for skip in skipped:
+        reason = str(skip.get("reason", "unknown")) if isinstance(skip, dict) else "unknown"
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    return ", ".join(f"{count} {reason}" for reason, count in by_reason.items())
+
+
+def _source_from_ignored(source_from: str) -> str:
+    # A bridge without source_from (stock upstream) searches every place.
+    return (f"source_from='{source_from}' was not echoed back, so the bridge may have ignored it and used the "
+            "default search order; check source.found_in and update the native bridge.")
+
+
+def _subs_ignored() -> str:
+    return ("include_sub_materials=False was not echoed back, so the bridge may have replaced sub-material slots "
+            "too; check replaced_slots and update the native bridge.")
+
+
+def _finish_entry(entry: dict, source: str, target: str, source_from: str, preview: bool) -> dict:
+    """Fork additions to a native or fallback entry: source hints and the blocked hint."""
+    if "error" in entry:
+        return entry
+    if entry.get("source_exists") is False:
+        if preview:
+            _add_warning(entry, f"Source material '{source}' was not found on {source_from or _SOURCE_PLACES}; "
+                                "a real run would fail.")
+        return entry
+    info = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+    if int(info.get("candidates") or 1) > 1 and not source_from:
+        _add_warning(entry, f"Pass source_from ({', '.join(_SOURCE_FROM)}) to pick another '{source}'.")
+    elif source == target and not source_from:
+        _add_warning(entry, f"source and target are both named '{source}'; the source is the first one found "
+                            f"({', '.join(_SOURCE_FROM)}), so objects already using it are left alone. To apply "
+                            "a re-imported copy, pass source_from (e.g. source_from=\"material_editor\").")
+    if entry.get("status") == "blocked":
+        skipped = entry.get("skipped") if isinstance(entry.get("skipped"), list) else []
+        _add_warning(entry, f"Target '{target}' was found, but every match was skipped ({_skip_summary(skipped)}). "
+                            "source and target are not reversed; do not swap them.")
+    return entry
+
+
+# ── Batch ordering (MAXScript fallback preview) ─────────────────────────────
 
 def _batch_dependencies(entries: list, results: list) -> list[list[int]]:
     """For each entry, the 1-based earlier entries whose result changes what it sees.
@@ -488,7 +295,8 @@ def _batch_dependencies(entries: list, results: list) -> list[list[int]]:
     found and an earlier entry removed a material of that name.
     """
     names = [_entry_names(entry) for entry in entries]
-    active = [index < len(results) and not _is_error_entry(results[index]) for index in range(len(names))]
+    active = [index < len(results) and isinstance(results[index], dict)
+              and results[index].get("status") != "error" for index in range(len(names))]
     deps = []
     for j, (src_j, tgt_j) in enumerate(names):
         found = []
@@ -506,59 +314,402 @@ def _batch_dependencies(entries: list, results: list) -> list[list[int]]:
     return deps
 
 
-def _mark_batch_dependencies(result: dict, entries: list, preview: bool) -> None:
+def _mark_batch_dependencies(result: dict, entries: list) -> bool:
+    """Flag preview entries whose real run can differ; True when any was flagged."""
     results = result.get("results")
     if not isinstance(results, list):
-        return
+        return False
     dependent = []
     for index, (deps, entry) in enumerate(zip(_batch_dependencies(entries, results), results), start=1):
         if deps:
             entry["depends_on_entries"] = deps
             dependent.append(index)
     if not dependent:
-        return
+        return False
     listed = ", ".join(str(i) for i in dependent)
+    _add_warning(result, f"Entries {listed} reuse a material name that an earlier entry applies or removes "
+                         "(see depends_on_entries). The MAXScript fallback previews every entry against the "
+                         "current scene, so a real run can differ for them: entries apply in order, so A->B then "
+                         "B->A does not swap and a source an earlier entry removed may not be found.")
+    return True
+
+
+# ── MAXScript fallback ──────────────────────────────────────────────────────
+# Used without the native bridge. The script reports raw matches and outcomes;
+# status and warnings are derived here with the same rules as the native
+# handler. Entries run in order inside one undo record when applied. A
+# for-collect only goes straight into a local (read inside call arguments it
+# failed live with "Bad free thunk local member index").
+
+_FALLBACK_SCRIPT = r"""(
+    fn mcpJs value = (
+        local q = bit.intAsChar 34
+        q + (MCP_Server.escapeJsonString (value as string)) + q
+    )
+    fn mcpField key value = ((mcpJs key) + ":" + value)
+    fn mcpJoin items = (
+        local out = "["
+        for i = 1 to items.count do (
+            if i > 1 do out += ","
+            out += items[i]
+        )
+        out + "]"
+    )
+    fn mcpObject fields = (
+        local out = "{"
+        for i = 1 to fields.count do (
+            if i > 1 do out += ","
+            out += fields[i]
+        )
+        out + "}"
+    )
+    fn mcpIsMtl m = (m != undefined and superClassOf m == material)
+    fn mcpSubCount m = (try (getNumSubMtls m) catch (0))
+    fn mcpSubAt m i = (try (getSubMtl m i) catch (undefined))
+    fn mcpSlotName m i = (
+        try (getSubMtlSlotName m i localizedName:false) catch (try (getSubMtlSlotName m i) catch (""))
+    )
+    -- true when owner referencing src would close a reference loop.
+    fn mcpLoop src owner = (try (refs.dependencyLoopTest src owner) catch (undefined))
+
+    fn mcpFindTree m wanted found places visited = (
+        if (mcpIsMtl m) and (findItem visited m) == 0 do (
+            append visited m
+            for i = 1 to (mcpSubCount m) do (
+                local sub = mcpSubAt m i
+                if (mcpIsMtl sub) do (
+                    if sub.name == wanted and (findItem found sub) == 0 do (
+                        append found sub
+                        append places "sub_material"
+                    )
+                    mcpFindTree sub wanted found places visited
+                )
+            )
+        )
+    )
+    -- Lookup order: object materials, their sub-material trees, then Material
+    -- Editor slots and their trees.
+    fn mcpFindNamed wanted found places = (
+        for obj in objects where (mcpIsMtl obj.material) and obj.material.name == wanted and (findItem found obj.material) == 0 do (
+            append found obj.material
+            append places "object"
+        )
+        local visited = #()
+        for obj in objects do mcpFindTree obj.material wanted found places visited
+        for i = 1 to meditMaterials.count do (
+            local m = meditMaterials[i]
+            if (mcpIsMtl m) and m.name == wanted and (findItem found m) == 0 do (
+                append found m
+                append places "material_editor"
+            )
+            mcpFindTree m wanted found places visited
+        )
+    )
+    -- The source: mcpFindNamed's places, then the scene materials and the
+    -- current material library. srcFrom (non-empty) keeps one place only.
+    fn mcpFindSource wanted srcFrom found places = (
+        local allFound = #()
+        local allPlaces = #()
+        mcpFindNamed wanted allFound allPlaces
+        try (
+            for m in sceneMaterials where (mcpIsMtl m) and m.name == wanted and (findItem allFound m) == 0 do (
+                append allFound m
+                append allPlaces "scene_materials"
+            )
+        ) catch ()
+        try (
+            for m in currentMaterialLibrary where (mcpIsMtl m) and m.name == wanted and (findItem allFound m) == 0 do (
+                append allFound m
+                append allPlaces "material_library"
+            )
+        ) catch ()
+        local wantedPlace = if srcFrom == "node" then "object" else srcFrom
+        for i = 1 to allFound.count where wantedPlace == "" or allPlaces[i] == wantedPlace do (
+            append found allFound[i]
+            append places allPlaces[i]
+        )
+    )
+    -- Slots holding a material named wanted in one object's material tree. A
+    -- matched material is not descended: its slot is the one replaced.
+    fn mcpCollectSlots m wanted parents indices hits visited = (
+        if (mcpIsMtl m) and (findItem visited m) == 0 do (
+            append visited m
+            for i = 1 to (mcpSubCount m) do (
+                local sub = mcpSubAt m i
+                if (mcpIsMtl sub) do (
+                    if sub.name == wanted then (
+                        local k = 0
+                        for j = 1 to parents.count while k == 0 do (
+                            if parents[j] == m and indices[j] == i do k = j
+                        )
+                        if k == 0 do (
+                            append parents m
+                            append indices i
+                            k = parents.count
+                        )
+                        append hits k
+                    ) else mcpCollectSlots sub wanted parents indices hits visited
+                )
+            )
+        )
+    )
+
+    -- A missing source fails an applied entry; a preview still lists the
+    -- matches (src undefined: no loop test, nothing applied).
+    fn mcpReplaceOne srcName tgtName applyChanges srcFrom includeSubs = (
+        local found = #()
+        local places = #()
+        mcpFindSource srcName srcFrom found places
+        if found.count == 0 and applyChanges then (
+            mcpObject #((mcpField "source_found" "false"))
+        ) else (
+            local src = if found.count > 0 then found[1] else undefined
+            local objMatches = #()
+            local parents = #()
+            local indices = #()
+            local hitObjs = #()
+            local objHits = #()
+            for obj in objects where (mcpIsMtl obj.material) do (
+                if obj.material.name == tgtName then append objMatches obj
+                else if includeSubs do (
+                    local hits = #()
+                    mcpCollectSlots obj.material tgtName parents indices hits #()
+                    if hits.count > 0 do (
+                        append hitObjs obj
+                        append objHits hits
+                    )
+                )
+            )
+
+            local replacedObjs = #()
+            local changedSlots = #()
+            local slotJson = #()
+            local skipped = #()
+            for obj in objMatches do (
+                local reason = ""
+                if src == undefined then reason = ""
+                else if obj.material == src then reason = "already_source"
+                else (
+                    local looped = mcpLoop src obj
+                    if looped == undefined then reason = "loop_test_failed"
+                    else if looped then reason = "would_create_loop"
+                    else if applyChanges do (
+                        try (obj.material = src) catch ()
+                        if obj.material != src do reason = "readback_mismatch"
+                    )
+                )
+                if reason == "" then append replacedObjs obj
+                else append skipped (mcpObject #(
+                    (mcpField "kind" (mcpJs "object")),
+                    (mcpField "object" (mcpJs obj.name)),
+                    (mcpField "handle" (obj.handle as string)),
+                    (mcpField "reason" (mcpJs reason))))
+            )
+            for k = 1 to parents.count do (
+                local p = parents[k]
+                local slot = indices[k]
+                local prev = mcpSubAt p slot
+                local users = 0
+                for h in objHits do (if (findItem h k) > 0 do users += 1)
+                local fields = #(
+                    (mcpField "parent_material" (mcpJs p.name)),
+                    (mcpField "parent_class" (mcpJs (classOf p))),
+                    (mcpField "slot_index" (slot as string)),
+                    (mcpField "slot_name" (mcpJs (mcpSlotName p slot))),
+                    (mcpField "previous_material" (mcpJs (if prev != undefined then prev.name else ""))),
+                    (mcpField "object_count" (users as string)))
+                local reason = ""
+                if src == undefined then reason = ""
+                else if prev == src then reason = "already_source"
+                else if p == src then reason = "parent_is_source"
+                else (
+                    local looped = mcpLoop src p
+                    if looped == undefined then reason = "loop_test_failed"
+                    else if looped then reason = "would_create_loop"
+                    else if applyChanges do (
+                        try (setSubMtl p slot src) catch ()
+                        local after = mcpSubAt p slot
+                        if after != src do reason = (if after == prev then "set_rejected" else "readback_mismatch")
+                    )
+                )
+                if reason == "" then (
+                    append changedSlots k
+                    append slotJson (mcpObject fields)
+                ) else (
+                    insertItem (mcpField "kind" (mcpJs "sub_material")) fields 1
+                    append fields (mcpField "reason" (mcpJs reason))
+                    append skipped (mcpObject fields)
+                )
+            )
+
+            local affected = for o in replacedObjs collect o
+            for j = 1 to hitObjs.count do (
+                local touched = false
+                for k in objHits[j] while not touched do (if (findItem changedSlots k) > 0 do touched = true)
+                if touched do appendIfUnique affected hitObjs[j]
+            )
+            local matchCount = objMatches.count + parents.count
+            local targetExists = matchCount > 0
+            if not targetExists do (
+                local tgtFound = #()
+                mcpFindNamed tgtName tgtFound #()
+                targetExists = tgtFound.count > 0
+            )
+            local sourceJson = "null"
+            if src != undefined do sourceJson = mcpObject #(
+                (mcpField "name" (mcpJs src.name)),
+                (mcpField "class" (mcpJs (classOf src))),
+                (mcpField "found_in" (mcpJs places[1])))
+            local replacedNames = for o in replacedObjs collect (mcpJs o.name)
+            local affectedNames = for o in affected collect (mcpJs o.name)
+            mcpObject #(
+                (mcpField "source_found" (if src != undefined then "true" else "false")),
+                (mcpField "source" sourceJson),
+                (mcpField "source_candidates" (found.count as string)),
+                (mcpField "match_count" (matchCount as string)),
+                (mcpField "target_exists" (if targetExists then "true" else "false")),
+                (mcpField "replaced_objects" (mcpJoin replacedNames)),
+                (mcpField "replaced_slots" (mcpJoin slotJson)),
+                (mcpField "skipped" (mcpJoin skipped)),
+                (mcpField "affected_objects" (mcpJoin affectedNames)))
+        )
+    )
+
+    local mcpEntries = __ENTRIES__
+    local mcpResults = #()
+    __RUN__
+    mcpJoin mcpResults
+)"""
+
+_LOCATION_TEXT = {
+    "object": "on an object",
+    "sub_material": "in a sub-material slot",
+    "material_editor": "in the Material Editor",
+    "scene_materials": "in the scene materials",
+    "material_library": "in the current material library",
+}
+
+
+def _fallback_script(pairs: list[tuple[str, str, str]], preview: bool, include_sub_materials: bool = True) -> str:
+    entries = "#(" + ", ".join(
+        f'#("{safe_string(src)}", "{safe_string(tgt)}", "{safe_string(src_from)}")' for src, tgt, src_from in pairs
+    ) + ")"
+    subs = "true" if include_sub_materials else "false"
+    run = "for e in mcpEntries do append mcpResults (mcpReplaceOne e[1] e[2] {apply} e[3] " + subs + ")"
     if preview:
-        message = (f"Entries {listed} reuse a material name that an earlier entry applies or removes "
-                   "(see depends_on_entries). This preview plans every entry against the current scene, so "
-                   "a real run can differ for them: entries apply in order, so A->B then B->A does not swap "
-                   "and a source an earlier entry removed may not be found.")
+        run = run.format(apply="false")
     else:
-        message = (f"Entries {listed} ran on the scene left by earlier entries (see depends_on_entries); "
-                   "entries apply in order, so A->B then B->A does not swap.")
-    _add_warning(result, message)
+        run = 'undo "MCP replace_material" on (' + run.format(apply="true") + ")"
+    return _FALLBACK_SCRIPT.replace("__ENTRIES__", entries).replace("__RUN__", run)
 
 
-def _check_batch_source_from(result: dict, effective_from: list) -> None:
-    results = result.get("results")
-    if not isinstance(results, list):
-        return
-    for entry, wanted in zip(results, effective_from):
-        if (wanted and isinstance(entry, dict) and "error" not in entry
-                and entry.get("source_from") != wanted):
-            _add_warning(result, _source_from_ignored(wanted))
-            return
+def _run_fallback(pairs: list[tuple[str, str, str]], preview: bool, include_sub_materials: bool = True,
+                  *, batch: bool = False) -> list[dict]:
+    response = client.send_command(_fallback_script(pairs, preview, include_sub_materials))
+    raw = response.get("result", "")
+    try:
+        parsed = _json.loads(raw)
+    except (TypeError, ValueError):
+        parsed = None
+    if not isinstance(parsed, list) or len(parsed) != len(pairs):
+        return [
+            {
+                "source_material": src,
+                "target_material": tgt,
+                "status": "error",
+                "error": "Unexpected MAXScript fallback result",
+                "raw": raw,
+            }
+            for src, tgt, _ in pairs
+        ]
+    return [_fallback_entry(item, src, tgt, preview, src_from, include_sub_materials, batch=batch)
+            for item, (src, tgt, src_from) in zip(parsed, pairs)]
 
 
-def _mark_batch_no_match(result: dict, include_sub_materials: bool = True) -> dict:
-    """Mark zero-match batch entries "no_match" (or "blocked"); one combined warning plus entry details."""
-    entries = result.get("results")
-    if not isinstance(entries, list):
-        return result
-    missed = [
-        str(entry.get("target_material", entry.get("target", "")))
-        for entry in entries
-        if isinstance(entry, dict) and _set_no_match(entry)
-    ]
-    details = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        source = str(entry.get("source_material", entry.get("source", "")))
-        target = str(entry.get("target_material", entry.get("target", "")))
-        details.extend(f"'{source}' -> '{target}': {message}" for message in _detail_warnings(entry, source))
-    if missed:
-        _add_warning(result, _no_match_warning(missed, include_sub_materials))
-    for message in details:
-        _add_warning(result, message)
-    return result
+def _replace_status(match_count: int, changed: int, skipped: list, target_exists: bool, preview: bool) -> str:
+    """Status rules shared with the native handler."""
+    if match_count == 0:
+        return "no_objects" if target_exists else "no_match"
+    if changed:
+        return "preview" if preview else "replaced"
+    if all(skip.get("reason") == "already_source" for skip in skipped):
+        return "unchanged"
+    return "blocked"
+
+
+def _fallback_entry(raw: dict, source: str, target: str, preview: bool, source_from: str = "",
+                    include_sub_materials: bool = True, *, batch: bool = False) -> dict:
+    entry: dict = {"source_material": source, "target_material": target}
+    if source_from:
+        entry["source_from"] = source_from
+    entry["include_sub_materials"] = include_sub_materials
+    source_found = isinstance(raw, dict) and bool(raw.get("source_found"))
+    # A preview without the source lists the matches (replace_material only;
+    # a batch entry without its source is an error, as in the native handler).
+    if not source_found and not (preview and not batch and isinstance(raw, dict) and "match_count" in raw):
+        where = (f"source_from={source_from}" if source_from else
+                 "objects, in sub-material slots, in the Material Editor, the scene materials or the current "
+                 "material library")
+        entry["status"] = "error"
+        entry["source_exists"] = False
+        entry["error"] = f"Source material '{source}' not found (searched {where})"
+        return entry
+
+    objects = list(raw.get("replaced_objects") or [])
+    slots = list(raw.get("replaced_slots") or [])
+    skipped = list(raw.get("skipped") or [])
+    affected = list(raw.get("affected_objects") or [])
+    match_count = int(raw.get("match_count") or 0)
+    changed = len(objects) + len(slots)
+    status = _replace_status(match_count, changed, skipped, bool(raw.get("target_exists")), preview)
+
+    warnings = []
+    entry["source_exists"] = source_found
+    if source_found:
+        source_info = dict(raw.get("source") or {})
+        candidates = int(raw.get("source_candidates") or 1)
+        source_info["candidates"] = candidates
+        entry["source"] = source_info
+        if candidates > 1:
+            where = _LOCATION_TEXT.get(source_info.get("found_in", ""), "first")
+            warnings.append(f"{candidates} materials are named '{source}'; used the one found {where}.")
+    verb = "would be" if preview else "was"
+    refused = sum(1 for skip in skipped if skip.get("reason") != "already_source")
+    if status == "no_match":
+        scope = "in their sub-material slots " if include_sub_materials else ""
+        warnings.append(
+            f"No material named '{target}' exists on objects, {scope}or in the Material Editor."
+            + ("" if include_sub_materials else " Sub-material slots were not searched (include_sub_materials=False).")
+        )
+    elif status == "no_objects":
+        warnings.append(
+            f"'{target}' exists only in the Material Editor; no object or sub-material slot "
+            f"uses it, so nothing {verb} replaced."
+        )
+    elif status == "blocked":
+        warnings.append(
+            f"Every match of '{target}' was skipped, so nothing {verb} replaced; "
+            "see skipped for reasons."
+        )
+    elif status == "unchanged":
+        warnings.append(f"Every match of '{target}' already uses '{source}', so nothing {verb} replaced.")
+    elif refused:
+        warnings.append(f"{refused} match(es) were skipped; see skipped for reasons.")
+
+    entry.update({
+        "status": status,
+        "preview": preview,
+        "match_count": match_count,
+        "replaced_count": changed,
+        "reassigned_count": len(objects),
+        "replaced_objects": objects,
+        "replaced_slot_count": len(slots),
+        "replaced_slots": slots,
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+        "affected_count": len(affected),
+        "affected_objects": affected,
+    })
+    if warnings:
+        entry["warnings"] = warnings
+    return entry

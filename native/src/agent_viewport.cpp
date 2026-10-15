@@ -3,6 +3,8 @@
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/spatial_snapshot.h"
 #include "mcp_bridge/scene_journal.h"
+#include "mcp_bridge/dialog_watch.h"
+#include "mcp_bridge/main_thread_executor.h"
 #include <IViewPanel.h>
 #include <IViewPanelManager.h>
 #include <Graphics/IViewportViewSetting.h>
@@ -32,6 +34,12 @@ using json = nlohmann::json;
 using namespace HandlerHelpers;
 namespace AgentViewport {
 namespace {
+// Shell code evaluates here, with the shell's dialog check. The one-argument
+// HandlerHelpers::RunMAXScript is the core's, through its host binding.
+std::string RunMAXScript(const std::string& script) {
+    return HandlerHelpers::RunMAXScript(script, &DialogWatch::ThrowIfDismissed);
+}
+
 constexpr wchar_t kTitle[] = L"AGENT VIEWPORT";
 constexpr wchar_t kWindowTitle[] = L"AGENT VIEWPORT (do not close or minimize while agent is working)";
 constexpr wchar_t kOwner[] = L"3dsmax-mcp.AgentViewport";
@@ -64,7 +72,12 @@ unsigned long long draws = 0;
 bool registered = false;
 bool ownsVFB = false;
 bool ownsCoronaVFB = false;
-bool vfbStarted = false;
+// V-Ray and Corona post their launches: a stopped renderer means the owned
+// session ended only after the session was seen rendering.
+bool previewStarted = false;
+UINT_PTR leaseWatch = 0;
+int leaseBusy = 0;          // agent calls reading or changing the lease
+bool watchingLease = false; // WatchLease is reading or restoring it
 int previousRenderView = -1;
 BOOL previousUseActive = TRUE;
 ULONG_PTR previewRenderer = 0;
@@ -108,7 +121,7 @@ void RestorePreviewSettings() {
     if(previousDenoiserLayerActive=="false")
         RunMAXScript("(vfbControl #getLayerMgr)[1].denoiserLayer.active=false");
     previousDenoiserLayerActive.clear();
-    previousElementsActive.clear(); previewRenderer=0;
+    previousElementsActive.clear(); previewRenderer=0; previewStarted=false;
 }
 
 void PrepareVRayPreview() {
@@ -117,17 +130,23 @@ void PrepareVRayPreview() {
     previewRenderer=Animatable::GetHandleByAnim(renderer);
     previousDenoiserLayerActive=RunMAXScript("((vfbControl #getLayerMgr)[1].denoiserLayer.active) as string");
     const auto handle=std::to_string(previewRenderer);
-    const auto has=[&](const std::string& property) {
-        return RunMAXScript("(isProperty (getAnimByHandle "+handle+") #"+property+") as string")=="true";
-    };
-    if(has("ipr_progressiveMode")) {
-        LeaseProperty(previewRenderer,"ipr_progressiveMode","true");
-        LeaseProperty(previewRenderer,"system_effects_progressive_update","100");
-    } else if(!has("fx_progressive_update")) {
-        throw std::runtime_error("UNSUPPORTED: V-Ray preview needs V-Ray CPU (ipr_progressiveMode) or V-Ray GPU");
+    // V-Ray CPU's IPR must be switched to progressive. V-Ray GPU's IPR is always
+    // progressive and has neither ipr_progressiveMode nor
+    // system_effects_progressive_update, so nothing is leased for it and its
+    // fx_progressive_update stays as set (#18). GPU is recognised by class
+    // name, or else by fx_progressive_update without ipr_progressiveMode.
+    const auto rendererClass=MaxScriptVisibleClassName(renderer);
+    if(rendererClass.find("GPU")==std::string::npos && rendererClass!="VRayRT") {
+        const auto has=[&](const std::string& property) {
+            return RunMAXScript("(isProperty (getAnimByHandle "+handle+") #"+property+") as string")=="true";
+        };
+        if(has("ipr_progressiveMode")) {
+            LeaseProperty(previewRenderer,"ipr_progressiveMode","true");
+            LeaseProperty(previewRenderer,"system_effects_progressive_update","100");
+        } else if(!has("fx_progressive_update")) {
+            throw std::runtime_error("UNSUPPORTED: V-Ray preview requires the progressive IPR API");
+        }
     }
-    // V-Ray GPU has neither ipr_progressiveMode nor system_effects_progressive_update: its IPR is
-    // always progressive, so nothing is leased and its fx_progressive_update stays as set (#18).
     // One denoiser only. Preserve its engine/preset; a temporary default denoiser
     // works without requiring an NVIDIA GPU and is removed when preview stops.
     const auto found=RunMAXScript("(local m=maxOps.GetCurRenderElementMgr(); local ds=#(); "
@@ -164,11 +183,59 @@ void RestoreRenderView() {
     }
     ownsVFB=false; ownsCoronaVFB=false;
 }
+
+// The owned session ended outside the tool, e.g. from V-Ray's or Corona's own
+// UI: return what it leased, as a stop does. Every restore compares first and
+// keeps the user's edits.
+void EndLease() {
+    if(ownsVFB) RestoreRenderView();
+    RestorePreviewSettings();
+    ++generation;
+}
+// Restores write renderer and render-element settings: not into the user's undo
+// operation, and not under a production render.
+bool CanEndLease() { return !theHold.Holding() && !GetCOREInterface7()->IsRenderActive(); }
+
+struct LeaseBusy { LeaseBusy() { ++leaseBusy; } ~LeaseBusy() { --leaseBusy; } };
+void StopLeaseWatch() { if(leaseWatch) KillTimer(nullptr,leaseWatch); leaseWatch=0; }
+
+// Max's main thread, from its message loop: the session can end while no agent
+// call reads status. Reads only the renderer's global state, never activating a
+// viewport, and never inside an agent call or an MCP request.
+void CALLBACK WatchLease(HWND, UINT, UINT_PTR, DWORD) {
+    if(!previewRenderer && !ownsVFB) { StopLeaseWatch(); return; }
+    if(leaseBusy || watchingLease || MainThreadExecutor::IsRunningWork()) return;
+    watchingLease=true;
+    try {
+        // A changed renderer or render view is reported by the next agent call.
+        auto* renderer=GetCOREInterface()->GetRenderer(RS_Production);
+        const bool ours=ownsVFB ? VFBViewIsOurs() : renderer && Animatable::GetHandleByAnim(renderer)==previewRenderer;
+        // Corona: 0 stopped, 3 floating VFB IR. V-Ray: 0 no IPR, 1 VFB IPR.
+        const auto state=!ours ? std::string() : RunMAXScript(ownsCoronaVFB ?
+            "(CoronaRenderer.CoronaFp.getRenderType()) as string" : "(vrayIsRenderingIPR()) as string");
+        const bool stopped=state=="0";
+        const bool running=ownsCoronaVFB ? state=="3" : ownsVFB ? state=="1" :
+            !stopped && !state.empty() && state.find_first_not_of("0123456789")==std::string::npos;
+        if(running) previewStarted=true;
+        if(stopped && previewStarted && CanEndLease()) {
+            EndLease();
+            StopLeaseWatch();
+        }
+    } catch(...) {
+        // The next agent call reads full state, ends the lease or reports why not.
+        StopLeaseWatch();
+        OutputDebugStringW(L"3dsmax-mcp: preview lease check failed\n");
+    }
+    watchingLease=false;
+}
+void StartLeaseWatch() { if(!leaseWatch) leaseWatch=SetTimer(nullptr,0,1000,WatchLease); }
+
 void SceneChanged(void*, NotifyInfo*) {
     ++generation; viewID=-1;
     // Handles and render-view IDs belong to the old scene. Never apply saved
     // settings through potentially reused handles after a load/reset.
-    ownsVFB=false; ownsCoronaVFB=false; vfbStarted=false; previewRenderer=0; addedDenoiser=0;
+    StopLeaseWatch();
+    ownsVFB=false; ownsCoronaVFB=false; previewStarted=false; previewRenderer=0; addedDenoiser=0;
     previewProperties.clear(); previousElementsActive.clear(); previousDenoiserLayerActive.clear();
 }
 void RequireMainThread() {
@@ -456,7 +523,7 @@ struct RenderState {
     std::string Mode() const { return coronaVfb ? "corona_vfb" : vfb ? "vray_vfb" : cpu || gpu ? "vray_ipr" : activeShade ? "activeshade" : "shaded"; }
 };
 
-RenderState ReadRenderState() {
+RenderState QueryRenderState() {
     RenderState state;
     if(auto* renderer=GetCOREInterface()->GetRenderer(RS_Production))
     {
@@ -468,7 +535,7 @@ RenderState ReadRenderState() {
             if(state.coronaType<0 || state.coronaType>3) throw std::runtime_error("Unknown Corona render type");
             state.coronaAvailable=true;
             state.coronaVfb=ownsCoronaVFB && VFBViewIsOurs() && (state.coronaType==0 || state.coronaType==3);
-            if(state.coronaVfb && state.coronaType==3) vfbStarted=true;
+            if(state.coronaVfb && state.coronaType==3) previewStarted=true;
         }
     }
     if(auto* fragment=ShadeFragment()) state.activeShade=fragment->IsEnabled();
@@ -490,7 +557,30 @@ RenderState ReadRenderState() {
     // vrayStartIPR posts its launch to Max's UI queue. Keep the pending lease
     // before vrayIsRenderingIPR becomes 1; do not tear down its settings early.
     state.vfb=!ownsCoronaVFB && VFBViewIsOurs() && (state.vrayGlobal==0 || state.vrayGlobal==1);
-    if(state.vfb && state.vrayGlobal==1) vfbStarted=true;
+    if(state.vfb && state.vrayGlobal==1) previewStarted=true;
+    if(previewRenderer && !ownsVFB && (state.cpu || state.gpu) && state.vrayGlobal) previewStarted=true;
+    return state;
+}
+
+// A lease whose session is no longer rendering. VFB sessions count only once
+// seen rendering. The owned view's V-Ray menu check is synchronous: unchecked,
+// the viewport IPR has ended or never began.
+bool LeaseEnded(const RenderState& state) {
+    if(ownsCoronaVFB) return state.coronaVfb && state.coronaType==0 && previewStarted;
+    if(ownsVFB) return state.vfb && state.vrayGlobal==0 && previewStarted;
+    return previewRenderer && state.vrayAvailable && !state.cpu && !state.gpu;
+}
+
+RenderState ReadRenderState() {
+    // Max can dispatch a request from inside the lease watch's MAXScript.
+    if(watchingLease) throw std::runtime_error(StructuredErrorPayload("RENDER_BUSY",
+        "AGENT VIEWPORT is restoring its preview settings; retry"));
+    LeaseBusy busy;
+    auto state=QueryRenderState();
+    if(LeaseEnded(state) && CanEndLease()) {
+        EndLease();
+        state.vfb=false; state.coronaVfb=false;
+    }
     return state;
 }
 
@@ -500,7 +590,8 @@ json RenderInfo(const RenderState& state) {
         // Both CPU and GPU menu checks can be true for one CPU IPR session.
         {"production_renderer",state.rendererClass},
         {"capture_target",state.coronaVfb ? "corona_vfb" : state.vfb ? "vray_vfb" : "agent"},
-        {"session_state",state.coronaVfb ? (state.coronaType==3 ? "running" : vfbStarted ? "stopped" : "starting") : state.vfb ? (state.vrayGlobal==1 ? "running" : vfbStarted ? "stopped" : "starting") : state.Rendered() ? "running" : "stopped"},
+        // A stopped VFB session still shows here only while its lease waits for CanEndLease.
+        {"session_state",state.coronaVfb ? (state.coronaType==3 ? "running" : previewStarted ? "stopped" : "starting") : state.vfb ? (state.vrayGlobal==1 ? "running" : previewStarted ? "stopped" : "starting") : state.Rendered() ? "running" : "stopped"},
         {"corona_available",state.coronaAvailable},{"corona_render_type",state.coronaType},
         {"progressive_requested",previewRenderer!=0},{"denoiser_requested",previewRenderer!=0 && !ownsCoronaVFB},
         {"vray_cpu_available",state.cpuEnabled!=0},{"vray_gpu_available",state.gpuEnabled!=0},
@@ -527,11 +618,12 @@ void StopOwnedRender() {
     // Also the cleanup after a failed start: an acknowledged MAXScript error
     // must not stop it halfway (the operation still fails with MAX_DIALOG_ERROR).
     DialogWatch::DeferDismissed finish_stop;
+    LeaseBusy busy;
     const auto state=ReadRenderState();
     if(ownsCoronaVFB) {
         if(!VFBViewIsOurs() || !state.coronaAvailable || (state.coronaType!=0 && state.coronaType!=3))
             throw std::runtime_error("RENDER_OWNERSHIP_LOST: Corona renderer/view changed; stop that render explicitly");
-        if(state.coronaType==0 && !vfbStarted)
+        if(state.coronaType==0 && !previewStarted)
             throw std::runtime_error("RENDER_STARTING: Corona launch has not been observed; read status before stopping");
         if(state.coronaType==3) {
             RunMAXScript("CoronaRenderer.CoronaFp.stopRender()");
@@ -541,7 +633,7 @@ void StopOwnedRender() {
         RestoreRenderView();
     }
     else if(ownsVFB) {
-        if(state.vrayGlobal==0 && !vfbStarted)
+        if(state.vrayGlobal==0 && !previewStarted)
             throw std::runtime_error("RENDER_STARTING: VFB launch has not been observed yet; read status again before stopping");
         if(state.vrayGlobal && !state.vfb)
             throw std::runtime_error("RENDER_OWNERSHIP_LOST: VFB renderer/view changed; stop rendering there before releasing preview settings");
@@ -568,9 +660,10 @@ void SetRenderMode(const json& p) {
         throw std::runtime_error("renderer_source must be activeshade or production");
     if(theHold.Holding()) throw std::runtime_error(StructuredErrorPayload("USER_BUSY",
         "Finish the current user operation before switching interactive rendering",{{"retryable",true}}));
+    LeaseBusy busy;
     const auto state=ReadRenderState();
     if(mode==state.Mode() && !(mode=="shaded" && (ownsVFB || previewRenderer)) &&
-       !(mode=="corona_vfb" && state.coronaType==0 && vfbStarted)) return;
+       !(mode=="corona_vfb" && state.coronaType==0 && previewStarted)) return;
     if(mode!="shaded") {
         if(state.coronaType!=0 && !state.coronaVfb)
             throw std::runtime_error("RENDER_BUSY: Corona is already rendering outside this owned preview");
@@ -607,7 +700,7 @@ void SetRenderMode(const json& p) {
             previousRenderView=ip->GetRendViewID(RS_Production);
             previousUseActive=ip->GetRendUseActiveView();
             ip->SetRendViewID(RS_Production,viewID);
-            ip->SetRendUseActiveView(FALSE); ownsVFB=true; ownsCoronaVFB=true; vfbStarted=false;
+            ip->SetRendUseActiveView(FALSE); ownsVFB=true; ownsCoronaVFB=true; previewStarted=false;
             ActivateOwnedView activation;
             const auto started=RunMAXScript("(CoronaRenderer.CoronaFp.startInteractive()) as string");
             if(started!="0") {
@@ -627,7 +720,7 @@ void SetRenderMode(const json& p) {
                 previousRenderView=ip->GetRendViewID(RS_Production);
                 previousUseActive=ip->GetRendUseActiveView();
                 ip->SetRendViewID(RS_Production,viewID);
-                ip->SetRendUseActiveView(FALSE); ownsVFB=true; vfbStarted=false;
+                ip->SetRendUseActiveView(FALSE); ownsVFB=true; previewStarted=false;
                 ActivateOwnedView activation;
                 RunMAXScript("vfbControl #show true; vrayStartIPR()");
             }
@@ -645,6 +738,8 @@ void SetRenderMode(const json& p) {
         ++generation;
         Redraw();
         if(ReadRenderState().Mode()!=mode) throw std::runtime_error("Requested render mode was not applied");
+        // V-Ray's and Corona's own UI can end the session between agent calls.
+        if(previewRenderer) StartLeaseWatch();
     } catch(...) {
         // Return to a stopped preview after partial start; never globally abort.
         if(View()) try { StopOwnedRender(); } catch(...) {}
@@ -774,7 +869,7 @@ Box3 Bounds(const json& p) {
     if (explicitNames) {
         for (const auto& name : p.at("frame_names")) {
             if (name.type()!=json::value_t::string) throw std::runtime_error("frame_names must contain names");
-            auto matches = CollectNodesByExactName(name.get<std::string>());
+            auto matches = CollectNodesByName(name.get<std::string>());
             if (matches.size()!=1) throw std::runtime_error("Framing name must resolve uniquely: "+name.get<std::string>());
             Descendants(matches.front(),nodes);
         }
@@ -1274,6 +1369,8 @@ void Shutdown(bool processExit) {
             OutputDebugStringW(L"3dsmax-mcp: preview stop incomplete during Max shutdown\n");
         }
     }
+    // Without the scene notifications below, saved handles could outlive their scene.
+    StopLeaseWatch();
     if(registered) {
         GetCOREInterface()->UnRegisterViewportDisplayCallback(FALSE,&label);
         UnRegisterNotification(SceneChanged,nullptr,NOTIFY_FILE_POST_OPEN);

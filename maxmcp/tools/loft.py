@@ -9,7 +9,7 @@ from typing import Any
 from ..coerce import DictValue
 from ..helpers.loft import build_loft, validate_parameters
 from ..helpers.maxscript import safe_string
-from ..helpers.mesh import MESH_FUNCTIONS, point, target_script, vector
+from ..helpers.mesh import MESH_FUNCTIONS, point, run_mesh_script, target_script, vector
 from ..server import client, mcp
 
 
@@ -105,34 +105,34 @@ def _parse_definition(raw: str) -> dict:
 
 
 def _read(name: str, handle: int) -> tuple[dict, dict, str]:
-    raw = _run(f'''(
+    # The bridge adds the node's mesh_token after this script, in the same step.
+    mesh = run_mesh_script(client, f'''(
         {MESH_FUNCTIONS}
         {LOFT_FUNCTIONS}
-        try (
-            {target_script(name, handle)}
-            local data = getAppData obj {LOFT_APPDATA_ID}
-            if data == undefined do throw "Node has no loft definition"
-            local token = lfToken obj
-            local instances = #()
-            InstanceMgr.GetInstances obj &instances
-            local out = stringstream ""
-            format "NAME|%\\n" (lfBase64 obj.name) to:out
-            format "META|%|%|%|%|%|%\\n" (formattedPrint ((getHandleByAnim obj) as integer64) format:"d") (mcCounts obj.baseobject) obj.modifiers.count instances.count token (mcToken obj) to:out
-            format "DATA|%\\n" (lfBase64 data) to:out
-            out as string
-        ) catch ("__ERROR__|" + (getCurrentException() as string))
+        {target_script(name, handle)}
+        local data = getAppData obj {LOFT_APPDATA_ID}
+        if data == undefined do throw "Node has no loft definition"
+        local token = lfToken obj
+        local instances = #()
+        InstanceMgr.GetInstances obj &instances
+        local out = stringstream ""
+        format "%\\n" (mcHandle obj) to:out
+        format "NAME|%\\n" (lfBase64 obj.name) to:out
+        format "META|%|%|%|%|%\\n" (mcHandle obj) (mcCounts obj.baseobject) obj.modifiers.count instances.count token to:out
+        format "DATA|%\\n" (lfBase64 data) to:out
+        out as string
     )''')
-    rows = dict(line.split("|", 1) for line in raw.splitlines() if "|" in line)
+    rows = dict(line.split("|", 1) for line in mesh["output"].splitlines() if "|" in line)
     try:
         fields = rows["META"].split("|")
-        if len(fields) != 6:
+        if len(fields) != 5 or int(fields[0]) != mesh["handle"]:
             raise ValueError("invalid metadata")
         definition_raw = base64.b64decode(rows["DATA"], validate=True).decode("utf-8")
         identity = {"name": base64.b64decode(rows["NAME"], validate=True).decode("utf-8"),
                     "handle": int(fields[0]),
                     "counts": dict(zip(("vertices", "edges", "faces"), map(int, fields[1].split(",")))),
                     "modifiers_above": int(fields[2]), "instance_count": int(fields[3]),
-                    "cage_fingerprint": fields[4], "mesh_token": fields[5]}
+                    "cage_fingerprint": fields[4], "mesh_token": mesh["mesh_token"]}
     except (KeyError, ValueError, UnicodeError) as exc:
         raise RuntimeError("Invalid loft readback; no write attempted") from exc
     return identity, _parse_definition(definition_raw), definition_raw

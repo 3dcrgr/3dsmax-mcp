@@ -20,7 +20,9 @@ namespace NativeHandlers {
         MCPBridgeGUP* gup,
         const std::string& session_id = ""
     );
+    // Invalidates every session's scene_delta baseline (new journal epoch).
     void ResetSceneDeltaSessions();
+    // Drops a closed session's snapshot fallback; the shell releases its cursor.
     void ReleaseSceneDeltaSession(const std::string& session_id);
 
     // Preflighted multi-node mutations in one strict native undo hold.
@@ -30,6 +32,11 @@ namespace NativeHandlers {
     // dispatcher mutation/undo classification cannot be bypassed by payload.
     std::string SceneQAScan(const std::string& params, MCPBridgeGUP* gup);
     std::string SceneQAFix(const std::string& params, MCPBridgeGUP* gup);
+
+    // Mesh tool MAXScript with the Editable Poly base-cage token checked and
+    // read back in the same main-thread step. Edits name their own undo hold.
+    std::string MeshScript(const std::string& params, MCPBridgeGUP* gup);
+    std::string GeometrySnapshot(const std::string& params, MCPBridgeGUP* gup);
 
     // Phase 1: Object operations
     std::string GetObjectProperties(const std::string& params, MCPBridgeGUP* gup);
@@ -126,6 +133,12 @@ namespace NativeHandlers {
     std::string MapClassRelationships(const std::string& params, MCPBridgeGUP* gup);
     std::string LearnScenePatterns(const std::string& params, MCPBridgeGUP* gup);
     std::string WatchScene(const std::string& params, MCPBridgeGUP* gup);
+    // Core shutdown (Max's main thread): unregisters watch_scene's
+    // notifications and viewport overlay.
+    void ShutdownSceneWatcher();
+    // True while one of watch_scene's Max callbacks runs (core code that Max
+    // entered outside any request).
+    bool SceneWatcherCallbackActive();
 
     // Effects
     std::string GetEffects(const std::string& params, MCPBridgeGUP* gup);
@@ -137,14 +150,13 @@ namespace NativeHandlers {
 
     // Render automation: kick a deferred render and emit a done-signal file at
     // NOTIFY_POST_RENDER. RenderStart returns immediately; the bridge is not
-    // blocked for the render. Register/Unregister are called from GUP Start/Stop.
+    // blocked for the render. The armed job and its Max notifications belong to
+    // the shell (render_host.cpp); these handlers reach them through the host API.
     // RenderCancel runs on the pipe thread (never marshals — the main thread IS
     // the render) and raises the SDK abort flag, like pressing Cancel.
     std::string RenderStart(const std::string& params, MCPBridgeGUP* gup);
     std::string RenderCancel(const std::string& params, MCPBridgeGUP* gup);
     std::string RenderCancelCapture(const std::string& params, MCPBridgeGUP* gup);
-    void RegisterRenderNotifications();
-    void UnregisterRenderNotifications();
 
     // Material replace
     std::string ReplaceMaterial(const std::string& params, MCPBridgeGUP* gup);

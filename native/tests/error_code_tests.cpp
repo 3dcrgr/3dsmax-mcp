@@ -1,6 +1,6 @@
-// SDK-independent tests for NativeErrors::CodeForMessage, the code the
-// dispatcher gives an unstructured native error.
-#include "mcp_bridge/native_error_code.h"
+// SDK-independent tests for McpEnvelope::ErrorCodeForMessage, the code the
+// dispatcher and the shell give an unstructured native error.
+#include "mcp_bridge/response_envelope.h"
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -8,15 +8,16 @@
 void require(bool ok, const std::string& message) { if (!ok) throw std::runtime_error(message); }
 
 void expect(const std::string& message, const std::string& code, bool retryable) {
-    const std::string got = NativeErrors::CodeForMessage(message);
+    const std::string got = McpEnvelope::ErrorCodeForMessage(message);
     require(got == code, "'" + message + "' -> " + got + ", expected " + code);
-    require(NativeErrors::IsRetryable(got) == retryable, "'" + message + "' retryable mismatch");
+    require(McpEnvelope::IsRetryableCode(got) == retryable, "'" + message + "' retryable mismatch");
 }
 
 int main() {
     try {
         // The executor refused or drained the request before it started:
         // bridge down, retryable (the work never ran).
+        expect("3ds Max is exiting; the request did not run", "BRIDGE_DOWN", true);
         expect("MainThreadExecutor is shutting down", "BRIDGE_DOWN", true);
         expect("MainThreadExecutor not initialized", "BRIDGE_DOWN", true);
         expect("Failed to post work to main thread", "BRIDGE_DOWN", true);

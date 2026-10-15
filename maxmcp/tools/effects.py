@@ -68,7 +68,7 @@ def toggle_effect(
     if effect_type == "atmospheric":
         maxscript = f"""(
             if {index} > numAtmospherics then (
-                "Index {index} out of range (total: " + (numAtmospherics as string) + ")"
+                "Error: Index {index} out of range (total: " + (numAtmospherics as string) + ")"
             ) else (
                 local atm = getAtmospheric {index}
                 setActive atm {active_str}
@@ -78,7 +78,7 @@ def toggle_effect(
     else:
         maxscript = f"""(
             if {index} > numEffects then (
-                "Index {index} out of range (total: " + (numEffects as string) + ")"
+                "Error: Index {index} out of range (total: " + (numEffects as string) + ")"
             ) else (
                 local eff = getEffect {index}
                 setActive eff {active_str}
@@ -103,7 +103,7 @@ def delete_effect(
     if effect_type == "atmospheric":
         maxscript = f"""(
             if {index} > numAtmospherics then (
-                "Index {index} out of range (total: " + (numAtmospherics as string) + ")"
+                "Error: Index {index} out of range (total: " + (numAtmospherics as string) + ")"
             ) else (
                 local atm = getAtmospheric {index}
                 local cn = (classof atm) as string
@@ -114,7 +114,7 @@ def delete_effect(
     else:
         maxscript = f"""(
             if {index} > numEffects then (
-                "Index {index} out of range (total: " + (numEffects as string) + ")"
+                "Error: Index {index} out of range (total: " + (numEffects as string) + ")"
             ) else (
                 local eff = getEffect {index}
                 local cn = (classof eff) as string

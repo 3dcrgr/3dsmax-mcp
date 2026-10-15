@@ -1,8 +1,8 @@
 """Native FStorm material graphs (property readback: FStorm 2.0.0Z / Max 2027).
 
 Keep these graphs separate from the generic builder: FStormBitmap handles normals
-itself, and FStormMix supplies the AO multiply. See docs/FSTORM.md for evidence and
-limits; unsupported inputs are reported instead of wired into unrelated slots.
+itself, and FStormMix supplies the AO multiply. Unsupported inputs are reported
+instead of wired into unrelated slots.
 """
 
 from ..helpers.maxscript import safe_string

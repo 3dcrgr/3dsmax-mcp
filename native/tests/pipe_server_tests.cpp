@@ -1,20 +1,22 @@
 // Exercise the real server with connected Windows pipes, without the Max SDK.
 #include "mcp_bridge/pipe_server.h"
 #include "mcp_bridge/bridge_health.h"
+#include "mcp_bridge/core_host.h"
 #include <iostream>
 #include <stdexcept>
 #include <chrono>
 
 std::atomic<int> calls{0};
-namespace CommandDispatcher {
-std::string Dispatch(const std::string& request, MCPBridgeGUP*, const std::string&) {
+// The pipe hands every request to the shell's CoreHost (core_control.cpp).
+namespace CoreHost {
+std::string Dispatch(const std::string& request, const std::string&) {
     ++calls;
     if (request == "large") return std::string(2 * 1024 * 1024, 'x');
     if (request == "quit") return "MAXSCRIPT_INTERRUPTED";
     return request;
 }
+void ReleaseSession(const std::string&) {}
 }
-namespace NativeHandlers { void ReleaseSceneDeltaSession(const std::string&) {} }
 
 void require(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
 template<class F> void await(F predicate) {
@@ -54,29 +56,29 @@ int main() {
     try {
         auto name = L"\\\\.\\pipe\\mcp-shutdown-test-" + std::to_wstring(GetCurrentProcessId());
         {
-            PipeServer server(nullptr, name); server.Start(); stop(server); // pending accept
+            PipeServer server(name); server.Start(); stop(server); // pending accept
         }
         for (int iteration = 0; iteration < 10; ++iteration) {
-            PipeServer server(nullptr, name); server.Start();
+            PipeServer server(name); server.Start();
             HANDLE client = connect(name);
             send(client, "hello\n"); require(read(client) == "hello\n", "normal round trip failed");
             stop(server); // idle client still open, waiting in ReadRequest
             CloseHandle(client);
         }
         {
-            PipeServer server(nullptr, name); server.Start(); HANDLE client = connect(name);
+            PipeServer server(name); server.Start(); HANDLE client = connect(name);
             int before = calls.load(); send(client, "partial request without delimiter"); Sleep(25);
             stop(server); require(calls.load() == before, "partial request was dispatched"); CloseHandle(client);
         }
         {
-            PipeServer server(nullptr, name); server.Start(); HANDLE client = connect(name);
+            PipeServer server(name); server.Start(); HANDLE client = connect(name);
             send(client, "large\n");
             await([&] { DWORD available = 0; return PeekNamedPipe(client, nullptr, 0, nullptr, &available, nullptr) && available > 0; });
             stop(server); // client never reads: WriteResponse must cancel too
             CloseHandle(client);
         }
         {
-            PipeServer server(nullptr, name); server.Start(); HANDLE client = connect(name);
+            PipeServer server(name); server.Start(); HANDLE client = connect(name);
             send(client, "quit\n"); require(read(client) == "MAXSCRIPT_INTERRUPTED\n", "interruption reply missing");
             stop(server); // shutdown after the quit reply, with the connection retained
             CloseHandle(client);

@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 from ..server import mcp, client
 from ..coerce import DictList, IntList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name, node_by_name_expr, safe_string
 
 
 # Friendly aliases resolve to the live catalog display name. AddOperator class
@@ -126,12 +126,11 @@ def _mxs_str(value: str) -> str:
 
 
 def _mxs_object_block(name: str, body: str, *, not_found: str = "") -> str:
-    safe_name = _mxs_str(name)
     msg = not_found or f"Object not found: {name}"
     safe_msg = msg.replace("\\", "\\\\").replace('"', '\\"')
     indented = "\n        ".join(line for line in body.splitlines() if line.strip())
     return f"""(
-    local obj = getNodeByName "{safe_name}"
+    local obj = {node_by_name(name, missing_ok=True)}
     if obj == undefined then "{safe_msg}"
     else
     (
@@ -254,11 +253,7 @@ def _authorize_executable(allow_executable: bool) -> None:
 
 def _dc_catalog_helpers() -> list[str]:
     return [
-        "fn mcpDcRequireNode nodeName = (",
-        "    local theNode = getNodeByName nodeName exact:true",
-        "    if theNode == undefined do throw (\"Data Channel node not found: \" + nodeName)",
-        "    theNode",
-        ")",
+        "fn mcpDcRequireNode nodeName = " + node_by_name_expr("nodeName", "Data Channel node"),
         "fn mcpDcAddOperatorByName theIF wantedName whereAt = (",
         "    local found = false",
         "    local idA = 0L",
@@ -301,6 +296,23 @@ def _dc_json_helpers() -> str:
             stream as string
         )
     '''
+
+
+_MAXSCRIPT_ERROR = "__MCP_MS_ERR__:"
+
+
+def _parse_dc_payload(response: Mapping[str, Any]) -> dict[str, Any] | str:
+    """JSON object from a Data Channel read; a MAXScript error stays the bridge's text."""
+    raw = response.get("result", str(response))
+    if isinstance(raw, str) and raw.startswith(_MAXSCRIPT_ERROR):
+        return raw
+    try:
+        payload = _json.loads(raw)
+    except (TypeError, ValueError):
+        return {"error": f"Unexpected Data Channel reply: {str(raw)[:300]}"}
+    return payload if isinstance(payload, dict) else {
+        "error": f"Unexpected Data Channel reply: {str(raw)[:300]}"
+    }
 
 
 def _format_add_result(raw: str) -> str:
@@ -347,8 +359,13 @@ def _resolve_dc_modifier_lines(
     modifier_index: int,
     create_new: bool,
     display: bool,
+    preflight: Sequence[str] = (),
 ) -> list[str]:
-    """MAXScript to get or create the single Data Channel modifier on the object."""
+    """MAXScript to get or create the single Data Channel modifier on the object.
+
+    preflight runs after an existing modifier is found and before one is
+    created; dcMod is undefined there when the edit will create it.
+    """
     display_lit = "true" if display else "false"
     return [
         "local dcMod = undefined",
@@ -371,6 +388,7 @@ def _resolve_dc_modifier_lines(
         "        )",
         "    )",
         ")",
+        *preflight,
         "if dcMod == undefined then (",
         "    dcMod = DataChannelModifier()",
         f"    dcMod.display = {display_lit}",
@@ -552,6 +570,33 @@ def add_data_channel(
     except ValueError as exc:
         return _json.dumps({"error": str(exc)})
 
+    # Checks that can fail run before the first operator or modifier is
+    # added: nothing here undoes a partly applied edit.
+    preflight: list[str] = []
+    if expected_operator_count is not None:
+        preflight.extend([
+            "local preStackCount = if dcMod == undefined then 0 else dcMod.DataChannelModifier.StackCount()",
+            f"if preStackCount != {expected_operator_count} do throw "
+            f'("Data Channel stack changed: expected {expected_operator_count}, found " + preStackCount as string)',
+        ])
+    order_str = ""
+    if order is not None:
+        order_values = list(order)
+        if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in order_values):
+            return _json.dumps({"error": "order must contain non-negative integer storage indexes"})
+        if len(set(order_values)) != len(order_values):
+            return _json.dumps({"error": "order must not contain duplicates"})
+        order_str = ", ".join(str(item) for item in order_values)
+        # New operators take the next storage indexes and join the active order.
+        preflight.extend([
+            "local predictedOrder = if dcMod == undefined then #() else (for storageId in dcMod.operator_order collect storageId)",
+            "local predictedStorage = if dcMod == undefined then 0 else dcMod.operators.count",
+            f"for i = 0 to {len(operator_list) - 1} do append predictedOrder (predictedStorage + i)",
+            f"local requestedOrder = #({order_str})",
+            "if requestedOrder.count != predictedOrder.count do throw (\"Data Channel order length must equal the stack count after adding the operators, \" + predictedOrder.count as string)",
+            "for storageId in requestedOrder do if (findItem predictedOrder storageId) == 0 do throw (\"Data Channel order references storage index \" + storageId as string + \", which will not be active\")",
+        ])
+
     roles = [_operator_role(_operator_display_name(operator.get("type", ""))) for operator in operator_list]
     warnings: list[str] = []
     if "input" not in roles:
@@ -572,25 +617,14 @@ def add_data_channel(
             modifier_index=modifier_index,
             create_new=create_new,
             display=display,
-        ),
-        (
-            f"if beforeStackCount != {expected_operator_count} do throw "
-            f'(\"Data Channel stack changed: expected {expected_operator_count}, found \" + beforeStackCount as string)'
-            if expected_operator_count is not None
-            else ""
+            preflight=preflight,
         ),
         *op_lines,
         f'local warningText = "{warning_text}"',
     ]
     if order is not None:
-        order_values = list(order)
-        if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in order_values):
-            return _json.dumps({"error": "order must contain non-negative integer storage indexes"})
-        if len(set(order_values)) != len(order_values):
-            return _json.dumps({"error": "order must not contain duplicates"})
-        order_str = ", ".join(str(item) for item in order_values)
+        # The preflight predicted the active order; this confirms it.
         body_lines.extend([
-            f"local requestedOrder = #({order_str})",
             "if requestedOrder.count != dcIF.StackCount() do throw (\"Data Channel order length must equal active stack count \" + dcIF.StackCount() as string)",
             "for storageId in requestedOrder do if (findItem dcMod.operator_order storageId) == 0 do throw (\"Data Channel order references inactive storage index \" + storageId as string)",
             "dcMod.operator_order = requestedOrder",
@@ -598,11 +632,8 @@ def add_data_channel(
     body_lines.append(_result_line())
 
     maxscript = _mxs_object_block(name, "\n        ".join(line for line in body_lines if line))
-    try:
-        response = client.send_command(maxscript)
-        return _format_add_result(response.get("result", str(response)))
-    except Exception as exc:
-        return _json.dumps({"error": str(exc)})
+    response = client.send_command(maxscript)
+    return _format_add_result(response.get("result", str(response)))
 
 
 @mcp.tool()
@@ -679,20 +710,17 @@ def list_dc_operators(
         "{{\"error\":" + (mcpDcJsonString (getCurrentException() as string)) + "}}"
     )
 )'''
-    try:
-        response = client.send_command(maxscript)
-        raw = response.get("result", str(response))
-        payload = _json.loads(raw)
-        aliases_by_name: dict[str, list[str]] = {}
-        for alias, display_name in _OPERATOR_NAMES.items():
-            aliases_by_name.setdefault(display_name, []).append(alias)
-        for operator in payload.get("operators", []):
-            display_name = str(operator.get("name", ""))
-            operator["role"] = _operator_role(display_name)
-            operator["aliases"] = aliases_by_name.get(display_name, [])
-        return _json.dumps(payload, ensure_ascii=False)
-    except Exception as exc:
-        return _json.dumps({"error": str(exc)})
+    payload = _parse_dc_payload(client.send_command(maxscript))
+    if not isinstance(payload, dict) or "error" in payload:
+        return _json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else payload
+    aliases_by_name: dict[str, list[str]] = {}
+    for alias, display_name in _OPERATOR_NAMES.items():
+        aliases_by_name.setdefault(display_name, []).append(alias)
+    for operator in payload.get("operators", []):
+        display_name = str(operator.get("name", ""))
+        operator["role"] = _operator_role(display_name)
+        operator["aliases"] = aliases_by_name.get(display_name, [])
+    return _json.dumps(payload, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -711,7 +739,6 @@ def inspect_data_channel(
     if modifier_index < 0:
         return _json.dumps({"error": "modifier_index must be zero or 1-based"})
     max_properties = max(0, min(int(max_properties), 256))
-    safe = _mxs_str(name)
     property_block = ""
     if include_properties and max_properties:
         property_block = rf'''
@@ -734,8 +761,7 @@ def inspect_data_channel(
     maxscript = rf'''(
     try (
         {_dc_json_helpers()}
-        local obj = getNodeByName "{safe}" exact:true
-        if obj == undefined do throw "Object not found: {safe}"
+        local obj = {node_by_name(name)}
         local dcMod = undefined
         local modStackIndex = 0
         if {modifier_index} > 0 then (
@@ -797,58 +823,55 @@ def inspect_data_channel(
         "{{\"error\":" + (mcpDcJsonString (getCurrentException() as string)) + "}}"
     )
 )'''
-    try:
-        response = client.send_command(maxscript)
-        raw = response.get("result", str(response))
-        payload = _json.loads(raw)
-        for operator in payload.get("operators", []):
-            display_name = str(operator.get("name", ""))
-            operator["role"] = _operator_role(display_name)
-            blend_value = operator.get("blend")
-            operator["blendName"] = next(
-                (name for name, value in _BLEND_MODES.items() if value == blend_value and "_" not in name),
-                "unknown",
-            )
-        roles = {operator.get("role") for operator in payload.get("operators", [])}
-        warnings = []
-        if payload.get("operatorCount", 0) and "input" not in roles:
-            warnings.append("active stack has no input operator")
-        if payload.get("operatorCount", 0) and "output" not in roles:
-            warnings.append("active stack has no output operator")
-        ui_active = bool(payload.pop("uiActive", False))
-        ui_error_text = str(payload.pop("uiErrorText", "") or "").strip()
-        structural_error = ""
-        operators = payload.get("operators", [])
-        if operators:
-            first = operators[0]
-            if first.get("role") != "input" or first.get("blend") != _BLEND_MODES["replace"]:
-                structural_error = "Error : First operator must be an Input Operator and in Replace"
-        error_text = ui_error_text or structural_error
-        if error_text and error_text not in warnings:
-            warnings.append(error_text)
-        if error_text:
-            validation_status = "invalid"
-            validation_valid: Optional[bool] = False
-            validation_source = "ui" if ui_error_text else "structural"
-        elif ui_active:
-            validation_status = "valid"
-            validation_valid = True
-            validation_source = "ui"
-        else:
-            validation_status = "structurally_valid"
-            validation_valid = None
-            validation_source = "structural"
-        payload["validation"] = {
-            "status": validation_status,
-            "valid": validation_valid,
-            "errorText": error_text or None,
-            "source": validation_source,
-            "uiActive": ui_active,
-        }
-        payload["warnings"] = warnings
-        return _json.dumps(payload, ensure_ascii=False)
-    except Exception as exc:
-        return _json.dumps({"error": str(exc)})
+    payload = _parse_dc_payload(client.send_command(maxscript))
+    if not isinstance(payload, dict) or "error" in payload:
+        return _json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else payload
+    for operator in payload.get("operators", []):
+        display_name = str(operator.get("name", ""))
+        operator["role"] = _operator_role(display_name)
+        blend_value = operator.get("blend")
+        operator["blendName"] = next(
+            (name for name, value in _BLEND_MODES.items() if value == blend_value and "_" not in name),
+            "unknown",
+        )
+    roles = {operator.get("role") for operator in payload.get("operators", [])}
+    warnings = []
+    if payload.get("operatorCount", 0) and "input" not in roles:
+        warnings.append("active stack has no input operator")
+    if payload.get("operatorCount", 0) and "output" not in roles:
+        warnings.append("active stack has no output operator")
+    ui_active = bool(payload.pop("uiActive", False))
+    ui_error_text = str(payload.pop("uiErrorText", "") or "").strip()
+    structural_error = ""
+    operators = payload.get("operators", [])
+    if operators:
+        first = operators[0]
+        if first.get("role") != "input" or first.get("blend") != _BLEND_MODES["replace"]:
+            structural_error = "Error : First operator must be an Input Operator and in Replace"
+    error_text = ui_error_text or structural_error
+    if error_text and error_text not in warnings:
+        warnings.append(error_text)
+    if error_text:
+        validation_status = "invalid"
+        validation_valid: Optional[bool] = False
+        validation_source = "ui" if ui_error_text else "structural"
+    elif ui_active:
+        validation_status = "valid"
+        validation_valid = True
+        validation_source = "ui"
+    else:
+        validation_status = "structurally_valid"
+        validation_valid = None
+        validation_source = "structural"
+    payload["validation"] = {
+        "status": validation_status,
+        "valid": validation_valid,
+        "errorText": error_text or None,
+        "source": validation_source,
+        "uiActive": ui_active,
+    }
+    payload["warnings"] = warnings
+    return _json.dumps(payload, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -918,11 +941,8 @@ def set_data_channel_operator(
         ),
     ]
     maxscript = _mxs_object_block(name, "\n        ".join(line for line in body_lines if line))
-    try:
-        response = client.send_command(maxscript)
-        return response.get("result", str(response))
-    except Exception as exc:
-        return _json.dumps({"error": str(exc)})
+    response = client.send_command(maxscript)
+    return response.get("result", str(response))
 
 
 @mcp.tool()
@@ -1036,11 +1056,8 @@ def manage_data_channel_stack(
         "resultStream as string",
     ]
     maxscript = _mxs_object_block(name, "\n        ".join(line for line in body_lines if line))
-    try:
-        response = client.send_command(maxscript)
-        return response.get("result", str(response))
-    except Exception as exc:
-        return _json.dumps({"error": str(exc)})
+    response = client.send_command(maxscript)
+    return response.get("result", str(response))
 
 
 @mcp.tool()
@@ -1108,7 +1125,9 @@ def add_dc_script_operator(
 @mcp.tool()
 def list_dc_presets() -> str:
     """List available Data Channel presets without creating a scene object."""
-    maxscript = """(
+    # Preset names are user file names, so they are escaped as JSON strings.
+    maxscript = f"""(
+    {_dc_json_helpers()}
     local dcMod = DataChannelModifier()
     local dcIF = dcMod.DataChannelModifier
     dcIF.GatherOperators()
@@ -1118,17 +1137,14 @@ def list_dc_presets() -> str:
     for i = 1 to count do (
         local pname = ""
         dcIF.PresetName i &pname
-        result += "\\"" + pname + "\\""
+        result += mcpDcJsonString pname
         if i < count do result += ", "
     )
     result += "]"
     result
 )"""
-    try:
-        response = client.send_command(maxscript)
-        return response.get("result", str(response))
-    except Exception as exc:
-        return _json.dumps({"error": str(exc)})
+    response = client.send_command(maxscript)
+    return response.get("result", str(response))
 
 
 @mcp.tool()
@@ -1146,6 +1162,17 @@ def load_dc_preset(
         return _json.dumps({"error": "expected_operator_count must be non-negative"})
     safe_preset = _mxs_str(preset_name)
     body = [
+        # LoadPreset returns nothing and ignores an unknown name, so check the
+        # catalog on an unattached modifier before touching the object's stack.
+        "local presetProbe = (DataChannelModifier()).DataChannelModifier",
+        "try (presetProbe.GatherOperators()) catch ()",
+        "local presetFound = false",
+        "for presetIndex = 1 to presetProbe.PresetCount() while not presetFound do (",
+        "    local presetName = \"\"",
+        "    presetProbe.PresetName presetIndex &presetName",
+        f'    if stricmp presetName "{safe_preset}" == 0 do presetFound = true',
+        ")",
+        f'if not presetFound do throw "Data Channel preset is unknown: {safe_preset}; list them with list_dc_presets"',
         *_resolve_dc_modifier_lines(
             modifier_index=modifier_index,
             create_new=create_new,
@@ -1158,6 +1185,7 @@ def load_dc_preset(
             else ""
         ),
         f'dcIF.LoadPreset "{safe_preset}"',
+        f'if dcIF.StackCount() == 0 do throw "Data Channel preset {safe_preset} loaded no operators"',
         (
             '"{\\"object\\":\\"" + obj.name + "\\",\\"modifierStackIndex\\":" + '
             '(modStackIndex as string) + ",\\"preset\\":\\"' + safe_preset +
@@ -1165,8 +1193,5 @@ def load_dc_preset(
         ),
     ]
     maxscript = _mxs_object_block(name, "\n        ".join(line for line in body if line))
-    try:
-        response = client.send_command(maxscript)
-        return response.get("result", str(response))
-    except Exception as exc:
-        return _json.dumps({"error": str(exc)})
+    response = client.send_command(maxscript)
+    return response.get("result", str(response))

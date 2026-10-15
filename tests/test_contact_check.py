@@ -155,9 +155,32 @@ class ScriptDeadlineTests(unittest.TestCase):
     def test_non_mesh_nodes_are_skipped_not_thrown(self):
         s = self.script
         self.assertNotIn('throw ("Not a mesh-convertible geometry node', s)
-        self.assertIn("append skipped m[1]; undefined", s)
-        self.assertIn('format "S|%|%|not_mesh|0\\n"', s)
+        self.assertIn("if ccIsMesh n then n else (", s)
+        self.assertIn("append skipped n", s)
+        # upstream 1.7.6: skip records carry the node class
+        self.assertIn('format "S|%|%|not_mesh|0|%\\n" (ccH n) (ccB64 n.name) (ccClass n)', s)
         self.assertIn("isAgainst and setB.count == 0", s)
+
+    def test_strict_name_resolution(self):
+        # upstream 1.7.6: exact case first, then any case; several matches fail as ambiguous
+        s = self.script
+        resolve = s[s.index("fn ccResolve"):s.index("fn ccCmp")]
+        self.assertIn("getNodeByName mcpName exact:true ignoreCase:false all:true", resolve)
+        self.assertIn("Ambiguous object name: ", resolve)
+        # the fork's linked-children scan stays as the fallback, held to the same rules
+        self.assertIn("for o in objects where o.name == nm collect o", resolve)
+        self.assertIn('throw ("Node not found: " + nm)', resolve)
+        self.assertNotIn("Node name must resolve uniquely", s)
+
+    def test_empty_meshes_without_pairs_are_reported(self):
+        # upstream 1.7.6: an empty mesh has an inverted box, so it never forms a candidate pair
+        s = self.script
+        self.assertIn("where not used[i] and bbs[i][1].x > bbs[i][2].x and (ccElapsed t0) <= limitMs", s)
+        self.assertIn('(if nf < 0 then "no_mesh" else "empty_mesh")', s)
+
+    def test_edge_dedup_without_dotnet(self):
+        self.assertNotIn("Hashtable", self.script)
+        self.assertIn("(findItem seen hi) == 0", self.script)
 
     def test_all_names_skipped_is_an_error_like_against(self):
         # review: an empty names side used to return complete=true with zero pairs
@@ -205,6 +228,8 @@ class ParseFullReportTests(unittest.TestCase):
         self.assertEqual(out["summary"]["touching"], 1)
         self.assertEqual(out["warnings"], [])
         self.assertEqual(out["skipped_nodes"], [])
+        self.assertEqual(out["skipped"], [])
+        self.assertEqual(out["pairs_measured"], 1)
 
     def test_explicit_near_gap_echo(self):
         # near_gap=2 mm in a cm scene -> 0.2 scene units
@@ -221,34 +246,56 @@ class ParseFullReportTests(unittest.TestCase):
             cc.parse_report(raw)
 
     def test_maxscript_error_passthrough(self):
-        with self.assertRaisesRegex(RuntimeError, "Node name must resolve uniquely"):
-            cc.parse_report("__ERROR__|Node name must resolve uniquely: X")
+        with self.assertRaisesRegex(RuntimeError, "Ambiguous object name: X"):
+            cc.parse_report("__ERROR__|Ambiguous object name: X (2 objects share it, handles 5, 6; pass a handle or rename them)")
 
 
 class ParseSkippedNodeTests(unittest.TestCase):
     def test_not_mesh_node_skipped_with_warning(self):
         raw = report(head(nodes=2, total=1, checked=1, work=16, done=16),
-                     f"S|99|{b64('Wall_StandardNew_10')}|not_mesh|0",
+                     f"S|99|{b64('Wall_StandardNew_10')}|not_mesh|0|{b64('Dummy')}",
                      n_rec(10, "Leg"), n_rec(11, "Floor"), p_rec(10, 11))
         out = cc.parse_report(raw)
         self.assertTrue(out["complete"])  # every candidate pair was measured
         self.assertEqual(out["skipped_nodes"], [{"name": "Wall_StandardNew_10", "reason": "not_mesh"}])
+        self.assertEqual(out["skipped"], [{"name": "Wall_StandardNew_10", "handle": 99, "class": "Dummy",
+                                           "reason": "not_mesh"}])
         self.assertEqual(len(out["warnings"]), 1)
         self.assertIn("not mesh-convertible", out["warnings"][0])
-        self.assertIn("Wall_StandardNew_10", out["warnings"][0])
+        self.assertIn("Wall_StandardNew_10 (Dummy)", out["warnings"][0])
 
     def test_face_limit_node_pairs_unchecked(self):
         raw = report(head(nodes=3, total=2, checked=1, work=16 + 500008, done=16),
                      n_rec(10, "Leg"), n_rec(11, "Floor"),
-                     f"S|12|{b64('Garland')}|face_limit|300000",
+                     f"S|12|{b64('Garland')}|face_limit|300000|{b64('Editable_Poly')}",
                      p_rec(10, 11),
                      "X|10|12|500008|skipped_node")
         out = cc.parse_report(raw)
+        self.assertEqual(out["skipped"], [{"name": "Garland", "handle": 12, "class": "Editable_Poly",
+                                           "reason": "face_limit", "faces": 300000}])
         self.assertFalse(out["complete"])
         self.assertIsNone(out["stop_reason"])
         self.assertEqual(out["unchecked_pairs"], [{"a": "Leg", "b": "Garland", "work": 500008, "reason": "skipped_node"}])
         self.assertTrue(any("face count above max_faces" in w for w in out["warnings"]))
         self.assertTrue(any("involve a skipped node" in w for w in out["warnings"]))
+
+    def test_empty_mesh_without_pair(self):
+        # an empty mesh never forms a candidate pair, yet is reported
+        raw = report(head(nodes=3, total=1, checked=1, work=16, done=16),
+                     n_rec(10, "Leg"), n_rec(11, "Floor"),
+                     f"S|12|{b64('Empty')}|empty_mesh|0|{b64('Editable_mesh')}",
+                     p_rec(10, 11))
+        out = cc.parse_report(raw)
+        self.assertTrue(out["complete"])
+        self.assertEqual(out["skipped_nodes"], [{"name": "Empty", "reason": "empty_mesh"}])
+        self.assertTrue(any("evaluated mesh has no faces: Empty" in w for w in out["warnings"]))
+
+    def test_not_mesh_node_cannot_be_in_a_pair(self):
+        with self.assertRaisesRegex(RuntimeError, "unmeasured node"):
+            cc.parse_report(report(head(nodes=2, total=2, checked=1, work=16, done=16),
+                                   n_rec(10, "a"), n_rec(11, "b"),
+                                   f"S|12|{b64('Grp')}|not_mesh|0|{b64('Dummy')}",
+                                   p_rec(10, 11), "X|10|12|0|skipped_node"))
 
 
 class ParseBudgetTests(unittest.TestCase):
@@ -354,7 +401,8 @@ class ParseValidationTests(unittest.TestCase):
                          n_rec(10, "a"), n_rec(11, "b"), p_rec(10, 11)), "work budget stop")
 
     def test_bad_reasons(self):
-        self._bad(report(head(total=0, checked=0), f"S|5|{b64('w')}|weird|0"), "skipped-node")
+        self._bad(report(head(total=0, checked=0), f"S|5|{b64('w')}|weird|0|{b64('Box')}"), "skipped-node")
+        self._bad(report(head(total=0, checked=0), f"S|5|{b64('w')}|not_mesh|0"), "skipped-node")
         self._bad(report(head(total=1, checked=0, work=16), n_rec(10, "a"), n_rec(11, "b"), "X|10|11|16|bored"),
                   "unchecked-pair")
 

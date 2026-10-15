@@ -15,9 +15,9 @@ import re
 from typing import Any, Optional
 
 from ..coerce import DictList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import name_in_use, node_by_name, safe_string
 from ..helpers.curves import add, sub, mul, length
-from ..helpers.curve_runtime import SPLINE_BASE_FUNCTION
+from ..helpers.curve_runtime import editable_spline
 from ..server import client, mcp
 
 KNOT_TYPES = {
@@ -41,8 +41,16 @@ def _err(message: str, **extra: Any) -> dict[str, Any]:
     return out
 
 
+_MAXSCRIPT_ERROR = "__MCP_MS_ERR__:"
+
+
 def _run(script: str) -> str:
-    return str(client.send_command(script).get("result", ""))
+    raw = str(client.send_command(script).get("result", ""))
+    # The bridge returns uncaught script exceptions (such as a shared object
+    # name) as a sentinel string; report them as script errors.
+    if raw.startswith(_MAXSCRIPT_ERROR):
+        return "__ERROR__|MAXScript error: " + raw[len(_MAXSCRIPT_ERROR):].strip()
+    return raw
 
 
 def _p3(value: Any) -> list[float] | None:
@@ -223,9 +231,8 @@ def _parse_summary(raw: str) -> dict[str, Any] | None:
 
 def _editable_guard(convert: bool) -> str:
     return (
-        SPLINE_BASE_FUNCTION
-        + "local wasConverted = false\n"
-        "if not (cvIsSpline obj.baseObject) do (\n"
+        "local wasConverted = false\n"
+        f"if not {editable_spline('obj')} do (\n"
         + ("" if convert else 'if obj.modifiers.count > 0 do throw "Editable spline base required; convert=true explicitly collapses the stack"\n')
         + "convertToSplineShape obj; wasConverted = true\n)\n"
     )
@@ -274,8 +281,8 @@ def draw_spline(
 
     Edits target the spline BASE, preserving Surface, CrossSection, Sweep, etc.
     A parametric base with modifiers requires convert=true to collapse explicitly;
-    bare parametric shapes still convert automatically. Line objects are edited
-    in place without conversion. Coordinates are world-space.
+    bare parametric shapes still convert automatically. A drawn Line already
+    counts as editable and is never converted. Coordinates are world-space.
     Pair with modifiers for solids: Extrude, Lathe, Bevel, Sweep on the result.
     Use when: tracing reference profiles/silhouettes, drawing paths, building
     curved forms parametric primitives cannot express, refining spline curves.
@@ -298,7 +305,7 @@ def draw_spline(
             return _err("create needs at least 2 points")
         lines = [
             f'local finalName = "{safe}"',
-            f'if (getNodeByName finalName) != undefined do finalName = uniquename "{safe}"',
+            f'if {name_in_use("finalName")} do finalName = uniquename "{safe}"',
             "local ss = splineShape name:finalName pos:[0,0,0]",
             "addNewSpline ss",
         ]
@@ -323,7 +330,7 @@ def draw_spline(
             summary["renamed_from"] = name
         return summary
 
-    guard = f'local obj = getNodeByName "{safe}"\nif obj == undefined then "__ERROR__|shape not found: {safe}" else '
+    guard = f'local obj = {node_by_name(name, missing_ok=True)}\nif obj == undefined then "__ERROR__|shape not found: {safe}" else '
 
     if action == "add_spline":
         pts, perr = _normalize_points(points, default_type)
@@ -377,9 +384,8 @@ def draw_spline(
     )"""
         script = f"""(
 {guard}(
-    {SPLINE_BASE_FUNCTION}
     local out = stringstream ""
-    format "SHAPE|%|%|%|%\\n" ((classof obj) as string) ((cvIsSpline obj.baseObject) as string) ((classof obj.baseObject) as string) obj.modifiers.count to:out
+    format "SHAPE|%|%|%|%\\n" ((classof obj) as string) ({editable_spline('obj')} as string) ((classof obj.baseObject) as string) obj.modifiers.count to:out
     local emitted = 0
     try (
         for s = 1 to (numSplines obj) do (

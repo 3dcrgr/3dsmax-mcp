@@ -15,7 +15,7 @@ import hashlib
 import json
 from typing import Any
 
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name, safe_string
 
 
 def _client():
@@ -28,6 +28,8 @@ def _client():
 
 LEDGER_APPDATA_ID = 1415075927
 LEDGER_VERSION = 1
+# The bridge returns an uncaught MAXScript exception as this prefixed string.
+MAXSCRIPT_ERROR = "__MCP_MS_ERR__:"
 
 # Shared MAXScript helpers (esc/jsonStringArray/find*SubAnim come from tyflow.HELPERS
 # where needed; this block is standalone for core reads).
@@ -179,7 +181,7 @@ def read_graph(
     max_props = max(1, int(max_properties_per_operator))
     maxscript = f"""(
 {CORE_HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
@@ -255,13 +257,13 @@ if flow == undefined then (
     out as string
 )
 )"""
-    try:
-        response = _client().send_command(maxscript)
-    except Exception as exc:
-        return {"error": str(exc)}
+    # Transport and call-state exceptions propagate with their code and hint.
+    response = _client().send_command(maxscript)
     raw = str(response.get("result", ""))
     if raw.startswith("__ERROR__|"):
         return {"error": raw.split("|", 1)[1]}
+    if raw.startswith(MAXSCRIPT_ERROR):
+        return {"error": "MAXScript error: " + raw[len(MAXSCRIPT_ERROR):].strip()}
 
     graph: dict[str, Any] = {
         "name": name,
@@ -387,7 +389,7 @@ def graph_payload(
 def write_ledger_appdata(name: str, ledger: dict[str, Any]) -> dict[str, Any]:
     """Write the ledger dict verbatim to appdata on the flow node."""
     maxscript = f"""(
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
@@ -395,10 +397,7 @@ if flow == undefined then (
     "OK"
 )
 )"""
-    try:
-        response = _client().send_command(maxscript)
-    except Exception as exc:
-        return {"error": str(exc)}
+    response = _client().send_command(maxscript)
     raw = str(response.get("result", ""))
     if raw.startswith("__ERROR__|"):
         return {"error": raw.split("|", 1)[1]}
@@ -452,6 +451,36 @@ def ledger_update(
     Returns {"ledgerHash": ...} on success or {"ledgerWarning": ...} — ledger
     failures never fail the mutation that preceded them.
     """
+    try:
+        return _ledger_update(
+            name,
+            replace_edge=replace_edge,
+            remove_event=remove_event,
+            remove_operator=remove_operator,
+            record_ops=record_ops,
+        )
+    except Exception as exc:
+        # The mutation already ran; a blocked or lost ledger round trip only
+        # leaves the ledger stale.
+        return {"ledgerWarning": f"Ledger not updated: {exc}"}
+
+
+def merge_ledger(payload: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
+    """Merge a ledger outcome into a tool reply; a stale ledger is also a warning."""
+    payload.update(outcome)
+    if outcome.get("ledgerWarning"):
+        payload.setdefault("warnings", []).append(outcome["ledgerWarning"])
+    return payload
+
+
+def _ledger_update(
+    name: str,
+    *,
+    replace_edge: tuple[str, str, str | None] | None,
+    remove_event: str | None,
+    remove_operator: tuple[str, str] | None,
+    record_ops: dict[str, str] | None,
+) -> dict[str, Any]:
     graph = read_graph(name)
     if "error" in graph:
         return {"ledgerWarning": f"Ledger not updated: {graph['error']}"}

@@ -1,16 +1,17 @@
 #pragma once
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <functional>
+#include <list>
 #include <string>
 #include <mutex>
 #include <condition_variable>
 #include <deque>
 #include <memory>
 #include <stdexcept>
-#include <atomic>
-#include <chrono>
-#include <list>
+#include <unordered_map>
 
 // Executes work on the 3ds Max main thread from a background thread.
 // Uses a hidden Win32 window + WM_USER message to marshal calls.
@@ -28,42 +29,54 @@ public:
     // Call from main thread (GUP::Start)
     void Initialize();
 
-    // Call from main thread (GUP::Stop) BEFORE tearing down anything that
-    // joins background threads (PipeServer::Stop). Closes the submission gate,
-    // then fails every queued/deferred WorkItem so blocked client threads wake
-    // at once instead of sleeping out their timeout while the main thread sits
-    // in thread::join() and can no longer pump WM_MCP_EXECUTE (Max hangs on
-    // exit). Idempotent; Shutdown() calls it.
-    void BeginShutdown();
+    // Main thread, before GUP::Stop joins the pipe threads. Max no longer
+    // pumps the window while it exits: every request that has not started
+    // fails now, and later requests fail without being queued (in direct mode
+    // too, so no pipe thread touches a dying scene). Idempotent; Shutdown()
+    // calls it, and Initialize() accepts work again.
+    void StopAccepting();
 
     // Call from main thread (GUP::Stop)
     void Shutdown();
 
-    // True once BeginShutdown()/Shutdown() ran; ExecuteSync then fails fast.
-    static bool IsShuttingDown() { return s_shutting_down_.load(std::memory_order_acquire); }
+    // True once StopAccepting()/Shutdown() ran, until the next Initialize().
+    static bool IsShuttingDown() { return !s_accepting_.load(std::memory_order_acquire); }
 
     // Call from ANY thread. In direct mode, runs work on calling thread.
     // Otherwise blocks until work completes on main thread.
     std::string ExecuteSync(std::function<std::string()> work,
                             DWORD timeout_ms = 120000);
 
-    // Direct mode control (thread-local, safe for concurrent pipe clients)
-    static void EnableDirectMode()  { tl_direct_mode_ = true; }
-    static void DisableDirectMode() { tl_direct_mode_ = false; }
-    static bool IsDirectMode()      { return tl_direct_mode_; }
+    // Direct mode control (thread-local, safe for concurrent pipe clients).
+    // Out of line: thread_local data cannot cross a DLL boundary, so the core
+    // reaches these through McpHostApi::setDirectMode/getDirectMode.
+    static void EnableDirectMode();
+    static void DisableDirectMode();
+    static bool IsDirectMode();
 
-    // True on the thread that called Initialize() (Max's main thread). Unlike
-    // !IsDirectMode() this also holds inside a nested Dispatch that runs on
-    // the main thread (invoke_tool, run_tool_smoke), and it is false on every
-    // other thread whatever its mode. Lock-free; any thread.
+    // True on the thread that called Initialize() (Max's main thread), where
+    // ExecuteSync runs work inline.
+    bool IsOwnThread() const {
+        return main_thread_id_ != 0 && GetCurrentThreadId() == main_thread_id_;
+    }
+
+    // Max's main thread: true while it runs a request, including inside the
+    // nested message loops that request's SDK work pumps.
+    static bool IsRunningWork() { return s_executing_; }
+
+    // True on Max's main thread (the thread that called Initialize()), for
+    // code without the executor instance. Unlike !IsDirectMode() this also
+    // holds inside a nested Dispatch that runs on the main thread (invoke_tool,
+    // run_tool_smoke), and it is false on every other thread whatever its
+    // mode. Lock-free; any thread.
     static bool IsMainThread() {
         const DWORD id = s_main_thread_id_.load(std::memory_order_acquire);
         return id != 0 && GetCurrentThreadId() == id;
     }
 
-    // Names the work items this thread submits (the dispatcher uses the
-    // request's cmd type, client id and request id) so health snapshots can
-    // say whose request is queued or running.
+    // Names the work items this thread submits (the shell labels each pipe
+    // request with its cmd type, client id and request id) so health
+    // snapshots can say whose request is queued or running.
     struct WorkLabel {
         std::string cmd_type;
         std::string client_id;
@@ -143,14 +156,6 @@ private:
     static long long SteadyNowMs();
     // Thread-pool timer callback: posts one heartbeat beat to the executor window.
     static void CALLBACK HeartbeatTimerProc(PTP_CALLBACK_INSTANCE, PVOID context, PTP_TIMER);
-    // Completes a queued item with an error and wakes its waiter. No-op if the
-    // item already started, finished, or was cancelled, so it is safe to call
-    // twice and never touches work that is running.
-    static void FailWorkItem(const std::shared_ptr<WorkItem>& item, const char* message);
-    // Main thread only. Fails s_deferred_ and any WM_MCP_EXECUTE still queued,
-    // deleting the heap shared_ptr each message owns (DestroyWindow would
-    // discard them: leaked control block + a waiter nobody ever wakes).
-    void DrainPendingWork();
 
     HWND hwnd_ = nullptr;
     ATOM wndclass_atom_ = 0;
@@ -159,6 +164,14 @@ private:
     // Process-wide copy for IsMainThread().
     static std::atomic<DWORD> s_main_thread_id_;
     PTP_TIMER heartbeat_timer_ = nullptr;
+
+    // Requests whose callers are waiting, by id. WM_MCP_EXECUTE carries only
+    // the id; a caller removes its entry when it stops waiting, so a message
+    // for a request nobody waits on finds nothing and is ignored.
+    static std::mutex s_waiting_mutex_;
+    static std::unordered_map<UINT64, std::shared_ptr<WorkItem>> s_waiting_;
+    static UINT64 s_last_id_;
+    static std::atomic<bool> s_accepting_;
 
     static thread_local bool tl_direct_mode_;
     static thread_local WorkLabel tl_label_;
@@ -195,17 +208,9 @@ private:
     static bool s_executing_;
     static std::deque<std::shared_ptr<WorkItem>> s_deferred_;
 
-    // Set under s_submit_mutex_ so the check-then-post in ExecuteSync cannot
-    // race the drain in BeginShutdown: a poster either got its message queued
-    // before the flag was set (the drain then fails it) or sees the flag and
-    // throws. Static because WndProc and the deferred queue are.
-    static std::atomic<bool> s_shutting_down_;
-    static std::mutex s_submit_mutex_;
-
     // Per-process random secret. Sent in wParam alongside every
-    // WM_MCP_EXECUTE so cross-process attackers can't smuggle pointers
-    // for WndProc to reinterpret_cast — same-user processes can enumerate
-    // and PostMessage to top-level windows freely (UIPI doesn't block
-    // WM_USER+ between same-integrity processes).
+    // WM_MCP_EXECUTE so other processes can't start queued requests — same-user
+    // processes can enumerate and PostMessage to top-level windows freely
+    // (UIPI doesn't block WM_USER+ between same-integrity processes).
     static WPARAM s_execute_cookie_;
 };

@@ -19,7 +19,7 @@ Connect AI agents to Autodesk 3ds Max through the [Model Context Protocol](https
 
 Automate everything!
 
-**Current release: 1.7.5** — see [CHANGELOG.md](docs/CHANGELOG.md).
+**Current release: 1.7.6** — see [CHANGELOG.md](docs/CHANGELOG.md).
 
 ## Features
 
@@ -165,7 +165,6 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `set_modifier_property` | Set a modifier parameter on one or many objects |
 | `collapse_modifier_stack` | Collapse the stack |
 | `make_modifier_unique` | De-instance a shared modifier |
-| `inspect_modifier_properties` | Compatibility alias for `inspect_properties(target="modifier")` |
 
 ### Modeling
 
@@ -237,8 +236,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `inspect_plugin_constructor` | Creation notes for a plugin class |
 | `inspect_plugin_instance` | SDK schema v2: live values, linked maps and guarded edit tokens |
 | `plugin_patch` | Atomic typed PB2 edits with readback and stale/shared/animation guards |
-| `get_plugin_manifest` | Structured manifest (classes, workflows, gotchas) |
-| `refresh_plugin_manifest` | Rebuild manifest from live runtime |
+| `get_plugin_manifest` | Structured manifest (classes, workflows, gotchas), rebuilt from the live runtime on each call |
 | `introspect_class` | SDK parameter descriptors and published interface metadata |
 | `introspect_instance` | Deep SDK introspection with live values |
 
@@ -356,15 +354,13 @@ and existing procedural skies use the provider's dome or environment binding.
 
 | Tool | Description |
 |------|-------------|
-| `list_tyflow_operator_types` | Available operator names for this install |
-| `create_tyflow` | Create tyFlow with events and operators |
-| `create_tyflow_preset` | Presets: rain, snow, fountain, burst, debris |
+| `create_tyflow` | Create tyFlow with an event and operators, or a preset: rain, snow, fountain, burst, debris |
 | `get_tyflow_info` | Deep flow/event/operator readback |
 | `harvest_tyflow_manifest` | Probe and cache the installed tyFlow operator surface by tyFlow version |
-| `list_tyflow_operators` | Query the cached tyFlow operator manifest without touching Max |
+| `list_tyflow_operators` | Query the cached manifest, including per-type availability, without touching Max |
 | `get_tyflow_graph` | Read events, operators, properties, ledger edges, and wiring staleness |
 | `tyflow_apply_patch` | Apply a batch of tyFlow graph operations as one verified transaction |
-| `connect_tyflow_operator` | Connect or retarget a test/Send Out operator to an event |
+| `connect_tyflow_operator` | Connect or retarget a test/Send Out operator to an event, optionally creating the Send Out |
 | `disconnect_tyflow_operator` | Disconnect an operator output and remove its ledger edge |
 | `set_tyflow_wiring_ledger` | Reconcile recorded graph wiring after external or visual edits |
 | `tyflow_event_census` | Count particles per event at probe frames with temporary instrumentation |
@@ -374,7 +370,6 @@ and existing procedural skies use the provider's dome or environment binding.
 | `set_tyflow_physx` | Object-level PhysX settings |
 | `add_tyflow_collision` | Collision operator + collider list |
 | `add_tyflow_event` | Add an event |
-| `connect_tyflow_events` | Wire Send Out destinations |
 | `remove_tyflow_element` | Remove operator or event |
 | `get_tyflow_particle_count` | Particle count at a frame |
 | `get_tyflow_particles` | Particle data rows |

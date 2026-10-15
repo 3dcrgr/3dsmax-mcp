@@ -66,11 +66,10 @@ PLUGIN_OVERLAYS: dict[str, dict[str, Any]] = {
             "set_tyflow_shape",
             "set_tyflow_physx",
             "add_tyflow_collision",
-            "connect_tyflow_events",
+            "connect_tyflow_operator",
             "get_tyflow_particle_count",
             "get_tyflow_particles",
             "reset_tyflow_simulation",
-            "create_tyflow_preset",
         ],
         "recipes": [
             "For existing flows, start with get_tyflow_info (enable include_flow_properties/include_event_properties/include_operator_properties as needed), then mutate.",
@@ -1219,16 +1218,11 @@ def inspect_plugin_instance(name: str = "", detail: str = "normal", schema_versi
 
 @mcp.tool()
 def get_plugin_manifest(plugin_name: str) -> str:
-    """Return a structured plugin manifest derived from live runtime data plus curated hints."""
+    """Return a structured plugin manifest derived from live runtime data plus curated hints.
+
+    The manifest is rebuilt from the live runtime on every call; nothing is cached.
+    """
     return json.dumps(_build_manifest(plugin_name))
-
-
-@mcp.tool()
-def refresh_plugin_manifest(plugin_name: str) -> str:
-    """Refresh and return the plugin manifest."""
-    manifest = _build_manifest(plugin_name)
-    manifest["refreshed"] = True
-    return json.dumps(manifest)
 
 
 @mcp.resource(PLUGIN_INDEX_RESOURCE_URI, name="Plugin Index", mime_type="application/json")

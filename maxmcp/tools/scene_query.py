@@ -5,7 +5,7 @@ from __future__ import annotations
 import json as _json
 
 from ..server import mcp, client
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import safe_string, node_by_name
 
 
 @mcp.tool()
@@ -21,7 +21,7 @@ def get_instances(name: str) -> str:
 
     safe = safe_string(name)
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "{{\\\"error\\\": \\\"Object not found: {safe}\\\"}}"
         ) else (
@@ -67,7 +67,7 @@ def get_dependencies(
     if normalized_direction == "dependentnodes":
         deps_expr = "refs.dependentnodes obj"
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "{{\\\"error\\\": \\\"Object not found: {safe}\\\"}}"
         ) else (

@@ -36,16 +36,17 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     overwrite and missing-file warnings silently take their default answer.
     A script that mentions resetMaxFile, loadMaxFile, fetchMaxFile, quitMax,
     checkForSave, "max file new/open", "max reset file", "max fetch" or the
-    Interface's FileReset/FileFetch/LoadFromFile runs with prompts shown,
-    so a save-changes prompt returns BLOCKED_BY_DIALOG instead of discarding work
-    (#noPrompt or quiet:true arguments in the script still suppress it, and so
-    discard unsaved changes: add them only with the user's OK). quiet=False always
-    shows prompts. quiet=True forces quiet mode, except on such a script: there it
-    needs allow_discard=True as well, because quiet mode answers the save prompt by
-    discarding unsaved changes; pass both only when the user agreed to lose them.
-    The check reads only this text: for a script that runs other scripts (fileIn,
-    include, python.ExecuteFile, macros.run) that may reset, open or quit, pass
-    quiet=False. Answer a shown prompt with max_dialogs.
+    Interface's FileReset/FileFetch/LoadFromFile runs with prompts shown, because
+    quiet mode skips the save-changes prompt (checkForSave() returns true and
+    resetMaxFile() discards unsaved work): a save-changes prompt then returns
+    BLOCKED_BY_DIALOG instead of discarding work (#noPrompt or quiet:true arguments
+    in the script still suppress it, and so discard unsaved changes: add them only
+    with the user's OK). quiet=False always shows prompts. quiet=True forces quiet
+    mode, except on such a script: there it needs allow_discard=True as well; pass
+    both only when the user agreed to lose unsaved changes. The check reads only
+    this text: for a script that runs other scripts (fileIn, include,
+    python.ExecuteFile, macros.run) that may reset, open or quit, pass quiet=False.
+    Answer a shown prompt with max_dialogs.
 
     Always pass #noPrompt to importFile, including OBJ/FBX imports:
     importFile @"C:/assets/model.fbx" #noPrompt

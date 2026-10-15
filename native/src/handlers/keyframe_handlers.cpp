@@ -1,6 +1,6 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 
 #include <control.h>
 #include <istdplug.h>
@@ -97,32 +97,30 @@ static Control* ControlFromAnimatable(Animatable* anim) {
     return nullptr;
 }
 
-static void CollectNodesForRequest(const json& p, Interface* ip, std::vector<INode*>& out) {
+static NamedNodes CollectNodesForRequest(const json& p, Interface* ip) {
+    auto names = p.value("names", std::vector<std::string>{});
+    if (!names.empty()) return ResolveNodesByNames(names);
+
+    NamedNodes request;
+    std::vector<INode*>& out = request.nodes;
     std::unordered_set<INode*> seen;
     auto push = [&](INode* node) {
         if (node && seen.insert(node).second) out.push_back(node);
     };
-
-    auto names = p.value("names", std::vector<std::string>{});
-    if (!names.empty()) {
-        for (const auto& name : names) {
-            push(FindNodeByName(name));
-        }
-        return;
-    }
 
     std::string target = LowerCopy(p.value("target", "selection"));
     if (target == "all" || target == "scene") {
         std::vector<INode*> nodes;
         CollectNodes(ip->GetRootNode(), nodes);
         for (INode* node : nodes) push(node);
-        return;
+        return request;
     }
 
     const int selCount = ip->GetSelNodeCount();
     for (int i = 0; i < selCount; ++i) {
         push(ip->GetSelNode(i));
     }
+    return request;
 }
 
 struct TrackRef {
@@ -1549,11 +1547,25 @@ std::string NativeHandlers::KeyframeTracks(const std::string& params, MCPBridgeG
             return ManageTimeline(p, ip).dump();
         }
 
-        std::vector<INode*> nodes;
-        CollectNodesForRequest(p, ip, nodes);
+        const NamedNodes requested = CollectNodesForRequest(p, ip);
+        std::vector<INode*> nodes = requested.nodes;
         if (nodes.empty()) {
+            if (requested.Unresolved()) ThrowUnresolvedNames(requested, "no keyframe track was read or changed.");
             throw std::runtime_error("No target nodes found. Pass names, target='all', or select objects in 3ds Max.");
         }
+        // Names that matched nothing, or several objects, are reported, never
+        // silently dropped.
+        auto withMissingNames = [&](json result) {
+            const json& notFoundNames = requested.notFound;
+            if (!notFoundNames.empty()) {
+                result["notFound"] = notFoundNames;
+                result["status"] = "partial";
+                result["warnings"].push_back(std::to_string(notFoundNames.size()) +
+                    " requested name(s) matched no object and were skipped: " + JoinNames(notFoundNames));
+            }
+            AddAmbiguousNamesWarning(result, requested.ambiguous);
+            return result;
+        };
 
         KeyframeBudget budget = BudgetFromRequest(p);
         if (p.contains("value") && p.contains("move")) {
@@ -1603,11 +1615,11 @@ std::string NativeHandlers::KeyframeTracks(const std::string& params, MCPBridgeG
             }
 
             MechanicalEditStats mechanical;
-            return BuildKeyframeResult(
+            return withMissingNames(BuildKeyframeResult(
                 action, nodes, tracks, budget,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 mechanical,
-                samples, loopGaps, true).dump();
+                samples, loopGaps, true)).dump();
         }
 
         json styleParams = p;
@@ -1851,12 +1863,22 @@ std::string NativeHandlers::KeyframeTracks(const std::string& params, MCPBridgeG
             }
         }
 
-        return BuildKeyframeResult(
+        json result = withMissingNames(BuildKeyframeResult(
             action, nodes, tracks, budget,
             keyed, matched, styled, styledControllerKeys,
             ranged, rangedControllerEdits,
             styleKeyCount, styleControllerKeyCount,
             mechanical,
-            samples, loopGaps, false).dump();
+            samples, loopGaps, false));
+        const long long edits = static_cast<long long>(keyed) + matched + styledControllerKeys +
+            rangedControllerEdits + mechanical.deletedKeys + mechanical.movedKeys +
+            mechanical.scaledKeys + mechanical.resampledKeys;
+        if (edits == 0) {
+            result["status"] = "no_change";
+            result["warnings"].push_back("The " + action + " request matched " +
+                std::to_string(tracks.size()) + " track(s) but changed no keys; check times, "
+                "track names and whether the tracks are keyable.");
+        }
+        return result.dump();
     });
 }

@@ -48,7 +48,7 @@ def keyframe_tracks(
 ) -> str:
     """Deterministic native animation edits. Actions: timeline; list/set; delete_keys/move_keys/scale_keys; resample or bake; normalize_tangents/style; match/loop; ort. Key-time edits use time/times or from_time/to_time. bake replaces keys in its sample window by default; resample preserves them unless replace_keys is true."""
     if not client.native_available:
-        return "Native bridge is required for keyframe_tracks."
+        return _json.dumps({"error": "Native bridge is required for keyframe_tracks."})
 
     payload: dict = {
         "action": action,

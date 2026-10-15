@@ -48,6 +48,11 @@ class ErrorCode(str, Enum):
     MAXSCRIPT_INTERRUPTED = "MAXSCRIPT_INTERRUPTED"
     REQUEST_OUTCOME_UNKNOWN = "REQUEST_OUTCOME_UNKNOWN"
     BRIDGE_OUTDATED = "BRIDGE_OUTDATED"
+    TRANSFORM_IGNORED = "TRANSFORM_IGNORED"
+    CORE_STATIC = "CORE_STATIC"
+    CORE_BUSY = "CORE_BUSY"
+    CORE_LOAD_FAILED = "CORE_LOAD_FAILED"
+    CORE_VERSION_MISMATCH = "CORE_VERSION_MISMATCH"
 
 
 class ToolEnvelope(BaseModel):
@@ -80,6 +85,10 @@ _ERROR_PREFIXES = (
     "maxscript error",
 )
 _ERROR_SUBSTRINGS = (" not found:",)
+# The bridge returns an uncaught MAXScript exception as this sentinel-prefixed
+# string with success=true. A tool that passes it through changed nothing it
+# reported, so the envelope treats it as an error.
+_MAXSCRIPT_ERROR_SENTINEL = "__MCP_MS_ERR__:"
 _RETRYABLE_CODES = {
     ErrorCode.BRIDGE_DOWN,
     ErrorCode.MAX_BUSY,
@@ -88,6 +97,7 @@ _RETRYABLE_CODES = {
     ErrorCode.USER_BUSY,
     ErrorCode.SCENE_CONFLICT,
     ErrorCode.TRANSACTION_BUSY,
+    ErrorCode.CORE_BUSY,
 }
 
 
@@ -273,7 +283,8 @@ def _json_safe(value: Any) -> Any:
     return repr(value)
 
 
-def _try_parse_error_payload(value: Any) -> dict[str, Any] | None:
+def parse_error_payload(value: Any) -> dict[str, Any] | None:
+    """The structured error dict in a value: a dict, or JSON text (optionally "MAXScript error:" prefixed)."""
     if isinstance(value, dict):
         return value
     if not isinstance(value, str):
@@ -370,7 +381,10 @@ def _error_from_result(result: Any, raw: Any) -> dict[str, Any] | None:
             )
     if isinstance(raw, str):
         stripped = raw.strip()
-        structured = _try_parse_error_payload(stripped)
+        if stripped.startswith(_MAXSCRIPT_ERROR_SENTINEL):
+            message = stripped[len(_MAXSCRIPT_ERROR_SENTINEL):].strip() or "MAXScript error"
+            return _normalize_error(error_type="MAXScriptError", message=message)
+        structured = parse_error_payload(stripped)
         structured_status = str(structured.get("status", "")).lower() if structured else ""
         if structured and (
             structured.get("error")
@@ -385,8 +399,12 @@ def _error_from_result(result: Any, raw: Any) -> dict[str, Any] | None:
                 hint=structured.get("hint"),
                 details=structured.get("details"),
             )
+        # Phrase checks are for plain-text results. A JSON object reports its
+        # own outcome; a partial success may quote "... not found: name".
         lowered = stripped.lower()
-        if lowered.startswith(_ERROR_PREFIXES) or any(s in lowered for s in _ERROR_SUBSTRINGS):
+        if structured is None and (
+            lowered.startswith(_ERROR_PREFIXES) or any(s in lowered for s in _ERROR_SUBSTRINGS)
+        ):
             return _normalize_error(error_type="ToolError", message=stripped)
     return None
 
@@ -395,7 +413,7 @@ def _error_from_exception(exc: BaseException) -> dict[str, Any]:
     bridge_message = getattr(exc, "bridge_message", None)
     response = getattr(exc, "bridge_response", None)
 
-    structured = _try_parse_error_payload(bridge_message)
+    structured = parse_error_payload(bridge_message)
     if structured:
         return _normalize_error(
             error_type=str(structured.get("error_type") or structured.get("type") or exc.__class__.__name__),
@@ -407,7 +425,7 @@ def _error_from_exception(exc: BaseException) -> dict[str, Any]:
         )
 
     if isinstance(response, dict):
-        structured = _try_parse_error_payload(response.get("error"))
+        structured = parse_error_payload(response.get("error"))
         if structured:
             return _normalize_error(
                 error_type=str(structured.get("error_type") or structured.get("type") or exc.__class__.__name__),
@@ -649,5 +667,6 @@ __all__ = [
     "envelope_result",
     "envelope_exception",
     "make_structured_tool",
+    "parse_error_payload",
     "tripback_mode",
 ]

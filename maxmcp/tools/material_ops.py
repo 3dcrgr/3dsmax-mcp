@@ -13,7 +13,15 @@ from pathlib import Path
 from typing import Optional
 from ..server import mcp, client
 from ..coerce import IntList, StrList
-from ..helpers.maxscript import safe_string, safe_value
+from ..helpers.maxscript import (
+    NODE_LOOKUP_FNS,
+    node_by_name,
+    node_by_name_expr,
+    report_ambiguous,
+    safe_string,
+    safe_value,
+    split_ambiguous_reply,
+)
 from ..helpers.material_assign import existing_material_script, existing_material_result
 from ..helpers.native_compat import is_missing_native_route_error
 from ..helpers.material_tripback import (
@@ -119,6 +127,10 @@ def _truncate_slots(payload: dict, key: str, max_per_group: int, out: dict, trun
         trunc[key] = len(items)
 
 
+# Separates the summary from the assign_to names that matched no object.
+_UNASSIGNED_MARKER = "__mcp_unassigned__"
+
+
 def _build_shared_pbr_maxscript(
     matched: dict[str, Path],
     material_name: str,
@@ -146,17 +158,24 @@ def _build_shared_pbr_maxscript(
     ))
     lines.append(f'summary = mat.name + " (" + ((classOf mat) as string) + ")"')
     if assign_to:
+        # Names that match no object or several objects are skipped and reported.
         names_arr = "#(" + ", ".join(f'"{safe_string(n)}"' for n in assign_to) + ")"
+        lines.append(NODE_LOOKUP_FNS)
         lines.extend([
             f"nameList = {names_arr}",
             "assignCount = 0",
-            "for n in nameList do (obj = getNodeByName n; if obj != undefined then (obj.material = mat; assignCount += 1))",
+            'unassigned = ""',
+            "assignMissing = #()",
+            "assignShared = #()",
+            "for n in nameList do (obj = mcpBatchNode n assignMissing assignShared; if obj != undefined do (obj.material = mat; assignCount += 1))",
+            'for n in assignMissing do unassigned += "|" + n',
             'summary += " | Assigned to " + (assignCount as string) + " object(s)"',
         ])
     lines.extend([
         'summary += " | Channels: " + channelList',
         'if skippedList != "" do summary += " | Skipped: " + skippedList',
-        "summary",
+        f'if unassigned != "" do summary += "{_UNASSIGNED_MARKER}" + unassigned' if assign_to else "",
+        "summary + (mcpAmbiguousReply assignShared)" if assign_to else "summary",
     ])
     return "(\n    " + "\n    ".join(lines) + "\n)"
 
@@ -204,19 +223,18 @@ def assign_material(
 
     maxscript = f"""(
         try (
-            mat = {material_class}{name_param} {params}
             nameList = {name_arr}
-            assignCount = 0
+            targets = #()
             notFound = #()
+            -- Every name resolves before the material is created, so a shared
+            -- name fails the call without a partial assignment.
             for n in nameList do (
-                obj = getNodeByName n
-                if obj != undefined then (
-                    obj.material = mat
-                    assignCount += 1
-                ) else (
-                    append notFound n
-                )
+                obj = {node_by_name_expr("n", missing_ok=True)}
+                if obj != undefined then appendIfUnique targets obj else append notFound n
             )
+            mat = {material_class}{name_param} {params}
+            for obj in targets do obj.material = mat
+            assignCount = targets.count
             msg = "Created " + (classof mat) as string + " \\\"" + mat.name + "\\\" and assigned to " + (assignCount as string) + " object(s)"
             if notFound.count > 0 do msg += " | Not found: " + (notFound as string)
             msg
@@ -263,22 +281,22 @@ def set_material_property(
         mat_label = "material"
 
     maxscript = f"""(
-        obj = getNodeByName "{safe}"
+        obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "Object not found: {safe}"
         ) else if obj.material == undefined then (
-            "No material assigned to {safe}"
+            "Error: No material assigned to {safe}"
         ) else (
             mat = {mat_expr}
             if mat == undefined then (
-                "Sub-material index {sub_material_index} not found on {safe}"
+                "Error: Sub-material index {sub_material_index} not found on {safe}"
             ) else (
                 try (
                     mat.{safe_prop} = {safe_value(value)}
                     readback = (getproperty mat #{safe_prop}) as string
                     "Set " + mat.name + ".{safe_prop} = " + readback
                 ) catch (
-                    "Error setting {safe_prop}: " + (getCurrentException())
+                    "Error: setting {safe_prop} failed: " + (getCurrentException())
                 )
             )
         )
@@ -328,15 +346,15 @@ def set_material_properties(
     set_block = "\n            ".join(set_lines)
 
     maxscript = f"""(
-        obj = getNodeByName "{safe}"
+        obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "Object not found: {safe}"
         ) else if obj.material == undefined then (
-            "No material assigned to {safe}"
+            "Error: No material assigned to {safe}"
         ) else (
             mat = {mat_expr}
             if mat == undefined then (
-                "Sub-material index {sub_material_index} not found on {safe}"
+                "Error: Sub-material index {sub_material_index} not found on {safe}"
             ) else (
                 okList = #()
                 errList = #()
@@ -455,7 +473,7 @@ def get_material_slots(
             else "other"
         )
 
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj == undefined then (
             "{{\\"error\\":\\"Object not found: {safe}\\"}}"
         ) else if obj.material == undefined then (
@@ -782,14 +800,14 @@ def set_sub_material(
     if source_index > 0:
         # Reference from another slot
         maxscript = f"""(
-            obj = getNodeByName "{safe}"
+            obj = {node_by_name(name, missing_ok=True)}
             if obj == undefined then "Object not found: {safe}"
-            else if obj.material == undefined then "No material on {safe}"
-            else if (classof obj.material) != Multimaterial then "Material is not Multimaterial"
+            else if obj.material == undefined then "Error: No material on {safe}"
+            else if (classof obj.material) != Multimaterial then "Error: Material is not Multimaterial"
             else (
                 try (
                     srcMat = obj.material.materialList[{source_index}]
-                    if srcMat == undefined then "Source slot {source_index} is empty"
+                    if srcMat == undefined then "Error: Source slot {source_index} is empty"
                     else (
                         obj.material.materialList[{sub_material_index}] = srcMat
                         "Sub[{sub_material_index}] = Sub[{source_index}] (" + srcMat.name + ") — shared reference"
@@ -800,10 +818,10 @@ def set_sub_material(
     else:
         # Create new material at slot
         maxscript = f"""(
-            obj = getNodeByName "{safe}"
+            obj = {node_by_name(name, missing_ok=True)}
             if obj == undefined then "Object not found: {safe}"
-            else if obj.material == undefined then "No material on {safe}"
-            else if (classof obj.material) != Multimaterial then "Material is not Multimaterial"
+            else if obj.material == undefined then "Error: No material on {safe}"
+            else if (classof obj.material) != Multimaterial then "Error: Material is not Multimaterial"
             else (
                 try (
                     newMat = {material_class}{name_param} {params}
@@ -841,6 +859,10 @@ def write_osl_shader(
         raw = response.get("result", "")
         try:
             data = json.loads(raw)
+            # Keep the full payload when the shader did not compile or a
+            # parameter was not set, so the envelope surfaces its warnings.
+            if data.get("warnings"):
+                return raw
             return data.get("message", raw)
         except Exception:
             return raw
@@ -956,12 +978,20 @@ def create_material_from_textures(
 
     # -- Step 6: Send to Max --
     response = client.send_command(maxscript)
-    raw = response.get("result", "")
+    reply, ambiguous = split_ambiguous_reply(str(response.get("result", "")))
+    message, _, unassigned = reply.partition(_UNASSIGNED_MARKER)
+    extra: dict = {}
+    if unassigned:
+        missing = [n for n in unassigned.split("|") if n]
+        extra = {"not_found": missing, "warnings": [
+            f"assign_to skipped {len(missing)} name(s) that match no object: {', '.join(missing)}"]}
+    report_ambiguous(extra, ambiguous)
     return wrap_material_tool_result(
-        str(raw),
+        message,
         material_class=material_class,
         renderer=renderer,
         tool="create_material_from_textures",
+        **extra,
     )
 
 
@@ -1571,4 +1601,11 @@ def create_shell_material(
 )"""
 
     response = client.send_command(maxscript)
-    return response.get("result", "{}")
+    result = response.get("result", "{}")
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if isinstance(payload, dict) and payload.get("ambiguous"):
+        return report_ambiguous(payload, payload["ambiguous"])
+    return result

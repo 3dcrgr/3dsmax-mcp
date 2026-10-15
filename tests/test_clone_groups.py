@@ -39,6 +39,12 @@ def _scripts(client):
     return [c.args[0] for c in client.send_command.call_args_list]
 
 
+def _unfilled(ms):
+    # Placeholders are __NAME__; the embedded upstream lookup functions carry the
+    # __MCP_AMBIGUOUS__ reply tag and errors start with __ERROR__.
+    return "__" in ms.replace("__ERROR__", "").replace("__MCP_AMBIGUOUS__", "")
+
+
 class ImportTargetTests(unittest.TestCase):
     def test_imports_checkout(self):
         repo = Path(__file__).resolve().parent.parent
@@ -110,7 +116,7 @@ class GroupMemberTests(unittest.TestCase):
         ms = cl.build_group_member_clone_maxscript([], [101], "copy", [0, 0, 0], 1)
         self.assertIn("for n in made where isValidNode n do delete n", ms)
         self.assertNotIn("maxOps.cloneNodes", ms)
-        self.assertNotIn("__", ms.replace("__ERROR__", ""))  # every placeholder filled
+        self.assertFalse(_unfilled(ms))  # every placeholder filled
 
     def test_ambiguous_member_name_refused(self):
         results = [json.dumps([_member(1, cs=2)])]
@@ -151,6 +157,9 @@ class UnchangedPathTests(unittest.TestCase):
             cl.clone_objects(["GRP_Vitrine_Props"])
         detect = _scripts(client)[0]
         self.assertIn("fn mcpIsMember n = (isGroupMember n) or (mcpInClosedGroup n)", detect)
+        # Upstream 1.7.6 strict names: exact case first, else ignoring case.
+        self.assertIn("local resolved = mcpNamedNodes nm", detect)
+        self.assertIn('\\"cs\\":" + (resolved.count as string)', detect)
         self.assertIn("ignoreCase:false", detect)
         self.assertIn('#("GRP_Vitrine_Props")', detect)
 
@@ -174,6 +183,32 @@ class UnchangedPathTests(unittest.TestCase):
         with patch.object(cl, "client", _client(True, ["900,901", _spatial(["A", "B"])])) as client:
             cl.clone_objects(["Vase01"], count=2, clone_whole_group=True)
         self.assertIn("maxOps.cloneNodes src", _scripts(client)[0])
+        # Upstream's closed-group refusal is skipped: Max's whole-group clone is wanted.
+        self.assertIn('local groupError = ""', _scripts(client)[0])
+
+    def test_clone_whole_group_falls_back_past_native_refusal(self):
+        # Upstream's native handler refuses closed-group members; the MAXScript
+        # fallback then clones the whole group as asked.
+        client = MagicMock()
+        client.native_available = True
+        fallback = json.dumps({"cloned": ["GRP001"], "notFound": [], "handles": ["900"]})
+        client.send_command.side_effect = [RuntimeError("Clone source 'Vase01' is in closed group"),
+                                           {"result": fallback}, {"result": _spatial(["GRP001"])}]
+        with patch.object(cl, "client", client):
+            out = json.loads(cl.clone_objects(["Vase01"], clone_whole_group=True))
+        script = _scripts(client)[1]
+        self.assertIn('local groupError = ""', script)
+        self.assertIn("maxOps.cloneNodes srcNodes", script)
+        self.assertEqual(out["cloned"], ["GRP001"])
+
+    def test_plain_paths_keep_closed_group_guard(self):
+        with patch.object(cl, "client", _client(False, ["[]", json.dumps({"cloned": [], "notFound": ["Box001"]})])) \
+                as client:
+            cl.clone_objects(["Box001"])
+        self.assertIn("local groupError = mcpClosedGroupError srcNodes", _scripts(client)[1])
+        with patch.object(cl, "client", _client(False, ["[]", "900", _spatial(["Box002"])])) as client:
+            cl.clone_objects(["Box001"], count=2)
+        self.assertIn("local groupError = mcpClosedGroupError src", _scripts(client)[1])
 
 
 class ReviewFixTests(unittest.TestCase):
@@ -182,13 +217,15 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIn("local preNodes = objects as array", ms)
         self.assertIn("objects.count - preNodes.count - made.count", ms)
         self.assertIn("mcpDeleteNew preNodes", ms)
-        self.assertNotIn("__", ms.replace("__ERROR__", ""))
+        self.assertFalse(_unfilled(ms))
 
     def test_clone_script_rejects_plain_members_and_dedupes(self):
         ms = cl.build_group_member_clone_maxscript(["Chair01"], [101, 101], "copy", [0, 0, 0], 1)
         self.assertIn("else if mcpIsMember matches[1] then append plainMembers nm", ms)
         self.assertIn("appendIfUnique memberSrc n", ms)
-        self.assertIn("getNodeByName nm exact:true ignoreCase:false all:true", ms)
+        # Upstream 1.7.6 strict names (mcpNamedNodes), never a loose lookup.
+        self.assertIn("local matches = mcpNamedNodes nm", ms)
+        self.assertIn("Ambiguous object name: ", ms)
         self.assertNotIn("getNodeByName nm exact:true all:true", ms)
 
     def test_detection_maps_by_index_not_string(self):
@@ -220,16 +257,22 @@ class ReviewFixTests(unittest.TestCase):
         self.assertFalse(out["detached_from_group"])
         self.assertIn("CHAIR01", out["warnings"][0])
 
-    def test_wrong_case_member_name_not_cloned(self):
-        # 'vase01' only matches member 'Vase01' ignoring case: notFound, nothing cloned.
-        results = [json.dumps([_shadow(1, "Vase01")]), _made([], members=[], missing=["vase01"])]
+    def test_wrong_case_member_name_clones_member_alone(self):
+        # Upstream 1.7.6 resolves a name with no exact-case match to the one object
+        # differing only in case: 'vase01' is member 'Vase01', cloned alone.
+        results = [json.dumps([_member(1)]), _made(["900"]), _spatial(["Vase002"])]
         with patch.object(cl, "client", _client(True, results)) as client:
             out = json.loads(cl.clone_objects(["vase01"]))
-        self.assertEqual(client.send_command.call_count, 2)
-        self.assertEqual(out["error"], "No valid objects found to clone")
-        self.assertEqual(out["notFound"], ["vase01"])
+        self.assertNotIn("maxOps.cloneNodes", _scripts(client)[1])
+        self.assertEqual(out["group_members"][0]["name"], "vase01")
         for call in client.send_command.call_args_list:
             self.assertNotEqual(call.kwargs.get("cmd_type"), "native:clone_objects")
+
+    def test_maxscript_error_from_group_path_raises(self):
+        results = [json.dumps([_member(1)]), "__MCP_MS_ERR__: -- Runtime error"]
+        with patch.object(cl, "client", _client(True, results)):
+            with self.assertRaisesRegex(RuntimeError, "Runtime error"):
+                cl.clone_objects(["Vase01"])
 
     def test_ambiguity_uses_case_exact_count(self):
         results = [json.dumps([_member(1, cs=1)]), _made(["900"]), _spatial(["Vase002"])]

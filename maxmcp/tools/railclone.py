@@ -15,11 +15,15 @@ from typing import Any
 
 from ..coerce import StrList
 from ..helpers import railclone_lib as rclib
+from ..helpers.maxscript import NODE_LOOKUP_FNS, name_in_use
 from ..helpers.mesh import integer
 from ..helpers.precheck import PrecheckBlocked
 from ..helpers.railclone_lib import RailCloneError
 from ..max_client import DialogBlocked
 from ..server import client, mcp
+
+
+_NODE_LOOKUP_FNS = NODE_LOOKUP_FNS
 
 
 MAX_XML_CHARS = 4_000_000
@@ -314,7 +318,7 @@ def _target(name: str, handle: int) -> str:
         if name:
             code += 'if obj.name != wantedName do throw "NODE_REF_MISMATCH: handle and name disagree"\n'
     elif name:
-        code += 'local matches = getNodeByName wantedName exact:true all:true\n'
+        code += 'local matches = mcpNamedNodes wantedName\n'
         code += 'if matches.count == 0 do throw "NOT_FOUND: node not found"\n'
         code += 'if matches.count != 1 do throw "AMBIGUOUS: use a handle for duplicate node names"\nobj = matches[1]\n'
     else:
@@ -323,7 +327,7 @@ def _target(name: str, handle: int) -> str:
 
 
 def _send(body: str) -> str:
-    response = client.send_command('(' + _FUNCTIONS + '\ntry (\n' + body +
+    response = client.send_command('(' + _FUNCTIONS + _NODE_LOOKUP_FNS + '\ntry (\n' + body +
                                    '\n) catch ("RCERROR|" + (getCurrentException() as string))\n)')
     if response.get("error") or response.get("ok") is False:
         error = response.get("error") or {}
@@ -1149,12 +1153,17 @@ local splineNames = #(@@SPLINES@@)
 local clipNames = #(@@CLIPS@@)
 if not (isKindOf RailClone_Pro MAXClass) do throw "NOT_INSTALLED: RailClone Pro is not loaded in this 3ds Max"
 if theHold.Holding() or theHold.IsSuspended() or theHold.SuperLevel() != 0 do throw "USER_BUSY: an undo operation is active"
-if wantName != "" and (getNodeByName wantName exact:true all:true).count > 0 do throw ("NAME_IN_USE: a node is already named " + wantName)
+if wantName != "" and @@WANT_IN_USE@@ do throw ("NAME_IN_USE: a node is already named " + wantName)
 local shapes = #()
 for nm in (splineNames + clipNames) do (
-    local found = getNodeByName nm exact:true all:true
+    -- Exact-case match first, else one differing only in case (mcpNamedNodes).
+    local found = mcpNamedNodes nm
     if found.count == 0 do throw ("SPLINE_NOT_FOUND: no node is named " + nm)
-    if found.count > 1 do throw ("AMBIGUOUS: several nodes are named " + nm)
+    if found.count > 1 do (
+        local handles = ""
+        for n in found do handles += (if handles == "" then "" else ", ") + (mcpHandleText n)
+        throw ("AMBIGUOUS: " + (found.count as string) + " nodes are named " + nm + " (handles " + handles + "); rename them first")
+    )
     if (superClassOf found[1]) != Shape do throw ("NOT_A_SPLINE: " + nm + " is not a shape")
     append shapes found[1]
 )
@@ -1184,7 +1193,7 @@ local created = #()
 local loaded = false
 local fixed = 0
 local missing = #()
-'''
+'''.replace("@@WANT_IN_USE@@", name_in_use("wantName"))
 
 # Merge: only for .max items, so only inside the undo-off wrapper.
 _LOAD_MERGE = r'''
@@ -1207,7 +1216,7 @@ if matPath != "" do (
 
 _LOAD_ROUTE = r'''
 o = RailClone_Pro()
-o.name = (if wantName != "" then wantName else (if (getNodeByName defaultName exact:true) == undefined then defaultName else uniqueName (defaultName + "_")))
+o.name = (if wantName != "" then wantName else (if not @@DEFAULT_IN_USE@@ then defaultName else uniqueName (defaultName + "_")))
 append created o
 -- loadLibraryItemByPath loads into the first SELECTED RailClone: select only this one.
 select o
@@ -1219,7 +1228,7 @@ loaded = true
 local code = api.loadLibraryItemByPath routeArg
 rcRestoreSel prevSel
 if code != 0 do throw ("LOAD_FAILED: loadLibraryItemByPath returned " + (code as string) + " for " + route)
-'''
+'''.replace("@@DEFAULT_IN_USE@@", name_in_use("defaultName"))
 
 _SETUP = r'''
 local base = o.baseObject

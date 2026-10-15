@@ -14,7 +14,7 @@ import math
 from typing import Any, Optional
 
 from ..coerce import DictList, DictValue, StrList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, name_in_use, node_by_name, node_by_name_expr, safe_string
 from ..server import client, mcp
 
 # Agent-friendly tokens -> MAXScript operationType enums.
@@ -165,13 +165,27 @@ def _err(message: str, **extra: Any) -> dict[str, Any]:
     return out
 
 
+_MAXSCRIPT_ERROR = "__MCP_MS_ERR__:"
+
+
 def _run(script: str) -> str:
-    return str(client.send_command(script).get("result", ""))
+    raw = str(client.send_command(script).get("result", ""))
+    # The bridge returns uncaught script exceptions as a sentinel string; report
+    # them as script errors, not as an unexpected (transport-looking) reply.
+    if raw.startswith(_MAXSCRIPT_ERROR):
+        return "__ERROR__|MAXScript error: " + raw[len(_MAXSCRIPT_ERROR):].strip()
+    return raw
 
 
-def _base_guard(safe: str) -> str:
-    """Shared script prologue: resolve base node into `obj` or emit __ERROR__."""
-    return f'local obj = getNodeByName "{safe}"\nif obj == undefined then "__ERROR__|base object not found: {safe}" else '
+def _base_guard(name: str) -> str:
+    """Modifier-route prologue: require BooleanMod, resolve base node into `obj`, or emit __ERROR__."""
+    safe = safe_string(name)
+    return (
+        f'local obj = {node_by_name(name, missing_ok=True)}\n'
+        'if not isKindOf BooleanMod MAXClass then "__ERROR__|BooleanMod requires 3ds Max 2024 or newer; '
+        'use backend=auto or backend=proboolean on this version"\n'
+        f'else if obj == undefined then "__ERROR__|base object not found: {safe}" else '
+    )
 
 
 def _find_boolmod() -> str:
@@ -187,7 +201,7 @@ def _boolean_backend(name: str, backend: str) -> str:
     if backend != "auto":
         return backend
     # Query the selected Max each time; routing must not survive an instance switch.
-    return _run(f'''(local obj = getNodeByName "{safe_string(name)}"
+    return _run(f'''(local obj = {node_by_name(name, missing_ok=True)}
         if obj != undefined and classof obj.baseobject == ProBoolean then "proboolean"
         else if isKindOf BooleanMod MAXClass then "modifier" else "proboolean")''')
 
@@ -209,20 +223,16 @@ def _apply_proboolean(safe, ops, per_op, cut_instances, cutter_block, use_operan
         local savedSelection = selection as array
         try (
             if theHold.Holding() do throw "USER_BUSY: an undo operation is active"
-            fn uniqueNode nm = (
-                local found = getNodeByName nm exact:true all:true
-                if found.count != 1 do throw ("Object name must resolve uniquely: " + nm)
-                found[1]
-            )
-            local original = uniqueNode "{safe}"
+            {NODE_LOOKUP_FNS}
+            local original = mcpUniqueNode "{safe}" "Base object"
             if superclassof original != GeometryClass do throw "Base object must be geometry"
             if not isKindOf ProBoolean MAXClass do throw "ProBoolean is unavailable"
             local opNames = {names_arr}
             local opEnums = {enums_arr}
             for nm in {inline_names} do (
-                if getNodeByName nm != undefined do throw ("Cutter name already exists: " + nm)
+                if {name_in_use("nm")} do throw ("Cutter name already exists: " + nm)
             )
-            local originals = for nm in opNames collect uniqueNode nm
+            local originals = for nm in opNames collect mcpUniqueNode nm "Operand"
             for n in originals do (
                 if n == original do throw "Base cannot be its own operand"
                 if superclassof n != GeometryClass do throw "Operand must be geometry"
@@ -468,17 +478,19 @@ def boolean_operation(
                 "(if classof obj.modifiers[i] == BooleanMod do bm = obj.modifiers[i])\n"
             )
             + "local madeNew = false\n"
-            "if bm == undefined do (bm = BooleanMod(); addModifier obj bm; madeNew = true)\n"
+            "local oldProps = undefined\n"
+            "if bm == undefined then (bm = BooleanMod(); addModifier obj bm; madeNew = true)\n"
+            "else try (oldProps = #(bm.useLiveReference, bm.useOperandMaterial, bm.method, bm.voxelSize, bm.name)) catch ()\n"
         )
         script = f"""(
-{_base_guard(safe)}(
+{_base_guard(name)}(
     local opNames = {names_arr}
     local opEnums = {enums_arr}
     local missing = ""
     local badKind = ""
     local opNodes = #()
     for nm in opNames do (
-        local o = getNodeByName nm
+        local o = {node_by_name_expr("nm", missing_ok=True)}
         if o == undefined then missing += nm + ", "
         else if superclassof o != GeometryClass then badKind += nm + " (" + ((classof o) as string) + "), "
         else append opNodes o
@@ -493,18 +505,31 @@ def boolean_operation(
             -- Otherwise a fresh BooleanMod can lose their relative transforms.
             local baseFaceCount = GetTriMeshFaceCount obj
             {cutter_block}local failed = ""
+            local appendedCount = 0
             for i = 1 to opNodes.count do (
                 local ok = false
                 try (ok = bm.appendOperand #single operandNode:opNodes[i] operationType:opEnums[i] operationOption:{opt}) catch ()
-                if not ok do (
+                if ok then appendedCount += 1 else (
                     failed += opNames[i] + ", "{fail_cleanup}
+                )
+            )
+            -- Nothing appended: leave the stack as it was found.
+            local reverted = false
+            if appendedCount == 0 and opNodes.count > 0 do (
+                if madeNew then (deleteModifier obj bm; reverted = true)
+                else if oldProps != undefined do (
+                    try (
+                        bm.useLiveReference = oldProps[1]; bm.useOperandMaterial = oldProps[2]
+                        bm.method = oldProps[3]; bm.voxelSize = oldProps[4]; bm.name = oldProps[5]
+                        reverted = true
+                    ) catch ()
                 )
             )
             local tris = 0
             try (tris = (GetTriMeshFaceCount obj)[1]) catch ()
             local total = 0
             try (total = bm.GetNumOperands()) catch ()
-            "OK|" + bm.name + "|" + (madeNew as string) + "|" + (total as string) + "|" + (tris as string) + "|" + failed
+            "OK|" + bm.name + "|" + (madeNew as string) + "|" + (total as string) + "|" + (tris as string) + "|" + failed + "|" + (reverted as string)
         )
     )
 )
@@ -516,12 +541,22 @@ def boolean_operation(
         if len(parts) < 6 or parts[0] != "OK":
             return _err(f"unexpected bridge reply: {raw[:200]}")
         failed = [f.strip() for f in parts[5].split(",") if f.strip()]
+        reverted = len(parts) > 6 and parts[6] == "true"
         all_names = ops + [ci["name"] for ci in cut_instances]
+        appended = [o for o in all_names if o not in failed]
+        if not appended:
+            # Failed cutters were deleted and failed operands keep their nodes.
+            return _err(
+                "BooleanMod appended no operand: " + ", ".join(failed),
+                failed=failed,
+                modifier_reverted=reverted,
+                new_modifier=parts[2] == "true",
+            )
         result: dict[str, Any] = {
             "modifier": parts[1],
             "new_modifier": parts[2] == "true",
             "operands_total": int(parts[3]) if parts[3].isdigit() else 0,
-            "appended": [o for o in all_names if o not in failed],
+            "appended": appended,
             "tris": int(parts[4]) if parts[4].isdigit() else 0,
             "live": live,
         }
@@ -529,6 +564,10 @@ def boolean_operation(
             result["cutters_created"] = [ci["name"] for ci in cut_instances]
         if failed:
             result["failed"] = failed
+            result["status"] = "partial"
+            result["warnings"] = [
+                f"{len(failed)} operand(s) were not appended and were skipped: {', '.join(failed)}"
+            ]
         if not live:
             result["consumed"] = result["appended"]
             result["note"] = (
@@ -543,7 +582,7 @@ def boolean_operation(
 
     if action == "list":
         script = f"""(
-{_base_guard(safe)}(
+{_base_guard(name)}(
     {_find_boolmod()}
     if bm == undefined then "__ERROR__|no Boolean modifier on {safe}" else (
         local out = stringstream ""
@@ -659,7 +698,7 @@ def boolean_operation(
                 "        )"
             )
         script = f"""(
-{_base_guard(safe)}(
+{_base_guard(name)}(
     {_find_boolmod()}
     if bm == undefined then "__ERROR__|no Boolean modifier on {safe}" else (
         {body}
@@ -675,11 +714,21 @@ def boolean_operation(
         if action == "set_operand":
             applied = payload.split()
             out: dict[str, Any] = {"operand_index": operand_index, "applied": applied}
-            requested = sum(
-                1 for flag in (operation.strip(), operation_option.strip(), rename, disable is not None) if flag
-            )
-            if len(applied) < requested:
+            requested = {
+                "op": operation.strip(), "option": operation_option.strip(),
+                "rename": rename, "disable": disable is not None,
+            }
+            skipped = [edit for edit, wanted in requested.items() if wanted and edit not in applied]
+            if skipped and not applied:
+                return _err(
+                    f"no edit applied to operand {operand_index} (check operand_index with action=list)",
+                    skipped=skipped,
+                )
+            if skipped:
                 out["warning"] = "some edits did not apply (check operand_index with action=list)"
+                out["status"] = "partial"
+                out["skipped"] = skipped
+                out["warnings"] = [f"Operand {operand_index} refused: {', '.join(skipped)}"]
             return out
         if action == "remove_operand":
             return {"operand_index": operand_index, "removed": True}

@@ -27,6 +27,8 @@ _READ_ONLY_TOOLS = {
     "cosmos_search",
     "vantage_status",
     "vantage_get_image",
+    "pulze_inspect",
+    "pulze_preflight",
     "material_roles",
     "get_bridge_status",
     "get_plugin_capabilities",
@@ -92,6 +94,8 @@ _DESTRUCTIVE_TOOLS = {
     "drop_to_surface",
     "forest_edit_items",
     "forest_set_mode",
+    "pulze_set",
+    "pulze_restore",
     "scene_patch",
     "scene_qa",
     "delete_objects",
@@ -115,6 +119,8 @@ _DESTRUCTIVE_TOOLS = {
 _IDEMPOTENT_TOOLS = {
     "cosmos_search",
     "vantage_status",
+    "pulze_inspect",
+    "pulze_preflight",
     "material_roles",
     "cosmos_download",
     "get_bridge_status",
@@ -291,6 +297,7 @@ CORE_TOOL_MODULES = (
 
 SPECIALTY_TOOL_MODULES = (
     "data_channel",
+    "pulze",
     "effects",
     "forest",
     "mcg",
@@ -308,6 +315,7 @@ SPECIALTY_TOOL_MODULES = (
     "tyflow_manifest",
     "tyflow_census",
     "wire_params",
+    "core_reload",  # Development: native core hot reload; full/progressive only.
 )
 
 

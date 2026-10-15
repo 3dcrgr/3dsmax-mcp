@@ -12,6 +12,8 @@ import math
 import re
 from pathlib import Path
 
+from .maxscript import NODE_LOOKUP_FNS
+
 
 def literal(value):
     if value is None:
@@ -142,7 +144,7 @@ def build_program(action, target, script=None, bindings=None, expected_controlle
             raise ValueError("sample_frames requires 1..64 finite frames in +/-1000000")
     args = [action, target_ref(target), script, binding_specs(bindings), expected_controller, frames]
     runtime = Path(__file__).with_name("script_controller.ms").read_text(encoding="utf-8")
-    return "(\n" + runtime + "\nscRun " + " ".join(literal(a) for a in args) + "\n)"
+    return "(\n" + NODE_LOOKUP_FNS + runtime + "\nscRun " + " ".join(literal(a) for a in args) + "\n)"
 
 
 def run(action, target, script=None, bindings=None, expected_controller=None, sample_frames=None):

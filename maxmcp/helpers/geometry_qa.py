@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Any
+from typing import Any, Callable
 
 
 def analyze_triangles(
@@ -23,16 +23,21 @@ def analyze_triangles(
     if (isinstance(area_epsilon, bool) or not isinstance(area_epsilon, (int, float))
             or not math.isfinite(area_epsilon) or area_epsilon < 0):
         raise ValueError("area_epsilon must be a nonnegative finite number")
+    # Plain loops: snapshots reach hundreds of thousands of triangles.
+    isfinite = math.isfinite
     for p in vertices:
-        if (not isinstance(p, (list, tuple)) or len(p) != 3
-                or any(isinstance(v, bool) or not isinstance(v, (float, int))
-                       or not math.isfinite(v) for v in p)):
+        if not isinstance(p, (list, tuple)) or len(p) != 3:
             raise ValueError("Snapshot contains invalid or non-finite vertex coordinates")
+        for v in p:
+            if type(v) is bool or not isinstance(v, (float, int)) or not isfinite(v):
+                raise ValueError("Snapshot contains invalid or non-finite vertex coordinates")
+    vertex_count = len(vertices)
     for face in faces:
-        if (not isinstance(face, (list, tuple)) or len(face) != 3
-                or any(isinstance(v, bool) or not isinstance(v, int)
-                       or not 1 <= v <= len(vertices) for v in face)):
+        if not isinstance(face, (list, tuple)) or len(face) != 3:
             raise ValueError("Snapshot contains invalid triangle vertex indices")
+        for v in face:
+            if type(v) is bool or not isinstance(v, int) or not 1 <= v <= vertex_count:
+                raise ValueError("Snapshot contains invalid triangle vertex indices")
 
     bounds = None
     if vertices:
@@ -52,11 +57,12 @@ def analyze_triangles(
                     "degenerate_faces", "duplicate_faces", "isolated_vertices")
     }
 
-    def record(kind: str, row: dict[str, Any]) -> None:
+    def record(kind: str, make_row: Callable[[], dict[str, Any]]) -> None:
+        # Rows are built only for kept samples; counts cover every finding.
         bucket = issues[kind]
         bucket["count"] += 1
         if len(bucket["samples"]) < limit:
-            bucket["samples"].append(row)
+            bucket["samples"].append(make_row())
 
     def center(ids: tuple[int, ...] | list[int]) -> list[float]:
         return [math.fsum(vertices[i - 1][a] / len(ids) for i in ids) for a in range(3)]
@@ -83,31 +89,40 @@ def analyze_triangles(
     used: set[int] = set()
     degenerate: set[int] = set()
     areas: list[float] = []
+    hypot = math.hypot
     for fid, face in enumerate(faces, 1):
-        used.update(face)
-        a, b, c = (vertices[v - 1] for v in face)
-        ab = [b[k] - a[k] for k in range(3)]
-        ac = [c[k] - a[k] for k in range(3)]
-        cross = [ab[1] * ac[2] - ab[2] * ac[1],
-                 ab[2] * ac[0] - ab[0] * ac[2],
-                 ab[0] * ac[1] - ab[1] * ac[0]]
-        area = math.hypot(*cross) * 0.5
+        i, j, k = face
+        used.add(i)
+        used.add(j)
+        used.add(k)
+        ax, ay, az = vertices[i - 1]
+        bx, by, bz = vertices[j - 1]
+        cx, cy, cz = vertices[k - 1]
+        abx, aby, abz = bx - ax, by - ay, bz - az
+        acx, acy, acz = cx - ax, cy - ay, cz - az
+        area = hypot(aby * acz - abz * acy, abz * acx - abx * acz, abx * acy - aby * acx) * 0.5
         areas.append(area)
-        if len(set(face)) != 3 or area <= epsilon:
+        distinct = i != j and j != k and i != k
+        if not distinct or area <= epsilon:
             degenerate.add(fid)
-            record("degenerate_faces", {
+            record("degenerate_faces", lambda: {
                 "face": fid, "vertices": list(face), "center": center(face),
                 "area": area,
-                "reason": "repeated_vertex" if len(set(face)) != 3 else "area_at_or_below_epsilon",
+                "reason": "area_at_or_below_epsilon" if distinct else "repeated_vertex",
             })
         signature = tuple(sorted(face))
         if signature in first_triangle:
-            record("duplicate_faces", {"face": fid, "other_face": first_triangle[signature],
-                                       "vertices": list(face), "center": center(face)})
+            record("duplicate_faces", lambda: {"face": fid, "other_face": first_triangle[signature],
+                                               "vertices": list(face), "center": center(face)})
         else:
             first_triangle[signature] = fid
+        if distinct:
+            edges[(i, j) if i < j else (j, i)].append((fid, i < j))
+            edges[(j, k) if j < k else (k, j)].append((fid, j < k))
+            edges[(k, i) if k < i else (i, k)].append((fid, k < i))
+            continue
         face_edges = set()
-        for u, v in zip(face, [*face[1:], face[0]]):
+        for u, v in ((i, j), (j, k), (k, i)):
             if u == v:
                 continue
             key = (min(u, v), max(u, v))
@@ -121,21 +136,25 @@ def analyze_triangles(
     component_non_manifold_faces: set[int] = set()
     component_winding_faces: set[int] = set()
     for pair, incident in edges.items():
-        for fid, _ in incident[1:]:
-            union(incident[0][0] - 1, fid - 1)
-        # Bound an individual sample even for pathological edge fans.
-        row = {"vertices": list(pair), "center": center(pair),
-               "faces": [fid for fid, _ in incident[:limit]], "face_count": len(incident)}
-        if len(incident) == 1:
-            record("boundary_edges", row)
-            component_open_faces.add(incident[0][0])
-        elif len(incident) > 2:
-            record("non_manifold_edges", row)
-            component_non_manifold_faces.update(fid for fid, _ in incident)
-        elif (incident[0][1] == incident[1][1]
-              and not any(fid in degenerate for fid, _ in incident)):
-            record("winding_conflicts", row)
+        count = len(incident)
+        if count == 2:
+            union(incident[0][0] - 1, incident[1][0] - 1)
+            if (incident[0][1] != incident[1][1]
+                    or incident[0][0] in degenerate or incident[1][0] in degenerate):
+                continue
+            kind = "winding_conflicts"
             component_winding_faces.update(fid for fid, _ in incident)
+        elif count == 1:
+            kind = "boundary_edges"
+            component_open_faces.add(incident[0][0])
+        else:
+            for fid, _ in incident[1:]:
+                union(incident[0][0] - 1, fid - 1)
+            kind = "non_manifold_edges"
+            component_non_manifold_faces.update(fid for fid, _ in incident)
+        # Bound an individual sample even for pathological edge fans.
+        record(kind, lambda: {"vertices": list(pair), "center": center(pair),
+                              "faces": [fid for fid, _ in incident[:limit]], "face_count": count})
 
     components: dict[int, dict[str, Any]] = {}
     for fid, area in enumerate(areas, 1):
@@ -157,7 +176,7 @@ def analyze_triangles(
     ordered_components = sorted(components.values(), key=lambda row: row["first_face"])
     for vid, p in enumerate(vertices, 1):
         if vid not in used:
-            record("isolated_vertices", {"vertex": vid, "point": list(p)})
+            record("isolated_vertices", lambda: {"vertex": vid, "point": list(p)})
     for bucket in issues.values():
         bucket["truncated"] = bucket["count"] > len(bucket["samples"])
 

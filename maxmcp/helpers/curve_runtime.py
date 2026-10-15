@@ -14,11 +14,20 @@ from .mesh import MESH_FUNCTIONS, target_script
 
 FINGERPRINT = re.compile(r"[0-9A-F]{2}(?:-[0-9A-F]{2}){31}")
 
-# Editable spline bases: SplineShape and Line (classOf ``line``, which isKindOf
-# SplineShape does not report). Parametric shapes and NURBS stay excluded.
-SPLINE_BASE_FUNCTION = "fn cvIsSpline b = (isKindOf b SplineShape or isKindOf b line)\n"
 
-CURVE_FUNCTIONS = SPLINE_BASE_FUNCTION + r'''
+# Base classes the curve tools edit in place. A drawn Line keeps class `line`
+# until it is collapsed; it takes every SplineShape method, yet isKindOf does
+# not count it as a SplineShape.
+EDITABLE_SPLINE_CLASSES = ("SplineShape", "line")
+
+
+def editable_spline(node: str) -> str:
+    """MAXScript expression, true when ``node``'s base object is an editable spline."""
+    return "(" + " or ".join(f"isKindOf {node}.baseObject {cls}" for cls in EDITABLE_SPLINE_CLASSES) + ")"
+
+
+CURVE_FUNCTIONS = r'''
+fn cvEditable obj = ''' + editable_spline("obj") + r'''
 fn cvHash text = (
     local sha = (dotNetClass "System.Security.Cryptography.SHA256").Create()
     local bytes = (dotNetClass "System.Text.Encoding").UTF8.GetBytes text
@@ -26,7 +35,7 @@ fn cvHash text = (
     sha.Dispose(); result as string
 )
 fn cvBase obj = (
-    if not cvIsSpline obj.baseobject do throw "Editable spline base required; no automatic conversion"
+    if not cvEditable obj do throw "Editable spline base required; no automatic conversion"
     if numSplines obj > 128 or numKnots obj > 2000 do throw "Curve inspection limit: 128 splines / 2000 knots"
     obj
 )

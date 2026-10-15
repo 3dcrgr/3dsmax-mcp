@@ -632,7 +632,7 @@ def scene_qa(
     if not (group_position_tolerance >= 0 and math.isfinite(group_position_tolerance)):
         raise ValueError("group_position_tolerance must be a finite number >= 0")
     if not client.native_available:
-        return "Native bridge is required for scene_qa."
+        return json.dumps({"error": "Native bridge is required for scene_qa; nothing was scanned or repaired."})
 
     native_checks: Optional[list[str]] = None
     run_duplicates = check_duplicate_groups

@@ -1,6 +1,6 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 #include <sfx.h>
 
 using json = nlohmann::json;
@@ -65,6 +65,8 @@ std::string NativeHandlers::ToggleEffect(const std::string& params, MCPBridgeGUP
         int index = p.value("index", 0);
         std::string effectType = p.value("effect_type", "atmospheric");
         bool active = p.value("active", true);
+        if (effectType != "atmospheric" && effectType != "render")
+            throw std::runtime_error("effect_type must be \"atmospheric\" or \"render\", got \"" + effectType + "\"");
 
         Interface* ip = GetCOREInterface();
 
@@ -85,7 +87,7 @@ std::string NativeHandlers::ToggleEffect(const std::string& params, MCPBridgeGUP
             script = "setActive (getEffect " + msIndex + ") " + msActive;
         }
 
-        RunMAXScript(script);
+        RunMAXScriptChecked(script);
 
         json result;
         result["status"] = "ok";
@@ -102,6 +104,8 @@ std::string NativeHandlers::DeleteEffect(const std::string& params, MCPBridgeGUP
         json p = json::parse(params);
         int index = p.value("index", 0);
         std::string effectType = p.value("effect_type", "atmospheric");
+        if (effectType != "atmospheric" && effectType != "render")
+            throw std::runtime_error("effect_type must be \"atmospheric\" or \"render\", got \"" + effectType + "\"");
 
         Interface* ip = GetCOREInterface();
 

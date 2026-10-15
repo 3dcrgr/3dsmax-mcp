@@ -1,6 +1,16 @@
-"""Tests for replace_material / batch_replace_materials result post-processing."""
+"""Tests for replace_material / batch_replace_materials.
+
+Since the upstream 1.7.6 merge the result shape is upstream's (status rules,
+replaced_count = objects + slots, source.found_in/candidates, per-entry
+warnings, one MAXScript fallback call per batch). The fork adds the
+direction hint on no_match, the blocked hint, include_sub_materials,
+source_from (and the scene materials / material library as source places), a
+preview that lists matches without a source, and depends_on_entries for the
+fallback's preview.
+"""
 
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -32,9 +42,11 @@ class NativeRegistryTests(unittest.TestCase):
 
 HEBREW = "טיח לבן"
 PLASTER = "Plaster_White_Smooth_300cm #0"
+SLOT = {"parent_material": "Walls", "parent_class": "Multimaterial", "slot_index": 2, "slot_name": "(2)",
+        "previous_material": "B", "object_count": 1}
 
 
-def _client(native: bool, result: dict | str) -> MagicMock:
+def _client(native: bool, result) -> MagicMock:
     client = MagicMock()
     client.native_available = native
     raw = result if isinstance(result, str) else json.dumps(result)
@@ -42,50 +54,51 @@ def _client(native: bool, result: dict | str) -> MagicMock:
     return client
 
 
+def _native_entry(src="A", tgt="B", status="replaced", objects=("Box001",), slots=(), skipped=(), **extra):
+    entry = {"source_material": src, "target_material": tgt,
+             "source": {"found_in": "object", "object": "Box009", "name": src, "class": "Standardmaterial",
+                        "candidates": 1},
+             "status": status, "preview": status == "preview",
+             "match_count": len(objects) + len(slots) + len(skipped),
+             "replaced_count": len(objects) + len(slots), "reassigned_count": len(objects),
+             "replaced_objects": list(objects), "replaced_slot_count": len(slots), "replaced_slots": list(slots),
+             "skipped_count": len(skipped), "skipped": list(skipped),
+             "affected_count": len(objects), "affected_objects": list(objects),
+             "include_sub_materials": True}
+    entry.update(extra)
+    return entry
+
+
+def _payload(client, index=-1):
+    return json.loads(client.send_command.call_args_list[index].args[0])
+
+
 class ReplaceMaterialNativeTests(unittest.TestCase):
     def test_success_unchanged(self):
-        native = {"source_material": "A", "target_material": "B", "replaced_count": 2,
-                  "replaced_objects": ["Box001", "Box002"], "status": "replaced"}
+        native = _native_entry()
         with patch.object(mr, "client", _client(True, native)) as client:
             out = json.loads(mr.replace_material("A", "B"))
         self.assertEqual(out, native)
         self.assertEqual(client.send_command.call_args.kwargs["cmd_type"], "native:replace_material")
 
-    def test_zero_match_is_no_match_with_warning(self):
-        native = {"source_material": HEBREW, "target_material": PLASTER, "replaced_count": 0,
-                  "replaced_objects": [], "status": "replaced"}
+    def test_no_match_gets_direction_hint(self):
+        native = _native_entry(HEBREW, PLASTER, status="no_match", objects=(),
+                               warnings=[f"No material named '{PLASTER}' exists on objects, in their "
+                                         "sub-material slots or in the Material Editor."])
         with patch.object(mr, "client", _client(True, native)):
             raw = mr.replace_material(source_material=HEBREW, target_material=PLASTER)
         out = json.loads(raw)
         self.assertEqual(out["status"], "no_match")
-        self.assertEqual(len(out["warnings"]), 1)
-        self.assertIn(PLASTER, out["warnings"][0])
-        self.assertIn("swap", out["warnings"][0])
-        self.assertIn("assign_material", out["warnings"][0])
+        self.assertEqual(len(out["warnings"]), 2)
+        hint = out["warnings"][1]
+        for text in (PLASTER, "swap", "assign_material", "source = material to apply", "Material Editor slot"):
+            self.assertIn(text, hint)
         env = envelope_result(raw, elapsed_ms=1.0, tool_name="replace_material")
         self.assertTrue(env["ok"])
         self.assertEqual(env["warnings"], out["warnings"])
 
-    def test_preview_zero_is_no_match(self):
-        native = {"source_material": "A", "target_material": "B", "affected_count": 0,
-                  "affected_objects": [], "preview": True}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.replace_material("A", "B", preview=True))
-        self.assertEqual(out["status"], "no_match")
-        self.assertTrue(out["preview"])
-        self.assertEqual(len(out["warnings"]), 1)
-
-    def test_preview_with_matches_unchanged(self):
-        native = {"source_material": "A", "target_material": "B", "affected_count": 1,
-                  "affected_objects": ["Box001"], "preview": True}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.replace_material("A", "B", preview=True))
-        self.assertEqual(out, native)
-
     def test_unicode_names_round_trip_in_payload(self):
-        native = {"source_material": PLASTER, "target_material": HEBREW, "replaced_count": 1,
-                  "replaced_objects": ["Wall"], "status": "replaced"}
-        with patch.object(mr, "client", _client(True, native)) as client:
+        with patch.object(mr, "client", _client(True, _native_entry(PLASTER, HEBREW))) as client:
             mr.replace_material(source_material=PLASTER, target_material=HEBREW)
         payload = client.send_command.call_args.args[0]
         self.assertTrue(payload.isascii())
@@ -97,572 +110,416 @@ class ReplaceMaterialNativeTests(unittest.TestCase):
         with patch.object(mr, "client", _client(True, "not json")):
             self.assertEqual(mr.replace_material("A", "B"), "not json")
 
-
-class ReplaceMaterialMaxScriptTests(unittest.TestCase):
-    def test_success_unchanged(self):
-        ms = {"source_material": "A", "target_material": "B", "replaced_count": 1,
-              "replaced_objects": ["Box001"], "status": "success"}
-        with patch.object(mr, "client", _client(False, ms)) as client:
-            out = json.loads(mr.replace_material("A", "B"))
-        self.assertEqual(out, ms)
-        self.assertNotIn("cmd_type", client.send_command.call_args.kwargs)
-
-    def test_zero_match_is_no_match(self):
-        ms = {"source_material": "A", "target_material": "B", "replaced_count": 0,
-              "replaced_objects": [], "status": "success"}
-        with patch.object(mr, "client", _client(False, ms)):
-            out = json.loads(mr.replace_material("A", "B"))
-        self.assertEqual(out["status"], "no_match")
-        self.assertEqual(len(out["warnings"]), 1)
-
-    def test_preview_zero_and_missing_source_warns(self):
-        ms = {"source_material": "A", "target_material": "B", "source_exists": False,
-              "affected_count": 0, "affected_objects": [], "preview": True}
-        with patch.object(mr, "client", _client(False, ms)):
-            out = json.loads(mr.replace_material("A", "B", preview=True))
-        self.assertEqual(out["status"], "no_match")
-        self.assertEqual(len(out["warnings"]), 2)
-        self.assertIn("'A'", out["warnings"][0])
-
-    def test_source_not_found_stays_error(self):
-        ms = {"error": "source material 'A' not found on any object", "status": "failed"}
-        with patch.object(mr, "client", _client(False, ms)):
-            raw = mr.replace_material("A", "B")
-        self.assertEqual(json.loads(raw), ms)
-        self.assertFalse(envelope_result(raw, elapsed_ms=1.0)["ok"])
-
-
-class BatchReplaceMaterialsTests(unittest.TestCase):
-    def test_native_mixed_results(self):
-        native = {
-            "results": [
-                {"source_material": "A", "target_material": "B", "replaced_count": 2,
-                 "replaced_objects": [], "status": "replaced"},
-                {"source_material": "A", "target_material": "C", "replaced_count": 0,
-                 "status": "no_objects"},
-                {"source_material": "X", "target_material": "B", "status": "error",
-                 "error": "source material not found"},
-            ],
-            "total_replaced": 2, "preview": False, "dry_run": False,
-        }
-        reps = [{"source": "A", "target": "B"}, {"source": "A", "target": "C"}, {"source": "X", "target": "B"}]
-        with patch.object(mr, "client", _client(True, native)):
-            raw = mr.batch_replace_materials(reps)
-        out = json.loads(raw)
-        statuses = [r["status"] for r in out["results"]]
-        self.assertEqual(statuses, ["replaced", "no_match", "error"])
-        self.assertEqual(out["total_replaced"], 2)
-        self.assertEqual(len(out["warnings"]), 1)
-        self.assertIn("'C'", out["warnings"][0])
-        self.assertNotIn("warnings", out["results"][1])
-        env = envelope_result(raw, elapsed_ms=1.0, tool_name="batch_replace_materials")
-        self.assertTrue(env["ok"])
-        self.assertEqual(len(env["warnings"]), 1)
-
-    def test_native_many_no_match_one_warning(self):
-        native = {
-            "results": [{"source_material": "A", "target_material": t, "replaced_count": 0,
-                         "status": "no_objects"} for t in ("B", "C", "D")],
-            "total_replaced": 0, "preview": False, "dry_run": False,
-        }
-        reps = [{"source": "A", "target": t} for t in ("B", "C", "D")]
-        with patch.object(mr, "client", _client(True, native)):
-            raw = mr.batch_replace_materials(reps)
-        out = json.loads(raw)
-        self.assertEqual([r["status"] for r in out["results"]], ["no_match"] * 3)
-        self.assertTrue(all("warnings" not in r for r in out["results"]))
-        self.assertEqual(len(out["warnings"]), 1)
-        for t in ("'B'", "'C'", "'D'"):
-            self.assertIn(t, out["warnings"][0])
-        env = envelope_result(raw, elapsed_ms=1.0, tool_name="batch_replace_materials")
-        self.assertEqual(json.dumps(env, ensure_ascii=False).count("No object has"), 2)
-
-    def test_native_preview_zero_entry(self):
-        native = {
-            "results": [
-                {"source_material": "A", "target_material": "B", "replaced_count": 1, "status": "preview"},
-                {"source_material": "A", "target_material": "C", "replaced_count": 0, "status": "preview"},
-            ],
-            "total_replaced": 1, "preview": True, "dry_run": False,
-        }
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"},
-                                                         {"source": "A", "target": "C"}], preview=True))
-        self.assertEqual([r["status"] for r in out["results"]], ["preview", "no_match"])
-        self.assertEqual(out["total_replaced"], 1)
-
-    def test_maxscript_mixed_results(self):
-        client = MagicMock()
-        client.native_available = False
-        client.send_command.side_effect = [
-            {"result": json.dumps({"source_material": "A", "target_material": "B", "replaced_count": 3,
-                                   "replaced_objects": [], "status": "success"})},
-            {"result": json.dumps({"source_material": "A", "target_material": "C", "replaced_count": 0,
-                                   "replaced_objects": [], "status": "success"})},
-        ]
-        reps = [{"source": "A", "target": "B"}, {"source": "A", "target": "C"}, {"source": "A"}]
-        with patch.object(mr, "client", client):
-            out = json.loads(mr.batch_replace_materials(reps))
-        self.assertEqual([r["status"] for r in out["results"]], ["success", "no_match", "skipped"])
-        self.assertEqual(out["total_replaced"], 3)
-        self.assertNotIn("warnings", out["results"][1])
-        self.assertEqual(len(out["warnings"]), 1)
-        self.assertIn("'C'", out["warnings"][0])
-
-    def test_maxscript_preview_totals(self):
-        client = MagicMock()
-        client.native_available = False
-        client.send_command.side_effect = [
-            {"result": json.dumps({"source_material": "A", "target_material": "B", "source_exists": True,
-                                   "affected_count": 2, "affected_objects": [], "preview": True})},
-            {"result": json.dumps({"source_material": "A", "target_material": "C", "source_exists": True,
-                                   "affected_count": 0, "affected_objects": [], "preview": True})},
-        ]
-        with patch.object(mr, "client", client):
-            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"},
-                                                         {"source": "A", "target": "C"}], dry_run=True))
-        self.assertTrue(out["preview"])
-        self.assertEqual(out["total_replaced"], 2)
-        self.assertEqual(out["results"][1]["status"], "no_match")
-        self.assertEqual(len(out["warnings"]), 1)
-
-    def test_maxscript_preview_missing_source_matches_native(self):
-        client = MagicMock()
-        client.native_available = False
-        client.send_command.side_effect = [
-            {"result": json.dumps({"source_material": "A", "target_material": "B", "source_exists": True,
-                                   "affected_count": 2, "affected_objects": [], "preview": True})},
-            {"result": json.dumps({"source_material": "X", "target_material": "B", "source_exists": False,
-                                   "affected_count": 3, "affected_objects": [], "preview": True})},
-        ]
-        with patch.object(mr, "client", client):
-            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"},
-                                                         {"source": "X", "target": "B"}], preview=True))
-        self.assertEqual(out["total_replaced"], 2)
-        self.assertEqual(out["results"][1]["status"], "error")
-        self.assertEqual(out["results"][1]["error"], "source material not found")
-        self.assertNotIn("warnings", out)
-
-    def test_maxscript_failed_entry_kept(self):
-        client = MagicMock()
-        client.native_available = False
-        client.send_command.return_value = {"result": json.dumps(
-            {"error": "source material 'X' not found on any object", "status": "failed"})}
-        with patch.object(mr, "client", client):
-            out = json.loads(mr.batch_replace_materials([{"source": "X", "target": "B"}]))
-        self.assertEqual(out["results"][0]["status"], "failed")
-        self.assertEqual(out["total_replaced"], 0)
-        self.assertNotIn("warnings", out)
-
-
-SLOT = {"parent_material": "Walls", "parent_class": "Multimaterial", "slot_index": 2, "slot_name": "(2)"}
-
-
-class SubMaterialSlotTests(unittest.TestCase):
-    def test_payload_passes_include_sub_materials(self):
-        native = {"replaced_count": 1, "replaced_slot_count": 0, "status": "replaced"}
-        with patch.object(mr, "client", _client(True, native)) as client:
-            mr.replace_material("A", "B")
-            self.assertIs(json.loads(client.send_command.call_args.args[0])["include_sub_materials"], True)
-            mr.replace_material("A", "B", include_sub_materials=False)
-            self.assertIs(json.loads(client.send_command.call_args.args[0])["include_sub_materials"], False)
-
-    def test_slot_only_replacement_is_not_no_match(self):
-        native = {"source_material": "A", "target_material": "B", "source_exists": True,
-                  "source_found_in": "material_editor", "include_sub_materials": True,
-                  "replaced_count": 0, "replaced_objects": [], "replaced_slot_count": 1,
-                  "replaced_slots": [SLOT], "skipped": [], "status": "replaced"}
+    def test_slot_only_replacement_unchanged(self):
+        native = _native_entry(objects=(), slots=(SLOT,))
         with patch.object(mr, "client", _client(True, native)):
             out = json.loads(mr.replace_material("A", "B"))
         self.assertEqual(out, native)
 
-    def test_preview_slot_only_is_not_no_match(self):
-        native = {"affected_count": 0, "affected_objects": [], "affected_slot_count": 2,
-                  "affected_slots": [SLOT, SLOT], "skipped": [], "source_exists": True, "preview": True}
+    def test_preview_missing_source_lists_matches(self):
+        native = _native_entry(status="preview", objects=("Box001", "Box002"), slots=(SLOT,), source_exists=False)
+        del native["source"]
         with patch.object(mr, "client", _client(True, native)):
             out = json.loads(mr.replace_material("A", "B", preview=True))
-        self.assertNotIn("status", out)
-        self.assertNotIn("warnings", out)
-
-    def test_no_match_only_when_objects_and_slots_are_zero(self):
-        native = {"replaced_count": 0, "replaced_objects": [], "replaced_slot_count": 0,
-                  "replaced_slots": [], "skipped": [], "status": "replaced"}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.replace_material("A", "B"))
-        self.assertEqual(out["status"], "no_match")
-        self.assertEqual(len(out["warnings"]), 1)
-        warning = out["warnings"][0]
-        self.assertIn("top-level or sub-material", warning)
-        self.assertIn("Material Editor slot", warning)
-        self.assertNotIn("not matched", warning)
-        self.assertNotIn("must already be", warning)
-
-    def test_no_match_warning_mentions_disabled_sub_materials(self):
-        native = {"replaced_count": 0, "replaced_objects": [], "replaced_slot_count": 0, "status": "replaced"}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.replace_material("A", "B", include_sub_materials=False))
-        self.assertEqual(out["status"], "no_match")
-        self.assertIn("include_sub_materials=False", out["warnings"][0])
-
-    def test_preview_missing_source_warns_but_lists_targets(self):
-        native = {"source_material": "A", "target_material": "B", "source_exists": False,
-                  "affected_count": 2, "affected_objects": ["Box001", "Box002"], "affected_slot_count": 1,
-                  "affected_slots": [SLOT], "skipped": [], "preview": True}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.replace_material("A", "B", preview=True))
-        self.assertNotIn("status", out)
+        self.assertEqual(out["replaced_slots"], [SLOT])
         self.assertEqual(len(out["warnings"]), 1)
         self.assertIn("'A'", out["warnings"][0])
         self.assertIn("real run would fail", out["warnings"][0])
-        self.assertEqual(out["affected_slots"], [SLOT])
 
-    def test_skipped_and_ambiguous_source_warn(self):
-        native = {"source_exists": True, "source_found_in": "node", "source_ambiguous": True,
-                  "source_candidates": 2, "replaced_count": 0, "replaced_slot_count": 1,
-                  "replaced_slots": [SLOT], "skipped": [dict(SLOT, reason="source_contains_parent")],
-                  "status": "replaced"}
+
+class IncludeSubMaterialsTests(unittest.TestCase):
+    def test_payload(self):
+        with patch.object(mr, "client", _client(True, _native_entry())) as client:
+            mr.replace_material("A", "B")
+            self.assertIs(_payload(client)["include_sub_materials"], True)
+            mr.replace_material("A", "B", include_sub_materials=False)
+            self.assertIs(_payload(client)["include_sub_materials"], False)
+
+    def test_echoed_false_has_no_warning(self):
+        native = _native_entry(include_sub_materials=False)
         with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.replace_material("A", "B"))
-        self.assertEqual(out["status"], "replaced")
-        self.assertEqual(len(out["warnings"]), 2)
-        self.assertIn("2 different materials are named 'A'", out["warnings"][0])
-        self.assertIn("skipped", out["warnings"][1])
-
-    def test_maxscript_script_embeds_names_and_flags(self):
-        ms = {"replaced_count": 0, "replaced_slot_count": 1, "status": "success"}
-        name = 'Wall "A" \\ ' + HEBREW
-        with patch.object(mr, "client", _client(False, ms)) as client:
-            out = json.loads(mr.replace_material(name, "B", include_sub_materials=False))
-        script = client.send_command.call_args.args[0]
-        self.assertEqual(out["status"], "success")
-        self.assertIn('local srcName = "Wall \\"A\\" \\\\ ' + HEBREW + '"', script)
-        self.assertIn("local includeSubs = false", script)
-        self.assertIn("local isPreview = false", script)
-        for token in ("meditMaterials", "sceneMaterials", "currentMaterialLibrary", "setSubMtl"):
-            self.assertIn(token, script)
-        self.assertEqual(script.count("("), script.count(")"))
-
-    def test_maxscript_preview_flag(self):
-        ms = {"affected_count": 1, "affected_slot_count": 0, "source_exists": True, "preview": True}
-        with patch.object(mr, "client", _client(False, ms)) as client:
-            mr.replace_material("A", "B", preview=True)
-        script = client.send_command.call_args.args[0]
-        self.assertIn("local isPreview = true", script)
-        self.assertIn("local includeSubs = true", script)
-
-
-class BatchSubMaterialSlotTests(unittest.TestCase):
-    def test_native_payload_and_slot_counts(self):
-        native = {
-            "results": [
-                {"source_material": "A", "target_material": "B", "replaced_count": 0, "replaced_objects": [],
-                 "replaced_slot_count": 3, "replaced_slots": [SLOT] * 3, "skipped": [], "status": "replaced"},
-                {"source_material": "A", "target_material": "C", "replaced_count": 0, "replaced_objects": [],
-                 "replaced_slot_count": 0, "replaced_slots": [], "skipped": [], "status": "no_objects"},
-            ],
-            "total_replaced": 0, "total_replaced_slots": 3, "include_sub_materials": True,
-            "preview": False, "dry_run": False,
-        }
-        with patch.object(mr, "client", _client(True, native)) as client:
-            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"},
-                                                         {"source": "A", "target": "C"}]))
-        self.assertIs(json.loads(client.send_command.call_args.args[0])["include_sub_materials"], True)
-        self.assertEqual([r["status"] for r in out["results"]], ["replaced", "no_match"])
-        self.assertEqual(len(out["warnings"]), 1)
-        self.assertIn("'C'", out["warnings"][0])
-        self.assertNotIn("'B'", out["warnings"][0])
-
-    def test_native_include_false_payload_and_warning(self):
-        native = {"results": [{"source_material": "A", "target_material": "B", "replaced_count": 0,
-                               "replaced_slot_count": 0, "status": "preview"}],
-                  "total_replaced": 0, "preview": True, "dry_run": True}
-        with patch.object(mr, "client", _client(True, native)) as client:
-            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"}], dry_run=True,
-                                                        include_sub_materials=False))
-        self.assertIs(json.loads(client.send_command.call_args.args[0])["include_sub_materials"], False)
-        self.assertEqual(out["results"][0]["status"], "no_match")
-        self.assertIn("include_sub_materials=False", out["warnings"][0])
-
-    def test_native_skipped_entry_warns_at_top_level(self):
-        native = {"results": [{"source_material": "A", "target_material": "B", "replaced_count": 1,
-                               "replaced_slot_count": 0, "skipped": [dict(SLOT, reason="parent_is_source")],
-                               "status": "replaced"}],
-                  "total_replaced": 1, "preview": False, "dry_run": False}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"}]))
-        self.assertEqual(out["results"][0]["status"], "replaced")
-        self.assertNotIn("warnings", out["results"][0])
-        self.assertEqual(len(out["warnings"]), 1)
-        self.assertIn("'A' -> 'B'", out["warnings"][0])
-
-    def test_maxscript_slot_totals_and_flag(self):
-        client = MagicMock()
-        client.native_available = False
-        client.send_command.side_effect = [
-            {"result": json.dumps({"source_material": "A", "target_material": "B", "source_exists": True,
-                                   "replaced_count": 1, "replaced_slot_count": 2, "status": "success"})},
-            {"result": json.dumps({"source_material": "A", "target_material": "C", "source_exists": True,
-                                   "replaced_count": 0, "replaced_slot_count": 1, "status": "success"})},
-            {"result": json.dumps({"source_material": "A", "target_material": "D", "source_exists": True,
-                                   "replaced_count": 0, "replaced_slot_count": 0, "status": "success"})},
-        ]
-        with patch.object(mr, "client", client):
-            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": t} for t in "BCD"],
-                                                        include_sub_materials=False))
-        self.assertTrue(all("local includeSubs = false" in c.args[0] for c in client.send_command.call_args_list))
-        self.assertEqual([r["status"] for r in out["results"]], ["success", "success", "no_match"])
-        self.assertEqual(out["total_replaced"], 1)
-        self.assertEqual(out["total_replaced_slots"], 3)
-        self.assertFalse(out["include_sub_materials"])
-        self.assertEqual(len(out["warnings"]), 1)
-        self.assertIn("'D'", out["warnings"][0])
-
-    def test_maxscript_preview_missing_source_is_error_entry(self):
-        client = MagicMock()
-        client.native_available = False
-        client.send_command.return_value = {"result": json.dumps(
-            {"source_material": "X", "target_material": "B", "source_exists": False, "affected_count": 1,
-             "affected_slot_count": 4, "preview": True})}
-        with patch.object(mr, "client", client):
-            out = json.loads(mr.batch_replace_materials([{"source": "X", "target": "B"}], preview=True))
-        self.assertEqual(out["results"][0]["status"], "error")
-        self.assertIs(out["results"][0]["source_exists"], False)
-        self.assertEqual(out["total_replaced"], 0)
-        self.assertEqual(out["total_replaced_slots"], 0)
+            out = json.loads(mr.replace_material("A", "B", include_sub_materials=False))
         self.assertNotIn("warnings", out)
 
+    def test_not_echoed_warns(self):
+        # A stock upstream bridge always searches sub-material slots.
+        native = _native_entry(slots=(SLOT,))
+        del native["include_sub_materials"]
+        with patch.object(mr, "client", _client(True, native)):
+            out = json.loads(mr.replace_material("A", "B", include_sub_materials=False))
+        self.assertTrue(any("include_sub_materials=False was not echoed" in w for w in out["warnings"]))
 
-class SkippedOnlyTests(unittest.TestCase):
-    """All matches loop-guarded/refused: "blocked", never the swap hint."""
 
-    def test_skipped_only_is_blocked_not_no_match(self):
-        native = {"source_material": "Walls", "target_material": "Plaster", "source_exists": True,
-                  "replaced_count": 0, "replaced_objects": [], "replaced_slot_count": 0, "replaced_slots": [],
-                  "skipped": [dict(SLOT, reason="parent_is_source")], "status": "replaced"}
+class BlockedTests(unittest.TestCase):
+    """All matches skipped: "blocked", never the swap hint."""
+
+    def test_blocked_hint(self):
+        skipped = [dict(SLOT, kind="sub_material", reason="would_create_loop"),
+                   dict(SLOT, kind="sub_material", reason="would_create_loop"),
+                   dict(SLOT, kind="sub_material", reason="set_rejected")]
+        native = _native_entry("Walls", "Plaster", status="blocked", objects=(), skipped=skipped,
+                               warnings=["Every match of 'Plaster' was skipped, so nothing was replaced; "
+                                         "see skipped for reasons."])
         with patch.object(mr, "client", _client(True, native)):
             out = json.loads(mr.replace_material("Walls", "Plaster"))
         self.assertEqual(out["status"], "blocked")
         text = " ".join(out["warnings"])
         self.assertNotIn("if reversed", text)
-        self.assertIn("parent_is_source", text)
         self.assertIn("not reversed", text)
+        self.assertIn("2 would_create_loop, 1 set_rejected", text)
 
-    def test_native_blocked_status_kept(self):
-        native = {"source_material": "Walls", "target_material": "Plaster", "replaced_count": 0,
-                  "replaced_slot_count": 0, "skipped": [dict(SLOT, reason="reference_loop")], "status": "blocked"}
+    def test_batch_blocked_entry_hint_stays_on_entry(self):
+        native = {"results": [_native_entry("Walls", "Brick", status="blocked", objects=(),
+                                            skipped=[dict(SLOT, reason="parent_is_source")])],
+                  "total_replaced": 0, "status": "no_changes", "preview": False, "dry_run": False,
+                  "include_sub_materials": True}
         with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.replace_material("Walls", "Plaster"))
-        self.assertEqual(out["status"], "blocked")
-        self.assertFalse(any("if reversed" in w for w in out["warnings"]))
-
-    def test_preview_skipped_only_is_blocked(self):
-        native = {"affected_count": 0, "affected_objects": [], "affected_slot_count": 0, "affected_slots": [],
-                  "skipped": [dict(SLOT, reason="source_contains_parent")], "source_exists": True,
-                  "target_material": "Plaster", "preview": True}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.replace_material("Walls", "Plaster", preview=True))
-        self.assertEqual(out["status"], "blocked")
-        self.assertFalse(any("if reversed" in w for w in out["warnings"]))
-
-    def test_batch_skipped_only_entries(self):
-        native = {"results": [
-            {"source_material": "Walls", "target_material": "Plaster", "replaced_count": 0,
-             "replaced_slot_count": 0, "skipped": [dict(SLOT, reason="set_failed")], "status": "no_objects"},
-            {"source_material": "Walls", "target_material": "Brick", "replaced_count": 0,
-             "replaced_slot_count": 0, "skipped": [dict(SLOT, reason="parent_is_source")], "status": "blocked"},
-        ], "total_replaced": 0, "preview": False, "dry_run": False}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.batch_replace_materials([{"source": "Walls", "target": "Plaster"},
-                                                         {"source": "Walls", "target": "Brick"}]))
-        self.assertEqual([r["status"] for r in out["results"]], ["blocked", "blocked"])
-        self.assertFalse(any("if reversed" in w for w in out["warnings"]))
-
-    def test_skipped_warning_names_each_reason(self):
-        skipped = [dict(SLOT, reason="set_failed"), dict(SLOT, reason="set_failed"),
-                   dict(SLOT, reason="source_contains_parent")]
-        native = {"replaced_count": 1, "replaced_slot_count": 0, "skipped": skipped, "status": "replaced"}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.replace_material("A", "B"))
-        self.assertEqual(out["status"], "replaced")
-        self.assertEqual(len(out["warnings"]), 1)
-        warning = out["warnings"][0]
-        self.assertIn("3 sub-material slot(s)", warning)
-        self.assertIn("2 set_failed: the parent material did not accept the assignment", warning)
-        self.assertIn("1 source_contains_parent", warning)
+            out = json.loads(mr.batch_replace_materials([{"source": "Walls", "target": "Brick"}]))
+        self.assertIn("not reversed", out["results"][0]["warnings"][-1])
+        self.assertNotIn("warnings", out)
 
 
 class SourceFromTests(unittest.TestCase):
     def test_payload_and_echo(self):
-        native = {"source_material": "Oak", "target_material": "Oak", "source_from": "material_editor",
-                  "source_exists": True, "source_found_in": "material_editor", "replaced_count": 3,
-                  "replaced_slot_count": 0, "skipped": [], "status": "replaced"}
+        native = _native_entry("Oak", "Oak", source_from="material_editor")
         with patch.object(mr, "client", _client(True, native)) as client:
             out = json.loads(mr.replace_material("Oak", "Oak", source_from="material_editor"))
-        self.assertEqual(json.loads(client.send_command.call_args.args[0])["source_from"], "material_editor")
+        self.assertEqual(_payload(client)["source_from"], "material_editor")
         self.assertEqual(out, native)
 
-    def test_default_payload_has_no_source_from(self):
-        native = {"replaced_count": 1, "replaced_slot_count": 0, "status": "replaced"}
+    def test_object_alias_sent_as_node(self):
+        native = _native_entry(source_from="node")
         with patch.object(mr, "client", _client(True, native)) as client:
+            out = json.loads(mr.replace_material("A", "B", source_from="object"))
+        self.assertEqual(_payload(client)["source_from"], "node")
+        self.assertNotIn("warnings", out)
+
+    def test_default_payload_has_no_source_from(self):
+        with patch.object(mr, "client", _client(True, _native_entry())) as client:
             mr.replace_material("A", "B")
-        self.assertNotIn("source_from", json.loads(client.send_command.call_args.args[0]))
+        self.assertNotIn("source_from", _payload(client))
 
     def test_invalid_source_from_is_rejected_before_sending(self):
         client = _client(True, {})
         with patch.object(mr, "client", client):
             raw = mr.replace_material("A", "B", source_from="medit")
-            batch_raw = mr.batch_replace_materials([{"source": "A", "target": "B"},
+            entry_raw = mr.batch_replace_materials([{"source": "A", "target": "B"},
                                                     {"source": "C", "target": "D", "source_from": "x"}])
+            default_raw = mr.batch_replace_materials([{"source": "A", "target": "B"}], source_from="x")
         client.send_command.assert_not_called()
         self.assertEqual(json.loads(raw)["status"], "failed")
         self.assertIn("material_editor", json.loads(raw)["error"])
-        self.assertIn("replacements[2].source_from", json.loads(batch_raw)["error"])
+        self.assertIn("replacements[2].source_from", json.loads(entry_raw)["error"])
+        self.assertIn("source_from", json.loads(default_raw)["error"])
         self.assertFalse(envelope_result(raw, elapsed_ms=1.0)["ok"])
 
     def test_not_echoed_warns(self):
-        native = {"source_material": "Oak", "target_material": "Pine", "source_exists": True,
-                  "source_found_in": "node", "replaced_count": 1, "replaced_slot_count": 0, "status": "replaced"}
-        with patch.object(mr, "client", _client(True, native)):
+        with patch.object(mr, "client", _client(True, _native_entry("Oak", "Pine"))):
             out = json.loads(mr.replace_material("Oak", "Pine", source_from="material_editor"))
         self.assertTrue(any("not echoed" in w for w in out["warnings"]))
 
     def test_same_name_without_source_from_warns(self):
-        native = {"source_material": "Oak", "target_material": "Oak", "source_exists": True,
-                  "source_found_in": "node", "replaced_count": 0, "replaced_slot_count": 0, "skipped": [],
-                  "status": "replaced"}
+        native = _native_entry("Oak", "Oak", status="unchanged", objects=(),
+                               skipped=[{"kind": "object", "object": "Box001", "reason": "already_source"}])
         with patch.object(mr, "client", _client(True, native)):
             out = json.loads(mr.replace_material("Oak", "Oak"))
         self.assertTrue(any("source_from" in w and "both named 'Oak'" in w for w in out["warnings"]))
 
-    def test_ambiguous_warning_points_to_source_from(self):
-        native = {"source_material": "Oak", "target_material": "Pine", "source_exists": True,
-                  "source_found_in": "node", "source_ambiguous": True, "source_candidates": 2,
-                  "replaced_count": 1, "replaced_slot_count": 0, "status": "replaced"}
+    def test_ambiguous_source_points_to_source_from(self):
+        native = _native_entry("Oak", "Pine", warnings=["2 materials are named 'Oak'; used the one on object "
+                                                        "'Box009'."])
+        native["source"]["candidates"] = 2
         with patch.object(mr, "client", _client(True, native)):
             out = json.loads(mr.replace_material("Oak", "Pine"))
-        self.assertIn("Pass source_from", out["warnings"][0])
-
-    def test_maxscript_filters_by_place(self):
-        ms = {"source_from": "material_library", "source_exists": True, "replaced_count": 1,
-              "replaced_slot_count": 0, "status": "success"}
-        with patch.object(mr, "client", _client(False, ms)) as client:
-            out = json.loads(mr.replace_material("A", "B", source_from="material_library"))
-        script = client.send_command.call_args.args[0]
-        self.assertIn('local srcFrom = "material_library"', script)
-        for place in mr._SOURCE_FROM:
-            self.assertIn(f'srcFrom == "{place}"', script)
-        self.assertEqual(script.count("("), script.count(")"))
-        self.assertNotIn("warnings", out)
-
-    def test_maxscript_default_srcfrom_empty(self):
-        with patch.object(mr, "client", _client(False, {"replaced_count": 1, "status": "success"})) as client:
-            mr.replace_material("A", "B")
-        self.assertIn('local srcFrom = ""', client.send_command.call_args.args[0])
+        self.assertEqual(len(out["warnings"]), 2)
+        self.assertIn("Pass source_from", out["warnings"][1])
 
     def test_batch_default_and_per_entry(self):
-        native = {"results": [
-            {"source_material": "A", "target_material": "B", "source_from": "material_library",
-             "replaced_count": 1, "replaced_slot_count": 0, "status": "replaced"},
-            {"source_material": "C", "target_material": "D", "source_from": "node",
-             "replaced_count": 1, "replaced_slot_count": 0, "status": "replaced"},
-        ], "total_replaced": 2, "preview": False, "dry_run": False}
-        reps = [{"source": "A", "target": "B"}, {"source": "C", "target": "D", "source_from": "node"}]
+        native = {"results": [_native_entry("A", "B", source_from="material_library"),
+                              _native_entry("C", "D", source_from="node")],
+                  "total_replaced": 2, "status": "replaced", "preview": False, "dry_run": False,
+                  "include_sub_materials": True}
+        reps = [{"source": "A", "target": "B"}, {"source": "C", "target": "D", "source_from": "object"}]
         with patch.object(mr, "client", _client(True, native)) as client:
             out = json.loads(mr.batch_replace_materials(reps, source_from="material_library"))
-        payload = json.loads(client.send_command.call_args.args[0])
+        payload = _payload(client)
         self.assertEqual(payload["source_from"], "material_library")
         self.assertEqual(payload["replacements"][1]["source_from"], "node")
+        self.assertNotIn("source_from", payload["replacements"][0])
+        self.assertEqual(reps[1]["source_from"], "object")  # caller's entry not mutated
         self.assertNotIn("warnings", out)
 
-    def test_batch_maxscript_per_entry_source_from(self):
-        client = MagicMock()
-        client.native_available = False
-        client.send_command.side_effect = [
-            {"result": json.dumps({"source_from": "node", "source_exists": True, "replaced_count": 1,
-                                   "status": "success"})},
-            {"result": json.dumps({"source_exists": True, "replaced_count": 1, "status": "success"})},
-        ]
-        with patch.object(mr, "client", client):
-            mr.batch_replace_materials([{"source": "A", "target": "B", "source_from": "node"},
-                                        {"source": "C", "target": "D"}])
-        scripts = [c.args[0] for c in client.send_command.call_args_list]
-        self.assertIn('local srcFrom = "node"', scripts[0])
-        self.assertIn('local srcFrom = ""', scripts[1])
-
-
-class BatchOrderTests(unittest.TestCase):
-    """Entries apply in order; preview cannot simulate that, so dependent entries are flagged."""
-
-    def _preview(self, reps, results):
-        native = {"results": results, "total_replaced": 0, "preview": True, "dry_run": False}
+    def test_batch_not_echoed_warns_once(self):
+        native = {"results": [_native_entry("A", "B"), _native_entry("C", "D")],
+                  "total_replaced": 2, "status": "replaced", "preview": False, "dry_run": False}
         with patch.object(mr, "client", _client(True, native)):
-            return json.loads(mr.batch_replace_materials(reps, preview=True))
+            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"},
+                                                         {"source": "C", "target": "D"}],
+                                                        source_from="material_editor"))
+        self.assertEqual(sum("not echoed" in w for w in out["warnings"]), 1)
 
-    @staticmethod
-    def _entry(src, tgt, count=1, **extra):
-        return dict({"source_material": src, "target_material": tgt, "source_exists": True,
-                     "replaced_count": count, "replaced_slot_count": 0, "status": "preview"}, **extra)
 
-    def test_reversed_pair_preview_is_flagged(self):
-        reps = [{"source": "A", "target": "B"}, {"source": "B", "target": "A"}]
-        out = self._preview(reps, [self._entry("A", "B"), self._entry("B", "A")])
+class NativeBatchTests(unittest.TestCase):
+    def test_mixed_results_one_direction_hint(self):
+        native = {
+            "results": [
+                _native_entry("A", "B"),
+                _native_entry("A", "C", status="no_match", objects=(),
+                              warnings=["No material named 'C' exists on objects, in their sub-material "
+                                        "slots or in the Material Editor."]),
+                _native_entry("A", "D", status="no_match", objects=()),
+                {"source_material": "X", "target_material": "B", "status": "error",
+                 "error": "Source material 'X' not found on objects, in sub-material slots or in the "
+                          "Material Editor"},
+            ],
+            "total_replaced": 1, "total_skipped": 0, "error_count": 1, "status": "replaced",
+            "preview": False, "dry_run": False, "include_sub_materials": True,
+        }
+        reps = [{"source": "A", "target": t} for t in "BCD"] + [{"source": "X", "target": "B"}]
+        with patch.object(mr, "client", _client(True, native)) as client:
+            raw = mr.batch_replace_materials(reps)
+        out = json.loads(raw)
+        self.assertEqual(client.send_command.call_args.kwargs["cmd_type"], "native:batch_replace_materials")
+        self.assertIs(_payload(client)["include_sub_materials"], True)
+        self.assertEqual([r["status"] for r in out["results"]], ["replaced", "no_match", "no_match", "error"])
+        self.assertEqual(len(out["results"][1]["warnings"]), 1)  # native's own warning stays on the entry
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertIn("'C', 'D'", out["warnings"][0])
+        self.assertIn("swap", out["warnings"][0])
+        self.assertNotIn("'B'", out["warnings"][0])
+        env = envelope_result(raw, elapsed_ms=1.0, tool_name="batch_replace_materials")
+        self.assertTrue(env["ok"])
+
+    def test_native_preview_chains_without_dependency_flags(self):
+        # The native handler plans a preview chain through its overlay, so the
+        # fallback's depends_on_entries is not added.
+        native = {"results": [_native_entry("A", "B", status="preview"), _native_entry("B", "A", status="preview")],
+                  "total_replaced": 2, "status": "preview", "preview": True, "dry_run": False,
+                  "include_sub_materials": True}
+        with patch.object(mr, "client", _client(True, native)):
+            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"},
+                                                         {"source": "B", "target": "A"}], preview=True))
+        self.assertTrue(all("depends_on_entries" not in r for r in out["results"]))
+        self.assertNotIn("warnings", out)
+
+    def test_include_false_not_echoed_warns(self):
+        native = {"results": [_native_entry()], "total_replaced": 1, "status": "replaced",
+                  "preview": False, "dry_run": False}
+        with patch.object(mr, "client", _client(True, native)) as client:
+            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"}],
+                                                        include_sub_materials=False))
+        self.assertIs(_payload(client)["include_sub_materials"], False)
+        self.assertTrue(any("include_sub_materials=False" in w for w in out["warnings"]))
+
+
+def _strip_strings(script):
+    return re.sub(r'"(?:\\.|[^"\\])*"', '""', script)
+
+
+def _fb(found=True, objects=(), slots=(), skipped=(), match=None, target_exists=None, candidates=1,
+        found_in="object", affected=None):
+    item = {"source_found": found,
+            "source": {"name": "A", "class": "Standardmaterial", "found_in": found_in} if found else None,
+            "source_candidates": candidates if found else 0,
+            "match_count": len(objects) + len(slots) + len(skipped) if match is None else match,
+            "target_exists": bool(objects or slots or skipped) if target_exists is None else target_exists,
+            "replaced_objects": list(objects), "replaced_slots": list(slots), "skipped": list(skipped),
+            "affected_objects": list(objects if affected is None else affected)}
+    return item
+
+
+class FallbackScriptTests(unittest.TestCase):
+    def _script(self, **kwargs):
+        with patch.object(mr, "client", _client(False, json.dumps([_fb(objects=["Box001"])]))) as client:
+            mr.replace_material(**kwargs)
+        return client.send_command.call_args.args[0]
+
+    def test_script_embeds_names_flags_and_places(self):
+        name = 'Wall "A" \\ ' + HEBREW
+        script = self._script(source_material=name, target_material="B", include_sub_materials=False,
+                              source_from="material_library")
+        self.assertIn('#("Wall \\"A\\" \\\\ ' + HEBREW + '", "B", "material_library")', script)
+        self.assertIn("mcpReplaceOne e[1] e[2] true e[3] false", script)
+        self.assertIn('undo "MCP replace_material" on (', script)
+        for token in ("meditMaterials", "sceneMaterials", "currentMaterialLibrary", "setSubMtl",
+                      "refs.dependencyLoopTest", 'srcFrom == "node"'):
+            self.assertIn(token, script)
+        bare = _strip_strings(script)
+        self.assertEqual(bare.count("("), bare.count(")"))
+        self.assertNotIn("__ENTRIES__", script)
+        self.assertNotIn("__RUN__", script)
+
+    def test_preview_runs_outside_undo(self):
+        script = self._script(source_material="A", target_material="B", preview=True)
+        self.assertIn("mcpReplaceOne e[1] e[2] false e[3] true", script)
+        self.assertNotIn("undo ", script)
+        self.assertIn('#("A", "B", "")', script)
+
+    def test_object_alias_becomes_node(self):
+        self.assertIn('#("A", "B", "node")', self._script(source_material="A", target_material="B",
+                                                          source_from="object"))
+
+    def test_no_for_collect_in_call_arguments(self):
+        # Fork rule, live: a for-collect read inside a call's arguments failed with
+        # "Bad free thunk local member index"; collect into a local first.
+        allowed = re.compile(r"(?:.*\b(?:do|then|else)\s+)?(?:local\s+)?\w+\s*=")
+        script = self._script(source_material="A", target_material="B")
+        for line in script.split("\n"):
+            code = _strip_strings(line.split("--")[0])
+            for match in re.finditer(r"\bfor\b", code):
+                if re.search(r"\bcollect\b", code[match.end():]):
+                    prefix = code[:match.start()].strip()
+                    self.assertTrue(prefix == "" or allowed.fullmatch(prefix), line.strip())
+
+
+class FallbackResultTests(unittest.TestCase):
+    def _run(self, items, *args, **kwargs):
+        with patch.object(mr, "client", _client(False, json.dumps(items))) as client:
+            raw = mr.replace_material(*args, **kwargs)
+        self.assertNotIn("cmd_type", client.send_command.call_args.kwargs)
+        return raw, json.loads(raw)
+
+    def test_replaced_objects_and_slots(self):
+        _, out = self._run([_fb(objects=["Box001"], slots=[SLOT], affected=["Box001", "Box002"])], "A", "B")
+        self.assertEqual(out["status"], "replaced")
+        self.assertEqual(out["replaced_count"], 2)
+        self.assertEqual(out["reassigned_count"], 1)
+        self.assertEqual(out["replaced_slots"], [SLOT])
+        self.assertEqual(out["source"]["found_in"], "object")
+        self.assertTrue(out["include_sub_materials"])
+        self.assertNotIn("warnings", out)
+
+    def test_no_match_has_both_warnings(self):
+        raw, out = self._run([_fb(match=0, target_exists=False)], "A", "B")
+        self.assertEqual(out["status"], "no_match")
+        self.assertEqual(len(out["warnings"]), 2)
+        self.assertIn("swap", out["warnings"][1])
+        self.assertTrue(envelope_result(raw, elapsed_ms=1.0)["ok"])
+
+    def test_no_match_mentions_disabled_sub_materials(self):
+        _, out = self._run([_fb(match=0, target_exists=False)], "A", "B", include_sub_materials=False)
+        self.assertIn("include_sub_materials=False", out["warnings"][0])
+        self.assertFalse(out["include_sub_materials"])
+
+    def test_no_objects_and_unchanged(self):
+        _, out = self._run([_fb(match=0, target_exists=True)], "A", "B")
+        self.assertEqual(out["status"], "no_objects")
+        _, out = self._run([_fb(skipped=[{"kind": "object", "object": "Box001", "reason": "already_source"}])],
+                           "A", "B")
+        self.assertEqual(out["status"], "unchanged")
+
+    def test_blocked_gets_fork_hint(self):
+        _, out = self._run([_fb(skipped=[dict(SLOT, kind="sub_material", reason="would_create_loop")])], "A", "B")
+        self.assertEqual(out["status"], "blocked")
+        self.assertIn("not reversed", out["warnings"][-1])
+
+    def test_source_from_echoed_by_fallback(self):
+        _, out = self._run([_fb(objects=["Box001"], found_in="material_editor")], "A", "B",
+                           source_from="material_editor")
+        self.assertEqual(out["source_from"], "material_editor")
+        self.assertNotIn("warnings", out)
+
+    def test_ambiguous_source(self):
+        _, out = self._run([_fb(objects=["Box001"], candidates=3, found_in="scene_materials")], "A", "B")
+        self.assertIn("3 materials are named 'A'; used the one found in the scene materials.", out["warnings"][0])
+        self.assertIn("Pass source_from", out["warnings"][1])
+
+    def test_missing_source_fails_real_run(self):
+        raw, out = self._run([{"source_found": False}], "A", "B")
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("Source material 'A' not found", out["error"])
+        self.assertFalse(envelope_result(raw, elapsed_ms=1.0)["ok"])
+
+    def test_missing_source_with_source_from_names_place(self):
+        _, out = self._run([{"source_found": False}], "A", "B", source_from="material_editor")
+        self.assertIn("source_from=material_editor", out["error"])
+
+    def test_preview_missing_source_lists_matches(self):
+        _, out = self._run([_fb(found=False, objects=["Box001"], slots=[SLOT])], "A", "B", preview=True)
+        self.assertEqual(out["status"], "preview")
+        self.assertIs(out["source_exists"], False)
+        self.assertEqual(out["replaced_objects"], ["Box001"])
+        self.assertTrue(any("real run would fail" in w for w in out["warnings"]))
+
+    def test_unexpected_result_fails(self):
+        with patch.object(mr, "client", _client(False, "garbage")):
+            out = json.loads(mr.replace_material("A", "B"))
+        self.assertEqual(out["status"], "failed")
+        self.assertEqual(out["raw"], "garbage")
+
+
+class FallbackBatchTests(unittest.TestCase):
+    def _batch(self, reps, items, **kwargs):
+        client = _client(False, json.dumps(items))
+        with patch.object(mr, "client", client):
+            out = json.loads(mr.batch_replace_materials(reps, **kwargs))
+        self.assertEqual(client.send_command.call_count, 1)  # one script, in order, one undo
+        return out, client.send_command.call_args.args[0]
+
+    def test_mixed_results_and_totals(self):
+        reps = [{"source": "A", "target": "B"}, {"source": "A", "target": "C"}, {"source": "A"},
+                {"source": "X", "target": "B", "source_from": "material_editor"}]
+        items = [_fb(objects=["Box001", "Box002"], slots=[SLOT]), _fb(match=0, target_exists=False),
+                 {"source_found": False}]
+        out, script = self._batch(reps, items, include_sub_materials=False)
+        self.assertIn('#("A", "B", ""), #("A", "C", ""), #("X", "B", "material_editor")', script)
+        self.assertIn("e[3] false)", script)
+        self.assertEqual([r["status"] for r in out["results"]], ["replaced", "no_match", "error", "error"])
+        self.assertEqual(out["results"][2]["error"], "missing source or target")
+        self.assertEqual(out["total_replaced"], 3)
+        self.assertEqual(out["error_count"], 2)
+        self.assertEqual(out["status"], "replaced")
+        self.assertFalse(out["include_sub_materials"])
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertIn("'C'", out["warnings"][0])
+
+    def test_preview_missing_source_is_error_entry(self):
+        out, _ = self._batch([{"source": "X", "target": "B"}],
+                             [_fb(found=False, objects=["Box001"])], preview=True)
+        self.assertEqual(out["results"][0]["status"], "error")
+        self.assertIs(out["results"][0]["source_exists"], False)
+        self.assertEqual(out["total_replaced"], 0)
+        self.assertEqual(out["status"], "no_changes")
+
+    def test_preview_reversed_pair_flagged(self):
+        out, script = self._batch([{"source": "A", "target": "B"}, {"source": "B", "target": "A"}],
+                                  [_fb(objects=["Box001"]), _fb(objects=["Box002"])], dry_run=True)
+        self.assertNotIn("undo ", script)
+        self.assertTrue(out["preview"] and out["dry_run"])
         self.assertNotIn("depends_on_entries", out["results"][0])
         self.assertEqual(out["results"][1]["depends_on_entries"], [1])
         self.assertEqual(len(out["warnings"]), 1)
         self.assertIn("Entries 2", out["warnings"][0])
         self.assertIn("does not swap", out["warnings"][0])
-        self.assertIn("preview", out["warnings"][0])
 
-    def test_chain_and_repeated_target_flagged(self):
+    def test_preview_chain_and_repeated_target_flagged(self):
         reps = [{"source": "A", "target": "B"}, {"source": "B", "target": "C"},
                 {"source": "D", "target": "B"}, {"source": "A", "target": "E"}]
-        out = self._preview(reps, [self._entry("A", "B"), self._entry("B", "C"),
-                                   self._entry("D", "B"), self._entry("A", "E")])
+        out, _ = self._batch(reps, [_fb(objects=["Box001"])] * 4, preview=True)
         deps = [r.get("depends_on_entries") for r in out["results"]]
         # 2: source B was entry 1's target; 3: target B was moved by entry 1 and
         # gains entry 2's users; 4: same source as entry 1 only, which is harmless.
         self.assertEqual(deps, [None, [1], [1, 2], None])
         self.assertIn("Entries 2, 3", out["warnings"][0])
 
-    def test_independent_entries_not_flagged(self):
-        reps = [{"source": "A", "target": "B"}, {"source": "A", "target": "C"}]
-        out = self._preview(reps, [self._entry("A", "B"), self._entry("A", "C")])
+    def test_preview_independent_entries_get_upstream_note(self):
+        out, _ = self._batch([{"source": "A", "target": "B"}, {"source": "A", "target": "C"}],
+                             [_fb(objects=["Box001"]), _fb(objects=["Box002"])], preview=True)
         self.assertTrue(all("depends_on_entries" not in r for r in out["results"]))
-        self.assertNotIn("warnings", out)
-
-    def test_apply_flags_source_removed_by_earlier_entry(self):
-        native = {"results": [
-            dict(self._entry("A", "B"), status="replaced"),
-            {"source_material": "B", "target_material": "C", "source_exists": False, "status": "error",
-             "error": "source material not found"},
-        ], "total_replaced": 1, "preview": False, "dry_run": False}
-        with patch.object(mr, "client", _client(True, native)):
-            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"},
-                                                         {"source": "B", "target": "C"}]))
-        self.assertEqual(out["results"][1]["depends_on_entries"], [1])
-        self.assertIn("ran on the scene left by earlier entries", out["warnings"][0])
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertIn("previews each entry against the current scene", out["warnings"][0])
 
     def test_errored_earlier_entry_is_not_a_dependency(self):
-        reps = [{"source": "X", "target": "B"}, {"source": "A", "target": "B"}]
-        out = self._preview(reps, [{"source_material": "X", "target_material": "B", "source_exists": False,
-                                    "status": "error", "error": "source material not found"},
-                                   self._entry("A", "B")])
+        out, _ = self._batch([{"source": "X", "target": "B"}, {"source": "A", "target": "B"}],
+                             [{"source_found": False}, _fb(objects=["Box001"])], preview=True)
         self.assertTrue(all("depends_on_entries" not in r for r in out["results"]))
 
-    def test_maxscript_preview_reversed_pair_flagged(self):
-        client = MagicMock()
-        client.native_available = False
-        client.send_command.side_effect = [
-            {"result": json.dumps({"source_material": "A", "target_material": "B", "source_exists": True,
-                                   "affected_count": 2, "affected_objects": [], "preview": True})},
-            {"result": json.dumps({"source_material": "B", "target_material": "A", "source_exists": True,
-                                   "affected_count": 3, "affected_objects": [], "preview": True})},
-        ]
-        with patch.object(mr, "client", client):
-            out = json.loads(mr.batch_replace_materials([{"source": "A", "target": "B"},
-                                                         {"source": "B", "target": "A"}], dry_run=True))
-        self.assertEqual(out["results"][1]["depends_on_entries"], [1])
-        self.assertTrue(any("does not swap" in w for w in out["warnings"]))
+    def test_real_run_not_flagged(self):
+        out, script = self._batch([{"source": "A", "target": "B"}, {"source": "B", "target": "A"}],
+                                  [_fb(objects=["Box001"]), _fb(objects=["Box002"])])
+        self.assertIn('undo "MCP replace_material" on (', script)
+        self.assertTrue(all("depends_on_entries" not in r for r in out["results"]))
+        self.assertNotIn("warnings", out)
 
 
 if __name__ == "__main__":

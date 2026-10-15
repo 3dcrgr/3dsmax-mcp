@@ -148,6 +148,17 @@ _MESSAGE_HINT_RULES: tuple[tuple[re.Pattern[str], ToolHint], ...] = (
             ),
         },
     ),
+    # A script exception that the bridge relayed. The transport worked, so this
+    # must win over the "bridge" rule below.
+    (
+        re.compile(r"__MCP_MS_ERR__|MAXScript error|-- \w+ error:", re.IGNORECASE),
+        {
+            "message": (
+                "MAXScript error inside 3ds Max; the bridge connection is fine. "
+                "Do not retry unchanged: read the error, then fix the arguments or script."
+            ),
+        },
+    ),
     # Deliberately narrow: bare "connect"/"connection"/"claim" also appear in
     # MAXScript errors (Slate node connections, etc.) and must not match.
     (

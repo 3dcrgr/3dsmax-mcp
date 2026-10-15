@@ -17,7 +17,7 @@ Read this reference completely before building, inspecting, editing, or verifyin
 - Verify empirically: `verify_frames` + `min_particles`/`max_particles` resets the sim and asserts counts; there is no compile step, so structural success does not imply behavioral success.
 - On failure, additive-only patches (add_event/add_operator/connect/set_event_position) roll back via synthesized inverse operations (`rollback_mode: inverse`) — no node clone involved. Patches containing other ops use a checkpoint clone (`rollback_mode: checkpoint`); that node swap breaks references other scene objects hold to the flow (e.g. tyMesher) — use `checkpoint=false` when such references exist.
 - Prefer additive patches plus a follow-up destructive patch over mixed batches: additive batches avoid clone churn entirely, which matters for tyFlow stability.
-- Single edges outside a patch: `connect_tyflow_events` (Send Out convenience) or `connect_tyflow_operator` / `disconnect_tyflow_operator` (any test operator). Re-connecting re-targets: the ledger edge for that (event, operator) is replaced.
+- Single edges outside a patch: `connect_tyflow_operator` / `disconnect_tyflow_operator` (any test or Send Out operator; `create_if_missing=true` adds a missing Send Out). Re-connecting re-targets: the ledger edge for that (event, operator) is replaced.
 
 ## Operator manifest
 

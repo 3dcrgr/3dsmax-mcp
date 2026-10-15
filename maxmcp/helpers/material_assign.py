@@ -1,6 +1,8 @@
 """Atomic assignment of an existing node's material, including older bridges."""
 import base64
 
+from .maxscript import NODE_LOOKUP_FNS
+
 
 def _name_literal(name: str) -> str:
     if not isinstance(name, str) or not name or "\0" in name:
@@ -32,11 +34,8 @@ def existing_material_script(names, handles, source_name, source_handle) -> str:
         local ownsHold = false
         try (
             if theHold.Holding() then "__BUSY__" else (
-                fn maByName name = (
-                    local matches = getNodeByName name exact:true all:true
-                    if matches.count != 1 do throw "Object name must resolve uniquely"
-                    matches[1]
-                )
+                {NODE_LOOKUP_FNS}
+                fn maByName name = mcpUniqueNode name "Object"
                 local source = ({source})
                 if not isValidNode source do throw "Source node is no longer valid"
                 {crosscheck}

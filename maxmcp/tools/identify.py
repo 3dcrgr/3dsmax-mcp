@@ -4,6 +4,7 @@ import re
 import tempfile
 from uuid import uuid4
 
+from ..helpers.maxscript import NODE_LOOKUP_FNS, batch_reply, safe_string
 from ..helpers.native_compat import is_missing_native_route_error
 from ..max_client import MaxBridgeError
 
@@ -148,29 +149,33 @@ def batch_rename_objects(renames_json: str) -> str:
         response = client.send_command(payload, cmd_type="native:batch_rename_objects")
         return response.get("result", "")
 
+    # Entries apply in order, each old name looked up when its entry applies;
+    # a name several objects share renames none of them.
     parts = []
     for r in renames:
-        old = r["old_name"].replace("\\", "\\\\").replace('"', '\\"')
-        new = r["new_name"].replace("\\", "\\\\").replace('"', '\\"')
+        old = safe_string(r["old_name"])
+        new = safe_string(r["new_name"])
         parts.append(
-            f'obj = getNodeByName "{old}"\n'
-            f'if obj != undefined then (\n'
+            f'obj = mcpBatchNode "{old}" notFound ambiguous\n'
+            f'if obj != undefined do (\n'
             f'    obj.name = "{new}"\n'
             f'    append renamed "{old} -> {new}"\n'
-            f') else (\n'
-            f'    append notFound "{old}"\n'
             f')'
         )
 
     rename_block = "\n".join(parts)
     maxscript = f"""(
-        renamed = #()
-        notFound = #()
+        {NODE_LOOKUP_FNS}
+        local obj = undefined
+        local renamed = #()
+        local notFound = #()
+        local ambiguous = #()
         {rename_block}
-        msg = "Renamed: " + (renamed.count as string)
+        if renamed.count == 0 and ambiguous.count > 0 do mcpThrowUnresolved notFound ambiguous "nothing was renamed"
+        local msg = "Renamed: " + (renamed.count as string)
         if notFound.count > 0 do msg += " | Not found: " + (notFound as string)
-        msg
+        msg + (mcpAmbiguousReply ambiguous)
     )"""
 
     response = client.send_command(maxscript)
-    return response.get("result", "")
+    return batch_reply(response.get("result", ""))

@@ -1,9 +1,10 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
-#include "mcp_bridge/scene_journal.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 #include <cmath>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 
 using json = nlohmann::json;
@@ -425,7 +426,7 @@ std::string NativeHandlers::GetHierarchy(const std::string& params, MCPBridgeGUP
         Interface* ip = GetCOREInterface();
         TimeValue t = ip->GetTime();
 
-        INode* node = FindNodeByName(name);
+        INode* node = FindUniqueNodeByName(name);
         if (!node) {
             throw std::runtime_error("Object not found: " + name);
         }
@@ -446,14 +447,17 @@ struct NodeState {
     bool hidden;
 };
 
-struct SceneDeltaBaseline {
-    std::map<std::string, NodeState> snapshot;
-    unsigned long long epoch;
-    unsigned long long journalSeq;
-};
+using SceneDeltaSnapshot = std::map<std::string, NodeState>;
 
-static std::map<std::string, SceneDeltaBaseline> g_sceneDeltaSessions;
-static unsigned long long g_sceneDeltaEpoch = 1;
+// Each session's cursor (journal position and epoch of its last call) lives in
+// the shell (McpHost::SceneDeltaCursors), so a core reload keeps clients'
+// deltas. Here only the snapshot fallback for a scene without the journal;
+// after a reload it is gone and that session's next call is a baseline.
+// Pipe workers of different sessions run scene_delta concurrently. Snapshots
+// are immutable and shared, so a poll takes one under the lock without
+// copying it and diffs outside the lock.
+static std::mutex g_sceneDeltaMutex;
+static std::map<std::string, std::shared_ptr<const SceneDeltaSnapshot>> g_sceneDeltaSnapshots;
 
 static std::string NormalizeSceneDeltaSessionId(const std::string& session_id) {
     return session_id.empty() ? "__default__" : session_id;
@@ -496,13 +500,17 @@ static std::map<std::string, NodeState> CaptureSceneState(Interface* ip) {
 }
 
 void NativeHandlers::ResetSceneDeltaSessions() {
-    g_sceneDeltaSessions.clear();
-    g_sceneDeltaEpoch++;
-    SceneJournal::Reset();
+    {
+        std::lock_guard<std::mutex> lock(g_sceneDeltaMutex);
+        g_sceneDeltaSnapshots.clear();
+    }
+    // A new journal epoch: every stored cursor now asks for a baseline.
+    McpHost::SceneJournal::Reset();
 }
 
 void NativeHandlers::ReleaseSceneDeltaSession(const std::string& session_id) {
-    g_sceneDeltaSessions.erase(NormalizeSceneDeltaSessionId(session_id));
+    std::lock_guard<std::mutex> lock(g_sceneDeltaMutex);
+    g_sceneDeltaSnapshots.erase(NormalizeSceneDeltaSessionId(session_id));
 }
 
 std::string NativeHandlers::SceneDelta(
@@ -516,10 +524,12 @@ std::string NativeHandlers::SceneDelta(
         const std::string sessionKey = NormalizeSceneDeltaSessionId(session_id);
 
         Interface* ip = GetCOREInterface();
-        const unsigned long long currentSeq = SceneJournal::CurrentSeq();
+        // Epoch before seq: a reset in between then reads as a new epoch.
+        const unsigned long long epoch = McpHost::SceneJournal::Epoch();
+        const unsigned long long currentSeq = McpHost::SceneJournal::CurrentSeq();
 
         if (unchangedSince > 0ULL) {
-            json changes = SceneJournal::ChangesSince(unchangedSince);
+            json changes = McpHost::SceneJournal::ChangesSince(unchangedSince);
             json result;
             result["journal"] = true;
             result["since"] = unchangedSince;
@@ -532,25 +542,34 @@ std::string NativeHandlers::SceneDelta(
             return result.dump();
         }
 
-        auto existing = g_sceneDeltaSessions.find(sessionKey);
-
-        if (forceCapture ||
-            existing == g_sceneDeltaSessions.end() ||
-            existing->second.epoch != g_sceneDeltaEpoch) {
-            auto current = CaptureSceneState(ip);
-            g_sceneDeltaSessions[sessionKey] = {current, g_sceneDeltaEpoch, currentSeq};
+        const bool journal = McpHost::SceneJournal::IsRegistered();
+        // A fresh baseline: the cursor, and the snapshot only without the journal.
+        const auto baseline = [&](SceneDeltaSnapshot current) -> std::string {
             json result;
             result["baseline"] = true;
             result["objectCount"] = (int)current.size();
-            result["journal"] = SceneJournal::IsRegistered();
+            result["journal"] = journal;
             result["currentSeq"] = currentSeq;
+            auto stored = journal ? nullptr : std::make_shared<const SceneDeltaSnapshot>(std::move(current));
+            {
+                std::lock_guard<std::mutex> lock(g_sceneDeltaMutex);
+                if (stored) g_sceneDeltaSnapshots[sessionKey] = std::move(stored);
+                else g_sceneDeltaSnapshots.erase(sessionKey);
+            }
+            McpHost::SceneDeltaCursors::Set(sessionKey, {currentSeq, epoch});
             return result.dump();
+        };
+
+        McpHost::SceneDeltaCursors::Cursor cursor;
+        const bool known = McpHost::SceneDeltaCursors::Get(sessionKey, cursor);
+        if (forceCapture || !known || cursor.epoch != epoch) {
+            return baseline(CaptureSceneState(ip));
         }
 
-        if (SceneJournal::IsRegistered()) {
-            const unsigned long long since = existing->second.journalSeq;
-            json changes = SceneJournal::ChangesSince(since);
-            existing->second.journalSeq = currentSeq;
+        if (journal) {
+            const unsigned long long since = cursor.journalSeq;
+            json changes = McpHost::SceneJournal::ChangesSince(since);
+            McpHost::SceneDeltaCursors::Set(sessionKey, {currentSeq, epoch});
 
             json result;
             result["journal"] = true;
@@ -563,7 +582,15 @@ std::string NativeHandlers::SceneDelta(
         }
 
         auto current = CaptureSceneState(ip);
-        auto& previous = existing->second.snapshot;
+        std::shared_ptr<const SceneDeltaSnapshot> stored;
+        {
+            std::lock_guard<std::mutex> lock(g_sceneDeltaMutex);
+            const auto found = g_sceneDeltaSnapshots.find(sessionKey);
+            if (found != g_sceneDeltaSnapshots.end()) stored = found->second;
+        }
+        // The core was reloaded since this session's last call: start over.
+        if (!stored) return baseline(std::move(current));
+        const SceneDeltaSnapshot& previous = *stored;
 
         // Diff
         json added = json::array();
@@ -617,11 +644,6 @@ std::string NativeHandlers::SceneDelta(
             }
         }
 
-        // Update baseline
-        existing->second.snapshot = current;
-        existing->second.epoch = g_sceneDeltaEpoch;
-        existing->second.journalSeq = currentSeq;
-
         json result;
         result["added"] = added;
         result["removed"] = removed;
@@ -632,6 +654,14 @@ std::string NativeHandlers::SceneDelta(
             {"modified", modified.size()},
             {"total", (int)current.size()}
         };
+
+        // Update baseline: the new snapshot replaces the old one, moved, not copied.
+        auto next = std::make_shared<const SceneDeltaSnapshot>(std::move(current));
+        {
+            std::lock_guard<std::mutex> lock(g_sceneDeltaMutex);
+            g_sceneDeltaSnapshots[sessionKey] = std::move(next);
+        }
+        McpHost::SceneDeltaCursors::Set(sessionKey, {currentSeq, epoch});
         result["currentSeq"] = currentSeq;
         return result.dump();
     });

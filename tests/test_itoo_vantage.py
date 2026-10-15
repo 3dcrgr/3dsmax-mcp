@@ -202,7 +202,6 @@ class RegistrationTests(unittest.TestCase):
     def test_registered_read_only_and_skipped_by_smoke(self):
         from maxmcp import server
         from maxmcp.tool_discovery import TOOLSET_SPECS, _module_tool_names
-        from scripts.gen_tool_catalog import MODULE_CATEGORY
         from scripts.gen_tool_smoke import MUTATE_TOOLS, SKIP_DEFAULT
         self.assertIn("itoo_vantage", server.SPECIALTY_TOOL_MODULES)
         self.assertNotIn("itoo_vantage", server.CORE_TOOL_MODULES)
@@ -213,7 +212,6 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(specs[0].name, "rendering")
         self.assertIn("itoo_vantage_check", SKIP_DEFAULT)
         self.assertNotIn("itoo_vantage_check", MUTATE_TOOLS)
-        self.assertEqual(MODULE_CATEGORY["itoo_vantage"], "Render")
         self.assertEqual(_module_tool_names(Path(iv.__file__)), ("itoo_vantage_check",))
 
     def test_progressive_profile_indexes_the_tool(self):

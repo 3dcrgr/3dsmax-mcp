@@ -7,6 +7,7 @@
 #include "mcp_bridge/bridge_health.h"
 #include "mcp_bridge/dialog_watch.h"
 #include "mcp_bridge/main_thread_executor.h"
+#include "mcp_bridge/shell_control.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -345,8 +346,21 @@ void client_registry_tracks_connections_and_requests() {
     }
 }
 
+// health is answered by the shell on the pipe thread and never enters the
+// (possibly reloading) core: the shell's request filter must claim it.
+void health_is_a_shell_request() {
+    require(McpIsShellType("health"), "health is not a shell request type");
+    require(McpMayBeShellRequest(R"({"type":"health","command":"","requestId":"r1"})"),
+            "health request skipped by the shell's prefilter");
+    const auto parsed = nlohmann::json::parse(R"({"type":"health","requestId":"r1"})");
+    require(McpShellType(parsed) == "health", "parsed health request not routed to the shell");
+    require(McpShellType(nlohmann::json::parse(R"({"type":"maxscript"})")).empty(),
+            "maxscript wrongly routed to the shell");
+}
+
 int main() {
     try {
+        health_is_a_shell_request();
         client_registry_tracks_connections_and_requests();
         queued_work_is_visible_with_label();
         running_work_is_visible();
@@ -355,7 +369,7 @@ int main() {
         dialogwatch_and_health_agree();
         heartbeat_tracks_pumping();
         heartbeat_survives_a_posted_message_flood();
-        std::cout << "PASS: client registry; queued work visible with label; running work visible "
+        std::cout << "PASS: health is a shell request; client registry; queued work visible with label; running work visible "
                      "without blocking; running past its timeout stays running; expired work leaves the "
                      "queue; dialog watch and health agree; heartbeat tracks pumping; heartbeat survives "
                      "a posted-message flood\n";

@@ -33,7 +33,13 @@ def contact_check(
     name only against the `against` nodes (e.g. all legs against the floor and
     seat). With neither, the current selection is used, or all visible geometry
     when nothing is selected. Only pairs whose world bounding boxes come within
-    near_gap are measured. Non-mesh nodes in names/against are skipped with a warning.
+    near_gap are measured.
+
+    Missing or ambiguous names fail the call. Named nodes that are not meshes
+    (group heads, dummies, shapes, lights), empty meshes and meshes over
+    max_faces are skipped with a reason and a warning, listed in skipped_nodes
+    (and in skipped, with handle and class); their pairs go to unchecked_pairs.
+    If no mesh is left in names (or in against), the call fails.
 
     Status per pair, most severe first:
       penetrating  - a vertex lies inside the other closed mesh deeper than tolerance
@@ -51,8 +57,9 @@ def contact_check(
     Cost: dense meshes (foliage, garlands, 100k+ verts) are slow, ~seconds per
     pair. Pairs run cheapest first until work_budget (sum of both vertex counts
     per pair) or time_budget_s (max 45 s, counted from the send, so queue wait
-    counts) runs out; then complete=false, unchecked_pairs and heaviest_nodes
-    say what was skipped.
+    counts) runs out; then complete=false, pairs_checked (= pairs_measured) is
+    below pairs_total, and unchecked_pairs and heaviest_nodes say what was
+    skipped. Unchecked pairs are unknown, not clear.
     """
     names_l, against_l, tol_mm, near_mm, max_pairs, max_faces = validate_args(
         names, against, tolerance, near_gap, max_pairs, max_faces)

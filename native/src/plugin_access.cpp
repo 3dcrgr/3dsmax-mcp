@@ -1,6 +1,6 @@
 #include "mcp_bridge/plugin_access.h"
 #include "mcp_bridge/node_ref.h"
-#include "mcp_bridge/scene_journal.h"
+#include "mcp_bridge/core_bridge.h"
 #include <hold.h>
 #include <units.h>
 #include <cmath>
@@ -34,7 +34,7 @@ std::string Hash(const json& value) {
     std::ostringstream out; out << std::hex << hash; return out.str();
 }
 std::string Session() {
-    return std::to_string(GetCurrentProcessId()) + ":" + std::to_string(SceneJournal::Epoch());
+    return std::to_string(GetCurrentProcessId()) + ":" + std::to_string(McpHost::SceneJournal::Epoch());
 }
 std::string Lower(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return (char)std::tolower(c); });
@@ -433,6 +433,7 @@ bool UsesPhotometricNodeMaker(ClassDesc* cd) {
         id==LS_SPHERE_LIGHT_ID||id==LS_CYLINDER_LIGHT_ID;
 }
 INode* CreatePhotometricNode(ClassDesc* cd) {
+    RequireMaxScriptThread();
     init_thread_locals();
     one_value_local(created);
     auto classID=cd->ClassID();
@@ -442,24 +443,10 @@ INode* CreatePhotometricNode(ClassDesc* cd) {
     if(!vl.created) Fail("CREATE_FAILED","Photometric light maker returned no node.");
     return vl.created->to_node();
 }
-class Pin : public ReferenceMaker {
-    RefTargetHandle value_=nullptr;
-public:
-    explicit Pin(RefTargetHandle value) { HoldSuspend suspend; ReplaceReference(0,value); }
-    ~Pin() override { HoldSuspend suspend; DeleteAllRefsFromMe(); }
-    int NumRefs() override { return 1; }
-    RefTargetHandle GetReference(int) override { return value_; }
-    void SetReference(int,RefTargetHandle value) override { value_=value; }
-    RefResult NotifyRefChanged(const Interval&,RefTargetHandle,PartID&,RefMessage,BOOL) override { return REF_SUCCEED; }
-};
-class EnvironmentRestore final : public RestoreObj {
-    Pin before_,after_; BOOL beforeOn_,afterOn_;
-public:
-    EnvironmentRestore(Texmap* before,BOOL beforeOn,Texmap* after,BOOL afterOn):before_(before),after_(after),beforeOn_(beforeOn),afterOn_(afterOn) {}
-    void Restore(int) override { GetCOREInterface()->SetEnvironmentMap(static_cast<Texmap*>(before_.GetReference(0))); GetCOREInterface()->SetUseEnvironmentMap(beforeOn_); }
-    void Redo() override { GetCOREInterface()->SetEnvironmentMap(static_cast<Texmap*>(after_.GetReference(0))); GetCOREInterface()->SetUseEnvironmentMap(afterOn_); }
-    MSTR Description() override { return _M("MCP Environment Binding"); }
-};
+// Pin (a ReferenceMaker holding one reference) and the environment undo
+// record live in the shell (undo_records.cpp): Max keeps them as dependents
+// and on the undo stack after the request.
+using Pin = McpHost::UndoRecords::Pin;
 void ValidateElement(const ParamDef& pd,const json& value) {
     const int type=BaseType(pd.type);
     if(FloatType(type)) {
@@ -540,7 +527,7 @@ bool Shared(Animatable* owner, json* evidence=nullptr, std::set<Animatable*>* vi
     while(auto* dep=it.Next()) {
         // These keep targets alive for scripting/undo; they are not scene
         // consumers. Both report IsRealDependency=true in the live SDK.
-        if(dynamic_cast<Pin*>(dep)||dynamic_cast<MAXWrapper*>(dep)||
+        if(McpHost::UndoRecords::IsPin(dep)||dynamic_cast<MAXWrapper*>(dep)||
             dynamic_cast<RestoreObj*>(dep)||!dep->IsRealDependency(rt)||
             !dynamic_cast<ReferenceTarget*>(dep)||
             dep==GetCOREInterface()->GetSceneMtls()||
@@ -592,7 +579,7 @@ json Apply(const json& p) {
         auto* cd=Descriptor(item.at("class_ref")); const auto sid=cd->SuperClassID();
         if(sid!=LIGHT_CLASS_ID&&sid!=TEXMAP_CLASS_ID&&sid!=MATERIAL_CLASS_ID) Fail("BAD_CLASS_REF","Construction is limited to light, map and material classes.");
         if(item.contains("expected_schema")&&item["expected_schema"]!=Schema(cd)["schema_token"]) Fail("STALE_SCHEMA","Creation schema changed.");
-        const auto name=item.value("name",""); if(sid==LIGHT_CLASS_ID&&!name.empty()&&(!names.insert(name).second||!CollectNodesByExactName(name).empty())) Fail("NAME_COLLISION","Light name already exists: "+name);
+        const auto name=item.value("name",""); if(sid==LIGHT_CLASS_ID&&!name.empty()&&(!names.insert(name).second||!CollectNodesByName(name).empty())) Fail("NAME_COLLISION","Light name already exists: "+name);
         if(item.contains("matrix")) { if(sid!=LIGHT_CLASS_ID||!item["matrix"].is_array()||item["matrix"].size()!=4) Fail("BAD_PLAN","Only lights accept a four-row world matrix.");
             for(const auto& row:item["matrix"]) { if(!row.is_array()||row.size()!=3) Fail("BAD_PLAN","Invalid matrix row."); for(const auto& x:row) if(!x.is_number()||!std::isfinite(x.get<double>())) Fail("BAD_PLAN","Matrix must be finite."); } }
         classes[id]=cd;
@@ -649,7 +636,7 @@ json Apply(const json& p) {
         if(p.contains("environment")) {
             const auto env=p["environment"]; auto* value=ResolvePlanOwner(env.at("owner_ref"),created);
             if(value->SuperClassID()!=TEXMAP_CLASS_ID) Fail("BAD_REFERENCE","Environment must reference a texture map.");
-            auto* map=static_cast<Texmap*>(value); theHold.Put(new EnvironmentRestore(static_cast<Texmap*>(previousEnv.GetReference(0)),previousOn,map,TRUE));
+            auto* map=static_cast<Texmap*>(value); McpHost::UndoRecords::PutEnvironmentRestore(static_cast<Texmap*>(previousEnv.GetReference(0)),previousOn,map,TRUE);
             ip->SetEnvironmentMap(map); ip->SetUseEnvironmentMap(TRUE);
             if(ip->GetEnvironmentMap()!=map||!ip->GetUseEnvironmentMap()) Fail("VERIFY_MISMATCH","Environment binding did not apply.");
         }
@@ -666,9 +653,9 @@ json Apply(const json& p) {
             resources.push_back(resource);
         }
         json result={{"status","applied"},{"resources",resources},{"properties",proofs},{"verification","typed_readback_matched"},{"transaction","one_native_hold"},{"context",Context()}};
-        DialogWatch::ThrowIfDismissed();
+        McpHost::DialogWatch::ThrowIfDismissed();
         theHold.Accept(_M("MCP Plugin Edit")); committed=true;
-        SceneJournal::AppendSynthetic("plugin_patch",{{"created",resources.size()},{"properties",proofs.size()}});
+        McpHost::SceneJournal::AppendSynthetic("plugin_patch",{{"created",resources.size()},{"properties",proofs.size()}});
         ip->RedrawViews(t);
         return result;
     } catch(...) {

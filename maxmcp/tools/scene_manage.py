@@ -31,9 +31,10 @@ def manage_scene(action: str) -> str:
         maxscript = """(
             local fp = maxFilePath + maxFileName
             if fp == "" then (
-                "No file path set — use File > Save As first"
+                "Error: Scene was not saved: it has no file path yet. Use File > Save As first."
+            ) else if not (saveMaxFile fp) then (
+                "Error: 3ds Max failed to save " + fp
             ) else (
-                saveMaxFile fp
                 "Saved: " + fp
             )
         )"""

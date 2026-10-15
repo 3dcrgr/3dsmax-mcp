@@ -5,9 +5,40 @@ from typing import Optional
 from ..coerce import FloatList, StrList
 from ..max_client import DialogBlocked
 from ..server import mcp, client
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, node_by_name_expr, safe_string
 from ..helpers.precheck import PrecheckBlocked
 from ..helpers.spatial import build_clone_spatial_maxscript, enrich_spatial_payload
+
+_NODE_LOOKUP_FNS = NODE_LOOKUP_FNS
+
+
+# The bridge returns an uncaught MAXScript exception as this prefixed string.
+_MAXSCRIPT_ERROR = "__MCP_MS_ERR__:"
+
+# Max clones the outermost closed group around a member instead of the member,
+# stacked on the original. Mirrors ClosedGroupAround in the native handler.
+# clone_objects routes group members to the group-safe path below first, so
+# this guard only catches what that check missed; clone_whole_group=True
+# skips it (and falls back from the native refusal) to keep Max's behaviour.
+_CLOSED_GROUP_FUNCTIONS = r'''
+fn mcpClosedGroup n = (
+    local outermost = undefined
+    local member = n
+    while isGroupMember member and isValidNode member.parent do (
+        member = member.parent
+        if isGroupHead member and not isOpenGroupHead member do outermost = member
+    )
+    outermost
+)
+fn mcpClosedGroupError nodes = (
+    local msg = ""
+    for n in nodes while msg == "" do (
+        local g = mcpClosedGroup n
+        if g != undefined do msg = "Clone source '" + n.name + "' is in closed group '" + g.name + "'; Max would clone the whole group. Clone the group, or open it with manage_groups to clone the member alone."
+    )
+    msg
+)
+'''
 
 
 @mcp.tool()
@@ -51,7 +82,8 @@ def clone_objects(
                 names, members, shadows, mode, list(offset or [0.0, 0.0, 0.0]), count
             )
     if count > 1:
-        return _clone_array(names, mode, list(offset or [0.0, 0.0, 0.0]), count)
+        return _clone_array(names, mode, list(offset or [0.0, 0.0, 0.0]), count,
+                            guard_groups=not clone_whole_group)
     if client.native_available:
         try:
             params: dict = {"names": names, "mode": mode}
@@ -76,20 +108,26 @@ def clone_objects(
     mode_map = {"copy": "#copy", "instance": "#instance", "reference": "#reference"}
     ms_mode = mode_map.get(mode, "#copy")
     name_arr = "#(" + ", ".join(f'"{safe_string(n)}"' for n in names) + ")"
+    group_check = '""' if clone_whole_group else "mcpClosedGroupError srcNodes"
 
     maxscript = f"""(
+        {_CLOSED_GROUP_FUNCTIONS}
         local nameList = {name_arr}
         local srcNodes = #()
         local notFound = #()
+        -- A source name several objects share fails the call before anything is cloned.
         for n in nameList do (
-            local obj = getNodeByName n
+            local obj = {node_by_name_expr("n", missing_ok=True)}
             if obj != undefined then
                 append srcNodes obj
             else
                 append notFound n
         )
+        local groupError = {group_check}
         if srcNodes.count == 0 then (
             "{{\\\"error\\\":\\\"No valid objects found to clone\\\"}}"
+        ) else if groupError != "" then (
+            "{{\\\"error\\\":\\\"" + groupError + "\\\"}}"
         ) else (
             local newNodes = #()
             maxOps.cloneNodes srcNodes cloneType:{ms_mode} newNodes:&newNodes
@@ -108,7 +146,13 @@ def clone_objects(
                 notFoundJson += ("\\\"" + notFound[i] + "\\\"")
             )
             notFoundJson += "]"
-            "{{\\\"cloned\\\":" + namesJson + ",\\\"notFound\\\":" + notFoundJson + "}}"
+            local handlesJson = "["
+            for i = 1 to newNodes.count do (
+                if i > 1 do handlesJson += ","
+                handlesJson += formattedPrint ((getHandleByAnim newNodes[i]) as integer64) format:"d"
+            )
+            handlesJson += "]"
+            "{{\\\"cloned\\\":" + namesJson + ",\\\"notFound\\\":" + notFoundJson + ",\\\"handles\\\":" + handlesJson + "}}"
         )
     )"""
     response = client.send_command(maxscript)
@@ -126,7 +170,10 @@ def clone_objects(
 
     cloned = payload.get("cloned", [])
     if cloned:
-        spatial_response = client.send_command(build_clone_spatial_maxscript(cloned))
+        # Clones are read back by handle; a clone's name may also be carried
+        # by another object.
+        handles = [int(h) for h in payload.get("handles") or []]
+        spatial_response = client.send_command(build_clone_spatial_maxscript(cloned, node_handles=handles or None))
         spatial_raw = spatial_response.get("result", "")
         if spatial_raw:
             try:
@@ -142,20 +189,26 @@ def clone_objects(
     return _json.dumps(payload)
 
 
-def _clone_array(names: list[str], mode: str, offset: list[float], count: int) -> str:
+def _clone_array(
+    names: list[str], mode: str, offset: list[float], count: int, *, guard_groups: bool = True
+) -> str:
     """One bridge call for the mutation, compatible with already installed bridges."""
     name_arr = "#(" + ",".join(f'"{safe_string(n)}"' for n in names) + ")"
+    group_check = "mcpClosedGroupError src" if guard_groups else '""'
     vec = "[" + ",".join(format(float(v), ".9g") for v in offset) + "]"
     # Keep the clone API's dependency/hierarchy mapping intact. Moving individual
     # nodes afterward would move parented descendants twice.
     script = f'''(
+        {_CLOSED_GROUP_FUNCTIONS}
         local src = #()
         local missing = #()
         for nm in {name_arr} do (
-            local matches = getNodeByName nm exact:true all:true
-            if matches.count != 1 then append missing nm else append src matches[1]
+            local hit = {node_by_name_expr("nm", missing_ok=True)}
+            if hit == undefined then append missing nm else append src hit
         )
+        local groupError = {group_check}
         if missing.count > 0 then ("__ERROR__|Sources must resolve uniquely: " + (missing as string))
+        else if groupError != "" then ("__ERROR__|" + groupError)
         else (
             local made = #()
             local failure = ""
@@ -184,6 +237,8 @@ def _clone_array(names: list[str], mode: str, offset: list[float], count: int) -
     raw = str(client.send_command(script).get("result", ""))
     if raw.startswith("__ERROR__|"):
         raise RuntimeError(raw.split("|", 1)[1])
+    if raw.startswith(_MAXSCRIPT_ERROR):
+        raise RuntimeError(raw[len(_MAXSCRIPT_ERROR):].strip())
     handles = [int(h) for h in raw.split(",") if h.strip()]
     if not handles:
         raise RuntimeError("Clone array returned no node handles")
@@ -233,10 +288,14 @@ _MS_GROUP_FNS = r'''
     fn mcpIsMember n = (isGroupMember n) or (mcpInClosedGroup n)
 '''
 
-# Names are matched case-exactly (like native CloneObjects) for members, but
-# case-insensitive member matches are reported too: the MAXScript fallback and
-# array paths ignore case and would otherwise reach the group via cloneNodes.
+# Names resolve like every other lookup (mcpNamedNodes: exact-case matches
+# first, else matches differing only in case; the native bridge applies the
+# same rule). A name several objects share is reported with their count when
+# one of them is a member, so it is refused before anything is cloned. Members
+# matching the name in another letter case, while the name resolved to a
+# non-member, are reported as shadows (not cloned).
 _DETECT_TEMPLATE = r'''(
+    __LOOKUP_FNS__
     __JSON_FN__
     __GROUP_FNS__
     fn mcpGroupHeadOf n = (
@@ -249,14 +308,14 @@ _DETECT_TEMPLATE = r'''(
     local first = true
     for i = 1 to reqNames.count do (
         local nm = reqNames[i]
-        local exact = getNodeByName nm exact:true ignoreCase:false all:true
-        local loose = getNodeByName nm exact:true all:true
-        local hits = for m in exact where mcpIsMember m collect m
-        local shadows = for m in loose where (findItem exact m) == 0 and (mcpIsMember m) collect m
+        local resolved = mcpNamedNodes nm
+        local loose = getNodeByName nm exact:true ignoreCase:true all:true
+        local hits = for m in resolved where mcpIsMember m collect m
+        local shadows = for m in loose where (findItem resolved m) == 0 and (mcpIsMember m) collect m
         if hits.count > 0 or shadows.count > 0 do (
             if not first do out += ","
             first = false
-            out += "{\"i\":" + (i as string) + ",\"cs\":" + (exact.count as string)
+            out += "{\"i\":" + (i as string) + ",\"cs\":" + (resolved.count as string)
             if hits.count > 0 then (
                 local m = hits[1]
                 local g = mcpGroupHeadOf m
@@ -271,6 +330,7 @@ _DETECT_TEMPLATE = r'''(
 )'''
 
 _CLONE_TEMPLATE = r'''(
+    __LOOKUP_FNS__
     __JSON_FN__
     __GROUP_FNS__
     fn mcpSubtree root = (
@@ -322,14 +382,22 @@ _CLONE_TEMPLATE = r'''(
     local ambiguous = #()
     local plainMembers = #()
     for nm in __PLAIN__ do (
-        local matches = getNodeByName nm exact:true ignoreCase:false all:true
+        local matches = mcpNamedNodes nm
         if matches.count == 0 then append missing nm
-        else if matches.count > 1 then append ambiguous nm
+        else if matches.count > 1 then (
+            local handles = ""
+            for m in matches do handles += (if handles == "" then "" else ", ") + (mcpHandleText m)
+            append ambiguous (nm + " (" + (matches.count as string) + " objects share it, handles " + handles + ")")
+        )
         else if mcpIsMember matches[1] then append plainMembers nm
         else appendIfUnique plainSrc matches[1]
     )
     if lost.count > 0 then ("__ERROR__|Group member nodes vanished before cloning: " + (lost as string))
-    else if ambiguous.count > 0 then ("__ERROR__|Sources must resolve uniquely: " + (ambiguous as string))
+    else if ambiguous.count > 0 then (
+        local msg = "Ambiguous object name: "
+        for i = 1 to ambiguous.count do msg += (if i == 1 then "" else "; ") + ambiguous[i]
+        "__ERROR__|" + msg + "; pass a handle or rename them. Nothing was cloned."
+    )
     else if plainMembers.count > 0 then ("__ERROR__|Group members would reach the whole-group clone path, nothing cloned: " + (plainMembers as string))
     else if __STRICT__ and missing.count > 0 then ("__ERROR__|Every array source must exist before cloning: " + (missing as string))
     else (
@@ -423,13 +491,16 @@ def _ms_name_array(names: list[str]) -> str:
 def _find_group_members(names: list[str]) -> tuple[list[dict], list[dict]]:
     """Return (members, shadows) for the requested names (one MAXScript read).
 
-    members: names matching a group member case-exactly.
-    shadows: names whose only member match differs in case.
+    members: names resolving to a group member (exact case first, else ignoring case).
+    shadows: names resolving elsewhere while a member matches them in another case.
     """
-    script = (_DETECT_TEMPLATE.replace("__JSON_FN__", _MS_JSON_STRING)
+    script = (_DETECT_TEMPLATE.replace("__LOOKUP_FNS__", _NODE_LOOKUP_FNS)
+              .replace("__JSON_FN__", _MS_JSON_STRING)
               .replace("__GROUP_FNS__", _MS_GROUP_FNS)
               .replace("__NAMES__", _ms_name_array(names)))
     raw = client.send_command(script).get("result", "")
+    if isinstance(raw, str) and raw.startswith(_MAXSCRIPT_ERROR):
+        raise RuntimeError(raw[len(_MAXSCRIPT_ERROR):].strip())
     try:
         entries = _json.loads(raw) if isinstance(raw, str) else raw
         members, shadows, ambiguous = [], [], []
@@ -446,8 +517,8 @@ def _find_group_members(names: list[str]) -> tuple[list[dict], list[dict]]:
         raise RuntimeError(f"Group membership check returned unexpected output: {str(raw)[:200]}")
     if ambiguous:
         raise ValueError(
-            f"Names match several nodes, at least one inside a group: {ambiguous}. "
-            "Rename to unique names before cloning."
+            f"Ambiguous object name(s), several objects share them, at least one inside a group: "
+            f"{ambiguous}. Rename to unique names before cloning; nothing was cloned."
         )
     unique: dict[int, dict] = {}
     for m in members:
@@ -461,7 +532,8 @@ def build_group_member_clone_maxscript(
     """MAXScript cloning group members alone and detaching the copies, in one undo step."""
     vec = "[" + ",".join(format(float(v), ".9g") for v in offset) + "]"
     plain_block = _PLAIN_BLOCK.replace("__MODE__", mode) if plain_names else ""
-    return (_CLONE_TEMPLATE.replace("__JSON_FN__", _MS_JSON_STRING)
+    return (_CLONE_TEMPLATE.replace("__LOOKUP_FNS__", _NODE_LOOKUP_FNS)
+            .replace("__JSON_FN__", _MS_JSON_STRING)
             .replace("__GROUP_FNS__", _MS_GROUP_FNS)
             .replace("__HANDLES__", "#(" + ",".join(str(int(h)) for h in member_handles) + ")")
             .replace("__PLAIN__", _ms_name_array(plain_names))
@@ -500,8 +572,8 @@ def _group_warnings(alone: list[dict], with_ancestor: list[str], shadows: list[d
     if shadows:
         listed = ", ".join(f"'{s['name']}' (member '{s['member']}')" for s in shadows)
         warnings.append(
-            f"Names matched case-exactly: {listed} differ only in case from a group member, "
-            "which was not cloned."
+            f"Names resolved to an exact-case match: {listed} differ only in case from a group "
+            "member, which was not cloned."
         )
     return warnings
 
@@ -518,6 +590,8 @@ def _clone_group_members(
     ).get("result", ""))
     if raw.startswith("__ERROR__|"):
         raise RuntimeError(raw.split("|", 1)[1])
+    if raw.startswith(_MAXSCRIPT_ERROR):
+        raise RuntimeError(raw[len(_MAXSCRIPT_ERROR):].strip())
     try:
         result = _json.loads(raw)
         made = [int(h) for h in result["handles"]]

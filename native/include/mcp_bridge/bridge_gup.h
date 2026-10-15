@@ -10,10 +10,14 @@
 // "MCPB" + "RIDG" as hex
 #define MCP_BRIDGE_CLASS_ID Class_ID(0x4D435042, 0x52494447)
 
-class MCPBridgeGUP : public GUP {
+// The Max plugin object, part of the shell: it owns the pipe, the main-thread
+// executor and the shell services, and reaches command handling only through
+// CoreHost (core_host.h). Core code knows none of this; there, MCPBridgeGUP is
+// the handler-facing facade of core_bridge.h.
+class MCPBridgeShellGUP : public GUP {
 public:
-    MCPBridgeGUP() = default;
-    ~MCPBridgeGUP() override = default;
+    MCPBridgeShellGUP() = default;
+    ~MCPBridgeShellGUP() override = default;
 
     // GUP interface
     DWORD Start() override;

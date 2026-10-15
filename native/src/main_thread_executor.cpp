@@ -4,18 +4,16 @@
 #include <algorithm>
 #include <random>
 
-namespace {
-constexpr char kShutdownError[] = "MainThreadExecutor is shutting down";
-}
-
 thread_local bool MainThreadExecutor::tl_direct_mode_ = false;
 thread_local MainThreadExecutor::WorkLabel MainThreadExecutor::tl_label_;
 WPARAM MainThreadExecutor::s_execute_cookie_ = 0;
 std::atomic<DWORD> MainThreadExecutor::s_main_thread_id_{0};
 bool MainThreadExecutor::s_executing_ = false;
 std::deque<std::shared_ptr<MainThreadExecutor::WorkItem>> MainThreadExecutor::s_deferred_;
-std::atomic<bool> MainThreadExecutor::s_shutting_down_{false};
-std::mutex MainThreadExecutor::s_submit_mutex_;
+std::mutex MainThreadExecutor::s_waiting_mutex_;
+std::unordered_map<UINT64, std::shared_ptr<MainThreadExecutor::WorkItem>> MainThreadExecutor::s_waiting_;
+UINT64 MainThreadExecutor::s_last_id_ = 0;
+std::atomic<bool> MainThreadExecutor::s_accepting_{true};
 std::mutex MainThreadExecutor::s_stats_mutex_;
 std::list<std::shared_ptr<MainThreadExecutor::Ticket>> MainThreadExecutor::s_pending_;
 bool MainThreadExecutor::s_running_ = false;
@@ -25,16 +23,22 @@ std::atomic<unsigned long long> MainThreadExecutor::s_completed_{0};
 std::atomic<long long> MainThreadExecutor::s_heartbeat_ms_{0};
 std::atomic<long long> MainThreadExecutor::s_beat_posted_ms_{0};
 
+static constexpr char kMaxExiting[] = "3ds Max is exiting; the request did not run";
+
 MainThreadExecutor::~MainThreadExecutor() {
     Shutdown();
 }
 
+void MainThreadExecutor::EnableDirectMode() { tl_direct_mode_ = true; }
+void MainThreadExecutor::DisableDirectMode() { tl_direct_mode_ = false; }
+bool MainThreadExecutor::IsDirectMode() { return tl_direct_mode_; }
+
 void MainThreadExecutor::Initialize() {
-    // A previous Start/Stop cycle may have closed the gate; reopen it before
-    // anything can post.
+    // A previous Start/Stop cycle stopped accepting work; accept it again
+    // before anything can post.
     {
-        std::lock_guard<std::mutex> lock(s_submit_mutex_);
-        s_shutting_down_.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(s_waiting_mutex_);
+        s_accepting_.store(true, std::memory_order_release);
     }
 
     // Initialize() is called from GUP::Start on the Max main thread, so this is
@@ -106,38 +110,36 @@ void CALLBACK MainThreadExecutor::HeartbeatTimerProc(PTP_CALLBACK_INSTANCE, PVOI
     }
 }
 
-void MainThreadExecutor::BeginShutdown() {
-    // Close the gate first: from here on ExecuteSync throws instead of posting,
-    // so the drain below cannot race a fresh submission into the queue.
+void MainThreadExecutor::StopAccepting() {
     {
-        std::lock_guard<std::mutex> lock(s_submit_mutex_);
-        s_shutting_down_.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(s_waiting_mutex_);
+        s_accepting_.store(false, std::memory_order_release);
+        for (auto& entry : s_waiting_) {
+            WorkItem& item = *entry.second;
+            std::lock_guard<std::mutex> item_lock(item.mutex);
+            if (item.started || item.completed) continue;
+            // Cancelled, so a queued or deferred copy never runs it.
+            item.cancelled = true;
+            item.work = nullptr;
+            item.error = true;
+            item.error_message = kMaxExiting;
+            item.ticket->phase.store(kDone, std::memory_order_release);
+            item.completed = true;
+            item.cv.notify_all();
+        }
     }
-    DrainPendingWork();
-}
-
-void MainThreadExecutor::DrainPendingWork() {
-    // Items parked by the re-entrancy guard never reach the message queue.
-    while (!s_deferred_.empty()) {
-        auto item = std::move(s_deferred_.front());
-        s_deferred_.pop_front();
-        FailWorkItem(item, kShutdownError);
-    }
-
-    if (!hwnd_) return;
-
-    MSG message;
-    while (PeekMessage(&message, hwnd_, WM_MCP_EXECUTE, WM_MCP_EXECUTE, PM_REMOVE)) {
-        if (message.wParam != s_execute_cookie_ || message.lParam == 0) continue;
-        auto* raw = reinterpret_cast<std::shared_ptr<WorkItem>*>(message.lParam);
-        auto item = *raw;
-        delete raw;
-        FailWorkItem(item, kShutdownError);
+    // On the main thread, also discard the queued messages of those requests:
+    // WndProc would skip them anyway (their callers stopped waiting), and an
+    // empty queue is what the exit expects. Other threads see none of them.
+    if (hwnd_) {
+        MSG message;
+        while (PeekMessage(&message, hwnd_, WM_MCP_EXECUTE, WM_MCP_EXECUTE, PM_REMOVE)) {
+        }
     }
 }
 
 void MainThreadExecutor::Shutdown() {
-    BeginShutdown();
+    StopAccepting();
     health_hwnd_.store(nullptr, std::memory_order_release);
     if (heartbeat_timer_) {
         // Cancel pending callbacks and wait out a running one (it only posts).
@@ -168,12 +170,12 @@ std::string MainThreadExecutor::ExecuteSync(
         return work();
     }
 
-    // Shutting down: the main thread is tearing the bridge down and is about to
-    // block joining this very thread, so nothing will ever pump our message.
-    // Checked after the main-thread path so teardown code running inline still
-    // works, and before direct mode so no background thread touches a dying scene.
-    if (s_shutting_down_.load(std::memory_order_acquire)) {
-        throw std::runtime_error(kShutdownError);
+    // Max is exiting: the main thread is about to join this very thread, so
+    // nothing will pump our message. Checked after the main-thread path so
+    // teardown code running inline still works, and before direct mode so no
+    // pipe thread touches a dying scene.
+    if (!s_accepting_.load(std::memory_order_acquire)) {
+        throw std::runtime_error(kMaxExiting);
     }
 
     // Direct mode: run on calling thread, skip main-thread roundtrip.
@@ -194,25 +196,27 @@ std::string MainThreadExecutor::ExecuteSync(
     item->ticket->label = tl_label_;
     item->ticket->posted_at = std::chrono::steady_clock::now();
 
-    DialogWatch::MarkQueued();
-    // prevent shared_ptr from dying before main thread processes it
-    auto* raw = new std::shared_ptr<WorkItem>(item);
-
+    UINT64 id = 0;
     {
-        // Re-check under the submit lock: BeginShutdown sets the flag while
-        // holding it, so either our PostMessage lands before its drain runs or
-        // we see the flag here and never post at all.
-        std::lock_guard<std::mutex> submit(s_submit_mutex_);
-        if (s_shutting_down_.load(std::memory_order_acquire)) {
-            delete raw;
-            throw std::runtime_error(kShutdownError);
+        std::lock_guard<std::mutex> waiting(s_waiting_mutex_);
+        if (!s_accepting_.load(std::memory_order_acquire)) throw std::runtime_error(kMaxExiting);
+        id = ++s_last_id_;
+        s_waiting_.emplace(id, item);
+    }
+    // Leaves the table on every exit, after the item lock below is released.
+    struct StopWaiting {
+        UINT64 id;
+        ~StopWaiting() {
+            std::lock_guard<std::mutex> waiting(s_waiting_mutex_);
+            s_waiting_.erase(id);
         }
-        TrackPending(item);
-        if (!PostMessage(hwnd_, WM_MCP_EXECUTE, s_execute_cookie_, reinterpret_cast<LPARAM>(raw))) {
-            item->ticket->phase.store(kDone, std::memory_order_release);
-            delete raw;
-            throw std::runtime_error("Failed to post work to main thread");
-        }
+    } stop_waiting{id};
+
+    DialogWatch::MarkQueued();
+    TrackPending(item);
+    if (!PostMessage(hwnd_, WM_MCP_EXECUTE, s_execute_cookie_, static_cast<LPARAM>(id))) {
+        item->ticket->phase.store(kDone, std::memory_order_release);
+        throw std::runtime_error("Failed to post work to main thread");
     }
 
     // Wait for main thread to complete the work
@@ -225,7 +229,11 @@ std::string MainThreadExecutor::ExecuteSync(
         if (!item->started) {
             // A timed-out queued mutation must never execute later, after the
             // caller has left (its lambda may also capture stack references).
+            // Drop the closure now, while its request is still in flight: the
+            // item itself may wait in the queue or s_deferred_ much longer,
+            // past a core reload, and must not keep anything of the core.
             item->cancelled = true;
+            item->work = nullptr;
             item->ticket->phase.store(kDone, std::memory_order_release);
             throw std::runtime_error("Main thread execution timed out before starting; queued work cancelled");
         }
@@ -265,19 +273,15 @@ LRESULT CALLBACK MainThreadExecutor::WndProc(
 
     if (msg == WM_MCP_EXECUTE) {
         // Reject any sender that doesn't know our per-process cookie. lParam
-        // is reinterpret_cast'd as a heap pointer; an attacker-supplied value
-        // would be an arbitrary read/write/free + vtable-call primitive.
+        // is a request id; a request nobody waits on any more is skipped.
         if (wp != s_execute_cookie_) return 0;
 
-        auto* raw = reinterpret_cast<std::shared_ptr<WorkItem>*>(lp);
-        auto item = *raw;
-        delete raw;
-
-        // Raced the shutdown drain (or arrived from a nested pump during it).
-        // Never start new scene work while the bridge is being torn down.
-        if (s_shutting_down_.load(std::memory_order_acquire)) {
-            FailWorkItem(item, kShutdownError);
-            return 0;
+        std::shared_ptr<WorkItem> item;
+        {
+            std::lock_guard<std::mutex> waiting(s_waiting_mutex_);
+            auto found = s_waiting_.find(static_cast<UINT64>(lp));
+            if (found == s_waiting_.end()) return 0;
+            item = found->second;
         }
 
         // Delivered by a nested message pump while another item is running
@@ -303,26 +307,31 @@ LRESULT CALLBACK MainThreadExecutor::WndProc(
 }
 
 void MainThreadExecutor::RunWorkItem(const std::shared_ptr<WorkItem>& item) {
+    std::function<std::string()> work;
     {
         std::lock_guard<std::mutex> lock(item->mutex);
-        // Cancelled: its caller timed out while it was queued. Completed: the
-        // shutdown drain already failed it.
+        // Cancelled: its caller timed out while it was queued, or Max is
+        // exiting; either way the caller already dropped the closure.
         if (item->cancelled || item->completed) return;
         item->started = true;
         item->ticket->phase.store(kRunning, std::memory_order_release);
+        work = std::move(item->work);
+        item->work = nullptr;
     }
     SetRunning(item.get());
     std::string result, error;
     try {
         DialogWatch::Guard guard(item->request_id, item->command_type);
-        result = guard.Execute(item->work);
+        result = guard.Execute(work);
     } catch (const std::exception& e) {
         error = e.what();
     } catch (...) {
         error = "Unknown exception on main thread";
     }
     SetRunning(nullptr);
-    item->work = {};  // drop the callback and its captures here, on the main thread
+    // Destroy the closure before its caller resumes, so nothing it captured
+    // outlives the request that created it.
+    work = nullptr;
     {
         std::lock_guard<std::mutex> lock(item->mutex);
         item->result = std::move(result);
@@ -330,21 +339,6 @@ void MainThreadExecutor::RunWorkItem(const std::shared_ptr<WorkItem>& item) {
         item->error_message = std::move(error);
         item->ticket->phase.store(kDone, std::memory_order_release);
         s_completed_.fetch_add(1, std::memory_order_relaxed);
-        item->completed = true;
-    }
-    item->cv.notify_all();
-}
-
-void MainThreadExecutor::FailWorkItem(const std::shared_ptr<WorkItem>& item,
-                                      const char* message) {
-    {
-        std::lock_guard<std::mutex> lock(item->mutex);
-        // Started items finish on their own; cancelled ones have no waiter.
-        if (item->completed || item->started || item->cancelled) return;
-        item->error = true;
-        item->error_message = message;
-        item->work = {};
-        item->ticket->phase.store(kDone, std::memory_order_release);
         item->completed = true;
     }
     item->cv.notify_all();
@@ -376,7 +370,7 @@ MainThreadExecutor::Health MainThreadExecutor::GetHealth() const {
     Health health;
     const HWND hwnd = health_hwnd_.load(std::memory_order_acquire);
     health.initialized = hwnd != nullptr;
-    health.shutting_down = s_shutting_down_.load(std::memory_order_acquire);
+    health.shutting_down = IsShuttingDown();
     health.completed = s_completed_.load(std::memory_order_relaxed);
     // IsHungAppWindow only reads the owner thread's input bookkeeping; it never
     // sends a message, so it is safe while the main thread is blocked.

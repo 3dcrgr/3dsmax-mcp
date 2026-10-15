@@ -9,7 +9,7 @@ from typing import Optional
 import json as _json
 from ..server import mcp, client
 from ..coerce import DictList
-from ..helpers.maxscript import safe_string, safe_name, normalize_subanim_path
+from ..helpers.maxscript import safe_string, normalize_subanim_path, node_by_name, node_script_ref
 
 
 @mcp.tool()
@@ -172,7 +172,7 @@ def assign_controller(
         keys = ", ".join(sorted(_CONTROLLER_MAP.keys()))
         return f"Unknown controller_type: {controller_type}. Available: {keys}"
 
-    safe_obj = safe_name(name)
+    safe_obj = safe_string(name)
     safe_path = safe_string(normalize_subanim_path(param_path))
     sep = "" if safe_path.startswith("[") else "."
     ctor = _CONTROLLER_MAP[ct]
@@ -187,9 +187,9 @@ def assign_controller(
         list_ctor = _CONTROLLER_MAP[list_type]
 
         lines = [
-            f'local obj = getNodeByName "{safe_obj}"',
+            f'local obj = {node_by_name(name, missing_ok=True)}',
             f'if obj == undefined do return "Object not found: {safe_obj}"',
-            f'local sa = execute("$\'" + obj.name + "\'{sep}{safe_path}")',
+            f'local sa = execute ({node_script_ref("obj")} + "{sep}{safe_path}")',
             f'if sa == undefined do return "Param not found: {safe_path}"',
             # Wrap in list if not already one
             'local clsLower = toLower ((classof sa.controller) as string)',
@@ -199,7 +199,7 @@ def assign_controller(
             '    try ((getSubAnim sa.controller 1).controller.value = curVal) catch ()',
             ')',
             # Add new controller to Available slot (must use $ path)
-            f'execute("$\'" + obj.name + "\'{sep}{safe_path}.controller.Available.controller = {ctor}")',
+            f'execute ({node_script_ref("obj")} + "{sep}{safe_path}.controller.Available.controller = {ctor}")',
             # Get reference to the newly added controller (before Available and Weights)
             'local listCtrl = sa.controller',
             'local ctrl = (getSubAnim listCtrl (listCtrl.numsubs - 2)).controller',
@@ -219,9 +219,9 @@ def assign_controller(
 
     # ── Direct assignment mode ──
     lines = [
-        f'local obj = getNodeByName "{safe_obj}"',
+        f'local obj = {node_by_name(name, missing_ok=True)}',
         f'if obj == undefined do return "Object not found: {safe_obj}"',
-        f'local sa = execute("$\'" + obj.name + "\'{sep}{safe_path}")',
+        f'local sa = execute ({node_script_ref("obj")} + "{sep}{safe_path}")',
         f'if sa == undefined do return "Param not found: {safe_path}"',
         f'sa.controller = {ctor}',
         'local ctrl = sa.controller',
@@ -253,41 +253,48 @@ def _build_controller_config(
         if ct in _SCRIPT_TYPES:
             for var in variables:
                 vname = safe_string(var.get("var_name", var.get("name", "")))
-                vobj = safe_name(var.get("object", var.get("target", "")))
+                vobj = var.get("object", var.get("target", ""))
                 if not vname or not vobj:
                     raise ValueError("Script variables require name/var_name and object")
-                lines.append(f'local varNode = getNodeByName "{vobj}"')
+                lines.append(f'local varNode = {node_by_name(vobj, missing_ok=True)}')
                 lines.append('if varNode == undefined do throw "Binding target not found"')
                 lines.append(f'if not ({ctrl_var}.addNode "{vname}" varNode) do throw "Binding rejected"')
+        # A missing or refused target throws instead of leaving a constraint
+        # with fewer targets than requested.
         elif ct in _CONSTRAINT_TYPES:
             for var in variables:
-                tobj = safe_name(var.get("object", ""))
+                tobj = safe_string(var.get("object", ""))
                 weight = var.get("weight", 50.0)
-                lines.append(f'local tgtNode = getNodeByName "{tobj}"')
-                lines.append(f'if tgtNode != undefined do {ctrl_var}.appendTarget tgtNode {weight}')
+                lines.append(f'local tgtNode = {node_by_name(var.get("object", ""), missing_ok=True)}')
+                lines.append(f'if tgtNode == undefined do throw "Constraint target object missing: {tobj}"')
+                lines.append(f'if ({ctrl_var}.appendTarget tgtNode {weight}) == false do throw "Constraint rejected target {tobj}"')
         elif ct == _LINK_TYPE:
             for var in variables:
-                tobj = safe_name(var.get("object", ""))
+                tobj = safe_string(var.get("object", ""))
                 frame = var.get("frame", 0)
-                lines.append(f'local tgtNode = getNodeByName "{tobj}"')
-                lines.append(f'if tgtNode != undefined do {ctrl_var}.addTarget tgtNode {frame}')
+                lines.append(f'local tgtNode = {node_by_name(var.get("object", ""), missing_ok=True)}')
+                lines.append(f'if tgtNode == undefined do throw "Constraint target object missing: {tobj}"')
+                lines.append(f'if ({ctrl_var}.addTarget tgtNode {frame}) == false do throw "Constraint rejected target {tobj}"')
         elif ct == _ATTACHMENT_TYPE:
             for var in variables:
-                tobj = safe_name(var.get("object", ""))
+                tobj = safe_string(var.get("object", ""))
                 face = var.get("face", 1)
-                lines.append(f'local tgtNode = getNodeByName "{tobj}"')
-                lines.append(f'if tgtNode != undefined do {ctrl_var}.appendTarget tgtNode {face}')
+                lines.append(f'local tgtNode = {node_by_name(var.get("object", ""), missing_ok=True)}')
+                lines.append(f'if tgtNode == undefined do throw "Constraint target object missing: {tobj}"')
+                lines.append(f'if ({ctrl_var}.appendTarget tgtNode {face}) == false do throw "Constraint rejected target {tobj}"')
         elif ct in _EXPRESSION_TYPES:
             for var in variables:
                 vname = safe_string(var.get("var_name", ""))
-                tobj = safe_name(var.get("object", ""))
+                tobj = safe_string(var.get("object", ""))
                 tpath = safe_string(var.get("target_param_path", ""))
                 tsep = "" if tpath.startswith("[") else "."
-                lines.append(f'local tgtNode = getNodeByName "{tobj}"')
-                lines.append(f'if tgtNode != undefined do (')
-                lines.append(f'    local tgtSA = execute("$\'" + tgtNode.name + "\'{tsep}{tpath}")')
-                lines.append(f'    if tgtSA != undefined do {ctrl_var}.addScalarTarget "{vname}" tgtSA.controller')
-                lines.append(f')')
+                lines.append(f'local tgtNode = {node_by_name(var.get("object", ""), missing_ok=True)}')
+                lines.append(f'if tgtNode == undefined do throw "Expression target object missing: {tobj}"')
+                lines.append('(')
+                lines.append(f'    local tgtSA = execute ({node_script_ref("tgtNode")} + "{tsep}{tpath}")')
+                lines.append(f'    if tgtSA == undefined do throw "Expression target track missing: {tpath}"')
+                lines.append(f'    if ({ctrl_var}.addScalarTarget "{vname}" tgtSA.controller) == false do throw "Expression rejected target {vname}"')
+                lines.append(')')
 
     # Set script/expression text
     if script is not None:
@@ -321,14 +328,14 @@ def inspect_controller(
         response = client.send_command(payload, cmd_type="native:inspect_controller")
         return response.get("result", "")
 
-    safe_obj = safe_name(name)
+    safe_obj = safe_string(name)
     safe_path = safe_string(normalize_subanim_path(param_path))
     sep = "" if safe_path.startswith("[") else "."
 
     maxscript = f"""(
-    local obj = getNodeByName "{safe_obj}"
+    local obj = {node_by_name(name, missing_ok=True)}
     if obj == undefined do return "Object not found: {safe_obj}"
-    local sa = execute("$'" + obj.name + "'{sep}{safe_path}")
+    local sa = execute ({node_script_ref("obj")} + "{sep}{safe_path}")
     if sa == undefined do return "Param not found: {safe_path}"
     local ctrl = sa.controller
     if ctrl == undefined do return "No controller on: {safe_path}"
@@ -479,14 +486,14 @@ def inspect_track_view(
         response = client.send_command(payload, cmd_type="native:inspect_track_view")
         return response.get("result", "")
 
-    safe_obj = safe_name(name)
+    safe_obj = safe_string(name)
     safe_filter = safe_string((filter or "").lower())
     max_depth = min(max(int(depth), 1), 6)
     include_values_str = "true" if include_values else "false"
 
     maxscript = f"""(
     local esc = MCP_Server.escapeJsonString
-    local obj = getNodeByName "{safe_obj}"
+    local obj = {node_by_name(name, missing_ok=True)}
     if obj == undefined do return "{{\\"error\\":\\"Object not found: {safe_obj}\\"}}"
 
     local filterStr = "{safe_filter}"
@@ -600,21 +607,24 @@ def add_controller_target(
     """Add a node variable or constraint target to an existing controller."""
     # Always use MAXScript TCP path — ctrl.addNode triggers script re-evaluation
     # which causes re-entrancy inside the native ExecuteSync handler.
-    safe_obj = safe_name(name)
+    safe_obj = safe_string(name)
     safe_path = safe_string(normalize_subanim_path(param_path))
-    safe_target = safe_name(target_object)
+    safe_target = safe_string(target_object)
     safe_var = safe_string(var_name) if var_name else ""
     sep = "" if safe_path.startswith("[") else "."
 
+    # Failures throw: the bridge returns them as a MAXScript error rather than
+    # a message string that reads as success. addNode/appendTarget/addTarget
+    # return false for a target the controller refuses.
     lines = [
-        f'local obj = getNodeByName "{safe_obj}"',
-        f'if obj == undefined do return "Object not found: {safe_obj}"',
-        f'local sa = execute("$\'" + obj.name + "\'{sep}{safe_path}")',
-        f'if sa == undefined do return "Param not found: {safe_path}"',
+        f'local obj = {node_by_name(name, missing_ok=True)}',
+        f'if obj == undefined do throw "Object not found: {safe_obj}"',
+        f'local sa = execute ({node_script_ref("obj")} + "{sep}{safe_path}")',
+        f'if sa == undefined do throw "Param not found: {safe_path}"',
         'local ctrl = sa.controller',
-        f'if ctrl == undefined do return "No controller on: {safe_path}"',
-        f'local tgtNode = getNodeByName "{safe_target}"',
-        f'if tgtNode == undefined do return "Target not found: {safe_target}"',
+        f'if ctrl == undefined do throw "No controller on: {safe_path}"',
+        f'local tgtNode = {node_by_name(target_object, missing_ok=True)}',
+        f'if tgtNode == undefined do throw "Target not found: {safe_target}"',
         'local clsStr = toLower ((classof ctrl) as string)',
         'local done = false',
     ]
@@ -622,41 +632,41 @@ def add_controller_target(
     # Script controllers: addNode
     lines.append('if (findString clsStr "script") != undefined do (')
     if safe_var:
-        lines.append(f'    ctrl.addNode "{safe_var}" tgtNode')
+        lines.append(f'    if (ctrl.addNode "{safe_var}" tgtNode) == false do throw "Script controller rejected variable {safe_var}"')
         lines.append('    done = true')
     else:
-        lines.append('    return "var_name is required for script controllers"')
+        lines.append('    throw "var_name is required for script controllers"')
     lines.append(')')
 
     # Standard constraints: appendTarget
     lines.append('if not done and (findString clsStr "constraint") != undefined and (findString clsStr "link") == undefined and (findString clsStr "attachment") == undefined do (')
-    lines.append(f'    ctrl.appendTarget tgtNode {weight}')
+    lines.append(f'    if (ctrl.appendTarget tgtNode {weight}) == false do throw "Constraint rejected target {safe_target}"')
     lines.append('    done = true')
     lines.append(')')
 
     # Link constraint: addTarget with frame
     lines.append('if not done and (findString clsStr "link") != undefined do (')
-    lines.append(f'    ctrl.addTarget tgtNode {frame}')
+    lines.append(f'    if (ctrl.addTarget tgtNode {frame}) == false do throw "Link constraint rejected target {safe_target}"')
     lines.append('    done = true')
     lines.append(')')
 
     # Attachment constraint: appendTarget with face
     lines.append('if not done and (findString clsStr "attachment") != undefined do (')
-    lines.append(f'    ctrl.appendTarget tgtNode {int(frame)}')
+    lines.append(f'    if (ctrl.appendTarget tgtNode {int(frame)}) == false do throw "Attachment rejected target {safe_target}"')
     lines.append('    done = true')
     lines.append(')')
 
     # Expression controllers: not supported here
     lines.append('if not done and (findString clsStr "expression") != undefined do (')
-    lines.append('    return "Use assign_controller with variables for expression scalar targets (requires target_param_path)"')
+    lines.append('    throw "Use assign_controller with variables for expression scalar targets (requires target_param_path)"')
     lines.append(')')
 
-    lines.append('if not done do return "Controller type not supported for adding targets: " + (classof ctrl) as string')
+    lines.append('if not done do throw ("Controller type not supported for adding targets: " + (classof ctrl) as string)')
     lines.append('"Added target \'" + tgtNode.name + "\' to " + (classof ctrl) as string + " on " + obj.name')
 
     maxscript = "(\n    " + "\n    ".join(lines) + "\n)"
     response = client.send_command(maxscript)
-    return response.get("result", str(response))
+    return _controller_result(response)
 
 
 @mcp.tool()
@@ -680,14 +690,14 @@ def set_controller_props(
         response = client.send_command(_json.dumps(payload), cmd_type="native:set_controller_props")
         return _controller_result(response)
 
-    safe_obj = safe_name(name)
+    safe_obj = safe_string(name)
     safe_path = safe_string(normalize_subanim_path(param_path))
     sep = "" if safe_path.startswith("[") else "."
 
     lines = [
-        f'local obj = getNodeByName "{safe_obj}"',
+        f'local obj = {node_by_name(name, missing_ok=True)}',
         f'if obj == undefined do return "Object not found: {safe_obj}"',
-        f'local sa = execute("$\'" + obj.name + "\'{sep}{safe_path}")',
+        f'local sa = execute ({node_script_ref("obj")} + "{sep}{safe_path}")',
         f'if sa == undefined do return "Param not found: {safe_path}"',
         'local ctrl = sa.controller',
         f'if ctrl == undefined do return "No controller on: {safe_path}"',

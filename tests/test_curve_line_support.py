@@ -17,7 +17,10 @@ from maxmcp.tools import splines as sp  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 TOKEN = "-".join(["AB"] * 32)
-PREDICATE = "fn cvIsSpline b = (isKindOf b SplineShape or isKindOf b line)"
+# Upstream 1.7.6 ships the same Line support as editable_spline()/cvEditable;
+# the fork's cvIsSpline predicate was folded into it on the 1.7.6 merge.
+EXPR = "(isKindOf obj.baseObject SplineShape or isKindOf obj.baseObject line)"
+PREDICATE = "fn cvEditable obj = " + EXPR
 BARE_GATE = re.compile(r"isKindOf\s+\(?\s*[\w.]+\s*\)?\s+SplineShape", re.IGNORECASE)
 
 
@@ -41,19 +44,20 @@ class PredicateTests(unittest.TestCase):
         self.assertEqual(Path(cr.__file__).resolve(), REPO / "maxmcp" / "helpers" / "curve_runtime.py")
 
     def test_predicate_accepts_splineshape_and_line_only(self):
-        self.assertEqual(cr.SPLINE_BASE_FUNCTION.strip(), PREDICATE)
+        self.assertEqual(cr.EDITABLE_SPLINE_CLASSES, ("SplineShape", "line"))
+        self.assertEqual(cr.editable_spline("obj"), EXPR)
 
     def test_curve_functions_define_predicate_before_cvbase(self):
         text = cr.CURVE_FUNCTIONS
-        self.assertTrue(text.startswith(cr.SPLINE_BASE_FUNCTION))
-        self.assertIn("if not cvIsSpline obj.baseobject do throw "
+        self.assertIn(PREDICATE, text)
+        self.assertIn("if not cvEditable obj do throw "
                       '"Editable spline base required; no automatic conversion"', text)
-        self.assertLess(text.index("fn cvIsSpline"), text.index("fn cvBase"))
+        self.assertLess(text.index("fn cvEditable"), text.index("fn cvBase"))
 
     def test_owned_sources_have_no_bare_splineshape_gate(self):
         for rel in ("maxmcp/helpers/curve_runtime.py", "maxmcp/tools/curve_model.py",
                     "maxmcp/tools/curve_edit.py", "maxmcp/tools/splines.py"):
-            source = (REPO / rel).read_text(encoding="utf-8").replace(PREDICATE, "")
+            source = (REPO / rel).read_text(encoding="utf-8").replace(EXPR, "")
             self.assertEqual(BARE_GATE.findall(source), [], rel)
 
 
@@ -85,7 +89,7 @@ class GeneratedScriptTests(unittest.TestCase):
         self.assertNotIn("convertTo", scripts[0])
 
     def test_curve_model_token(self):
-        self.assertIn("fn cmToken obj = (if cvIsSpline obj.baseobject then cvToken obj else lfToken obj)",
+        self.assertIn("fn cmToken obj = (if cvEditable obj then cvToken obj else lfToken obj)",
                       cm.functions())
         scripts = []
         with patch.object(cm, "run", _capture(scripts)), self.assertRaises(_Stop):
@@ -101,14 +105,14 @@ class DrawSplineTests(unittest.TestCase):
             out = sp.draw_spline(name="Line001", **kwargs)
         self.assertEqual(out, {"status": "error", "error": "stop"})
         script = client.send_command.call_args.args[0]
-        self.assertIn(PREDICATE, script)
-        self.assertEqual(BARE_GATE.findall(script.replace(PREDICATE, "")), [])
+        self.assertIn(EXPR, script)
+        self.assertEqual(BARE_GATE.findall(script.replace(EXPR, "")), [])
         bare = _strip_strings(script)
         self.assertEqual(bare.count("("), bare.count(")"))
         return script
 
     def _assert_guard(self, script, convert=False):
-        self.assertLess(script.index(PREDICATE), script.index("if not (cvIsSpline obj.baseObject) do ("))
+        self.assertIn("if not " + EXPR + " do (", script)
         self.assertIn("convertToSplineShape obj; wasConverted = true", script)
         rejection = 'if obj.modifiers.count > 0 do throw "Editable spline base required; convert=true explicitly collapses the stack"'
         if convert:
@@ -118,8 +122,7 @@ class DrawSplineTests(unittest.TestCase):
 
     def test_get_reports_line_as_editable(self):
         script = self._script(action="get")
-        self.assertIn("((cvIsSpline obj.baseObject) as string)", script)
-        self.assertLess(script.index(PREDICATE), script.index("cvIsSpline obj.baseObject"))
+        self.assertIn("(" + EXPR + " as string)", script)
 
     def test_editing_actions_use_shared_guard(self):
         cases = [

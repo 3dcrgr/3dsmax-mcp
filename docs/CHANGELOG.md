@@ -2,7 +2,48 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [1.7.6] — 2026-10-14
+
+- Faster mesh tools: `inspect_mesh` on a 288k-face mesh takes about 11 ms instead of 4.7 s (72k faces: 7 ms instead of 1 s), whatever the `limit`. `inspect_mesh`, `mesh_edit`, `create_mesh`, `pick_component` and `loft_mesh` get `mesh_token` from the native bridge, which hashes the Editable Poly base cage in the same main-thread step as the tool's script, instead of formatting every vertex, edge and face in MAXScript for a SHA-256. Tokens from earlier versions no longer match; inspect again. `mesh_edit` and `create_mesh` started inside another 3ds Max undo operation fail with `USER_BUSY` (retryable). These tools require the native bridge.
+- Faster repeated `mesh_edit`: it updates the Modify panel only where it differs, so repeated edits on one object take a few milliseconds instead of about 400 ms.
+- Faster `geometry_qa`: 8k triangles take 32 ms (was 265 ms) and 72k take 0.3 s (was 2.4 s). The native bridge exports the evaluated mesh and the analysis builds issue rows only for reported samples. It also works with safe mode on (the default); its MAXScript export used `createFile`, which safe mode blocks.
+- Tools that take object names no longer act on an arbitrary object when several share a name. Single-object tools fail with `AMBIGUOUS` and list the candidates with their handles; batch tools (selection, visibility, layers, groups, selection sets, `set_parent`, `batch_rename_objects`, `set_modifier_property`, keyframes, `replicate_material`, `add_tyflow_collision` colliders, `assign_to` of texture and Shell materials) skip shared names and report them in `ambiguous` with `status: "partial"`. A name with no exact match matches by letter case alone, as MAXScript does.
+- tyFlow, MCG, Data Channel and Boolean tools report what applied. Edits, collisions, PhysX settings, patches, census and manifest runs that applied in part return `status: "partial"` with warnings; edits that applied nothing are errors. `add_tyflow_collision` with only unknown names no longer clears the operator's colliders, an interrupted `harvest_tyflow_manifest` no longer replaces the cached manifest, and a failed `tyflow_apply_patch` returns `PATCH_APPLY_FAILED`. `load_dc_preset` rejects unknown presets before touching the stack. These tools keep `BLOCKED_BY_DIALOG`, `MAX_BUSY` and `TARGET_UNAVAILABLE` errors instead of flattening them.
+- `transform_object` and `set_object_property(position)` fail with `TRANSFORM_IGNORED` when a constraint, script or expression controller ignores the edit, instead of reporting success for an object that did not move. A `transform_object` call that moved only some parts returns `status: "partial"` with `ignored`. `set_object_property` names `transform_object` for rotation and scale instead of reporting the property missing.
+- `scene_patch` warns when no operation changed the scene, and `scene_qa` without the native bridge returns an error. Transforms that a constraint, script or expression controller ignored are reported in `ignored` with the controller (`status: "partial"`); a patch in which nothing took effect fails with `PATCH_APPLY_FAILED` and leaves no undo entry.
+- A call that 3ds Max does not answer no longer freezes the MCP server. After its deadline (about 130 s for ordinary calls, the exact timeout for probes, longer timeouts honored) it returns `MAX_BUSY`, not retryable; the call keeps running in Max and `max_dialogs(action="inspect")` reports its result once it finishes.
+- Mutating tools report what actually happened. A MAXScript error inside a native edit fails the call and rolls back its undo step instead of returning success. Requests that matched nothing are errors; requests that applied only in part return `status: "partial"` with the skipped names and warnings. This covers objects, selection, visibility, modifiers, layers, groups, selection sets, `set_parent`, `batch_rename_objects`, `manage_scene` save, materials, texture maps, controllers, wires, keyframes, effects and render.
+- `replace_material` and `batch_replace_materials` also replace materials inside sub-material slots (Multi/Sub and other material trees), find the source in sub-material slots and the Material Editor, refuse slots that would create a reference loop, and report `replaced_slots`, `skipped` and a status of `replaced`, `no_match`, `no_objects`, `blocked` or `unchanged`. Batch entries apply in order.
+- `contact_check` takes `time_budget_s` (default 20 s): it measures pairs with the fewest faces first and returns `complete: false` with what it measured when time runs out. Named group heads, dummies, shapes, lights, empty meshes and meshes over `max_faces` are returned in `skipped` instead of failing the call.
+- The agent viewport restores its preview settings (temporary denoiser, render elements, VFB denoiser layer, render view lock) when a V-Ray or Corona preview is stopped from the renderer's own UI.
+- MAXScript reached from a read handler that runs off Max's main thread now runs on the main thread; `inspect_properties` on modifiers without parameter blocks (Normal, Surface) no longer evaluated MAXScript off it.
+- `set_modifier_property` matches `modifier_class` by the MAXScript class name (`Bend`) as well as the SDK name (`BendMod`).
+- `add_tyflow_event` returns the new event instead of a parse error.
+- Removed `inspect_modifier_properties`, a compatibility alias. Call `inspect_properties(name, target="modifier", modifier_index=N)`.
+- Removed `refresh_plugin_manifest`. `get_plugin_manifest` already rebuilds the manifest from the live runtime on every call; the removed tool only added `"refreshed": true`.
+- `create_tyflow` takes `preset` (rain, snow, fountain, burst, debris) with `amount` and `speed`, replacing `create_tyflow_preset`. Presets build the same operators, flow name and event name as before; `event_name` now overrides the preset's event name.
+- `connect_tyflow_operator` takes `create_if_missing` to add a missing Send Out, replacing `connect_tyflow_events`. Call `connect_tyflow_operator(name, from_event, from_operator="Send Out", to_event, create_if_missing=true)`; the reply reports `created_send_out`.
+- Removed `list_tyflow_operator_types`. It probed a fixed list of 34 operator names; `harvest_tyflow_manifest` probes the documented catalog the same way and caches it per tyFlow version, and `list_tyflow_operators` reports each type's `available` flag. Pass `operator_names` to `harvest_tyflow_manifest` to probe specific types live.
+- tyFlow particle reads (`get_tyflow_info`, `get_tyflow_particle_count`, `get_tyflow_particles`) refuse objects that are not tyFlow and report a failed read instead of 0 particles; a frame update or attribute read that failed is a warning.
+- A `tyflow_apply_patch` whose applied operations were kept records them in the wiring ledger, and a tyFlow edit whose ledger update failed says so in `warnings`.
+- `add_data_channel` checks `order` and `expected_operator_count` before it adds a modifier or operator, so a rejected request leaves the stack unchanged. `list_dc_presets` escapes preset names.
+- `mcg_search_operators` warns when it falls back to the offline catalog, and `mcg_create_graph` no longer treats a class-name probe that could not run as proof the name is free.
+- `scene_qa` fix runs that had nothing to repair return `status: "noop"` with a warning.
+- `create_lights` and `edit_lights` warn when a committed light could not be inspected afterwards.
+- 3ds Max now quits while an MCP client is connected. The bridge waited for every connected client to disconnect, so Max kept running in the background after its window closed. Requests still queued when Max exits now fail at once instead of waiting out their timeout.
+- After the selected 3ds Max exits or restarts, calls fail with `TARGET_UNAVAILABLE`, not retryable, and point to `list_max_instances`, `select_max_instance` and `release_max_instance`, instead of a retryable bridge error with a scene-search hint.
+- `get_state_sets`, `get_camera_sequence`, `get_wired_params` and `introspect_instance` run on Max's main thread. They ran MAXScript on a pipe thread.
+- `inspect_curve` and `edit_curve` accept Line objects, and `draw_spline` edits a Line in place instead of converting it, or collapsing its modifiers with `convert=true`.
+- `contact_check` no longer misreads a whole-number `tolerance` or `near_gap` as almost zero.
+- `clone_objects` refuses a member of a closed group and names the group, instead of cloning the whole group on top of the original. Clone the group, or open it to clone the member alone.
+- `replace_material` returns `no_objects` with a warning when no object uses the target material, instead of reporting success.
+- Agent viewport V-Ray previews (`vray_ipr`, `vray_vfb`) start on V-Ray GPU; they were refused.
+- `execute_maxscript` and the agent skill warn that quiet mode skips the save prompt: `checkForSave()` returns true and `resetMaxFile()` discards unsaved work.
+- Added Pulze Scene Manager tools: `pulze_inspect`, `pulze_preflight`, and guarded, undoable `pulze_set` edits with `pulze_restore` from a backup (#26).
+- A Boolean forced to the modifier backend on 3ds Max 2023, which has no Boolean modifier, now fails with a script error naming the working backends instead of a bridge error.
+- The native bridge is split into a permanent shell and a core. Installed bridges still ship as one plugin; development builds rebuild the core and reload it into a running Max with `reload_native_core`, and `scripts/mcpcall.py` runs a tool from current source without restarting the MCP server.
+- Removed the Tool Playground GUI (`Tool Playground.bat`, `scripts/tool_playground.py`) and its generated catalog.
+- Rebuilt bridges for Max 2023-2027.
 
 ### Verified deployments, 2026-10-12–13
 

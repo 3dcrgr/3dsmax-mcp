@@ -106,7 +106,7 @@ void running_work_outlives_caller_timeout() {
     executor.Shutdown();
 }
 
-// BeginShutdown from inside a running item (Max's exit can begin from a
+// StopAccepting from inside a running item (Max's exit can begin from a
 // nested message loop): the running item still completes, and the item it
 // deferred is failed without running.
 void begin_shutdown_inside_running_item() {
@@ -125,7 +125,7 @@ void begin_shutdown_inside_running_item() {
             require(wait_for_queued_message(5000), "second item never reached the queue");
             MSG message;  // nested pump: B is delivered while A runs, so it is deferred
             while (PeekMessage(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessage(&message);
-            executor.BeginShutdown();
+            executor.StopAccepting();
             return std::string("ok");
         }, 20000);
         a_done = true;
@@ -133,9 +133,9 @@ void begin_shutdown_inside_running_item() {
     pump_until(a_done, 10000);
     worker_a.join();
     if (worker_b.joinable()) worker_b.join();
-    require(a_result == "ok", "running item did not complete after BeginShutdown");
+    require(a_result == "ok", "running item did not complete after StopAccepting");
     require(b_done && !b_ran, "deferred item ran during shutdown");
-    require(b_error == "MainThreadExecutor is shutting down", "deferred item not failed by the drain");
+    require(b_error == "3ds Max is exiting; the request did not run", "deferred item not failed by the drain");
     executor.Shutdown();
 }
 
@@ -161,7 +161,7 @@ void direct_mode_passes_through_dialog_guard() {
 
 // Max used to hang on exit: a client thread inside ExecuteSync waits for a
 // WM_MCP_EXECUTE the main thread can no longer pump (it is joining that very
-// thread). BeginShutdown must fail queued items immediately.
+// thread). StopAccepting must fail queued items immediately.
 void shutdown_wakes_queued_waiter() {
     MainThreadExecutor executor;
     executor.Initialize();
@@ -173,7 +173,7 @@ void shutdown_wakes_queued_waiter() {
     require(wait_for_queued_message(5000), "work item never reached the queue");
 
     const auto start = Clock::now();
-    executor.BeginShutdown(); // deliberately never pump the message
+    executor.StopAccepting(); // deliberately never pump the message
     worker.join();
     const long long elapsed = ms_since(start);
 
@@ -189,7 +189,7 @@ void shutdown_wakes_queued_waiter() {
 void execute_after_shutdown_fails_fast() {
     MainThreadExecutor executor;
     executor.Initialize();
-    executor.BeginShutdown();
+    executor.StopAccepting();
     require(MainThreadExecutor::IsShuttingDown(), "shutdown flag not set");
 
     std::atomic<bool> ran{false}, errored{false};

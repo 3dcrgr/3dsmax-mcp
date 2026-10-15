@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..helpers.maxscript import safe_name, safe_string
+from ..helpers.maxscript import name_in_use, name_literal, safe_name, safe_string
 from ..helpers.mcg_catalog import (
     compound_root,
     find_max_installations,
@@ -44,7 +44,9 @@ from ..helpers.mcg_graph import (
     restore_checkpoint,
 )
 from ..helpers.mcg_models import MCGPatchOperation, MCGVerificationSpec
+from ..max_client import CALL_STATE_ERRORS
 from ..server import client, mcp
+from ..tool_response import parse_error_payload
 
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -188,15 +190,23 @@ def _live_context() -> dict[str, Any]:
     }
 
 
-def _context_with_fallback() -> dict[str, Any]:
+def _context_with_fallback(*, require_bridge: bool = False) -> dict[str, Any]:
+    """Live MCG context, or installation data when Max cannot answer.
+
+    require_bridge raises the bridge exception instead, so a compile step keeps
+    its code (for example BLOCKED_BY_DIALOG) rather than a generic failure.
+    """
     try:
         context = _live_context()
     except Exception as exc:
+        if require_bridge:
+            raise
         installations = find_max_installations()
         latest = installations[0] if installations else None
         context = {
             "bridge_available": False,
             "bridge_error": str(exc),
+            "bridge_error_code": _exception_code(exc),
             "max_year": int(latest["year"]) if latest else 0,
             "max_root": str(latest["root"]) if latest else "",
             "secure_mode": None,
@@ -252,6 +262,24 @@ def _error(
             "suggested_tools": ["mcg_inspect_graph", "mcg_search_operators", "mcg_apply_patch"],
         },
     }
+
+
+def _exception_error(exc: BaseException, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Error result for an exception, keeping the bridge's own hint.
+
+    A call blocked by a dialog or still running in Max must not be repeated;
+    its own hint says so, where the generic MCG hint would invite a retry.
+    """
+    code = _exception_code(exc)
+    structured = parse_error_payload(getattr(exc, "bridge_message", None)) or {}
+    return _error(
+        str(exc),
+        error_type=exc.__class__.__name__,
+        code=code,
+        retryable=bool(structured["retryable"]) if "retryable" in structured else code == "BRIDGE_DOWN",
+        details=details,
+        hint=structured.get("hint") or None,
+    )
 
 
 def _exception_code(exc: BaseException) -> str:
@@ -926,7 +954,7 @@ try (
     testMesh = undefined
     try (delete testObject) catch ()
     testObject = undefined
-    local disposed = (getNodeByName "{object_name}" == undefined)
+    local disposed = not {name_in_use(name_literal(object_name))}
     local result = "MCG_VERIFY|geometry|" + (b64 className) + "|" +
         (numVerts as string) + "|" + (numFaces as string) + "|" +
         (dims.x as string) + "|" + (dims.y as string) + "|" + (dims.z as string) + "|" +
@@ -984,7 +1012,7 @@ try (
     afterMesh = undefined
     try (delete testObject) catch ()
     testObject = undefined
-    local disposed = (getNodeByName "{object_name}" == undefined)
+    local disposed = not {name_in_use(name_literal(object_name))}
     local result = "MCG_VERIFY|modifier|" + (b64 className) + "|" +
         (beforeVerts as string) + "|" + (beforeFaces as string) + "|" +
         (beforeDims.x as string) + "|" + (beforeDims.y as string) + "|" + (beforeDims.z as string) + "|" +
@@ -1215,7 +1243,7 @@ def _compile_and_verify(
     path = _resolve_graph(graph_id)
     info = inspect_graph(path)
     findings = _executable_findings(info)
-    context = _context_with_fallback()
+    context = _context_with_fallback(require_bridge=True)
     if not context.get("bridge_available"):
         raise RuntimeError(str(context.get("bridge_error") or "3ds Max bridge is unavailable"))
     max_root = Path(context["max_root"]) if context.get("max_root") else None
@@ -1537,6 +1565,7 @@ def mcg_search_operators(
             limit=limit,
         )
         result["warning"] = f"Live typed operator catalog unavailable: {exc}"
+        result["warnings"] = [result["warning"] + "; results come from the offline catalog."]
         return result
 
 
@@ -1569,11 +1598,8 @@ def mcg_create_graph(
 
     context = _context_with_fallback()
     if context.get("bridge_available"):
-        try:
-            symbol_exists = _class_is_available(identifier)
-        except Exception:
-            symbol_exists = False
-        if symbol_exists:
+        # A probe that could not run is not proof the name is free.
+        if _class_is_available(identifier):
             raise ValueError(
                 f"identifier already resolves to a class or symbol in 3ds Max: {identifier}"
             )
@@ -1625,13 +1651,7 @@ def mcg_create_graph(
             timeout_seconds=120,
         )
     except Exception as exc:
-        return _error(
-            str(exc),
-            error_type=exc.__class__.__name__,
-            code=_exception_code(exc),
-            retryable=_exception_code(exc) == "BRIDGE_DOWN",
-            details=result,
-        )
+        return _exception_error(exc, details=result)
     result["proof"] = live_proof
     if not live_proof["compile"]["compiled"]:
         return _error(
@@ -1667,13 +1687,7 @@ def mcg_compile_graph(
             timeout_seconds=timeout_seconds,
         )
     except Exception as exc:
-        return _error(
-            str(exc),
-            error_type=exc.__class__.__name__,
-            code=_exception_code(exc),
-            retryable=_exception_code(exc) == "BRIDGE_DOWN",
-            details={"graph_id": graph_id},
-        )
+        return _exception_error(exc, details={"graph_id": graph_id})
     if not proof["compile"]["compiled"]:
         return _error("MCG compilation failed", error_type="MCGCompileError", details=proof)
     if verify and not proof.get("verified"):
@@ -1702,14 +1716,7 @@ def mcg_resolve_class(
         )
         return _native_mcg_result(graph_id, proof, _native_json_result(response))
     except Exception as exc:
-        code = _exception_code(exc)
-        return _error(
-            str(exc),
-            error_type=exc.__class__.__name__,
-            code=code,
-            retryable=code == "BRIDGE_DOWN",
-            details={"graph_id": graph_id},
-        )
+        return _exception_error(exc, details={"graph_id": graph_id})
 
 
 @mcp.tool()
@@ -1745,12 +1752,8 @@ def mcg_apply_modifier(
         )
         return _native_mcg_result(graph_id, proof, _native_json_result(response))
     except Exception as exc:
-        code = _exception_code(exc)
-        return _error(
-            str(exc),
-            error_type=exc.__class__.__name__,
-            code=code,
-            retryable=code == "BRIDGE_DOWN",
+        return _exception_error(
+            exc,
             details={"graph_id": graph_id, "target_name": target_name, "target_handle": target_handle},
         )
 
@@ -1797,12 +1800,8 @@ def mcg_set_node_parameter(
         )
         return _native_mcg_result(graph_id, proof, _native_json_result(response))
     except Exception as exc:
-        code = _exception_code(exc)
-        return _error(
-            str(exc),
-            error_type=exc.__class__.__name__,
-            code=code,
-            retryable=code == "BRIDGE_DOWN",
+        return _exception_error(
+            exc,
             details={
                 "graph_id": graph_id,
                 "target_name": target_name,
@@ -1842,12 +1841,8 @@ def mcg_inspect_instance(
         )
         return _native_mcg_result(graph_id, proof, _native_json_result(response))
     except Exception as exc:
-        code = _exception_code(exc)
-        return _error(
-            str(exc),
-            error_type=exc.__class__.__name__,
-            code=code,
-            retryable=code == "BRIDGE_DOWN",
+        return _exception_error(
+            exc,
             details={
                 "graph_id": graph_id,
                 "target_name": target_name,
@@ -1874,13 +1869,7 @@ def mcg_test_tool(
             timeout_seconds=120,
         )
     except Exception as exc:
-        return _error(
-            str(exc),
-            error_type=exc.__class__.__name__,
-            code=_exception_code(exc),
-            retryable=_exception_code(exc) == "BRIDGE_DOWN",
-            details={"graph_id": graph_id},
-        )
+        return _exception_error(exc, details={"graph_id": graph_id})
     if not proof["compile"]["compiled"]:
         return _error("MCG compilation failed", error_type="MCGCompileError", details=proof)
     result = proof.get("verification", {})
@@ -1961,6 +1950,10 @@ def mcg_apply_patch(
             allow_executable=allow_executable,
             timeout_seconds=timeout_seconds,
         )
+    except CALL_STATE_ERRORS as exc:
+        # The compile may still run in Max against the patched file, so this
+        # is not a compile failure to roll back; checkpoint_token restores it.
+        return _exception_error(exc, details=result)
     except Exception as exc:
         live_proof = {
             "graph_id": graph_id,
@@ -2089,6 +2082,10 @@ def mcg_restore_checkpoint(
                 allow_executable=allow_executable,
                 timeout_seconds=120,
             )
+        except CALL_STATE_ERRORS as exc:
+            # The compile may still run against the restored file; the safety
+            # token undoes the restore if needed.
+            return _exception_error(exc, details=result)
         except Exception as exc:
             proof = {
                 "graph_id": graph_id,
@@ -2129,7 +2126,12 @@ def mcg_restore_checkpoint(
 @_serialized_mcg_transaction
 def mcg_reload_operators() -> dict[str, Any]:
     """Explicitly refresh the global MCG depot; not used by the normal per-graph loop."""
-    context = _context_with_fallback()
+    try:
+        context = _context_with_fallback(require_bridge=True)
+    except CALL_STATE_ERRORS as exc:
+        return _exception_error(exc)
+    except Exception as exc:
+        context = {"bridge_available": False, "bridge_error": str(exc)}
     if not context.get("bridge_available"):
         return _error(
             str(context.get("bridge_error") or "3ds Max bridge is unavailable"),

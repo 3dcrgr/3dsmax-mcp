@@ -41,8 +41,9 @@ TOOLSET_SPECS = (
     ),
     ToolsetSpec(
         "connection",
-        "Bridge diagnostics, hung-Max stack capture, installed capabilities, session context, and main-thread checks.",
-        ("bridge", "diagnostics", "capabilities", "session_context", "mainthread"),
+        "Bridge diagnostics, hung-Max stack capture, installed capabilities, session context, main-thread checks, "
+        "and native core reload.",
+        ("bridge", "diagnostics", "capabilities", "session_context", "mainthread", "core_reload"),
     ),
     ToolsetSpec(
         "scene",
@@ -146,6 +147,11 @@ TOOLSET_SPECS = (
         "scene_effects",
         "Scene effects, state sets, and camera sequence reads.",
         ("effects", "state_sets"),
+    ),
+    ToolsetSpec(
+        "pulze",
+        "Pulze Scene Manager setups: inspection, render pre-flight, guarded edits and restore.",
+        ("pulze",),
     ),
     ToolsetSpec(
         "rendering",

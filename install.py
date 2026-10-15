@@ -329,8 +329,22 @@ def bridge_replacement_conflicts(dest: Path) -> list[str]:
     return conflicts
 
 
-def stage_bundle(dest: Path) -> tuple[list[int], list[int]]:
-    """Stage ApplicationPlugins bundle. Returns (included years, missing years)."""
+# A bridge built with MCP_HOT_CORE (dev.bat stages one in native/bin) loads its
+# core from the build tree and has no core anywhere else. Only that shell's
+# loader names the core locator file.
+HOT_SHELL_MARKER = "mcp_core.path".encode("utf-16-le")
+
+
+def is_hot_shell(gup: Path) -> bool:
+    return HOT_SHELL_MARKER in gup.read_bytes()
+
+
+def stage_bundle(dest: Path, allow_hot_shell: bool = False) -> tuple[list[int], list[int]]:
+    """Stage ApplicationPlugins bundle. Returns (included years, missing years).
+
+    Raises RuntimeError for a development hot shell unless allow_hot_shell, and
+    ValueError when native/bin does not match bridge_manifest.json.
+    """
     validate_bridge_sources()
     bin_dir = dest / "Contents" / "bin"
     scripts_dir = dest / "Contents" / "scripts"
@@ -342,6 +356,9 @@ def stage_bundle(dest: Path) -> tuple[list[int], list[int]]:
     for year in sorted(GUP_SRCS.keys()):
         src = GUP_SRCS[year]
         if src.exists():
+            if not allow_hot_shell and is_hot_shell(src):
+                raise RuntimeError(f"{src} is a development bridge that loads its core from the build tree; "
+                                   f"build the release bridge with native\\build.bat {year}")
             shutil.copy2(src, bin_dir / src.name)
             included.append(year)
         else:
@@ -378,7 +395,7 @@ def package_differences(staging: Path, dest: Path) -> list[str]:
     return differences
 
 
-def deploy_application_package() -> bool:
+def deploy_application_package(allow_hot_shell: bool = False) -> bool:
     print(f"\n[2/4] Application package -> {APPLICATION_PACKAGE_DST}")
     if not MS_SERVER.exists():
         print(f"  FAILED: missing {MS_SERVER}")
@@ -392,11 +409,17 @@ def deploy_application_package() -> bool:
 
     with tempfile.TemporaryDirectory() as tmp:
         staging = Path(tmp) / BUNDLE_PACKAGE_NAME
-        included, missing = stage_bundle(staging)
+        try:
+            included, missing = stage_bundle(staging, allow_hot_shell)
+        except (RuntimeError, ValueError) as error:
+            print(f"  FAILED: {error}")
+            print(f"  {APPLICATION_PACKAGE_DST} was left unchanged.")
+            return False
         conflicts = bridge_replacement_conflicts(APPLICATION_PACKAGE_DST)
         if conflicts:
             print("  FAILED: installed bridge is not a recognized superseded build; refusing to replace it: "
                   + ", ".join(conflicts))
+            print(f"  {APPLICATION_PACKAGE_DST} was left unchanged.")
             return False
         try:
             if APPLICATION_PACKAGE_DST.exists():
@@ -458,7 +481,10 @@ def build_skills(skip_skill: bool = False) -> bool:
     print("    1) Project only")
     print("    2) Global only (default)")
     print("    3) Both project and global (might cause conflict in some agents)")
-    choice = input("  Choice [2]: ").strip()
+    try:
+        choice = input("  Choice [2]: ").strip()
+    except EOFError:
+        choice = ""
     target = {"1": "local", "3": "both"}.get(choice, "global")
     try:
         subprocess.run(

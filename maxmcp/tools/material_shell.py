@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, safe_string
 
 # MultiOutputChannelTexmapToTexmap output indices for UberBitmap2 (used by PBR builder ORM split).
 UBER_OUT_COL = 1
@@ -67,13 +67,20 @@ def build_shell_wrap_maxscript(
         "assignCount = 0",
     ])
 
+    shared_line = ""
     if assign_to:
+        # Names that match no object or several objects are skipped; shared
+        # names are reported in ambiguous.
         names_arr = "#(" + ", ".join(f'"{safe_string(n)}"' for n in assign_to) + ")"
+        lines.append(NODE_LOOKUP_FNS)
         lines.append(f"nameList = {names_arr}")
+        lines.append("assignMissing = #()")
+        lines.append("assignShared = #()")
         lines.append(
-            f"for n in nameList do (obj = getNodeByName n; "
-            f"if obj != undefined then (obj.material = shell; assignCount += 1))"
+            "for n in nameList do (obj = mcpBatchNode n assignMissing assignShared; "
+            "if obj != undefined do (obj.material = shell; assignCount += 1))"
         )
+        shared_line = 'if assignShared.count > 0 do resultJson += "\\"ambiguous\\":" + (mcpAmbiguousJson assignShared) + ","'
 
     lines.extend([
         'resultJson = "{"',
@@ -86,6 +93,7 @@ def build_shell_wrap_maxscript(
         f'    resultJson += "\\"export_material_class\\":\\"" + ((classOf {export_var}) as string) + "\\","',
         ")",
         'resultJson += "\\"assigned_count\\":" + (assignCount as string) + ","',
+        shared_line,
         'resultJson += "\\"status\\":\\"success\\""',
         'resultJson += "}"',
         "resultJson",

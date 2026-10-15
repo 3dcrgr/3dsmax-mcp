@@ -88,7 +88,8 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 ## Dialogs
 
 - `execute_maxscript` and tool scripts run in Max's quiet mode: prompts such as `queryBox`, overwrite or missing-file warnings silently take their default answer. Pass `execute_maxscript(quiet=False)` when the user wants to be asked.
-- Exception: a script that mentions `resetMaxFile`, `loadMaxFile`, `fetchMaxFile`, `quitMax`, `checkForSave`, `max reset file`/`max file new`/`max file open`/`max fetch` or the Interface's `FileReset`/`FileFetch`/`LoadFromFile` runs with prompts shown, so a "save changes?" prompt returns `BLOCKED_BY_DIALOG` instead of discarding unsaved work. Never add `#noPrompt` or `quiet:true` to those commands, or pass `quiet=True` with `allow_discard=True`, without the user's explicit OK: each discards unsaved changes. The check reads only the script's text: pass `quiet=False` when a script runs other scripts (`fileIn`, `python.ExecuteFile`, `macros.run`) that may reset, open or quit.
+- Quiet mode would also skip the save-changes prompt (`checkForSave()` returns true, `resetMaxFile()` discards unsaved work, `loadMaxFile` never asks), so a script that mentions `resetMaxFile`, `loadMaxFile`, `fetchMaxFile`, `quitMax`, `checkForSave`, `max reset file`/`max file new`/`max file open`/`max fetch` or the Interface's `FileReset`/`FileFetch`/`LoadFromFile` runs with prompts shown: a "save changes?" prompt returns `BLOCKED_BY_DIALOG` instead of discarding unsaved work. Never add `#noPrompt` or `quiet:true` to those commands, or pass `quiet=True` with `allow_discard=True`, without the user's explicit OK: each discards unsaved changes. The check reads only the script's text: pass `quiet=False` when a script runs other scripts (`fileIn`, `python.ExecuteFile`, `macros.run`) that may reset, open or quit.
+- Reset with `manage_scene`, which keeps the prompt; for a load, fetch or quit script, ask the user first.
 - A call that opens or waits behind a modal dialog returns `BLOCKED_BY_DIALOG` with its title, text and buttons. The call keeps running inside Max: never repeat it. Other replies warn while any dialog is open.
 - Read and answer dialogs with `max_dialogs`. `respond` presses a button by label or index and returns the interrupted call's result. A call whose connection broke comes back `status: "lost"` (outcome unknown): inspect before running it again.
 - Only dialogs on Max's main thread can be read or pressed. Another thread's dialog is listed but not read, and `respond` fails with `DIALOG_NOT_ON_MAIN_THREAD`; `BRIDGE_OUTDATED` means the bridge has no dialog monitor. In both cases ask the user to answer it in Max.
@@ -99,9 +100,29 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 
 - Replies are a `ToolEnvelope` dict (`ok`/`result`/`error`/`hint`), not a JSON string. Tool-authored hints win over automatic ones; `hint.suggested_tools` may list alternatives.
 - Classify raw structured errors by `error`, `code` or `status=error|failed`, never by `message` alone.
+- `status: "partial"` means only part of the request applied. Read `warnings` and the skipped items (`notFound`, `ambiguous`, `ignored`) before continuing.
+- `AMBIGUOUS`: several objects share the name. Retry with a candidate's `handle` where the tool takes one; otherwise rename them first (`set_object_property(handle=..., property="name")`). Never guess which object was meant.
+- `TRANSFORM_IGNORED`: a constraint, script or expression controller drives that part of the transform. Edit the controller's targets or values, or ask before replacing it; repeating the move changes nothing.
 - `USER_BUSY`: Max has an open undo operation and the write was rejected before any change. Continue read-only and retry after it finishes; never bypass it with MAXScript.
 - `REQUEST_OUTCOME_UNKNOWN`: the request was sent and its reply was lost, so it may have run. Inspect the scene before running it again; never replay it blindly.
-- `MAX_BUSY`, `MAX_NOT_RESPONDING`, `IMPORT_SETTLING`: Max is busy, hung or settling after a Cosmos import. Retry only when `retryable` is true; `request_sent: false` means nothing reached Max. Wait up to ~10 min, re-checking with `get_bridge_status`; still blocked after that means a deadlock, and the user must end Max (unsaved work is lost). `get_bridge_status` answers while Max is hung and says what holds its main thread; `capture_hang_diagnostics` shows where it is stuck without contacting Max. A modal dialog is not a hang while Max's main thread keeps pumping: calls return `BLOCKED_BY_DIALOG` and `get_bridge_status` reports `blocked_by_dialog`.
+- `MAX_BUSY`: Max did not answer within the call's deadline (about 130 s, or a long tool's own timeout). The call keeps running inside Max: never repeat it; `max_dialogs(action='inspect')` reports its result in `blocked_calls` once it finishes.
+- `MAX_NOT_RESPONDING`, `IMPORT_SETTLING`, and a `MAX_BUSY` before the request was sent: Max is hung, settling after a Cosmos import, or busy. Retry only when `retryable` is true; `request_sent: false` means nothing reached Max. Wait up to ~10 min, re-checking with `get_bridge_status`; still blocked after that means a deadlock, and the user must end Max (unsaved work is lost). `get_bridge_status` answers while Max is hung and says what holds its main thread; `capture_hang_diagnostics` shows where it is stuck without contacting Max. A modal dialog is not a hang while Max's main thread keeps pumping: calls return `BLOCKED_BY_DIALOG` and `get_bridge_status` reports `blocked_by_dialog`.
+
+## Native Core Development
+
+Only when changing the bridge's native C++ handlers; ordinary sessions never need it. `reload_native_core` (full and progressive profiles) swaps a rebuilt core into the running Max.
+
+- `reload_native_core(action="status")` tells you whether reload applies: `layout="hot"` reloads. `static`, the shipped layout, cannot; a native change there applies only after the rebuilt plugin is installed and Max restarts.
+- After rebuilding the core, call `reload_native_core(action="reload")`, check that `build` changed (a warning flags an unchanged one), then verify the changed behavior through its real tool, not just the status.
+- On any error the previous core keeps serving, unless the message says no core is loaded:
+  - `CORE_STATIC`: static layout. Do not retry.
+  - `CORE_BUSY` (retryable; with `wait_ms` up to 20000 the tool already retried): native calls were still running (including one waiting on a dialog), Max's main thread was busy (a render), or another reload was running. Let long calls finish or answer the dialog with `max_dialogs`, then reload, or raise `wait_ms` (up to 600000).
+  - `CORE_LOAD_FAILED`: the DLL is missing, is not a core build, or would not load or initialize. Fix the cause and rebuild; never retry unchanged.
+  - `CORE_VERSION_MISMATCH`: the core does not match the running shell's interface, SDK, compiler or build configuration. Rebuild Release from the same tree; a change to the shell itself cannot be reloaded.
+  - A lost reload response: never resend it; compare `build`, `reloads` and `last_error` from status.
+- A reload stops `watch_scene` and drops its events; start it again if needed. `query_scene(action="delta")` positions, dialogs, the agent viewport, armed render jobs and undo history survive. Calls that arrive mid-swap get a retryable `CORE_BUSY`.
+- A reload cannot apply shell changes: the named pipe, main-thread executor, dialog monitoring (Win32 and Qt), scene journal, agent viewport, render job notifications, undo records, the core loader, and the shell/core interface. Those need the rebuilt plugin installed and a Max restart.
+- Python tool changes need a fresh MCP server process; a reload does not apply them.
 
 ## execute_maxscript
 

@@ -17,15 +17,16 @@ import json
 import threading
 from typing import Any
 
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, node_by_name, safe_string
 
 from ..coerce import DictList, IntList
+from ..max_client import CALL_STATE_ERRORS
 from ..server import client, mcp
 from ._tyflow_core import (
     CORE_HELPERS,
+    MAXSCRIPT_ERROR,
     canon_name,
     graph_payload,
-    ledger_update,
     parse_ledger,
     read_graph,
     store_ledger,
@@ -324,6 +325,15 @@ def _ledger_mutations(
 
 
 def _apply_ledger_mutations(name: str, mutations: list[tuple[Any, ...]]) -> dict[str, Any]:
+    # The patch already ran; a blocked or lost ledger round trip only leaves
+    # the ledger stale.
+    try:
+        return _write_ledger_mutations(name, mutations)
+    except Exception as exc:
+        return {"ledgerWarning": f"Ledger not updated: {exc}"}
+
+
+def _write_ledger_mutations(name: str, mutations: list[tuple[Any, ...]]) -> dict[str, Any]:
     graph = read_graph(name)
     if "error" in graph:
         return {"ledgerWarning": f"Ledger not updated: {graph['error']}"}
@@ -417,7 +427,7 @@ def _run_operations(name: str, operations: list[dict[str, Any]]) -> list[dict[st
 {HELPERS}
 {CORE_HELPERS}
 {PATCH_HELPERS}
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
@@ -530,26 +540,34 @@ def _inverse_operations(
 
 
 def _run_simple(maxscript: str) -> tuple[str, str | None]:
-    """Run MAXScript, return (result, error)."""
+    """Run MAXScript, return (result, error).
+
+    A call blocked by a dialog, lost after dispatch, or sent to a vanished Max
+    may still run, so it is raised as is instead of driving a rollback.
+    """
     try:
         response = client.send_command(maxscript)
+    except CALL_STATE_ERRORS:
+        raise
     except Exception as exc:
         return "", str(exc)
     raw = str(response.get("result", ""))
     if raw.startswith("__ERROR__|"):
         return "", raw.split("|", 1)[1]
+    if raw.startswith(MAXSCRIPT_ERROR):
+        return "", "MAXScript error: " + raw[len(MAXSCRIPT_ERROR):].strip()
     return raw, None
 
 
 def _create_checkpoint(name: str) -> tuple[str, str | None]:
     maxscript = f"""(
-local flow = getNodeByName "{safe_string(name)}"
+{NODE_LOOKUP_FNS}
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
     local ckptName = "zzz_mcp_ckpt_" + flow.name
-    local stale = getNodeByName ckptName
-    if stale != undefined do (try (delete stale) catch ())
+    for stale in (mcpNamedNodes ckptName) do (try (delete stale) catch ())
     local nn = #()
     local okClone = false
     try (okClone = maxOps.cloneNodes flow cloneType:#copy newNodes:&nn) catch ()
@@ -573,11 +591,11 @@ if flow == undefined then (
 
 def _rollback_checkpoint(name: str, ckpt_name: str) -> str | None:
     maxscript = f"""(
-local ckpt = getNodeByName "{safe_string(ckpt_name)}"
+local ckpt = {node_by_name(ckpt_name, missing_ok=True)}
 if ckpt == undefined then (
     "__ERROR__|Checkpoint missing: {safe_string(ckpt_name)}"
 ) else (
-    local broken = getNodeByName "{safe_string(name)}"
+    local broken = {node_by_name(name, missing_ok=True)}
     if broken != undefined do (try (delete broken) catch ())
     ckpt.name = "{safe_string(name)}"
     unhide ckpt
@@ -589,14 +607,19 @@ if ckpt == undefined then (
     return error
 
 
-def _drop_checkpoint(ckpt_name: str) -> None:
+def _drop_checkpoint(ckpt_name: str) -> str | None:
+    """Delete the checkpoint clone; return why it may still be in the scene."""
     maxscript = f"""(
-local ckpt = getNodeByName "{safe_string(ckpt_name)}"
+local ckpt = {node_by_name(ckpt_name, missing_ok=True)}
 if ckpt != undefined do (try (delete ckpt) catch ())
 try (windows.processPostedMessages()) catch ()
-"OK"
+if isValidNode ckpt then "__ERROR__|delete was refused" else "OK"
 )"""
-    _run_simple(maxscript)
+    try:
+        _, error = _run_simple(maxscript)
+    except Exception as exc:
+        return str(exc)
+    return error
 
 
 def _run_verification(
@@ -604,7 +627,7 @@ def _run_verification(
 ) -> dict[str, Any]:
     frame_list = ", ".join(str(int(frame)) for frame in frames)
     maxscript = f"""(
-local flow = getNodeByName "{safe_string(name)}"
+local flow = {node_by_name(name, missing_ok=True)}
 if flow == undefined then (
     "__ERROR__|Object not found: {safe_string(name)}"
 ) else (
@@ -736,7 +759,10 @@ def tyflow_apply_patch(
                     payload["rolled_back"] = True
                     # maxOps.cloneNodes does not carry AppData (live-verified),
                     # so the restored node needs the pre-patch ledger rewritten.
-                    restored = write_ledger_appdata(name, current["ledger"])
+                    try:
+                        restored = write_ledger_appdata(name, current["ledger"])
+                    except Exception as exc:
+                        restored = {"error": str(exc)}
                     payload["ledger_restored"] = "error" not in restored
                     if "error" in restored:
                         payload["ledgerWarning"] = restored["error"]
@@ -753,19 +779,86 @@ def tyflow_apply_patch(
                     payload["rolled_back"] = True
                 # Ledger appdata was never touched on this path; the restored
                 # structure matches the pre-patch hash, so it stays fresh.
-            elif ckpt_name:
-                payload["checkpoint"] = ckpt_name
-                payload["ledger"] = ledger_update(name)
             else:
-                payload["ledger"] = ledger_update(name)
-            return json.dumps(payload)
+                if ckpt_name:
+                    payload["checkpoint"] = ckpt_name
+                # The kept operations are recorded as a successful patch records them.
+                ledger_outcome = _apply_ledger_mutations(
+                    name, _ledger_mutations(operations, op_results)
+                )
+                payload.update(ledger_outcome)
+                if "ledgerHash" in ledger_outcome:
+                    payload["graph_hash"] = ledger_outcome["ledgerHash"]
+            return json.dumps(_failed_patch_outcome(payload, rollback_on_failure))
 
+        warnings = _property_error_warnings(op_results)
         if ckpt_name:
-            _drop_checkpoint(ckpt_name)
+            drop_error = _drop_checkpoint(ckpt_name)
+            if drop_error:
+                warnings.append(f"Checkpoint clone {ckpt_name} may remain hidden in the scene: {drop_error}")
         ledger_outcome = _apply_ledger_mutations(
             name, _ledger_mutations(operations, op_results)
         )
         payload.update(ledger_outcome)
         if "ledgerHash" in ledger_outcome:
             payload["graph_hash"] = ledger_outcome["ledgerHash"]
+        if ledger_outcome.get("ledgerWarning"):
+            warnings.append(ledger_outcome["ledgerWarning"])
+        if warnings:
+            payload["status"] = "partial"
+            payload["warnings"] = warnings
         return json.dumps(payload)
+
+
+def _property_error_warnings(op_results: list[dict[str, Any]]) -> list[str]:
+    """Values an applied operation could not set; the operation itself stayed."""
+    return [
+        f"Operation {result['index']} ({result.get('op')}): {error}"
+        for result in op_results
+        if result.get("status") == "ok"
+        for error in result.get("propertyErrors") or []
+    ]
+
+
+def _failed_patch_outcome(payload: dict[str, Any], rollback_on_failure: bool) -> dict[str, Any]:
+    """Report a failed patch as an error unless some of it stayed applied."""
+    issues = [
+        f"Operation {result['index']} ({result.get('op')}): {result.get('error') or result.get('status')}"
+        for result in payload["operations"]
+        if result.get("status") != "ok"
+    ]
+    verification = payload.get("verification")
+    if verification and not verification.get("passed"):
+        issues.extend(verification.get("problems") or [])
+        if verification.get("error"):
+            issues.append(f"Verification failed: {verification['error']}")
+    applied_any = any(result.get("status") == "ok" for result in payload["operations"])
+    if payload["rolled_back"]:
+        message = "tyFlow patch failed and was rolled back; the flow is unchanged"
+    elif payload.get("rollback_mode"):
+        message = "tyFlow patch failed and its rollback did not complete; the flow may be partly patched"
+    elif applied_any:
+        payload["status"] = "partial"
+        payload["warnings"] = issues + _property_error_warnings(payload["operations"]) + [
+            "The applied operations were kept: "
+            + ("checkpoint=false left no restore point for this patch."
+               if rollback_on_failure else "rollback_on_failure is false.")
+        ]
+        if payload.get("checkpoint"):
+            payload["warnings"].append(
+                f"Checkpoint clone {payload['checkpoint']} remains hidden in the scene.")
+        if payload.get("ledgerWarning"):
+            payload["warnings"].append(payload["ledgerWarning"])
+        return payload
+    else:
+        message = "tyFlow patch failed; every operation reported an error"
+    payload["error"] = f"{message}: {'; '.join(issues)}"
+    payload["code"] = "PATCH_APPLY_FAILED"
+    payload["details"] = {
+        key: value for key, value in payload.items() if key not in {"error", "code"}
+    }
+    payload["hint"] = {
+        "message": "Read the per-operation errors, re-read the graph, and send a corrected patch.",
+        "suggested_tools": ["get_tyflow_graph", "tyflow_apply_patch"],
+    }
+    return payload

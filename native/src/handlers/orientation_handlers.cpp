@@ -1,7 +1,7 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/spatial_snapshot.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 
 #include <algorithm>
 #include <set>
@@ -42,15 +42,16 @@ std::vector<std::string> ReadNames(const json& p) {
     return names;
 }
 
-std::vector<INode*> ResolveTargets(const json& p, Interface* ip) {
+// Named targets fill resolved; the caller reports its unresolved names.
+std::vector<INode*> ResolveTargets(const json& p, Interface* ip, NamedNodes& resolved) {
     std::vector<INode*> targets;
     const std::vector<std::string> names = ReadNames(p);
     const std::string pattern = p.value("pattern", "");
 
     if (!names.empty()) {
-        for (const std::string& name : names) {
-            PushUnique(targets, FindNodeByName(name));
-        }
+        resolved = ResolveNodesByNames(names);
+        if (resolved.nodes.empty()) ThrowUnresolvedNames(resolved, "no node was analyzed.");
+        targets = resolved.nodes;
     } else if (!pattern.empty()) {
         std::vector<INode*> matched = CollectNodesByPattern(pattern);
         for (INode* node : matched) PushUnique(targets, node);
@@ -77,7 +78,8 @@ std::string NativeHandlers::AnalyzeNodeOrientation(const std::string& params, MC
 
         Interface* ip = GetCOREInterface();
         const TimeValue t = ip->GetTime();
-        std::vector<INode*> targets = ResolveTargets(p, ip);
+        NamedNodes resolved;
+        std::vector<INode*> targets = ResolveTargets(p, ip, resolved);
 
         int maxNodes = p.value("max_nodes", 20);
         maxNodes = (std::max)(1, (std::min)(maxNodes, 100));
@@ -97,6 +99,13 @@ std::string NativeHandlers::AnalyzeNodeOrientation(const std::string& params, MC
         };
         result["nodes"] = nodes;
         result["truncated"] = static_cast<int>(targets.size()) > count;
+        if (!resolved.notFound.empty()) {
+            result["notFound"] = resolved.notFound;
+            result["status"] = "partial";
+            result["warnings"].push_back(std::to_string(resolved.notFound.size()) +
+                " requested name(s) matched no object and were skipped: " + JoinNames(resolved.notFound));
+        }
+        AddAmbiguousNamesWarning(result, resolved.ambiguous);
         return result.dump();
     });
 }

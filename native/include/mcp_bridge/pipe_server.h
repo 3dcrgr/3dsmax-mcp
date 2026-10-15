@@ -5,13 +5,12 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
-#include <memory>
+#include <unordered_set>
 
-class MCPBridgeGUP;
-
+// Serves the pipe; every request goes to the core through CoreHost.
 class PipeServer {
 public:
-    explicit PipeServer(MCPBridgeGUP* gup, std::wstring pipe_name);
+    explicit PipeServer(std::wstring pipe_name);
     ~PipeServer();
 
     void Start();
@@ -22,16 +21,21 @@ public:
 private:
     void AcceptLoop();
     void HandleClient(HANDLE pipe);
-    std::string ReadRequest(HANDLE pipe);
-    bool WriteResponse(HANDLE pipe, const std::string& response);
-    bool Transfer(HANDLE pipe, void* buffer, DWORD size, DWORD& transferred, bool write);
+    bool Await(HANDLE pipe, OVERLAPPED& io, DWORD& bytes);
+    std::string ReadRequest(HANDLE pipe, OVERLAPPED& io);
+    bool WriteResponse(HANDLE pipe, OVERLAPPED& io, const std::string& response);
     void CleanupFinishedThreads();
+    void Track(HANDLE pipe);
+    void Untrack(HANDLE pipe);
 
-    MCPBridgeGUP* gup_;
     std::wstring pipe_name_;
     std::thread accept_thread_;
     std::atomic<bool> running_{false};
-    HANDLE shutdown_event_ = nullptr;
+
+    // Every pipe instance this server owns, listening or connected. Stop()
+    // cancels their I/O, so no thread is left waiting on a pipe.
+    std::mutex instances_mutex_;
+    std::unordered_set<HANDLE> instances_;
 
     // Track client threads for cleanup
     std::mutex threads_mutex_;

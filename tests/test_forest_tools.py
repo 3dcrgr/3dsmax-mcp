@@ -208,7 +208,6 @@ class RegistrationTests(unittest.TestCase):
     def test_registration(self):
         from maxmcp import server
         from maxmcp.tool_discovery import TOOLSET_SPECS, _module_tool_names
-        from scripts.gen_tool_catalog import MODULE_CATEGORY
         from scripts.gen_tool_smoke import MUTATE_TOOLS, SKIP_DEFAULT
         self.assertIn("forest", server.SPECIALTY_TOOL_MODULES)
         self.assertNotIn("forest", server.CORE_TOOL_MODULES)
@@ -225,7 +224,6 @@ class RegistrationTests(unittest.TestCase):
         self.assertTrue({"scatter_forest_pack", "forest_edit_items", "forest_set_mode", "forest_from_library",
                          "forest_validate"} <= MUTATE_TOOLS)
         self.assertFalse({"forest_items", "forest_library"} & MUTATE_TOOLS)
-        self.assertEqual(MODULE_CATEGORY["forest"], "Scattering")
         self.assertEqual(set(_module_tool_names(Path(forest.__file__))), self.NEW)
         self.assertEqual(_module_tool_names(Path(scattering.__file__)), ("scatter_forest_pack",))
 

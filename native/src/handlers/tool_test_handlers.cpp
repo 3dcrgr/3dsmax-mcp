@@ -1,6 +1,6 @@
 #include "mcp_bridge/native_handlers.h"
 
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 
 #include "mcp_bridge/native_tool_registry.h"
 
@@ -33,6 +33,8 @@ struct SmokeCase {
     uint8_t tier;
 
     uint8_t flags;
+
+    const char* command;  // Native command for a case with no registry entry
 
 };
 
@@ -252,29 +254,57 @@ static void CleanupSmokeFixture(MCPBridgeGUP* gup) {
 
 
 
-static void SceneHold(MCPBridgeGUP* gup) {
+// The mutate tier restores the scene from a copy of its own. Hold would
+// overwrite the user's maxhold.mx in the project's autoback folder, and Fetch
+// asks "About to Fetch. OK?". Saving a copy leaves the file name, recent files
+// and unsaved state alone; loading it back without kSetCurrentFilePath keeps
+// the scene's own file name and title.
+struct SceneRestorePoint {
 
-    try {
+    std::wstring path;
 
-        NativeToolRegistry::ExecuteTool("manage_scene", json{{"action", "hold"}}, gup);
+    BOOL needSave = FALSE;
 
-    } catch (...) {
+    BOOL needAutoBackup = FALSE;
 
-    }
+};
+
+
+
+static bool SaveRestorePoint(SceneRestorePoint& point) {
+
+    wchar_t dir[MAX_PATH] = {};
+
+    if (!GetTempPathW(MAX_PATH, dir)) return false;
+
+    // A new name per run: Max keeps a loaded scene file open, and saving over an
+    // existing file also writes a backup into the project's autoback folder.
+    point.path = std::wstring(dir) + L"3dsmax-mcp-smoke-" + std::to_wstring(GetCurrentProcessId()) +
+        L"-" + std::to_wstring(GetTickCount64()) + L".max";
+
+    point.needSave = GetSaveRequiredFlag();
+
+    point.needAutoBackup = GetAutoBackupSaveRequiredFlag();
+
+    return GetCOREInterface()->SaveToFile(point.path.c_str(), FALSE, FALSE) != 0;
 
 }
 
 
 
-static void SceneFetch(MCPBridgeGUP* gup) {
+static bool LoadRestorePoint(const SceneRestorePoint& point) {
 
-    try {
+    const bool loaded = GetCOREInterface8()->LoadFromFile(point.path.c_str(),
 
-        NativeToolRegistry::ExecuteTool("manage_scene", json{{"action", "fetch"}}, gup);
+        Interface8::kRefreshViewports | Interface8::kSuppressPrompts | Interface8::kUseFileUnits);
 
-    } catch (...) {
+    if (loaded) SetSaveRequiredFlag(point.needSave, point.needAutoBackup);
 
-    }
+    NativeHandlers::ResetSceneDeltaSessions();
+
+    DeleteFileW(point.path.c_str());
+
+    return loaded;
 
 }
 
@@ -360,11 +390,31 @@ static std::string RunToolSmokeImpl(const std::string& params, MCPBridgeGUP* gup
 
 
 
+    SceneRestorePoint restorePoint;
+
     bool held = false;
 
     if (needsHold && !dryRun) {
 
-        SceneHold(gup);
+        bool saved = false;
+
+        try {
+
+            saved = SaveRestorePoint(restorePoint);
+
+        } catch (const std::exception& e) {
+
+            report["restorePointError"] = e.what();
+
+        }
+
+        if (!saved) {
+
+            report["error"] = "Could not save a restore point for the scene; the mutate tier was not run.";
+
+            return report.dump();
+
+        }
 
         held = true;
 
@@ -476,7 +526,11 @@ static std::string RunToolSmokeImpl(const std::string& params, MCPBridgeGUP* gup
 
         try {
 
-            raw = NativeToolRegistry::ExecuteTool(sc.tool, input, gup);
+            raw = sc.command && *sc.command
+
+                ? NativeToolRegistry::ExecuteCommand(sc.command, input, gup, sc.tool)
+
+                : NativeToolRegistry::ExecuteTool(sc.tool, input, gup);
 
         } catch (const std::exception& e) {
 
@@ -544,7 +598,17 @@ static std::string RunToolSmokeImpl(const std::string& params, MCPBridgeGUP* gup
 
     if (held) {
 
-        SceneFetch(gup);
+        try {
+
+            report["sceneRestored"] = LoadRestorePoint(restorePoint);
+
+        } catch (const std::exception& e) {
+
+            report["sceneRestored"] = false;
+
+            report["restoreError"] = e.what();
+
+        }
 
     }
 

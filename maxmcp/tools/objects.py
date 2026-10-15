@@ -3,7 +3,8 @@ import re
 
 from ..server import mcp, client
 from ..coerce import FloatList, IntList, StrList
-from ..helpers.maxscript import safe_string
+from ..max_client import MaxBridgeError
+from ..helpers.maxscript import safe_string, node_by_name, node_by_name_expr, node_script_ref
 from ..helpers.spatial import (
     apply_pos_mode_fix_maxscript,
     build_create_object_maxscript,
@@ -25,7 +26,9 @@ def _orientation_payload_for_name(name: str) -> dict | None:
             return None
         payload = _json.loads(raw) if isinstance(raw, str) else raw
         return payload if isinstance(payload, dict) else None
-    except (RuntimeError, _json.JSONDecodeError, TypeError):
+    except (MaxBridgeError, RuntimeError, _json.JSONDecodeError, TypeError):
+        # A name several objects share is refused natively: report no
+        # snapshot rather than failing a creation that already happened.
         return None
 
 
@@ -88,7 +91,7 @@ def get_object_properties(name: str = "", handle: int = 0) -> str:
     # ── MAXScript fallback (TCP) ──────────────────────────────────
     safe = safe_string(name)
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj != undefined then (
             local posStr = "[" + (obj.pos.x as string) + "," + \
                            (obj.pos.y as string) + "," + \
@@ -175,10 +178,10 @@ def set_object_property(name: str = "", property: str = "", value: str = "", han
     safe = safe_string(name)
     safe_prop = safe_string(property)
     maxscript = f"""(
-        local obj = getNodeByName "{safe}"
+        local obj = {node_by_name(name, missing_ok=True)}
         if obj != undefined then (
             try (
-                execute ("$'" + obj.name + "'." + "{safe_prop}" + " = " + "{value}")
+                execute ({node_script_ref("obj")} + "." + "{safe_prop}" + " = " + "{value}")
                 "Set {safe_prop} = " + ({value} as string) + " on " + obj.name
             ) catch (
                 "Error: " + (getCurrentException())
@@ -378,17 +381,20 @@ def delete_objects(names: StrList | None = None, handles: IntList | None = None,
 
     maxscript = f"""(
         local nameList = {names_array}
+        local targets = #()
         local deleted = #()
         local notFound = #()
+        -- Every name resolves before anything is deleted, so a shared name
+        -- fails the call without leaving a partially deleted scene.
         for n in nameList do (
-            local obj = getNodeByName n
+            local obj = {node_by_name_expr("n", missing_ok=True)}
             if obj != undefined then (
-                if not {str(dry_run).lower()} do delete obj
-                append deleted n
+                if appendIfUnique targets obj do append deleted n
             ) else (
                 append notFound n
             )
         )
+        if not {str(dry_run).lower()} do delete targets
         local result = (if {str(dry_run).lower()} then "Would delete: " else "Deleted: ") + (deleted as string)
         if notFound.count > 0 then
             result += " | Not found: " + (notFound as string)

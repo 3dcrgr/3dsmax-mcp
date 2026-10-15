@@ -1,12 +1,13 @@
 #include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_host.h"
 #include "mcp_bridge/forest_runtime.h"
-#include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
 #include "mcp_bridge/gdiplus_runtime.h"
 #include "mcp_bridge/scene_journal.h"
 #include "mcp_bridge/agent_viewport.h"
 #include "mcp_bridge/dialog_watch.h"
 #include "mcp_bridge/qt_dialogs.h"
+#include "mcp_bridge/render_host.h"
 #include <maxapi.h>
 #include <notify.h>
 #include <shlobj.h>
@@ -18,7 +19,7 @@
 class MCPBridgeClassDesc : public ClassDesc2 {
 public:
     int IsPublic() override { return TRUE; }
-    void* Create(BOOL) override { return new MCPBridgeGUP(); }
+    void* Create(BOOL) override { return new MCPBridgeShellGUP(); }
     const TCHAR* ClassName() override { return _T("MCP Bridge"); }
     const TCHAR* NonLocalizedClassName() override { return _T("MCP Bridge"); }
     SClass_ID SuperClassID() override { return GUP_CLASS_ID; }
@@ -32,7 +33,7 @@ static MCPBridgeClassDesc mcpBridgeDesc;
 ClassDesc2* GetMCPBridgeDesc() { return &mcpBridgeDesc; }
 
 // ── Register macroscripts after Max is fully loaded ─────────────
-static MCPBridgeGUP* g_gupInstance = nullptr;
+static MCPBridgeShellGUP* g_gupInstance = nullptr;
 
 static std::string LocalAppDataDir() {
     char buf[MAX_PATH];
@@ -113,8 +114,10 @@ static void LogBridge(const std::wstring& message, int type = SYSLOG_INFO) {
 }
 
 static void SetNativePipeRunningFlag(bool running) {
+    // Shell code passes its own dialog check; the one-argument RunMAXScript
+    // reaches the main thread and DialogWatch through the core's host binding.
     HandlerHelpers::RunMAXScript(std::string("global MCP_NativePipeRunning; MCP_NativePipeRunning = ") +
-        (running ? "true" : "false"));
+        (running ? "true" : "false"), &DialogWatch::ThrowIfDismissed);
 }
 
 static std::string BuildInstanceJson(
@@ -131,12 +134,12 @@ static std::string BuildInstanceJson(
     return ss.str();
 }
 
-void MCPBridgeGUP::RegisterInstance() {
+void MCPBridgeShellGUP::RegisterInstance() {
     EnsureRegistryDirs();
     WriteTextFile(InstancePath(instance_id_), BuildInstanceJson(instance_id_, pipe_name_utf8_));
 }
 
-void MCPBridgeGUP::UnregisterInstance() {
+void MCPBridgeShellGUP::UnregisterInstance() {
     std::string active = ReadTextFile(ActiveInstancePath());
     if (active.find("\"instance_id\": \"" + instance_id_ + "\"") != std::string::npos) {
         DeleteFileA(ActiveInstancePath().c_str());
@@ -144,7 +147,7 @@ void MCPBridgeGUP::UnregisterInstance() {
     DeleteFileA(InstancePath(instance_id_).c_str());
 }
 
-void MCPBridgeGUP::ClaimInstance() {
+void MCPBridgeShellGUP::ClaimInstance() {
     RegisterInstance();
     if (WriteTextFile(ActiveInstancePath(), BuildInstanceJson(instance_id_, pipe_name_utf8_))) {
         LogBridge(L"MCP Bridge: this 3ds Max instance is now the active MCP target");
@@ -153,20 +156,20 @@ void MCPBridgeGUP::ClaimInstance() {
     }
 }
 
-void MCPBridgeGUP::StartPipe() {
+void MCPBridgeShellGUP::StartPipe() {
     if (pipe_server_ && pipe_server_->IsRunning()) {
         SetNativePipeRunningFlag(true);
         return;
     }
 
-    pipe_server_ = std::make_unique<PipeServer>(this, HandlerHelpers::Utf8ToWide(pipe_name_utf8_));
+    pipe_server_ = std::make_unique<PipeServer>(HandlerHelpers::Utf8ToWide(pipe_name_utf8_));
     pipe_server_->Start();
     SetNativePipeRunningFlag(true);
     RegisterInstance();
     LogBridge(L"MCP Bridge: native pipe server started on " + HandlerHelpers::Utf8ToWide(pipe_name_utf8_));
 }
 
-void MCPBridgeGUP::StopPipe() {
+void MCPBridgeShellGUP::StopPipe() {
     if (pipe_server_) {
         pipe_server_->Stop();
         pipe_server_.reset();
@@ -174,7 +177,7 @@ void MCPBridgeGUP::StopPipe() {
     SetNativePipeRunningFlag(false);
 }
 
-bool MCPBridgeGUP::IsPipeRunning() const {
+bool MCPBridgeShellGUP::IsPipeRunning() const {
     return pipe_server_ && pipe_server_->IsRunning();
 }
 
@@ -183,13 +186,22 @@ void ClaimNativeInstance() {
 }
 
 // ── GUP implementation ──────────────────────────────────────────
-DWORD MCPBridgeGUP::Start() {
+DWORD MCPBridgeShellGUP::Start() {
     g_gupInstance = this;
     executor_.Initialize();
     SetNativePipeRunningFlag(false);
+    // Shell: MAXScript keeps pointers to these primitives for the session.
     ForestRuntime::RegisterPrimitives();
     instance_id_ = "pid-" + std::to_string(GetCurrentProcessId());
     pipe_name_utf8_ = "\\\\.\\pipe\\3dsmax-mcp-" + instance_id_;
+
+    // Before the pipe, which dispatches requests to the core. Linked into this
+    // .gup, or loaded from core/mcp_core.dll (MCP_HOT_CORE). On failure the
+    // pipe still answers ping, native:max_dialogs and native:core.
+    std::string coreError;
+    if (!CoreHost::Start(executor_, coreError)) {
+        LogBridge(L"MCP Bridge: native core unavailable: " + HandlerHelpers::Utf8ToWide(coreError), SYSLOG_ERROR);
+    }
 
     // Before the pipe: control requests rely on the monitor and its lane.
     // A stale heartbeat (3 periods) means the main thread is not pumping: the
@@ -204,7 +216,7 @@ DWORD MCPBridgeGUP::Start() {
 
     // Render automation: hook NOTIFY_POST_RENDER so render_start jobs emit a
     // filesystem done-signal at the real completion event (no polling).
-    NativeHandlers::RegisterRenderNotifications();
+    RenderHost::RegisterNotifications();
 
     // Watch scene loads from startup so a restored agent viewport is recognised
     // on the first load after a restart (Hold/Fetch, file open).
@@ -213,19 +225,19 @@ DWORD MCPBridgeGUP::Start() {
     return GUPRESULT_KEEP;
 }
 
-void MCPBridgeGUP::Stop() {
-    // FIRST: close the executor gate and fail everything already queued. A
-    // client thread in Dispatch -> ExecuteSync waits for a WM_MCP_EXECUTE the
-    // main thread can no longer pump once StopPipe() is inside join(), which
-    // stalled Max's exit for up to the executor timeout per in-flight request.
+void MCPBridgeShellGUP::Stop() {
+    // FIRST: pipe threads waiting on requests that will never start would hold
+    // the StopPipe join below (Max's exit stalled for up to the executor timeout
+    // per in-flight request); fail those requests and refuse new ones.
     // executor_.Shutdown() still runs last to destroy the window.
-    executor_.BeginShutdown();
-
+    executor_.StopAccepting();
     AgentViewport::Shutdown(true);
     SceneJournal::Unregister();
-    NativeHandlers::UnregisterRenderNotifications();
+    RenderHost::UnregisterNotifications();
 
     StopPipe();
+    // No request is in flight once the pipe has stopped.
+    CoreHost::Shutdown();
     DialogWatch::Stop();
     GdiPlusRuntime::Shutdown();
     UnregisterInstance();
@@ -233,6 +245,6 @@ void MCPBridgeGUP::Stop() {
     g_gupInstance = nullptr;
 }
 
-void MCPBridgeGUP::DeleteThis() {
+void MCPBridgeShellGUP::DeleteThis() {
     delete this;
 }

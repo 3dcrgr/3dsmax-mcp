@@ -17,6 +17,7 @@ inline bool IsModifierClass(SClass_ID superClassId) {
 inline ClassDesc* FindModifierClass(const std::string& name) {
     using namespace HandlerHelpers;
     const std::wstring wanted = Utf8ToWide(name);
+    RequireMaxScriptThread();
     ScopedMaxScriptEvaluationContext evaluationContext;
     auto& directory = ClassDirectory::GetInstance();
     for (bool scriptNames : {true, false}) {
@@ -91,6 +92,7 @@ inline bool SetParameter(Modifier* modifier, const std::string& name,
     if (first == std::string::npos) return false;
     const std::string literal = value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
     json parsed = json::parse(literal, nullptr, false);
+    RequireMaxScriptThread();
     ScopedMaxScriptEvaluationContext evaluationContext;
     three_value_locals(wrapper, property, input);
     try {
@@ -124,35 +126,41 @@ inline bool SetParameter(Modifier* modifier, const std::string& name,
     return true;
 }
 
+// inspect_properties is a direct handler: its pipe thread hands these MAXScript
+// wrapper reads to Max's main thread.
 inline nlohmann::json InspectLegacyParameters(Modifier* modifier) {
     using namespace HandlerHelpers;
     json properties = json::array();
     if (!modifier) return properties;
-    ScopedMaxScriptEvaluationContext evaluationContext;
-    Class_ID id = modifier->ClassID();
-    MAXClass* scriptClass = MAXClass::lookup_class(&id, modifier->SuperClassID(), true);
-    if (!scriptClass) return properties;
-    scriptClass->build_parm_descs(modifier);
-    four_value_locals(wrapper, output, type, printed);
-    vl.wrapper = MAXModifier::intern(modifier);
-    for (int index = 0; index < scriptClass->n_parms && index < 500; ++index) {
-        const parm_desc& parameter = scriptClass->parms[index];
-        if (!parameter.name) continue;
-        json entry = {{"name", WideToUtf8(parameter.name->to_string())},
-            {"source", "MAXScript property metadata"}};
-        try {
-            vl.output = vl.wrapper->_get_property(parameter.name);
-            vl.printed = new StringStream();
-            vl.output->sprin1(static_cast<CharStream*>(vl.printed));
-            entry["value"] = WideToUtf8(vl.printed->to_string());
-            vl.type = vl.output->classOf_vf(nullptr, 0);
-            vl.printed = new StringStream();
-            vl.type->sprin1(static_cast<CharStream*>(vl.printed));
-            entry["runtimeType"] = WideToUtf8(vl.printed->to_string());
-            entry["declaredTypeCode"] = static_cast<int>(parameter.type);
-        } catch (...) { entry["value"] = "<unavailable>"; }
-        properties.push_back(std::move(entry));
-    }
+    McpHost::RunOnMainThread([&] {
+        RequireMaxScriptThread();
+        ScopedMaxScriptEvaluationContext evaluationContext;
+        Class_ID id = modifier->ClassID();
+        MAXClass* scriptClass = MAXClass::lookup_class(&id, modifier->SuperClassID(), true);
+        if (!scriptClass) return std::string();
+        scriptClass->build_parm_descs(modifier);
+        four_value_locals(wrapper, output, type, printed);
+        vl.wrapper = MAXModifier::intern(modifier);
+        for (int index = 0; index < scriptClass->n_parms && index < 500; ++index) {
+            const parm_desc& parameter = scriptClass->parms[index];
+            if (!parameter.name) continue;
+            json entry = {{"name", WideToUtf8(parameter.name->to_string())},
+                {"source", "MAXScript property metadata"}};
+            try {
+                vl.output = vl.wrapper->_get_property(parameter.name);
+                vl.printed = new StringStream();
+                vl.output->sprin1(static_cast<CharStream*>(vl.printed));
+                entry["value"] = WideToUtf8(vl.printed->to_string());
+                vl.type = vl.output->classOf_vf(nullptr, 0);
+                vl.printed = new StringStream();
+                vl.type->sprin1(static_cast<CharStream*>(vl.printed));
+                entry["runtimeType"] = WideToUtf8(vl.printed->to_string());
+                entry["declaredTypeCode"] = static_cast<int>(parameter.type);
+            } catch (...) { entry["value"] = "<unavailable>"; }
+            properties.push_back(std::move(entry));
+        }
+        return std::string();
+    });
     return properties;
 }
 

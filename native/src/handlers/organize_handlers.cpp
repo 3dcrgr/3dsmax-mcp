@@ -1,12 +1,55 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 
 #include <ILayerManager.h>
 #include <INamedSelectionSetManager.h>
 
 using json = nlohmann::json;
 using namespace HandlerHelpers;
+
+// Layer wire colors are [r,g,b] bytes. Anything else is rejected instead of
+// being skipped, so a malformed color never reports as applied.
+static DWORD LayerColorFromPayload(const json& value) {
+    if (value.type() != json::value_t::array || value.size() != 3 ||
+        !std::all_of(value.begin(), value.end(), [](const json& part) {
+            return part.is_number_integer() && part.get<int>() >= 0 && part.get<int>() <= 255;
+        })) {
+        throw std::runtime_error("color must be [r,g,b] with integers from 0 to 255");
+    }
+    return RGB(value[0].get<int>(), value[1].get<int>(), value[2].get<int>());
+}
+
+// Resolves object names for an organization edit. Every name is looked up
+// before the first change; the caller reports the unresolved ones.
+static NamedNodes ResolveNamedNodes(const json& names) {
+    if (names.type() != json::value_t::array)
+        throw std::runtime_error("names must be an array of object names");
+    std::vector<std::string> requested;
+    for (const auto& nameVal : names) requested.push_back(nameVal.get<std::string>());
+    return ResolveNodesByNames(requested);
+}
+
+// The group a group action names. Only group heads qualify, so a member that
+// shares its group's name does not make the group ambiguous; two groups with
+// one name do.
+static INode* FindGroupHead(const std::string& name) {
+    std::vector<INode*> heads;
+    for (INode* node : CollectNodesByName(name))
+        if (node->IsGroupHead()) heads.push_back(node);
+    if (heads.size() > 1) ThrowAmbiguousName(name, heads, kUniqueNamesAdvice);
+    return heads.empty() ? nullptr : heads.front();
+}
+
+static void AddUnresolvedNamesWarnings(json& result, const NamedNodes& resolved) {
+    result["notFound"] = resolved.notFound;
+    if (!resolved.notFound.empty()) {
+        result["status"] = "partial";
+        result["warnings"].push_back(std::to_string(resolved.notFound.size()) +
+            " requested name(s) matched no object and were skipped: " + JoinNames(resolved.notFound));
+    }
+    AddAmbiguousNamesWarning(result, resolved.ambiguous);
+}
 
 // ═════════════════════════════════════════════════════════════════
 // native:manage_layers — full layer management
@@ -80,31 +123,43 @@ std::string NativeHandlers::ManageLayers(const std::string& params, MCPBridgeGUP
             if (lm->GetLayer(wname.c_str()))
                 throw std::runtime_error("Layer already exists: " + name);
 
+            // Resolve optional inputs before creating, so a bad parent or
+            // color fails cleanly instead of leaving a half-configured layer.
+            const DWORD* color = nullptr;
+            DWORD parsedColor = 0;
+            if (p.contains("color")) {
+                parsedColor = LayerColorFromPayload(p["color"]);
+                color = &parsedColor;
+            }
+            ILayer* parentLayer = nullptr;
+            if (p.contains("parent")) {
+                const std::string parentName = p["parent"].get<std::string>();
+                std::wstring wparent = Utf8ToWide(parentName);
+                parentLayer = lm->GetLayer(wparent.c_str());
+                if (!parentLayer)
+                    throw std::runtime_error("Parent layer not found: " + parentName);
+            }
+
             MSTR mname(wname.c_str());
             ILayer* layer = lm->CreateLayer(mname);
             if (!layer)
                 throw std::runtime_error("Failed to create layer: " + name);
 
             // Apply optional properties
-            if (p.contains("color") && p["color"].size() == 3) {
-                DWORD col = RGB(p["color"][0].get<int>(), p["color"][1].get<int>(), p["color"][2].get<int>());
-                layer->SetWireColor(col);
-            }
+            if (color) layer->SetWireColor(*color);
             if (p.contains("hidden"))
                 layer->Hide(p["hidden"].get<bool>());
             if (p.contains("frozen"))
                 layer->Freeze(p["frozen"].get<bool>());
             if (p.contains("renderable"))
                 layer->SetRenderable(p["renderable"].get<bool>());
-            if (p.contains("parent")) {
-                std::wstring wparent = Utf8ToWide(p["parent"].get<std::string>());
-                ILayer* parentLayer = lm->GetLayer(wparent.c_str());
-                if (parentLayer)
-                    layer->SetParentLayer(parentLayer);
-            }
+            if (parentLayer && !layer->SetParentLayer(parentLayer))
+                throw std::runtime_error("Max rejected parent layer " + p["parent"].get<std::string>() +
+                    " for " + name);
 
             json result;
-            result["created"] = name;
+            result["created"] = WideToUtf8(layer->GetName().data());
+            if (parentLayer) result["parent"] = WideToUtf8(parentLayer->GetName().data());
             return result.dump();
         }
 
@@ -129,10 +184,17 @@ std::string NativeHandlers::ManageLayers(const std::string& params, MCPBridgeGUP
             if (!p.contains("name"))
                 throw std::runtime_error("name is required for set_current");
             std::wstring wname = Utf8ToWide(p["name"].get<std::string>());
+            if (!lm->GetLayer(wname.c_str()))
+                throw std::runtime_error("Layer not found: " + p["name"].get<std::string>());
             MSTR mname(wname.c_str());
             lm->SetCurrentLayer(mname);
+            ILayer* current = lm->GetCurrentLayer();
+            const std::string currentName = current ? WideToUtf8(current->GetName().data()) : "";
+            if (_wcsicmp(Utf8ToWide(currentName).c_str(), wname.c_str()) != 0)
+                throw std::runtime_error("Max did not make " + p["name"].get<std::string>() +
+                    " the current layer (current: " + currentName + ")");
             json result;
-            result["current"] = p["name"].get<std::string>();
+            result["current"] = currentName;
             return result.dump();
         }
 
@@ -145,7 +207,32 @@ std::string NativeHandlers::ManageLayers(const std::string& params, MCPBridgeGUP
             if (!layer)
                 throw std::runtime_error("Layer not found: " + p["name"].get<std::string>());
 
+            // Validate every requested change before the first edit.
+            DWORD color = 0;
+            if (p.contains("color")) color = LayerColorFromPayload(p["color"]);
+            ILayer* parentLayer = nullptr;
+            if (p.contains("parent")) {
+                const std::string parentName = p["parent"].get<std::string>();
+                parentLayer = lm->GetLayer(Utf8ToWide(parentName).c_str());
+                if (!parentLayer)
+                    throw std::runtime_error("Parent layer not found: " + parentName);
+            }
+            if (p.contains("rename")) {
+                const std::string newName = p["rename"].get<std::string>();
+                if (newName.empty())
+                    throw std::runtime_error("rename must be a non-empty layer name");
+                ILayer* existing = lm->GetLayer(Utf8ToWide(newName).c_str());
+                if (existing && existing != layer)
+                    throw std::runtime_error("Layer already exists: " + newName);
+            }
+
             json applied = json::array();
+            if (parentLayer) {
+                if (!layer->SetParentLayer(parentLayer))
+                    throw std::runtime_error("Max rejected parent layer " + p["parent"].get<std::string>() +
+                        " (a layer cannot be parented to itself or its children)");
+                applied.push_back("parent");
+            }
             if (p.contains("hidden")) { layer->Hide(p["hidden"].get<bool>()); applied.push_back("hidden"); }
             if (p.contains("frozen")) { layer->Freeze(p["frozen"].get<bool>()); applied.push_back("frozen"); }
             if (p.contains("renderable")) { layer->SetRenderable(p["renderable"].get<bool>()); applied.push_back("renderable"); }
@@ -159,9 +246,8 @@ std::string NativeHandlers::ManageLayers(const std::string& params, MCPBridgeGUP
             if (p.contains("rcvShadows")) { layer->SetRcvShadows(p["rcvShadows"].get<bool>()); applied.push_back("rcvShadows"); }
             if (p.contains("primaryVisibility")) { layer->SetPrimaryVisibility(p["primaryVisibility"].get<bool>()); applied.push_back("primaryVisibility"); }
             if (p.contains("secondaryVisibility")) { layer->SetSecondaryVisibility(p["secondaryVisibility"].get<bool>()); applied.push_back("secondaryVisibility"); }
-            if (p.contains("color") && p["color"].size() == 3) {
-                DWORD col = RGB(p["color"][0].get<int>(), p["color"][1].get<int>(), p["color"][2].get<int>());
-                layer->SetWireColor(col);
+            if (p.contains("color")) {
+                layer->SetWireColor(color);
                 applied.push_back("color");
             }
             if (p.contains("rename")) {
@@ -171,9 +257,20 @@ std::string NativeHandlers::ManageLayers(const std::string& params, MCPBridgeGUP
                 applied.push_back("rename");
             }
 
+            if (applied.empty())
+                throw std::runtime_error("set_properties needs at least one property to change "
+                    "(hidden, frozen, renderable, color, parent, rename, or a display flag)");
+
+            const std::string currentName = WideToUtf8(layer->GetName().data());
             json result;
             result["layer"] = p["name"].get<std::string>();
+            result["name"] = currentName;
             result["applied"] = applied;
+            if (p.contains("rename") && currentName != p["rename"].get<std::string>()) {
+                result["status"] = "partial";
+                result["warnings"] = json::array({"Requested rename to " + p["rename"].get<std::string>() +
+                    ", but the layer is now named " + currentName + "."});
+            }
             return result.dump();
         }
 
@@ -188,23 +285,32 @@ std::string NativeHandlers::ManageLayers(const std::string& params, MCPBridgeGUP
                 throw std::runtime_error("Layer not found: " + p["layer"].get<std::string>());
 
             json moved = json::array();
-            json notFound = json::array();
+            json failed = json::array();
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            if (resolved.nodes.empty()) ThrowUnresolvedNames(resolved, "no object was moved to a layer.");
 
-            for (auto& nameVal : p["names"]) {
-                std::string name = nameVal.get<std::string>();
-                INode* node = FindNodeByName(name);
-                if (node) {
-                    layer->AddToLayer(node);
+            for (INode* node : resolved.nodes) {
+                const std::string name = WideToUtf8(node->GetName());
+                // AddToLayer reports false for a node it did not move.
+                if (layer->AddToLayer(node) || NodeLayerName(node) == WideToUtf8(layer->GetName().data()))
                     moved.push_back(name);
-                } else {
-                    notFound.push_back(name);
-                }
+                else
+                    failed.push_back(name);
             }
 
             json result;
             result["layer"] = p["layer"].get<std::string>();
             result["moved"] = moved;
-            result["notFound"] = notFound;
+            AddUnresolvedNamesWarnings(result, resolved);
+            if (!failed.empty()) {
+                if (moved.empty())
+                    throw std::runtime_error("Max did not move any object to layer " +
+                        p["layer"].get<std::string>() + ": " + JoinNames(failed));
+                result["failed"] = failed;
+                result["status"] = "partial";
+                result["warnings"].push_back(std::to_string(failed.size()) +
+                    " object(s) stayed on their layer: " + JoinNames(failed));
+            }
             return result.dump();
         }
 
@@ -219,9 +325,23 @@ std::string NativeHandlers::ManageLayers(const std::string& params, MCPBridgeGUP
 
             layer->SelectObjects();
 
+            int layerNodeCount = 0;
+            if (ILayerProperties* lp = (ILayerProperties*)layer->GetInterface(LAYERPROPERTIES_INTERFACE)) {
+                Tab<INode*> layerNodes;
+                lp->Nodes(layerNodes);
+                layerNodeCount = layerNodes.Count();
+            }
+
             json result;
             result["layer"] = p["name"].get<std::string>();
             result["selected"] = true;
+            result["objectCount"] = layerNodeCount;
+            result["selectionCount"] = GetCOREInterface()->GetSelNodeCount();
+            if (layerNodeCount == 0) {
+                result["status"] = "no_objects";
+                result["warnings"] = json::array({"Layer " + p["name"].get<std::string>() +
+                    " has no objects, so nothing was selected."});
+            }
             return result.dump();
         }
 
@@ -282,19 +402,10 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
                 throw std::runtime_error("names (array of object names) is required for create");
 
             INodeTab nodes;
-            json notFound = json::array();
-            for (auto& nameVal : p["names"]) {
-                std::string name = nameVal.get<std::string>();
-                INode* node = FindNodeByName(name);
-                if (node) {
-                    nodes.AppendNode(node);
-                } else {
-                    notFound.push_back(name);
-                }
-            }
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) nodes.AppendNode(node);
 
-            if (nodes.Count() == 0)
-                throw std::runtime_error("No valid objects found to group");
+            if (nodes.Count() == 0) ThrowUnresolvedNames(resolved, "no group was created.");
 
             MSTR groupName;
             if (p.contains("name")) {
@@ -309,7 +420,7 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             json result;
             result["group"] = WideToUtf8(groupHead->GetName());
             result["memberCount"] = nodes.Count();
-            result["notFound"] = notFound;
+            AddUnresolvedNamesWarnings(result, resolved);
             return result.dump();
         }
 
@@ -318,11 +429,11 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             if (!p.contains("name"))
                 throw std::runtime_error("name is required for ungroup");
 
-            INode* node = FindNodeByName(p["name"].get<std::string>());
+            const std::string name = p["name"].get<std::string>();
+            INode* node = FindGroupHead(name);
             if (!node)
-                throw std::runtime_error("Object not found: " + p["name"].get<std::string>());
-            if (!node->IsGroupHead())
-                throw std::runtime_error("Object is not a group head: " + p["name"].get<std::string>());
+                throw std::runtime_error((CollectNodesByName(name).empty()
+                    ? "Object not found: " : "Object is not a group head: ") + name);
 
             INodeTab nodes;
             nodes.AppendNode(node);
@@ -338,8 +449,8 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             if (!p.contains("name"))
                 throw std::runtime_error("name is required for open");
 
-            INode* node = FindNodeByName(p["name"].get<std::string>());
-            if (!node || !node->IsGroupHead())
+            INode* node = FindGroupHead(p["name"].get<std::string>());
+            if (!node)
                 throw std::runtime_error("Group not found: " + p["name"].get<std::string>());
 
             INodeTab nodes;
@@ -356,8 +467,8 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             if (!p.contains("name"))
                 throw std::runtime_error("name is required for close");
 
-            INode* node = FindNodeByName(p["name"].get<std::string>());
-            if (!node || !node->IsGroupHead())
+            INode* node = FindGroupHead(p["name"].get<std::string>());
+            if (!node)
                 throw std::runtime_error("Group not found: " + p["name"].get<std::string>());
 
             INodeTab nodes;
@@ -374,29 +485,44 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             if (!p.contains("group") || !p.contains("names"))
                 throw std::runtime_error("group and names are required for attach");
 
-            INode* groupHead = FindNodeByName(p["group"].get<std::string>());
-            if (!groupHead || !groupHead->IsGroupHead())
+            INode* groupHead = FindGroupHead(p["group"].get<std::string>());
+            if (!groupHead)
                 throw std::runtime_error("Group not found: " + p["group"].get<std::string>());
 
             INodeTab nodes;
-            json notFound = json::array();
-            for (auto& nameVal : p["names"]) {
-                std::string name = nameVal.get<std::string>();
-                INode* node = FindNodeByName(name);
-                if (node) {
-                    nodes.AppendNode(node);
-                } else {
-                    notFound.push_back(name);
-                }
-            }
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) nodes.AppendNode(node);
+            if (nodes.Count() == 0) ThrowUnresolvedNames(resolved, "nothing was attached to the group.");
 
-            if (nodes.Count() > 0)
-                ip->AttachNodesToGroup(nodes, *groupHead);
+            if (!ip->AttachNodesToGroup(nodes, *groupHead))
+                throw std::runtime_error("Max could not attach the objects to group " +
+                    p["group"].get<std::string>() +
+                    " (members of another group cannot be attached; detach them first)");
+
+            // Read back membership: AttachNodesToGroup reports one result for the batch.
+            int attached = 0;
+            json failed = json::array();
+            for (int i = 0; i < nodes.Count(); ++i) {
+                INode* node = nodes[i];
+                bool inGroup = false;
+                for (INode* parent = node->GetParentNode(); node->IsGroupMember() && parent &&
+                     !parent->IsRootNode(); parent = parent->GetParentNode()) {
+                    if (parent == groupHead) { inGroup = true; break; }
+                }
+                if (inGroup) attached++;
+                else failed.push_back(WideToUtf8(node->GetName()));
+            }
 
             json result;
             result["group"] = p["group"].get<std::string>();
-            result["attached"] = nodes.Count();
-            result["notFound"] = notFound;
+            result["attached"] = attached;
+            AddUnresolvedNamesWarnings(result, resolved);
+            if (!failed.empty()) {
+                result["failed"] = failed;
+                result["status"] = "partial";
+                result["warnings"].push_back(std::to_string(failed.size()) +
+                    " object(s) are not members of the group after attach: " + JoinNames(failed));
+            }
             return result.dump();
         }
 
@@ -406,7 +532,6 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
                 throw std::runtime_error("names is required for detach");
 
             INodeTab nodes;
-            json notFound = json::array();
             json notGroupMembers = json::array();
             json autoOpenedGroups = json::array();
             std::vector<INode*> groupsToReclose;
@@ -434,30 +559,32 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
                 autoOpenedGroups.push_back(WideToUtf8(groupHead->GetName()));
             };
 
-            for (auto& nameVal : p["names"]) {
-                std::string name = nameVal.get<std::string>();
-                INode* node = FindNodeByName(name);
-                if (node) {
-                    if (!node->IsGroupMember()) {
-                        notGroupMembers.push_back(name);
-                        continue;
-                    }
-
-                    INode* parent = node->GetParentNode();
-                    if (parent && parent->IsGroupHead()) {
-                        ensureGroupOpen(parent);
-                    }
-
-                    nodes.AppendNode(node);
-                } else {
-                    notFound.push_back(name);
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) {
+                if (!node->IsGroupMember()) {
+                    notGroupMembers.push_back(WideToUtf8(node->GetName()));
+                    continue;
                 }
+
+                INode* parent = node->GetParentNode();
+                if (parent && parent->IsGroupHead()) {
+                    ensureGroupOpen(parent);
+                }
+
+                nodes.AppendNode(node);
             }
 
             const int requestedDetach = nodes.Count();
-            if (requestedDetach > 0) {
-                ip->DetachNodesFromGroup(nodes);
+            if (requestedDetach == 0) {
+                // Nothing was opened above: only group members queue a group to reopen.
+                const json hint = {{"notGroupMembers", notGroupMembers}};
+                if (notGroupMembers.empty()) ThrowUnresolvedNames(resolved, "nothing was detached.", hint);
+                throw std::runtime_error(StructuredErrorPayload(
+                    "BAD_PARAM",
+                    "None of the requested objects is a group member; nothing was detached.",
+                    UnresolvedNamesHint(resolved, hint)));
             }
+            ip->DetachNodesFromGroup(nodes);
 
             int detachedCount = 0;
             json failedDetach = json::array();
@@ -479,10 +606,24 @@ std::string NativeHandlers::ManageGroups(const std::string& params, MCPBridgeGUP
             json result;
             result["detached"] = detachedCount;
             result["requested"] = requestedDetach;
-            result["notFound"] = notFound;
             result["notGroupMembers"] = notGroupMembers;
             result["autoOpenedGroups"] = autoOpenedGroups;
             result["failedDetach"] = failedDetach;
+            if (detachedCount == 0)
+                throw std::runtime_error(StructuredErrorPayload(
+                    "BAD_PARAM", "Max did not detach any of the requested group members.",
+                    {{"failedDetach", failedDetach}}));
+            AddUnresolvedNamesWarnings(result, resolved);
+            if (!notGroupMembers.empty()) {
+                result["status"] = "partial";
+                result["warnings"].push_back(std::to_string(notGroupMembers.size()) +
+                    " object(s) were not group members and were skipped: " + JoinNames(notGroupMembers));
+            }
+            if (!failedDetach.empty()) {
+                result["status"] = "partial";
+                result["warnings"].push_back(std::to_string(failedDetach.size()) +
+                    " group member(s) are still in a group: " + JoinNames(failedDetach));
+            }
             return result.dump();
         }
 
@@ -541,16 +682,9 @@ std::string NativeHandlers::ManageSelectionSets(const std::string& params, MCPBr
             MSTR mname(wname.c_str());
 
             Tab<INode*> nodes;
-            json notFound = json::array();
-            for (auto& nameVal : p["names"]) {
-                std::string name = nameVal.get<std::string>();
-                INode* node = FindNodeByName(name);
-                if (node) {
-                    nodes.Append(1, &node);
-                } else {
-                    notFound.push_back(name);
-                }
-            }
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) nodes.Append(1, &node);
+            if (nodes.Count() == 0) ThrowUnresolvedNames(resolved, "the selection set was not created.");
 
             if (!mgr->AddNewNamedSelSet(nodes, mname))
                 throw std::runtime_error("Failed to create selection set: " + setName);
@@ -558,7 +692,7 @@ std::string NativeHandlers::ManageSelectionSets(const std::string& params, MCPBr
             json result;
             result["created"] = setName;
             result["memberCount"] = nodes.Count();
-            result["notFound"] = notFound;
+            AddUnresolvedNamesWarnings(result, resolved);
             return result.dump();
         }
 
@@ -609,6 +743,12 @@ std::string NativeHandlers::ManageSelectionSets(const std::string& params, MCPBr
             json result;
             result["selected"] = setName;
             result["count"] = itemCount;
+            result["selectionCount"] = ip->GetSelNodeCount();
+            if (ip->GetSelNodeCount() == 0) {
+                result["status"] = "no_objects";
+                result["warnings"] = json::array({"Selection set " + setName +
+                    " has no live objects; the selection is now empty."});
+            }
             return result.dump();
         }
 
@@ -622,10 +762,9 @@ std::string NativeHandlers::ManageSelectionSets(const std::string& params, MCPBr
             MSTR mname(wname.c_str());
 
             Tab<INode*> nodes;
-            for (auto& nameVal : p["names"]) {
-                INode* node = FindNodeByName(nameVal.get<std::string>());
-                if (node) nodes.Append(1, &node);
-            }
+            const NamedNodes resolved = ResolveNamedNodes(p["names"]);
+            for (INode* node : resolved.nodes) nodes.Append(1, &node);
+            if (nodes.Count() == 0) ThrowUnresolvedNames(resolved, "the selection set was not replaced.");
 
             if (!mgr->ReplaceNamedSelSet(nodes, mname))
                 throw std::runtime_error("Failed to replace selection set: " + setName);
@@ -633,6 +772,7 @@ std::string NativeHandlers::ManageSelectionSets(const std::string& params, MCPBr
             json result;
             result["replaced"] = setName;
             result["memberCount"] = nodes.Count();
+            AddUnresolvedNamesWarnings(result, resolved);
             return result.dump();
         }
 

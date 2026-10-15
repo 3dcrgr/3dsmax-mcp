@@ -2,7 +2,7 @@ import json as _json
 
 from ..server import mcp, client
 from ..coerce import StrList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import NODE_LOOKUP_FNS, batch_reply, node_by_name, safe_string
 
 
 @mcp.tool()
@@ -18,47 +18,49 @@ def set_parent(children: StrList, parent: str = "") -> str:
     if parent:
         safe_parent = safe_string(parent)
         maxscript = f"""(
-            local parentObj = getNodeByName "{safe_parent}"
+            {NODE_LOOKUP_FNS}
+            local parentObj = {node_by_name(parent, missing_ok=True)}
             if parentObj == undefined then (
                 "Parent not found: {safe_parent}"
             ) else (
                 local childNames = {child_names}
                 local done = #()
                 local notFound = #()
+                local ambiguous = #()
                 for n in childNames do (
-                    local c = getNodeByName n
-                    if c != undefined then (
+                    local c = mcpBatchNode n notFound ambiguous
+                    if c != undefined do (
                         c.parent = parentObj
                         append done n
-                    ) else (
-                        append notFound n
                     )
                 )
+                if done.count == 0 and ambiguous.count > 0 do mcpThrowUnresolved notFound ambiguous "nothing was parented"
                 local result = "Parented " + (done.count as string) + " objects under " + parentObj.name
                 if notFound.count > 0 do result += " | Not found: " + (notFound as string)
-                result
+                result + (mcpAmbiguousReply ambiguous)
             )
         )"""
     else:
         maxscript = f"""(
+            {NODE_LOOKUP_FNS}
             local childNames = {child_names}
             local done = #()
             local notFound = #()
+            local ambiguous = #()
             for n in childNames do (
-                local c = getNodeByName n
-                if c != undefined then (
+                local c = mcpBatchNode n notFound ambiguous
+                if c != undefined do (
                     c.parent = undefined
                     append done n
-                ) else (
-                    append notFound n
                 )
             )
+            if done.count == 0 and ambiguous.count > 0 do mcpThrowUnresolved notFound ambiguous "nothing was unparented"
             local result = "Unparented " + (done.count as string) + " objects"
             if notFound.count > 0 do result += " | Not found: " + (notFound as string)
-            result
+            result + (mcpAmbiguousReply ambiguous)
         )"""
     response = client.send_command(maxscript)
-    return response.get("result", "")
+    return batch_reply(response.get("result", ""))
 
 
 @mcp.tool()
@@ -92,7 +94,7 @@ def get_hierarchy(name: str) -> str:
                 "\\\"children\\\":" + childStr + \
             "}}"
         )
-        local rootObj = getNodeByName "{safe}"
+        local rootObj = {node_by_name(name, missing_ok=True)}
         if rootObj != undefined then (
             buildTree rootObj
         ) else (

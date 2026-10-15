@@ -7,7 +7,7 @@ from typing import Any
 
 from ..server import mcp, client
 from ..coerce import StrList, FloatList, IntList
-from ..helpers.maxscript import safe_string
+from ..helpers.maxscript import node_by_name_expr, safe_string
 from ..helpers.native_compat import is_missing_native_route_error
 from ..max_client import MaxBridgeError
 
@@ -282,8 +282,8 @@ def set_viewport(
         local nodes = #()
         local missing = #()
         for nm in {name_arr} do (
-            local matches = getNodeByName nm exact:true all:true
-            if matches.count != 1 then append missing nm else append nodes matches[1]
+            local hit = {node_by_name_expr("nm", missing_ok=True)}
+            if hit == undefined then append missing nm else append nodes hit
         )
         if missing.count > 0 then ("__ERROR__|Framing nodes must resolve uniquely: " + (missing as string))
         else try (
@@ -326,7 +326,7 @@ def set_viewport(
     )'''
     raw = str(client.send_command(script).get("result", ""))
     if not raw.startswith("OK|"):
-        raise RuntimeError(raw.removeprefix("__ERROR__|"))
+        raise RuntimeError(raw.removeprefix("__ERROR__|").removeprefix("__MCP_MS_ERR__:").strip())
     _, actual_view, actual_fov = raw.split("|", 2)
     return {"view": view, "actual_view": actual_view, "fov": float(actual_fov) if view == "perspective" else None,
             "framed": names, "shading": shading, "edges": edges, "grid": grid}

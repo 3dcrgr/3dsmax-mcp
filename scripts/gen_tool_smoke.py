@@ -35,6 +35,7 @@ SKIP_DEFAULT = {
     "itoo_api_inventory", "itoo_catalog", "forest_inspect", "forest_effects", "forest_effect_parameters",
     "railclone_slots", "railclone_metadata", "railclone_proxy", "railclone_instances",
     "max_dialogs",
+    "reload_native_core",  # Development control of the bridge shell, never a smoke probe.
     "vantage_status",
     "vantage_get_image",
     "vantage_live_link",
@@ -92,12 +93,10 @@ SKIP_DEFAULT = {
     "capture_multi_view",
     "capture_screen",
     "create_tyflow",
-    "create_tyflow_preset",
     "get_tyflow_info",
-    "list_tyflow_operator_types",
     "modify_tyflow_operator",
     "add_tyflow_event",
-    "connect_tyflow_events",
+    "connect_tyflow_operator",
     "set_tyflow_shape",
     "set_tyflow_physx",
     "add_tyflow_collision",
@@ -114,12 +113,11 @@ SKIP_DEFAULT = {
     "discover_plugin_classes",
     "execute_maxscript",
     "execute_python",
-    # Compatibility aliases stay callable but are not part of the default smoke pass.
-    "inspect_modifier_properties",
 }
 
 # Explicit inputs — ${SMOKE_TARGET} / ${SMOKE_SPAWN} replaced at runtime.
 CUSTOM: dict[str, dict] = {
+    "reload_native_core": {"action": "status"},  # Never reload by default.
     "execute_maxscript": {"code": "42"},
     "execute_python": {"code": "result = 42"},
     "manage_scene": {"action": "info"},
@@ -131,7 +129,10 @@ CUSTOM: dict[str, dict] = {
     "scene_qa": {"max_issues": 20},
     "discover_plugin_classes": {"limit": 10},
     "list_plugin_classes": {"limit": 10},
-    "introspect_class": {"class_name": "Box"},
+    "introspect_class": {"class_name": "Teapot"},  # Box is ambiguous across superclasses
+    "resolve_node_refs": {"refs": [{"name": SMOKE_TARGET}]},
+    "scene_patch": {"operations": [{"target": {"name": SMOKE_TARGET}, "op": "set_flags", "hidden": False}],
+                    "dry_run": True},
     "map_class_relationships": {"limit": 5},
     "get_object_properties": {"name": SMOKE_TARGET},
     "inspect_object": {"name": SMOKE_TARGET},
@@ -150,7 +151,7 @@ CUSTOM: dict[str, dict] = {
     "introspect_instance": {"name": SMOKE_TARGET},
     "analyze_node_orientation": {"names": [SMOKE_TARGET]},
     "select_objects": {"names": [SMOKE_TARGET]},
-    "set_visibility": {"names": [SMOKE_TARGET], "action": "unhide"},
+    "set_visibility": {"names": [SMOKE_TARGET], "action": "show"},
     "transform_object": {"name": SMOKE_TARGET, "move": [0, 0, 0]},
     "set_object_property": {"name": SMOKE_TARGET, "property": "wirecolor", "value": "[180,180,180]"},
     "add_modifier": {"name": SMOKE_TARGET, "modifier": "Smooth"},
@@ -164,8 +165,10 @@ CUSTOM: dict[str, dict] = {
         "material_name": "MCP_SmokeMtl",
     },
     "set_material_property": {"name": SMOKE_TARGET, "property": "base_color", "value": "[0.5,0.5,0.5]"},
-    "set_material_properties": {"name": SMOKE_TARGET, "properties": {"roughness": 0.5}},
-    "create_texture_map": {"map_class": "Noise", "map_name": "MCP_SmokeNoise"},
+    "set_material_properties": {"name": SMOKE_TARGET, "properties": {"roughness": "0.5"}},
+    "create_texture_map": {"map_class": "Noise", "map_name": "MCP_SmokeNoise", "global_var": "MCP_SmokeNoise"},
+    # The smoke material has no sub-material slots: the case checks the refusal.
+    "set_sub_material": {"name": SMOKE_TARGET, "sub_material_index": 1, "material_class": "PhysicalMaterial"},
     "set_texture_map_properties": {"global_var": "MCP_SmokeNoise", "properties": {"size": 25}},
     "write_osl_shader": {
         "shader_name": "mcp_smoke_test",
@@ -189,7 +192,8 @@ CUSTOM: dict[str, dict] = {
         "property_value": "true",
     },
     "batch_rename_objects": {
-        "renames": [{"old_name": SMOKE_SPAWN, "new_name": SMOKE_SPAWN}],
+        "renames": [{"old_name": SMOKE_SPAWN, "new_name": SMOKE_SPAWN + "_Renamed"},
+                    {"old_name": SMOKE_SPAWN + "_Renamed", "new_name": SMOKE_SPAWN}],
     },
     "capture_screen": {"enabled": False},
     "inspect_data_channel": {"name": SMOKE_TARGET},
@@ -207,52 +211,58 @@ CUSTOM: dict[str, dict] = {
     "get_session_context": {"max_roots": 5, "max_selection": 5},
     "discover_plugin_surface": {"limit": 5},
     "get_plugin_manifest": {"plugin_name": "tyFlow"},
-    "refresh_plugin_manifest": {"plugin_name": "tyFlow"},
     "inspect_plugin_class": {"class_name": "Box"},
     "inspect_plugin_constructor": {"class_name": "Box"},
     "inspect_plugin_instance": {"name": SMOKE_TARGET},
-    "inspect_modifier_properties": {"name": SMOKE_TARGET, "modifier_index": 1},
 }
 
-MUTATE_TOOLS = {
-    "railclone_settings", "forest_settings",
-    "railclone_slots", "railclone_metadata", "railclone_proxy", "railclone_instances", "forest_effects", "forest_effect_parameters",
-    "script_controller",
-    "drop_to_surface",
-    "scatter_forest_pack",
-    "forest_edit_items",
-    "forest_set_mode",
-    "forest_from_library",
-    "forest_validate",
+# Mutate cases run in this order, not alphabetically: each one sets up what the
+# next needs (the spawn box before it is parented or renamed, the Smooth
+# modifier before it is edited and removed). undo_last runs last and undoes
+# delete_objects; the run then reloads its saved copy of the scene.
+MUTATE_ORDER = (
+    "create_object",
+    "set_parent",
+    "batch_rename_objects",
+    "transform_object",
+    "set_object_property",
+    "set_visibility",
+    "clone_objects",
+    "add_modifier",
+    "set_modifier_property",
+    "set_modifier_state",
+    "make_modifier_unique",
+    "remove_modifier",
+    "collapse_modifier_stack",
+    "assign_material",
+    "set_material_property",
+    "set_material_properties",
+    "set_sub_material",
+    "create_texture_map",
+    "set_texture_map_properties",
+    "write_osl_shader",
     "create_lights",
     "edit_lights",
     "plugin_patch",
     "curve_model",
     "edit_curve",
-    "create_object",
-    "delete_objects",
-    "clone_objects",
-    "set_parent",
-    "transform_object",
-    "set_object_property",
-    "set_visibility",
-    "add_modifier",
-    "remove_modifier",
-    "set_modifier_state",
-    "make_modifier_unique",
-    "collapse_modifier_stack",
-    "assign_material",
-    "set_material_property",
-    "set_material_properties",
-    "create_texture_map",
-    "set_texture_map_properties",
-    "set_sub_material",
-    "write_osl_shader",
-    "set_modifier_property",
-    "batch_rename_objects",
+    "script_controller",
+    # Fork tools: all skipped by default (SKIP_DEFAULT); with include_skipped they
+    # run here, before delete_objects/undo_last, which must stay the last pair.
+    "drop_to_surface",
+    "railclone_settings", "railclone_slots", "railclone_metadata", "railclone_proxy", "railclone_instances",
     "railclone_set_param",
     "railclone_from_library",
-}
+    "scatter_forest_pack",
+    "forest_settings", "forest_effects", "forest_effect_parameters",
+    "forest_edit_items",
+    "forest_set_mode",
+    "forest_from_library",
+    "forest_validate",
+    "delete_objects",
+    "undo_last",
+)
+MUTATE_TOOLS = set(MUTATE_ORDER)
 
 TIER_FIXTURE_NAMES = {
     name
@@ -269,7 +279,7 @@ def flags_for(name: str) -> int:
     flags = 0
     if name in SKIP_DEFAULT:
         flags |= FLAG_SKIP_DEFAULT
-    if name == "capture_screen":
+    if name in {"capture_screen", "set_sub_material"}:
         flags |= FLAG_EXPECT_ERROR
     return flags
 
@@ -413,10 +423,11 @@ def main() -> int:
             "input": payload,
             "tier": tier,
             "flags": 0,
+            "command": cmd_type,  # query_scene is a Python tool: run its native command directly
         })
 
     # Stable run order: read → fixture → mutate
-    cases.sort(key=lambda c: (c["tier"], c["tool"]))
+    cases.sort(key=lambda c: (c["tier"], MUTATE_ORDER.index(c["tool"]) if c["tool"] in MUTATE_ORDER else 0, c["tool"]))
 
     lines: list[str] = []
     lines.append("// AUTO-GENERATED by scripts/gen_tool_smoke.py — do not edit by hand.")
@@ -431,6 +442,7 @@ def main() -> int:
     lines.append("    const char* inputJson;")
     lines.append("    uint8_t tier;")
     lines.append("    uint8_t flags;")
+    lines.append("    const char* command;  // Native command for a case with no registry entry")
     lines.append("};")
     lines.append("")
     lines.append(f"static constexpr const char* kSmokeTargetToken = \"{SMOKE_TARGET}\";")
@@ -440,7 +452,8 @@ def main() -> int:
     for c in cases:
         inp = json.dumps(c["input"], separators=(",", ":"))
         lines.append(
-            f'    {{"{c_escape(c["tool"])}", "{c_escape(inp)}", {c["tier"]}, {c["flags"]}}},'
+            f'    {{"{c_escape(c["tool"])}", "{c_escape(inp)}", {c["tier"]}, {c["flags"]}, '
+            f'"{c_escape(c.get("command", ""))}"}},'
         )
     lines.append("};")
     lines.append("static const size_t kSmokeCaseCount = sizeof(kSmokeCases) / sizeof(kSmokeCases[0]);")

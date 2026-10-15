@@ -1,16 +1,14 @@
 #include "mcp_bridge/command_dispatcher.h"
-#include "mcp_bridge/bridge_health.h"
-#include "mcp_bridge/quiet_policy.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 #include "mcp_bridge/native_handlers.h"
-#include "mcp_bridge/main_thread_executor.h"
 #include "mcp_bridge/handler_helpers.h"
+#include "mcp_bridge/quiet_policy.h"
+#include "mcp_bridge/response_envelope.h"
 #include "mcp_bridge/transaction_policy.h"
-#include "mcp_bridge/dialog_watch.h"
-#include "mcp_bridge/native_error_code.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <initializer_list>
 #include <optional>
 #include <unordered_set>
 #include <shlobj.h>
@@ -30,23 +28,9 @@ using json = nlohmann::json;
 static bool g_safeMode = true;
 static bool g_safeModeLoaded = false;
 
-static bool LoadSafeModeSetting() {
-    char localAppData[MAX_PATH];
-    if (FAILED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData)))
-        return true;  // default: safe
-
-    std::string iniPath = std::string(localAppData) + "\\3dsmax-mcp\\mcp_config.ini";
-
-    char buf[16] = {};
-    GetPrivateProfileStringA("mcp", "safe_mode", "true", buf, 16, iniPath.c_str());
-
-    std::string val(buf);
-    return !(val == "false" || val == "0" || val == "off");
-}
-
 static bool IsSafeModeEnabled() {
     if (!g_safeModeLoaded) {
-        g_safeMode = LoadSafeModeSetting();
+        g_safeMode = McpEnvelope::ReadSafeModeSetting();
         g_safeModeLoaded = true;
     }
     return g_safeMode;
@@ -57,10 +41,17 @@ static bool IsSafeModeEnabled() {
 // skipping the main-thread PostMessage roundtrip. ~25 handlers
 // benefit: scene reads, plugin introspection, reference walking.
 // Mutation handlers (create/delete/transform/assign) and MAXScript
-// execution always marshal to the main thread.
+// execution always marshal to the main thread, including reads that run
+// any MAXScript (introspect_instance, get_wired_params, state sets).
+// The MAXScript paths themselves (RunMAXScript, EvaluateMAXScript,
+// HandleMaxScript, the PB1 modifier reads of inspect_properties) reach the
+// main thread through McpHost::RunOnMainThread: script reached from a direct
+// handler waits for the main thread instead of running on this one.
+// ping and native:max_dialogs never reach the core: the shell answers them
+// (core_control.cpp). watch_scene's reads run direct; the handler marshals its
+// start and stop, which register with Max, to the main thread itself.
 static bool IsDirectHandler(const std::string& cmd_type) {
     static const std::unordered_set<std::string> kDirect = {
-        "native:max_dialogs",
         // Scene reads
         "native:scene_info",
         "native:selection",
@@ -88,7 +79,6 @@ static bool IsDirectHandler(const std::string& cmd_type) {
         "native:list_plugin_classes",
         "native:discover_classes",
         "native:introspect_class",
-        "native:introspect_instance",
         // Controller reads
         "native:inspect_track_view",
         "native:list_wireable_params",
@@ -99,11 +89,6 @@ static bool IsDirectHandler(const std::string& cmd_type) {
         "native:watch_scene",
         // Effects (read-only)
         "native:get_effects",
-        // Wire params (read-only)
-        "native:get_wired_params",
-        // State sets (read-only)
-        "native:get_state_sets",
-        "native:get_camera_sequence",
         // System discovery (read-only)
         "native:list_macroscripts",
         "native:list_action_tables",
@@ -161,6 +146,7 @@ static bool IsMutatingNativeHandler(const std::string& cmd_type) {
         "native:scene_patch",
         "native:plugin_patch",
         "native:scene_qa_fix",
+        "native:mesh_script",
     };
     return kMutating.count(cmd_type) > 0;
 }
@@ -196,19 +182,9 @@ static bool ResultLooksLikeError(const std::string& result) {
     return status == "error" || status == "failed";
 }
 
+// Shared with the shell's own answers (response_envelope.h).
 static std::string NormalizeNativeError(const std::string& message) {
-    json structured = json::parse(message, nullptr, false);
-    if (!structured.is_discarded() && structured.is_object() &&
-        (structured.contains("code") || structured.contains("message"))) {
-        return structured.dump();
-    }
-    const std::string code = NativeErrors::CodeForMessage(message);
-    json payload;
-    payload["type"] = "NativeError";
-    payload["message"] = message;
-    payload["code"] = code;
-    payload["retryable"] = NativeErrors::IsRetryable(code);
-    return payload.dump();
+    return McpEnvelope::NormalizeError(message);
 }
 
 class NativeUndoTransaction {
@@ -259,26 +235,14 @@ private:
 struct DirectModeGuard {
     bool active;
     bool previous;
-    DirectModeGuard(bool enable) : active(enable), previous(MainThreadExecutor::IsDirectMode()) {
-        if (active) MainThreadExecutor::EnableDirectMode();
+    DirectModeGuard(bool enable) : active(enable), previous(HostExecutor::IsDirectMode()) {
+        if (active) HostExecutor::EnableDirectMode();
     }
     ~DirectModeGuard() {
         if (!active) return;
-        if (previous) MainThreadExecutor::EnableDirectMode();
-        else MainThreadExecutor::DisableDirectMode();
+        if (previous) HostExecutor::EnableDirectMode();
+        else HostExecutor::DisableDirectMode();
     }
-};
-
-// RAII guard — names the main-thread work this request submits (health shows
-// whose request, and which cmd type, is queued or running). Restores the outer
-// label so a nested Dispatch does not clear it.
-struct ExecutorLabelGuard {
-    MainThreadExecutor::WorkLabel previous;
-    explicit ExecutorLabelGuard(const MainThreadExecutor::WorkLabel& label)
-        : previous(MainThreadExecutor::ThreadLabel()) {
-        MainThreadExecutor::SetThreadLabel(label);
-    }
-    ~ExecutorLabelGuard() { MainThreadExecutor::SetThreadLabel(previous); }
 };
 
 // ── UTF-8 <-> Wide helpers ──────────────────────────────────────
@@ -310,24 +274,16 @@ static std::string BuildResponse(
     const std::string& request_id,
     const std::string& cmd_type,
     int duration_ms) {
-
-    json resp;
-    resp["success"] = success;
-    resp["requestId"] = request_id;
-    resp["result"] = result;
-    resp["error"] = error;
-    resp["meta"] = {
-        {"protocolVersion", 2},
-        {"cmdType", cmd_type},
-        {"safeMode", IsSafeModeEnabled()},
-        {"durationMs", duration_ms},
-        {"transport", "namedpipe"},
-        {"threadMode", MainThreadExecutor::IsDirectMode() ? "direct" : "mainThread"}
-    };
-    // Every response reports dialogs blocking Max, whoever opened them.
-    json dialogs = DialogWatch::OpenDialogs();
-    if (!dialogs.empty()) resp["meta"]["openDialogs"] = std::move(dialogs);
-    if (!tl_quiet_override.empty()) resp["meta"]["quietOverride"] = tl_quiet_override;
+    // Same envelope as the shell's own answers (response_envelope.h).
+    const bool safe_mode = IsSafeModeEnabled();
+    const bool direct = HostExecutor::IsDirectMode();
+    std::string response = McpEnvelope::Build(success, result, error, request_id, cmd_type, duration_ms,
+                                              safe_mode, direct, McpHost::DialogWatch::OpenDialogs());
+    if (tl_quiet_override.empty()) return response;
+    // A script ran with Max's quiet mode off although the caller left quiet
+    // unset (#12). Rare, so the envelope is reparsed only then.
+    json resp = json::parse(response);
+    resp["meta"]["quietOverride"] = tl_quiet_override;
     return resp.dump();
 }
 
@@ -351,24 +307,43 @@ static bool ContainsBlockedCommand(const std::string& cmd) {
     return false;
 }
 
+static void RejectBlockedScript(const std::string& script) {
+    if (IsSafeModeEnabled() && ContainsBlockedCommand(script)) {
+        throw std::runtime_error("Blocked by safe mode: command contains a restricted function. Set safe_mode=false in %LOCALAPPDATA%\\3dsmax-mcp\\mcp_config.ini to disable.");
+    }
+}
+
+// Native payloads that carry MAXScript get the maxscript route's screen. The
+// decoded strings are checked: JSON escapes can spell a blocked name.
+static void RejectBlockedPayloadScripts(const std::string& command, std::initializer_list<const char*> keys) {
+    if (!IsSafeModeEnabled()) return;
+    json payload = json::parse(command, nullptr, false);
+    if (!payload.is_object()) return;
+    for (const char* key : keys) {
+        auto it = payload.find(key);
+        if (it != payload.end() && it->type() == json::value_t::string)
+            RejectBlockedScript(it->get<std::string>());
+    }
+}
+
 // ── MAXScript handler ───────────────────────────────────────────
 static std::string HandleMaxScript(
     const std::string& command,
-    MCPBridgeGUP* gup,
     bool quiet) {
 
-    if (IsSafeModeEnabled() && ContainsBlockedCommand(command)) {
-        throw std::runtime_error("Blocked by safe mode: command contains a restricted function. Set safe_mode=false in %LOCALAPPDATA%\\3dsmax-mcp\\mcp_config.ini to disable.");
-    }
+    RejectBlockedScript(command);
 
-    return gup->GetExecutor().ExecuteSync([&command, quiet]() -> std::string {
+    // MAXScript runs on Max's main thread only, whatever the thread mode.
+    return McpHost::RunOnMainThread([&command, quiet]() -> std::string {
+        HandlerHelpers::RequireMaxScriptThread();
         // Quiet mode lets prompts take their defaults, as batch scripts expect.
         // quiet=false forces quiet mode off for the script (restored after),
         // even if a plugin or script left Max quiet, so prompts reach the
         // agent as blocking dialogs (#12). Only the main thread changes the
-        // process-wide flag. quietErrors keeps errors textual either way.
+        // process-wide flag; this lambda always runs there.
+        // quietErrors keeps errors textual either way.
         std::optional<TempQuietMode> quiet_mode;
-        if (MainThreadExecutor::IsMainThread()) quiet_mode.emplace(quiet ? TRUE : FALSE);
+        quiet_mode.emplace(quiet ? TRUE : FALSE);
         std::wstring wcmd = HandlerHelpers::WrapForErrorCapture(
             HandlerHelpers::Utf8ToWide(command));
 
@@ -397,7 +372,7 @@ static std::string HandleMaxScript(
             std::string message = HandlerHelpers::MaxScriptFailureMessage(wcmd, &code, detail);
             throw std::runtime_error(HandlerHelpers::StructuredErrorPayload(code, message));
         }
-        DialogWatch::ThrowIfDismissed();
+        McpHost::DialogWatch::ThrowIfDismissed();
 
         // Convert FPValue to string
         if (fpv.type == TYPE_STRING || fpv.type == TYPE_FILENAME) {
@@ -428,99 +403,6 @@ static std::string HandleMaxScript(
     });
 }
 
-// ── Ping handler ────────────────────────────────────────────────
-static std::string HandlePing(MCPBridgeGUP* gup) {
-    return gup->GetExecutor().ExecuteSync([]() -> std::string {
-        Interface* ip = GetCOREInterface();
-        json result;
-        result["pong"] = true;
-        result["server"] = "3dsmax-mcp-native";
-        result["protocolVersion"] = 2;
-        result["transport"] = "namedpipe";
-        DWORD v = Get3DSMAXVersion();
-        result["maxVersion"] = 1998 + (HIWORD(v) / 1000);
-        return result.dump();
-    });
-}
-
-// ── Health handler (pipe thread only) ───────────────────────────
-// Answers from bookkeeping alone: never posts to the main thread and never
-// calls into the scene (Get3DSMAXVersion is a compile-time constant). Unlike
-// ping it still answers while the main thread is hung, and it says whether an
-// MCP request (this client's or another's) or something outside the bridge
-// holds the main thread.
-static constexpr long long kHeartbeatStaleMs = 3LL * MainThreadExecutor::kHeartbeatMs;
-
-static std::string HandleHealth(MCPBridgeGUP* gup, const std::string& client_session_id) {
-    const MainThreadExecutor::Health ex = gup->GetExecutor().GetHealth();
-    const BridgeHealth::ClientsSnapshot clients = BridgeHealth::Snapshot();
-
-    // -1: the heartbeat timer could not be created; never read that as stale.
-    const bool heartbeatKnown = ex.heartbeat_age_ms >= 0;
-    const bool heartbeatStale = heartbeatKnown && ex.heartbeat_age_ms > kHeartbeatStaleMs;
-    std::string state;
-    if (!ex.initialized) state = "not_initialized";
-    else if (ex.shutting_down) state = "shutting_down";
-    else if (ex.running) state = "busy_mcp";        // a bridge request is executing on it
-    else if (!heartbeatKnown) state = "unknown";    // no heartbeat: callers fall back to ping
-    else if (heartbeatStale) state = "busy_other";  // stopped pumping outside the bridge
-    else state = "responsive";
-
-    json result;
-    result["server"] = "3dsmax-mcp-native";
-#ifdef MCP_BRIDGE_VERSION
-    result["bridgeVersion"] = MCP_BRIDGE_VERSION;
-#endif
-    // 2: posted-message heartbeat (1 used WM_TIMER, which paints and posted
-    // messages starve), request ids on executor items, internal clients.
-    result["healthVersion"] = 2;
-    result["protocolVersion"] = 2;
-    result["transport"] = "namedpipe";
-    result["pid"] = static_cast<unsigned long>(GetCurrentProcessId());
-    DWORD v = Get3DSMAXVersion();
-    result["maxVersion"] = 1998 + (HIWORD(v) / 1000);
-    result["mainThread"] = {
-        {"state", state},
-        {"pumping", heartbeatKnown ? json(!heartbeatStale) : json(nullptr)},
-        {"heartbeatAgeMs", ex.heartbeat_age_ms < 0 ? json(nullptr) : json(ex.heartbeat_age_ms)},
-        {"heartbeatPeriodMs", MainThreadExecutor::kHeartbeatMs},
-        {"windowHung", ex.executor_window_hung},
-    };
-    json running = nullptr;
-    if (ex.running) {
-        running = {{"cmdType", ex.running_label.cmd_type}, {"runningMs", ex.running_ms},
-                   {"clientId", ex.running_label.client_id},
-                   {"requestId", ex.running_label.request_id}};
-    }
-    result["executor"] = {
-        {"running", running},
-        {"queued", ex.queued},
-        {"oldestQueuedMs", ex.queued ? json(ex.oldest_queued_ms) : json(nullptr)},
-        {"oldestQueuedCmd", ex.queued ? json(ex.oldest_queued_label.cmd_type) : json(nullptr)},
-        {"oldestQueuedRequestId", ex.queued ? json(ex.oldest_queued_label.request_id) : json(nullptr)},
-        {"completed", ex.completed},
-        {"shuttingDown", ex.shutting_down},
-    };
-    json inflight = json::array();
-    for (const auto& r : clients.inflight) {
-        inflight.push_back({
-            {"clientId", r.client_id},
-            {"requestId", r.request_id},
-            {"cmdType", r.cmd_type},
-            {"elapsedMs", r.elapsed_ms},
-            {"nested", r.nested},
-            {"internal", r.internal},
-        });
-    }
-    result["clients"] = {
-        {"connected", clients.connected},  // includes the client asking
-        {"totalConnections", clients.total_connections},
-        {"requestingClient", client_session_id},
-        {"inflight", inflight},
-    };
-    return result.dump();
-}
-
 // ── Dispatcher ──────────────────────────────────────────────────
 std::string CommandDispatcher::Dispatch(
     const std::string& json_request,
@@ -528,6 +410,7 @@ std::string CommandDispatcher::Dispatch(
     const std::string& client_session_id) {
 
     auto start = std::chrono::steady_clock::now();
+    tl_quiet_override.clear();  // set below only for this request's script
 
     // Parse request
     json req;
@@ -540,31 +423,10 @@ std::string CommandDispatcher::Dispatch(
     std::string command = req.value("command", "");
     std::string cmd_type = req.value("type", "maxscript");
     std::string request_id = req.value("requestId", "");
-    tl_quiet_override.clear();
-
-    // health runs here on the pipe thread, ahead of every main-thread path and
-    // outside both request registries (it would only ever report itself).
-    if (cmd_type == "health") {
-        DirectModeGuard pipeThread(true);  // reported as threadMode "direct"
-        try {
-            std::string result = HandleHealth(gup, client_session_id);
-            int ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            return BuildResponse(true, result, "", request_id, cmd_type, ms);
-        } catch (const std::exception& e) {
-            return BuildResponse(false, "", NormalizeNativeError(e.what()), request_id, cmd_type, 0);
-        }
-    }
-    DialogWatch::RequestContext request_context(request_id, cmd_type);
-    // native:max_dialogs is a control request like health: it never reaches the
-    // main thread, and listing the client's 1 s dialog polls as in-flight work
-    // would misreport them as other clients' requests.
-    std::optional<BridgeHealth::RequestScope> inflight;
-    std::optional<ExecutorLabelGuard> label;
-    if (cmd_type != "native:max_dialogs") {
-        inflight.emplace(client_session_id, request_id, cmd_type);
-        label.emplace(MainThreadExecutor::WorkLabel{cmd_type, client_session_id, request_id});
-    }
+    // health and native:max_dialogs never reach the core: the shell answers
+    // them on the pipe thread, and labels every core request for health
+    // (core_control.cpp).
+    McpHost::DialogWatch::RequestContext request_context(request_id, cmd_type);
 
     // Route to handler — read-only handlers run directly on pipe thread
     // _forceMainThread flag allows benchmarking the same handler both ways
@@ -572,19 +434,14 @@ std::string CommandDispatcher::Dispatch(
     // A Dispatch nested on the main thread (invoke_tool, run_tool_smoke) is
     // already where main-thread work runs: direct mode would only make it look
     // like a pipe thread (no quiet mode, no compile check, threadMode "direct").
-    bool direct = !forceMain && IsDirectHandler(cmd_type) && !MainThreadExecutor::IsMainThread();
+    bool direct = !forceMain && IsDirectHandler(cmd_type) && !HostExecutor::IsMainThread();
     DirectModeGuard dmg(direct);
 
     try {
         auto invoke = [&]() -> std::string {
         std::string result;
 
-        if (cmd_type == "native:max_dialogs") {
-            // No ExecuteSync, SDK calls, undo hold, or blocked command's pipe.
-            result = DialogWatch::Control(command);
-        } else if (cmd_type == "ping") {
-            result = HandlePing(gup);
-        } else if (cmd_type == "native:plugin_inspect") {
+        if (cmd_type == "native:plugin_inspect") {
             result = NativeHandlers::PluginInspect(command, gup);
         } else if (cmd_type == "native:plugin_patch") {
             result = NativeHandlers::PluginPatch(command, gup);
@@ -602,7 +459,7 @@ std::string CommandDispatcher::Dispatch(
             bool overridden = false;
             const bool quiet = QuietPolicy::ResolveQuiet(command, explicitQuiet, &overridden);
             if (overridden) tl_quiet_override = "file_command";
-            result = HandleMaxScript(command, gup, quiet);
+            result = HandleMaxScript(command, quiet);
         // Native handlers
         } else if (cmd_type == "native:scene_info") {
             result = NativeHandlers::SceneInfo(command, gup);
@@ -626,6 +483,11 @@ std::string CommandDispatcher::Dispatch(
             result = NativeHandlers::SceneQAScan(command, gup);
         } else if (cmd_type == "native:scene_qa_fix") {
             result = NativeHandlers::SceneQAFix(command, gup);
+        } else if (cmd_type == "native:mesh_script") {
+            RejectBlockedPayloadScripts(command, {"resolve", "script", "finish"});
+            result = NativeHandlers::MeshScript(command, gup);
+        } else if (cmd_type == "native:geometry_snapshot") {
+            result = NativeHandlers::GeometrySnapshot(command, gup);
         // Phase 1: Object operations
         } else if (cmd_type == "native:get_object_properties") {
             result = NativeHandlers::GetObjectProperties(command, gup);
@@ -844,7 +706,9 @@ std::string CommandDispatcher::Dispatch(
         std::string result;
         // scene_patch owns a strict hold so it can reject an already-open user
         // transaction and report rollback only after Cancel() has completed.
-        const bool handlerOwnsTransaction = cmd_type == "native:scene_patch" || cmd_type == "native:plugin_patch";
+        // mesh_script opens its labeled hold for edits only; reads open none.
+        const bool handlerOwnsTransaction = cmd_type == "native:scene_patch" ||
+            cmd_type == "native:plugin_patch" || cmd_type == "native:mesh_script";
         const bool transact =
             IsMutatingNativeHandler(cmd_type) &&
             !CommandDispatcher::Detail::RequestIsDryRunOrPreview(cmd_type, command) &&
@@ -855,7 +719,7 @@ std::string CommandDispatcher::Dispatch(
             result = gup->GetExecutor().ExecuteSync([&]() -> std::string {
                 NativeUndoTransaction tx(cmd_type);
                 std::string inner = invoke();
-                DialogWatch::ThrowIfDismissed();
+                McpHost::DialogWatch::ThrowIfDismissed();
                 if (ResultLooksLikeError(inner)) {
                     tx.Cancel();
                 } else {

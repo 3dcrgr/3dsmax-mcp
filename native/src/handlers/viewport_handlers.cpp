@@ -1,9 +1,7 @@
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
-#include "mcp_bridge/bridge_gup.h"
-#include "mcp_bridge/gdiplus_runtime.h"
+#include "mcp_bridge/core_bridge.h"
 #include "mcp_bridge/spatial_snapshot.h"
-#include "mcp_bridge/agent_viewport.h"
 #include "mcp_bridge/capture_region.h"
 #include "mcp_bridge/window_capture.h"
 #include <cwctype>
@@ -33,8 +31,8 @@ std::string NativeHandlers::AgentViewportCommand(const std::string& params, MCPB
     if(action=="capture_multi") return CaptureMultiView(p.dump(),gup);
     return gup->GetExecutor().ExecuteSync([params]() {
         json p=json::parse(params);
-        if(p.value("action","")=="set" && !AgentViewport::IsRequested(p)) return json({{"handled",false}}).dump();
-        return AgentViewport::Execute(p).dump();
+        if(p.value("action","")=="set" && !McpHost::AgentViewport::IsRequested(p)) return json({{"handled",false}}).dump();
+        return McpHost::AgentViewport::Execute(p).dump();
     });
 }
 
@@ -448,7 +446,7 @@ private:
 
 // ── native:capture_multi_view ───────────────────────────────
 std::string NativeHandlers::CaptureMultiViewMainThread(const std::string& params) {
-    if (!GdiPlusRuntime::EnsureStarted())
+    if (!McpHost::GdiPlusRuntime::EnsureStarted())
         throw std::runtime_error("GDI+ initialization failed");
 
     json p = json::parse(params, nullptr, false);
@@ -471,8 +469,8 @@ std::string NativeHandlers::CaptureMultiViewMainThread(const std::string& params
     Interface* ip = GetCOREInterface();
     TimeValue t = ip->GetTime();
 
-    const bool agent=AgentViewport::IsRequested(p);
-    ViewExp& vp = agent ? AgentViewport::Get() : ip->GetActiveViewExp();
+    const bool agent=McpHost::AgentViewport::IsRequested(p);
+    ViewExp& vp = agent ? McpHost::AgentViewport::Get() : ip->GetActiveViewExp();
     Matrix3 savedTM;
     vp.GetAffineTM(savedTM);
 
@@ -546,7 +544,7 @@ std::string NativeHandlers::CaptureMultiViewMainThread(const std::string& params
         }
 
         const std::vector<INode*> matches =
-            CollectNodesByExactName(requestedRoot);
+            CollectNodesByName(requestedRoot);
         if (matches.empty()) {
             throw std::runtime_error(
                 "frame_root not found: " + requestedRoot);
@@ -571,12 +569,12 @@ std::string NativeHandlers::CaptureMultiViewMainThread(const std::string& params
     }
 
     std::unique_ptr<MultiViewStateGuard> stateGuard;
-    std::unique_ptr<AgentViewport::CameraState> agentState;
-    if(agent) agentState=std::make_unique<AgentViewport::CameraState>(AgentViewport::SaveCamera());
+    std::unique_ptr<McpHost::AgentViewport::CameraState> agentState;
+    if(agent) agentState=std::make_unique<McpHost::AgentViewport::CameraState>(McpHost::AgentViewport::SaveCamera());
     else stateGuard=std::make_unique<MultiViewStateGuard>(ip,vp,sceneNodes);
     struct RestoreAgent {
-        std::unique_ptr<AgentViewport::CameraState>& state;
-        ~RestoreAgent() { if(state) try { AgentViewport::RestoreCamera(*state); } catch(...) {} }
+        std::unique_ptr<McpHost::AgentViewport::CameraState>& state;
+        ~RestoreAgent() { if(state) try { McpHost::AgentViewport::RestoreCamera(*state); } catch(...) {} }
     } restoreAgent{agentState};
     if (framedRoot != nullptr && !agent) {
         const std::unordered_set<INode*> framedNodeSet(
@@ -594,8 +592,8 @@ std::string NativeHandlers::CaptureMultiViewMainThread(const std::string& params
         if(agent) {
             json config={{"view",view.name},{"frame_all",true},{"fov",45}};
             if(framedRoot) config["frame_names"]={framedRootName};
-            AgentViewport::Configure(config);
-            agentViews.push_back(AgentViewport::Snapshot());
+            McpHost::AgentViewport::Configure(config);
+            agentViews.push_back(McpHost::AgentViewport::Snapshot());
         } else {
         // Set viewport orientation via SDK (no MAXScript needed)
         if (!view.persp) {
@@ -619,9 +617,9 @@ std::string NativeHandlers::CaptureMultiViewMainThread(const std::string& params
         }
 
         // Capture
-        ViewExp& activeVP = agent ? AgentViewport::Get() : ip->GetActiveViewExp();
+        ViewExp& activeVP = agent ? McpHost::AgentViewport::Get() : ip->GetActiveViewExp();
         auto captured=CaptureViewportImage(activeVP,captureMethod);
-        if(agent && AgentViewport::Snapshot().at("view_token")!=agentViews.back().at("view_token"))
+        if(agent && McpHost::AgentViewport::Snapshot().at("view_token")!=agentViews.back().at("view_token"))
             throw std::runtime_error("STALE_VIEW: agent view changed during capture");
         captureMethods.push_back(captured.method);
         std::unique_ptr<Gdiplus::Bitmap> bmp(std::move(captured.bitmap));
@@ -641,7 +639,7 @@ std::string NativeHandlers::CaptureMultiViewMainThread(const std::string& params
     // Keep the state mutation window short. The guard remains armed for
     // every exceptional exit and Restore is idempotent.
     if(stateGuard) stateGuard->Restore();
-    if(agentState) { AgentViewport::RestoreCamera(*agentState); agentState.reset(); }
+    if(agentState) { McpHost::AgentViewport::RestoreCamera(*agentState); agentState.reset(); }
 
     // Determine grid layout
     int cols, rows;
@@ -736,7 +734,7 @@ std::string NativeHandlers::CaptureMultiViewMainThread(const std::string& params
     result["capture_methods"]=captureMethods;
     if(agent) {
         result["agent_views"]=agentViews;
-        result["restored_agent_viewport"]=AgentViewport::Snapshot();
+        result["restored_agent_viewport"]=McpHost::AgentViewport::Snapshot();
     }
     result["isolation_applied"]=framedRoot!=nullptr && !agent;
     result["framed_root"] =
@@ -767,7 +765,7 @@ static std::string SaveBitmapToTemp(Gdiplus::Bitmap* bmp, const wchar_t* filenam
 
 // ── native:capture_viewport ─────────────────────────────────
 std::string NativeHandlers::CaptureViewportMainThread(const std::string& params) {
-    if (!GdiPlusRuntime::EnsureStarted())
+    if (!McpHost::GdiPlusRuntime::EnsureStarted())
         throw std::runtime_error("GDI+ initialization failed");
 
     json p = json::parse(params, nullptr, false);
@@ -780,17 +778,17 @@ std::string NativeHandlers::CaptureViewportMainThread(const std::string& params)
         throw std::runtime_error("Capture dimensions must be between 0 and 8192");
 
     Interface* ip = GetCOREInterface();
-    const bool agent=AgentViewport::IsRequested(p);
+    const bool agent=McpHost::AgentViewport::IsRequested(p);
     if(agent && p.contains("expected_view")) {
-        auto state=AgentViewport::Snapshot();
+        auto state=McpHost::AgentViewport::Snapshot();
         if(p.at("expected_view")!=state.at("view_token")) throw std::runtime_error("STALE_VIEW: capture again before targeting");
     }
-    if(agent) AgentViewport::Redraw(); else ip->ForceCompleteRedraw(FALSE);
+    if(agent) McpHost::AgentViewport::Redraw(); else ip->ForceCompleteRedraw(FALSE);
 
-    ViewExp& vp = agent ? AgentViewport::Get() : ip->GetActiveViewExp();
-    const auto captureView=agent ? AgentViewport::Snapshot().at("view_token") : json(nullptr);
+    ViewExp& vp = agent ? McpHost::AgentViewport::Get() : ip->GetActiveViewExp();
+    const auto captureView=agent ? McpHost::AgentViewport::Snapshot().at("view_token") : json(nullptr);
     auto captured=CaptureViewportImage(vp,captureMethod);
-    if(agent && AgentViewport::Snapshot().at("view_token")!=captureView)
+    if(agent && McpHost::AgentViewport::Snapshot().at("view_token")!=captureView)
         throw std::runtime_error("STALE_VIEW: agent view changed during capture");
     Gdiplus::Bitmap* bmp = captured.bitmap.release();
     if (!bmp) throw std::runtime_error("Failed to capture viewport DIB");
@@ -806,7 +804,7 @@ std::string NativeHandlers::CaptureViewportMainThread(const std::string& params)
             if(labels.type()!=json::value_t::array || labels.size()>100) throw std::runtime_error("At most 100 labels allowed");
             json points=json::array();
             for(const auto& item:labels) points.push_back(item.at("point"));
-            auto projected=AgentViewport::Project(points);
+            auto projected=McpHost::AgentViewport::Project(points);
             Gdiplus::FontFamily family(L"Arial");
             Gdiplus::Font font(&family,16,Gdiplus::FontStyleBold,Gdiplus::UnitPixel);
             Gdiplus::SolidBrush ink(Gdiplus::Color(255,255,225,65));
@@ -847,7 +845,7 @@ std::string NativeHandlers::CaptureViewportMainThread(const std::string& params)
     result["capture_contract"]="viewport_capture_v2";
     result["capture_method"]=captured.method;
     result["occlusion_free"]=true;
-    if(agent) result["agent_viewport"]=AgentViewport::Snapshot();
+    if(agent) result["agent_viewport"]=McpHost::AgentViewport::Snapshot();
     auto serialized=result.dump();
     outputFile.Keep();
     return serialized;
@@ -911,7 +909,7 @@ struct ScreenPixels {
 }
 
 std::string NativeHandlers::CaptureScreen(const std::string& params, MCPBridgeGUP* /*gup*/) {
-    if(!GdiPlusRuntime::EnsureStarted()) throw std::runtime_error("GDI+ initialization failed");
+    if(!McpHost::GdiPlusRuntime::EnsureStarted()) throw std::runtime_error("GDI+ initialization failed");
     const json p=json::parse(params);
     if(!p.is_object()) throw std::runtime_error("Expected object payload");
     const std::string target=p.value("target","screen");
