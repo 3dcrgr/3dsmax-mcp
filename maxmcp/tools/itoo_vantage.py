@@ -358,7 +358,8 @@ if wanted.count == 0 then (
     )
 ) else (
     for w in wanted do (
-        local found = getNodeByName (ivDec w) exact:true all:true
+        local found = getNodeByName (ivDec w) exact:true ignoreCase:false all:true
+        if found.count == 0 do found = getNodeByName (ivDec w) exact:true ignoreCase:true all:true
         if found.count == 0 do format "MISS|%\n" w to:ss
         for o in found do (
             local c = (classOf o.baseobject) as string

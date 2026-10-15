@@ -1314,7 +1314,8 @@ undo "MCP Forest validate fix" on (
                 for i = 1 to n do (
                     if i > c0 or (findItem op[2] i) > 0 do (
                         local nm = if i <= cn.count and cn[i] != undefined and cn[i] != "" then (cn[i] as string) else (nl[i] as string)
-                        local hits = getNodeByName nm exact:true all:true
+                        local hits = getNodeByName nm exact:true ignoreCase:false all:true
+                        if hits.count == 0 do hits = getNodeByName nm exact:true ignoreCase:true all:true
                         local pick = undefined
                         if hits.count == 1 and superclassOf hits[1] == GeometryClass and classOf hits[1].baseObject != Forest_Pro do pick = hits[1]
                         if pick != undefined do relinked += 1

@@ -160,7 +160,9 @@ fn fpOffTM src = (scaleMatrix src.objectOffsetScale) * (src.objectOffsetRot as m
 fn fpBusy = (theHold.Holding() or theHold.IsSuspended() or theHold.SuperLevel() != 0)
 fn fpNode b64 = (
     local wanted = fpDec b64
-    local hits = getNodeByName wanted exact:true all:true
+    -- Exact case first, then any case: the rule upstream's node_by_name_expr applies.
+    local hits = getNodeByName wanted exact:true ignoreCase:false all:true
+    if hits.count == 0 do hits = getNodeByName wanted exact:true ignoreCase:true all:true
     if hits.count == 0 do throw ("NOT_FOUND: no object is named '" + wanted + "'")
     if hits.count > 1 do throw ("AMBIGUOUS: " + (hits.count as string) + " objects are named '" + wanted + "'; rename them first")
     hits[1]

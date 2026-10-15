@@ -638,7 +638,8 @@ fn iaEffectNode text handle = (
         if not isValidNode n or n.name!=wanted do throw "STALE_NODE_REFERENCE: refresh node identity"
         n
     ) else (
-        local nodes=getNodeByName wanted exact:true all:true
+        local nodes=getNodeByName wanted exact:true ignoreCase:false all:true
+        if nodes.count==0 do nodes=getNodeByName wanted exact:true ignoreCase:true all:true
         if nodes==undefined or nodes.count!=1 do throw "NODE_NOT_UNIQUE: use a name/handle identity"
         nodes[1]
     )
@@ -1325,7 +1326,9 @@ def _literal(value: Any, typ: str) -> str:
 
 _SLOT_LIB = r'''
 fn iaNode text = (
-    local hits = getNodeByName (rcDecode text) exact:true all:true
+    local wanted = rcDecode text
+    local hits = getNodeByName wanted exact:true ignoreCase:false all:true
+    if hits.count == 0 do hits = getNodeByName wanted exact:true ignoreCase:true all:true
     if hits.count != 1 do throw "NODE_NOT_UNIQUE: source must exist with a unique name"
     hits[1]
 )
