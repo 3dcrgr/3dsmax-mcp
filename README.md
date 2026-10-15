@@ -183,7 +183,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `backup_material_library` | Save temporary/scratch material libraries to `.mat` files |
 | `get_material_slots` | Compact slot/property readback for a material |
 | `inspect_material_network` | Semantic material graph, wired slots, texture manifest, health checks |
-| `material_roles` | Texture sources per material slot, including shared maps, composites and submaterials; advisory filename mismatches and missing files |
+| `material_roles` | Texture sources per material slot, including shared maps, composites and submaterials; advisory filename mismatches and missing files; flags maps whose file path can't be read |
 | `replicate_material` | Preview/apply structure-preserving material clone and texture remap |
 | `assign_material` | Create a material and assign it to objects |
 | `set_material_property` | Set one property on an object's material |
@@ -194,7 +194,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `create_material_from_textures` | Build a fully wired PBR material from texture files |
 | `create_shell_material` | Wrap any render + export materials in Shell Material (dual pipeline) |
 | `write_osl_shader` | Write OSL to disk and compile an OSLMap |
-| `replace_material` | Swap one material for another on all users |
+| `replace_material` | Put a source material wherever a target is used, on objects and in sub-material slots; the source can come from a slot, the Material Editor or the material library |
 | `batch_replace_materials` | Batch material replacement |
 | `palette_laydown` | Fill Material Editor palette slots from a texture folder |
 | `smart_import` | Batch-import meshes from a folder with auto PBR assignment |

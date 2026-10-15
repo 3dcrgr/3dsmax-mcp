@@ -20,7 +20,8 @@ def material_roles(names: list[str] | None = None, scan_scene: bool = False,
     renderer modes before changing anything. Mask inputs are identified separately.
     only_problems retains missing files, mismatches, warnings and incomplete reads.
     Follow next_offset for more results; pages are stable while the scene is unchanged.
-    complete=false means there are unread pages, failed targets or a truncated graph.
+    complete=false means there are unread pages, failed targets, a truncated graph or
+    an image map whose path could not be read (FILE_PATH_UNREADABLE warning).
     Increase depth/max_nodes for truncated graphs. Use inspect_material_network for
     parameter values. Requires a native bridge supporting graphVersion 2 connections.
     """
