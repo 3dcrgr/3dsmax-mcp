@@ -23,6 +23,12 @@ struct QtBackend {
 void Start(QtBackend qt = {});
 void Stop();
 
+// Optional. Returns false while Max's main thread is known not to retrieve
+// posted messages (e.g. blocked inside its own SendMessage). Qt reads and
+// presses then fail at once instead of sending into that thread, where they
+// would run re-entrantly inside the blocked call.
+void SetMainThreadPumping(std::function<bool()> pumping);
+
 // One bridge request, for the lifetime of its dispatch on a pipe worker.
 struct RequestContext {
     RequestContext(const std::string& request, const std::string& command);
@@ -55,7 +61,19 @@ private:
 };
 
 // Call before committing a transaction, and after returning from MAXScript.
+// Waits for an acknowledgment still being published.
 void ThrowIfDismissed();
+
+// Within its scope ThrowIfDismissed does not throw on this thread, so cleanup
+// that runs several scripts (restoring leased settings) finishes after an
+// acknowledged error. The operation still fails with MAX_DIALOG_ERROR when its
+// Guard finishes, and a transaction checks again before committing.
+struct DeferDismissed {
+    DeferDismissed();
+    ~DeferDismissed();
+    DeferDismissed(const DeferDismissed&) = delete;
+    DeferDismissed& operator=(const DeferDismissed&) = delete;
+};
 
 // Open blocking dialogs from window-manager state only, for response metadata.
 nlohmann::json OpenDialogs();

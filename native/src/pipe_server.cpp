@@ -1,4 +1,5 @@
 #include "mcp_bridge/pipe_server.h"
+#include "mcp_bridge/bridge_health.h"
 #include "mcp_bridge/core_api.h"
 #include "mcp_bridge/core_host.h"
 
@@ -137,6 +138,8 @@ void PipeServer::HandleClient(HANDLE pipe) {
     static std::atomic<unsigned long long> next_client_id{1};
     const std::string client_id =
         "pipe-" + std::to_string(next_client_id.fetch_add(1));
+    // health's client registry (bridge_health.h): connected clients and their requests.
+    BridgeHealth::ClientConnected(client_id);
 
     // One operation at a time per client, so one OVERLAPPED serves them all.
     OVERLAPPED io = {};
@@ -144,7 +147,8 @@ void PipeServer::HandleClient(HANDLE pipe) {
 
     while (running_.load()) {
         std::string request = ReadRequest(pipe, io);
-        if (request.empty()) break;
+        // A request whose read completed as Stop() began is not dispatched.
+        if (request.empty() || !running_.load()) break;
 
         std::string response;
         try {
@@ -160,6 +164,7 @@ void PipeServer::HandleClient(HANDLE pipe) {
 
     if (io.hEvent) CloseHandle(io.hEvent);
     CoreHost::ReleaseSession(client_id);
+    BridgeHealth::ClientDisconnected(client_id);
 }
 
 std::string PipeServer::ReadRequest(HANDLE pipe, OVERLAPPED& io) {

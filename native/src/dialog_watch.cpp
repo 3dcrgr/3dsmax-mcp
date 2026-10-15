@@ -40,8 +40,12 @@ constexpr int kAutoLimit = 8;
 // window that a later modal dialog happened to block, not the dialog itself.
 constexpr auto kModalGrace = std::chrono::milliseconds(1000);
 
+// Longest ThrowIfDismissed waits for an acknowledgment in flight to publish.
+constexpr auto kPublishWait = std::chrono::milliseconds(3000);
+
 thread_local std::string request_id, command_type;
 thread_local std::shared_ptr<Session> current;
+thread_local int defer_depth = 0;
 
 struct Request { std::string command, state; DWORD thread; Clock::time_point since; };
 struct Open {
@@ -69,6 +73,8 @@ DWORD main_thread = 0;
 HWND lane = nullptr;
 WPARAM lane_cookie = 0;
 QtBackend qt;
+std::mutex pumping_mutex;
+std::function<bool()> main_pumping;
 std::mutex monitor_mutex;
 std::condition_variable monitor_wake;
 bool monitor_stop = false;
@@ -78,8 +84,12 @@ std::atomic<unsigned> controller_closed{0};
 
 std::mutex text_mutex;
 // A timed-out in-process WM_GETTEXT may still execute later. Keep its buffer
-// alive rather than letting a late window procedure write into freed memory.
-std::vector<std::unique_ptr<wchar_t[]>> pending_text;
+// alive rather than letting a late window procedure write into freed memory,
+// until its window is destroyed: a message to a destroyed window is never
+// delivered. Capped per window, so one hung field cannot disable the others.
+struct PendingText { HWND hwnd; std::unique_ptr<wchar_t[]> buffer; };
+std::vector<PendingText> pending_text;
+constexpr size_t kPendingPerWindow = 4, kPendingTotal = 256;
 
 // Structured errors keep their code through the dispatcher.
 [[noreturn]] void Fail(const char* code, const std::string& message, bool retryable = false) {
@@ -124,6 +134,37 @@ std::string InternalText(HWND hwnd, bool* truncated = nullptr) {
 
 bool IsQt(const std::string& cls) {
     return cls.rfind("Qt", 0) == 0 && cls.find("QWindow") != std::string::npos;
+}
+
+// Modeless tool windows that a modal dialog elsewhere can leave enabled above a
+// disabled owner. They are never blocking dialogs, and some must never be
+// messaged: a Chaos Cosmos browser may belong to a deadlocked importer thread,
+// and closing or activating the Material Editor around a Cosmos import
+// deadlocked Max. Window-manager title only; no message is sent.
+bool ToolWindow(HWND hwnd) {
+    const std::string title = InternalText(hwnd);
+    auto starts = [&title](const char* prefix) { return title.rfind(prefix, 0) == 0; };
+    return title == "Chaos Cosmos Browser" || title == "Material Editor" || starts("Material Editor - ") ||
+        starts("Slate Material Editor") || starts("AGENT VIEWPORT") || starts("Floating Viewport");
+}
+
+// Only dialogs on Max's main thread are read or pressed. Another thread's
+// window may belong to a thread that is itself hung (the Cosmos importer's),
+// and a Qt widget may only be touched from the thread that owns it.
+bool OnMainThread(HWND hwnd) {
+    return main_thread != 0 && GetWindowThreadProcessId(hwnd, nullptr) == main_thread;
+}
+constexpr char kNotMainThread[] = "not on Max's main thread, so it is not read or pressed (its thread may be hung); "
+                                  "the user can answer it in Max";
+constexpr char kNotPumping[] = "Max's main thread is not processing messages";
+
+bool MainThreadPumping() {
+    std::function<bool()> pumping;
+    {
+        std::lock_guard<std::mutex> lock(pumping_mutex);
+        pumping = main_pumping;
+    }
+    try { return !pumping || pumping(); } catch (...) { return true; }
 }
 
 std::string Lower(std::string text) {
@@ -171,12 +212,17 @@ std::string Token(const std::string& id, const json& snapshot) {
 // cross-thread message read has a timeout.
 bool MessageText(HWND hwnd, std::string& text) {
     std::lock_guard<std::mutex> lock(text_mutex);
-    if (GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId() || pending_text.size() >= 64) return false;
+    if (GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId()) return false;
+    pending_text.erase(std::remove_if(pending_text.begin(), pending_text.end(),
+        [](const PendingText& entry) { return !IsWindow(entry.hwnd); }), pending_text.end());
+    const auto for_window = std::count_if(pending_text.begin(), pending_text.end(),
+        [hwnd](const PendingText& entry) { return entry.hwnd == hwnd; });
+    if (static_cast<size_t>(for_window) >= kPendingPerWindow || pending_text.size() >= kPendingTotal) return false;
     auto buffer = std::make_unique<wchar_t[]>(4096);
     DWORD_PTR count = 0;
     if (!SendMessageTimeoutW(hwnd, WM_GETTEXT, 4096, reinterpret_cast<LPARAM>(buffer.get()),
             SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT, 40, &count)) {
-        pending_text.push_back(std::move(buffer));
+        pending_text.push_back({hwnd, std::move(buffer)});
         return false;
     }
     text = Utf8(buffer.get());
@@ -200,10 +246,15 @@ std::vector<HWND> Windows() {
 // Qt widgets are only readable on Max's main thread. A modal dialog runs a
 // nested message loop there, so a message-only window receives work even
 // while an MCP operation is blocked inside that dialog.
+// A sent task that its caller gave up on is withdrawn unless the lane already
+// started it, so a late delivery does nothing (a press reported as not made
+// never clicks afterwards).
+enum LaneState : int { kLaneQueued, kLaneStarted, kLaneWithdrawn };
 struct LaneTask {
     std::function<json()> work;
     json result;
     std::string error;
+    std::atomic<int> state{kLaneQueued};
 };
 
 LRESULT CALLBACK LaneProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -211,6 +262,8 @@ LRESULT CALLBACK LaneProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* raw = reinterpret_cast<std::shared_ptr<LaneTask>*>(lp);
         std::shared_ptr<LaneTask> task = std::move(*raw);
         delete raw;
+        int queued = kLaneQueued;
+        if (!task->state.compare_exchange_strong(queued, kLaneStarted)) return 1;  // withdrawn
         try { task->result = task->work(); }
         catch (const std::exception& e) { task->error = e.what(); }
         catch (...) { task->error = "Unknown dialog lane error"; }
@@ -222,14 +275,26 @@ LRESULT CALLBACK LaneProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 json RunOnMain(std::function<json()> work, DWORD timeout_ms) {
     if (!lane) Fail("DIALOG_LANE_UNAVAILABLE", "the dialog monitor is not running");
     if (GetCurrentThreadId() == main_thread) return work();
+    // A main thread that stops retrieving posted messages is not in a dialog's
+    // loop; a sent message would only run inside whatever call blocks it.
+    // The heartbeat notices that only after a few periods (up to ~3 s), so in
+    // that window a read can still run inside such a call. Reads only read,
+    // and presses are posted (PostOnMain), so neither ever acts there.
+    if (!MainThreadPumping()) Fail("MAIN_THREAD_BUSY", kNotPumping, true);
     auto task = std::make_shared<LaneTask>();
     task->work = std::move(work);
     auto* raw = new std::shared_ptr<LaneTask>(task);
     DWORD_PTR ignored = 0;
-    // On timeout the message may still run later; the lane then frees raw.
+    // On timeout the message may still be delivered later; the lane then frees
+    // raw. Withdraw it so it does nothing then; only a task the lane already
+    // started can still act, and its caller is told the outcome is unknown.
     if (!SendMessageTimeoutW(lane, kLaneSend, lane_cookie, reinterpret_cast<LPARAM>(raw),
-            SMTO_ABORTIFHUNG | SMTO_BLOCK, timeout_ms, &ignored))
-        Fail("MAIN_THREAD_BUSY", "Max's main thread is not processing messages", true);
+            SMTO_ABORTIFHUNG | SMTO_BLOCK, timeout_ms, &ignored)) {
+        int queued = kLaneQueued;
+        if (task->state.compare_exchange_strong(queued, kLaneWithdrawn)) Fail("MAIN_THREAD_BUSY", kNotPumping, true);
+        Fail("DIALOG_OUTCOME_UNKNOWN", "Max's main thread started this dialog action but did not finish it in time; "
+             "it may still take effect (a press may still click). Inspect again before responding");
+    }
     if (!task->error.empty()) throw std::runtime_error(task->error);
     return task->result;
 }
@@ -346,6 +411,7 @@ json Win32Snapshot(HWND hwnd, std::vector<HWND>* button_windows = nullptr) {
 }
 
 json Snapshot(HWND hwnd, const std::string& cls, DWORD timeout_ms = 1500) {
+    if (!OnMainThread(hwnd)) return Unreadable(hwnd, cls, kNotMainThread);
     if (!IsQt(cls)) return Win32Snapshot(hwnd);
     if (!qt.snapshot) return Unreadable(hwnd, cls, "Qt dialog reader unavailable in this build");
     try {
@@ -392,6 +458,7 @@ struct Pressed { json snapshot, button; };
 
 // Re-reads the dialog, requires the inspected state, then posts the click.
 Pressed PressButton(HWND hwnd, const std::string& id, const std::string& cls, const std::string& expected, const json& spec) {
+    if (!OnMainThread(hwnd)) Fail("DIALOG_NOT_ON_MAIN_THREAD", std::string("this dialog is ") + kNotMainThread);
     if (IsQt(cls)) {
         if (!qt.snapshot || !qt.click) Fail("DIALOG_UNREADABLE", "Qt dialog support is unavailable in this build");
         json out = RunOnMain([hwnd, id, expected, spec]() -> json {
@@ -407,16 +474,31 @@ Pressed PressButton(HWND hwnd, const std::string& id, const std::string& cls, co
         }, 1500);
         return {out["snapshot"], out["button"]};
     }
+    // Like the Qt path: never queue a click into a main thread that is not
+    // pumping (it would fire whenever Max recovers, maybe minutes later).
+    if (!MainThreadPumping()) Fail("MAIN_THREAD_BUSY", kNotPumping, true);
     std::vector<HWND> controls;
     json snapshot = Win32Snapshot(hwnd, &controls);
     if (Token(id, snapshot) != expected) Fail("STALE_DIALOG", "the dialog changed or closed; inspect again");
     const int index = SelectButton(snapshot, spec);
     const json& button = snapshot["buttons"][index];
     const int control_id = button.value("id", 0);
-    const bool posted = button.value("kind", "") == "push" && control_id > 0
-        ? PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(control_id, BN_CLICKED), reinterpret_cast<LPARAM>(controls[index]))
-        : PostMessageW(controls[index], BM_CLICK, 0, 0);
-    if (!posted) Fail("DIALOG_PRESS_FAILED", "the click could not be posted");
+    const HWND control = controls[index];
+    const bool command = button.value("kind", "") == "push" && control_id > 0;
+    const ULONG_PTR identity = reinterpret_cast<ULONG_PTR>(GetPropW(hwnd, kTokenProperty));
+    // Posted through the lane and checked again when the main thread takes it:
+    // the same dialog instance, the button still enabled inside it.
+    PostOnMain([hwnd, control, control_id, command, identity] {
+        if (!IsWindow(hwnd) || reinterpret_cast<ULONG_PTR>(GetPropW(hwnd, kTokenProperty)) != identity ||
+            !IsWindow(control) || !IsChild(hwnd, control) || !IsWindowEnabled(control)) return;
+        // A button's WM_COMMAND goes to its own parent, which is a nested pane
+        // (e.g. a file dialog's template) rather than the dialog itself.
+        const HWND parent = GetParent(control);
+        if (command && parent)
+            PostMessageW(parent, WM_COMMAND, MAKEWPARAM(control_id, BN_CLICKED), reinterpret_cast<LPARAM>(control));
+        else
+            PostMessageW(control, BM_CLICK, 0, 0);
+    });
     return {snapshot, button};
 }
 
@@ -479,7 +561,7 @@ void Refresh() {
 
     std::set<HWND> blocked, blockers;
     for (HWND hwnd : windows) {
-        if (hwnd == lane || !IsWindowEnabled(hwnd)) continue;
+        if (hwnd == lane || !IsWindowEnabled(hwnd) || ToolWindow(hwnd)) continue;
         HWND blocker = GetWindow(hwnd, GW_OWNER);
         if (blocker) {
             DWORD pid = 0;
@@ -563,24 +645,38 @@ void AutoAcknowledge() {
             ++session->pending;
         }
         json event;
+        bool retry = false;
         try {
             const json snapshot = Snapshot(hwnd, dialog.cls);
-            if (KnownError(snapshot)) {
+            // A Qt read refused (or withdrawn) while the main thread did not take
+            // it is no reading of the dialog: leave it for a later tick.
+            retry = snapshot.value("unavailable", "") == kNotPumping;
+            if (!retry && KnownError(snapshot)) {
                 const Pressed pressed = PressButton(hwnd, dialog.id, dialog.cls, Token(dialog.id, snapshot), 0);
                 event = Event("acknowledged_error", dialog, pressed.snapshot);
                 event["button"] = pressed.button.value("label", "");
                 event["request_id"] = session->request;
                 event["command"] = session->command;
             }
+        } catch (const std::exception& e) {
+            // A press refused because the main thread stopped pumping is retried
+            // on a later tick, like a refused Qt read.
+            retry = Message(e) == kNotPumping;
         } catch (...) { /* Recovery must never terminate Max; inspection remains available. */ }
         {
             // Publish before the operation can finish, so a fast return cannot
             // commit before its error is recorded.
             std::lock_guard<std::mutex> lock(session->mutex);
             if (!event.is_null()) session->events.push_back(event);
+            if (retry) session->attempted.erase(dialog.id);
             --session->pending;
         }
         session->idle.notify_all();
+        if (retry) {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            auto found = open.find(hwnd);
+            if (found != open.end() && found->second.token == dialog.token) found->second.checked = false;
+        }
         if (!event.is_null()) RecordHistory(event);
     }
 }
@@ -590,6 +686,7 @@ void AutoAcknowledge() {
 // operation, and it blocks the main thread until acknowledged. Max 2027 draws
 // it with Qt; #32770 covers a Win32 message box with the same title.
 bool IsScriptControllerException(HWND hwnd) {
+    if (!OnMainThread(hwnd)) return false;
     const std::string cls = ClassOf(hwnd);
     if (!IsQt(cls) && cls != "#32770") return false;
     HWND owner = GetWindow(hwnd, GW_OWNER);
@@ -658,7 +755,10 @@ json Status() {
     for (const auto& [id, request] : requests)
         in_flight.push_back({{"request_id", id}, {"command", request.command}, {"state", request.state},
             {"main_thread", request.thread == main_thread}, {"age_ms", AgeMs(request.since)}});
+    // A main thread that stopped pumping is busy or hung whatever dialog is open:
+    // clients then diagnose the hang instead of reporting the dialog.
     return {{"pid", GetCurrentProcessId()}, {"dialogs", dialogs}, {"requests", in_flight},
+        {"main_thread_pumping", MainThreadPumping()},
         {"monitor", {{"running", monitor_running.load()}, {"qt_reader", static_cast<bool>(qt.snapshot)},
             {"script_controller_exceptions_closed", controller_closed.load()}}}};
 }
@@ -692,6 +792,11 @@ void Start(QtBackend backend) {
     monitor_stop = false;
     monitor = std::thread(Monitor);
     monitor_running = true;
+}
+
+void SetMainThreadPumping(std::function<bool()> pumping) {
+    std::lock_guard<std::mutex> lock(pumping_mutex);
+    main_pumping = std::move(pumping);
 }
 
 void Stop() {
@@ -772,9 +877,17 @@ std::string Guard::Error(const std::string& cause) const {
         {"message", "Max showed an error dialog during this operation; it was acknowledged. Inspect the affected scene before retrying."},
         {"details", {{"dialogs", session_->events}, {"cause", cause}, {"scene_state", "verification_required"}}}}.dump();
 }
+DeferDismissed::DeferDismissed() { ++defer_depth; }
+DeferDismissed::~DeferDismissed() { --defer_depth; }
+
 void ThrowIfDismissed() {
-    if (!current) return;
-    std::lock_guard<std::mutex> lock(current->mutex);
+    if (!current || defer_depth > 0) return;
+    std::unique_lock<std::mutex> lock(current->mutex);
+    // An acknowledgment publishes its event after posting the click, so the
+    // operation can resume first. Wait for it: a commit must never precede the
+    // error it should fail on. Bounded: a read the main thread does not take
+    // here times out after 1.5 s anyway.
+    current->idle.wait_for(lock, kPublishWait, [] { return current->pending == 0; });
     if (!current->events.empty())
         throw std::runtime_error(json{{"type", "NativeError"}, {"code", "MAX_DIALOG_ERROR"}, {"retryable", false},
             {"message", "Max displayed an error dialog during the operation."},
@@ -877,7 +990,9 @@ std::string Control(const std::string& command) {
         }
     }
     result["recent_actions"] = recent;
-    result["policy"] = "Any listed button can be pressed with respond. Automatic: Script Controller Exception boxes "
+    result["policy"] = "Any listed button of a dialog on Max's main thread can be pressed with respond; dialogs of "
+        "other threads are listed but never read or pressed. Cosmos browser, Material Editor and viewport windows "
+        "are never dialogs. Automatic: Script Controller Exception boxes "
         "are closed at any time; recognized acknowledgment-only MAXScript errors are acknowledged only when new "
         "during an MCP operation, which then fails with MAX_DIALOG_ERROR.";
     return result.dump();

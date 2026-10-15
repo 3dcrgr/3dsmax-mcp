@@ -1,13 +1,13 @@
 #pragma once
 // The pipe requests the shell answers without entering the core (ping,
-// native:max_dialogs, native:core) and the native:core protocol. Pure and
+// health, native:max_dialogs, native:core) and the native:core protocol. Pure and
 // SDK-independent; native/tests/core_reload_tests.cpp covers it.
 #include <string>
 #include <string_view>
 #include <nlohmann/json.hpp>
 
 inline bool McpIsShellType(const std::string& type) {
-    return type == "ping" || type == "native:max_dialogs" || type == "native:core";
+    return type == "ping" || type == "health" || type == "native:max_dialogs" || type == "native:core";
 }
 
 // False when `request` is not a shell request, so ordinary requests skip a
@@ -17,6 +17,7 @@ inline bool McpIsShellType(const std::string& type) {
 // answers that it does not know the type.
 inline bool McpMayBeShellRequest(const std::string& request) {
     return request.find("\"ping\"") != std::string::npos ||
+           request.find("\"health\"") != std::string::npos ||
            request.find("\"native:max_dialogs\"") != std::string::npos ||
            request.find("\"native:core\"") != std::string::npos;
 }

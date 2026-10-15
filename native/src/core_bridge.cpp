@@ -57,6 +57,11 @@ void HostExecutor::DisableDirectMode() {
     if (const McpHostApi* host = g_host.load()) host->setDirectMode(host->ctx, 0);
 }
 
+bool HostExecutor::IsMainThread() {
+    const McpHostApi* host = g_host.load();
+    return host && host->isMainThread(host->ctx) != 0;
+}
+
 bool HostExecutor::IsDirectMode() {
     const McpHostApi* host = g_host.load();
     return host && host->getDirectMode(host->ctx) != 0;

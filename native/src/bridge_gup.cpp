@@ -201,6 +201,12 @@ DWORD MCPBridgeShellGUP::Start() {
     }
 
     // Before the pipe: control requests rely on the monitor and its lane.
+    // A stale heartbeat (3 periods) means the main thread is not pumping: the
+    // dialog lane then never sends into it.
+    DialogWatch::SetMainThreadPumping([] {
+        const long long age = MainThreadExecutor::HeartbeatAgeMs();
+        return age < 0 || age <= 3LL * MainThreadExecutor::kHeartbeatMs;
+    });
     DialogWatch::Start({QtDialogs::Snapshot, QtDialogs::Click});
     StartPipe();
     SceneJournal::Register();
@@ -213,8 +219,10 @@ DWORD MCPBridgeShellGUP::Start() {
 }
 
 void MCPBridgeShellGUP::Stop() {
-    // Pipe threads waiting on requests that will never start would hold the
-    // StopPipe join below; fail those requests first.
+    // FIRST: pipe threads waiting on requests that will never start would hold
+    // the StopPipe join below (Max's exit stalled for up to the executor timeout
+    // per in-flight request); fail those requests and refuse new ones.
+    // executor_.Shutdown() still runs last to destroy the window.
     executor_.StopAccepting();
     AgentViewport::Shutdown(true);
     SceneJournal::Unregister();
