@@ -710,14 +710,23 @@ struct NamedMaterialSearch {
         if (seen.insert(mtl).second) found.push_back({mtl, std::move(where)});
     }
 
-    void ScanLibrary(MtlBaseLib* library, const char* place) {
+    void ScanLibrary(MtlBaseLib* library, const char* place, const std::set<Mtl*>* skip = nullptr) {
         if (!library) return;
         for (int i = 0; i < library->Count(); ++i) {
             MtlBase* entry = (*library)[i];
             if (!entry || entry->SuperClassID() != MATERIAL_CLASS_ID) continue;
             Mtl* mtl = static_cast<Mtl*>(entry);
+            if (skip && skip->count(mtl)) continue;
             if (MaterialNamed(mtl, name)) Add(mtl, {{"found_in", place}});
         }
+    }
+
+    // Every material in the objects' trees, read through the overlay or, with
+    // `planned` null, from the scene as it is.
+    static void CollectUsed(Mtl* mtl, const MaterialReplaceOverlay* planned, std::set<Mtl*>& out) {
+        if (!mtl || !out.insert(mtl).second) return;
+        for (int i = 0; i < mtl->NumSubMtls(); ++i)
+            CollectUsed(planned ? planned->SubMtl(mtl, i) : mtl->GetSubMtl(i), planned, out);
     }
 
     void Walk(Mtl* parent, const json& origin) {
@@ -759,7 +768,22 @@ struct NamedMaterialSearch {
             Walk(mtl, origin);
         }
         if (!libraries) return;
-        ScanLibrary(ip->GetSceneMtls(), "scene_materials");
+        // The scene material list is rebuilt only on request, so it still holds
+        // the materials of deleted objects; those must not become sources.
+        if (Interface17* ip17 = GetCOREInterface17()) ip17->UpdateSceneMaterialLib();
+        // A batch preview plans earlier entries through the overlay. A material
+        // they take off every object is listed now, but not when they apply.
+        std::set<Mtl*> plannedAway;
+        if (!overlay.nodes.empty() || !overlay.slots.empty()) {
+            std::set<Mtl*> live, planned;
+            for (INode* node : nodes) {
+                CollectUsed(node->GetMtl(), nullptr, live);
+                CollectUsed(overlay.NodeMtl(node), &overlay, planned);
+            }
+            for (Mtl* mtl : live)
+                if (!planned.count(mtl)) plannedAway.insert(mtl);
+        }
+        ScanLibrary(ip->GetSceneMtls(), "scene_materials", &plannedAway);
         ScanLibrary(&ip->GetMaterialLibrary(), "material_library");
     }
 };
