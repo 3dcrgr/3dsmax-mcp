@@ -404,6 +404,7 @@ class FallbackResultTests(unittest.TestCase):
     def test_no_objects_and_unchanged(self):
         _, out = self._run([_fb(match=0, target_exists=True)], "A", "B")
         self.assertEqual(out["status"], "no_objects")
+        self.assertIn("arguments are reversed", out["warnings"][-1])
         _, out = self._run([_fb(skipped=[{"kind": "object", "object": "Box001", "reason": "already_source"}])],
                            "A", "B")
         self.assertEqual(out["status"], "unchanged")

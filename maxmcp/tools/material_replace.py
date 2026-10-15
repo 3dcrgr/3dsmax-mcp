@@ -275,6 +275,11 @@ def _finish_entry(entry: dict, source: str, target: str, source_from: str, previ
         _add_warning(entry, f"source and target are both named '{source}'; the source is the first one found "
                             f"({', '.join(_SOURCE_FROM)}), so objects already using it are left alone. To apply "
                             "a re-imported copy, pass source_from (e.g. source_from=\"material_editor\").")
+    if entry.get("status") == "no_objects":
+        # The fork's #3 case: with the arguments reversed, the "target" is a freshly imported
+        # material that sits only in the Material Editor.
+        _add_warning(entry, f"If you meant to put '{target}' onto the objects that use '{source}', the "
+                            "arguments are reversed: source = material to apply, target = material to replace.")
     if entry.get("status") == "blocked":
         skipped = entry.get("skipped") if isinstance(entry.get("skipped"), list) else []
         _add_warning(entry, f"Target '{target}' was found, but every match was skipped ({_skip_summary(skipped)}). "
