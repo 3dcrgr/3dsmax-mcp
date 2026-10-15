@@ -62,9 +62,42 @@ FILE_CHANNEL_TO_VOCAB: dict[str, str] = {
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f]")
 
+# Map classes (lower-case, alphanumerics only) whose output is an image file.
+_FILE_MAP_CLASSES = frozenset({
+    "bitmap", "bitmaptexture", "bitmaptex", "autodeskbitmap", "vraybitmap", "vrayhdri",
+    "coronabitmap", "aiimage",
+})
+# Shipped OSL shaders that load an image from their own filename input.
+_OSL_IMAGE_SHADERS = frozenset({
+    "hdrienviron", "hdrilights", "cameraprojector", "sphericalprojector", "objectprojector",
+})
+_SHADER_EXTS = (".osl", ".oso")
+
 
 def _clean(value: Any) -> Any:
     return _CONTROL_CHARS.sub("", value) if isinstance(value, str) else value
+
+
+def _map_class(node: dict) -> str:
+    # classInternal is the non-localized class name; "class" is the UI label.
+    return re.sub(r"[^a-z0-9]", "", str(node.get("classInternal") or node.get("class") or "").lower())
+
+
+def _paths(node: dict) -> list[str]:
+    return [str(f["path"]) for f in node.get("files") or [] if isinstance(f, dict) and f.get("path")]
+
+
+def _file_path_unreadable(node: dict) -> bool:
+    """A file-bearing map from which no image path was read (procedural maps never match)."""
+    cls, paths = _map_class(node), _paths(node)
+    if cls in _FILE_MAP_CLASSES:
+        return not paths
+    if cls == "oslmap":  # An OSL image loader reports its shader; the image must be there too.
+        shaders = [p for p in paths if p.lower().endswith(_SHADER_EXTS)]
+        stems = {re.split(r"[\\/]", p)[-1].lower().rsplit(".", 1)[0] for p in shaders}
+        return (bool(shaders) and len(shaders) == len(paths)
+                and any("bitmap" in stem or stem in _OSL_IMAGE_SHADERS for stem in stems))
+    return False
 
 
 def fetch_graphs(client: MaxClient, **arguments: Any) -> dict[str, Any]:
@@ -207,6 +240,37 @@ def roles_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
                         f"Filename suggests {hint}; connected to {role}. Check channel selection, map transforms and renderer modes."
                         if mismatch else None),
                 })
+
+    def image_below(node_id: str) -> bool:
+        """A connected input (e.g. SetFile feeding an OSL loader) supplies an image path."""
+        stack, seen = [e["nodeId"] for e in children.get(node_id, [])], {node_id}
+        while stack and len(seen) < 500:
+            child_id = stack.pop()
+            if child_id in seen or child_id not in by_id:
+                continue
+            seen.add(child_id)
+            if any(not p.lower().endswith(_SHADER_EXTS) for p in _paths(by_id[child_id])):
+                return True
+            stack.extend(e["nodeId"] for e in children.get(child_id, []))
+        return False
+
+    for node in payload.get("nodes", []):
+        if node.get("kind") == "material" or not _file_path_unreadable(node):
+            continue
+        node_id, label = node.get("id", ""), f"{_clean(node.get('class'))} '{_clean(node.get('name'))}'"
+        # Every file parameter is empty: nothing to audit. Autodesk Bitmap keeps its
+        # source outside plain parameters, so empty parameters are no proof there.
+        if node.get("fileUnset") is True and _map_class(node) != "autodeskbitmap":
+            warning = {"code": "FILE_NOT_ASSIGNED", "nodeId": node_id, "message": f"{label} has no file assigned."}
+        elif image_below(node_id):
+            continue
+        else:
+            complete = False
+            warning = {"code": "FILE_PATH_UNREADABLE", "nodeId": node_id,
+                       "message": f"No image path could be read from {label} (unset or unreadable "
+                                  "source); its texture is not audited."}
+        if warning not in warnings:
+            warnings.append(warning)
 
     root = payload.get("root") or {}
     material(root.get("id", "n0"), frozenset(), [])

@@ -631,12 +631,40 @@ std::string NativeHandlers::CreateShellMaterial(const std::string& params, MCPBr
 }
 
 // ── replace_material / batch_replace_materials ──────────────────
-// Targets match by exact name on an object's own material and in every
-// sub-material slot of its material tree (Multi/Sub and any other material
-// that exposes sub-materials). The source may live on an object, in a
-// sub-material slot or in a compact Material Editor slot.
+// Targets match by exact name on an object's own material and, unless
+// include_sub_materials is false, in every sub-material slot of its material
+// tree (Multi/Sub and any other material that exposes sub-materials). The
+// source may live on an object, in a sub-material slot, in a compact Material
+// Editor slot, among the scene materials or in the current material library,
+// searched in that order; source_from limits the search to one of those places.
 
 static constexpr int kMaterialEditorSlotCount = 24;
+
+// source_from values ("object", the search's found_in name, is accepted for "node").
+// Empty means "search every place in order".
+static bool IsReplaceSourcePlace(const std::string& place) {
+    return place.empty() || place == "node" || place == "object" || place == "sub_material" ||
+           place == "material_editor" || place == "scene_materials" || place == "material_library";
+}
+
+static std::string ReadReplaceSourceFrom(const json& p, const std::string& fallback) {
+    std::string from = fallback;
+    // json::is_string() collides with the MAXScript is_string macro.
+    if (p.contains("source_from") && p["source_from"].type() == json::value_t::string)
+        from = p["source_from"].get<std::string>();
+    else if (p.contains("source_from") && !p["source_from"].is_null())
+        throw std::runtime_error("source_from must be a string");
+    if (!IsReplaceSourcePlace(from))
+        throw std::runtime_error("source_from must be one of node, sub_material, material_editor, "
+                                 "scene_materials, material_library (got '" + from + "')");
+    return from == "object" ? std::string("node") : from;
+}
+
+// The search's found_in names an object as "object"; source_from and
+// source_found_in call it "node".
+static std::string ReplaceSourcePlace(const std::string& foundIn) {
+    return foundIn == "object" ? std::string("node") : foundIn;
+}
 
 static bool MaterialNamed(Mtl* mtl, const std::wstring& name) {
     return mtl && name == mtl->GetName().data();
@@ -665,16 +693,31 @@ struct MaterialReplaceOverlay {
 
 // Distinct materials with one exact name, in lookup priority: object
 // materials, their sub-material trees, then Material Editor slots and their
-// trees. Each hit records where it was found.
+// trees, then (source searches only) the scene materials and the current
+// material library. Each hit records where it was found. `from` keeps only
+// the hits of one place (a source_from value).
 struct NamedMaterialSearch {
     const std::wstring& name;
     const MaterialReplaceOverlay& overlay;
+    std::string from;
+    bool libraries = false;
     std::set<Mtl*> visited;
     std::set<Mtl*> seen;
     std::vector<std::pair<Mtl*, json>> found;
 
     void Add(Mtl* mtl, json where) {
+        if (!from.empty() && ReplaceSourcePlace(where.value("found_in", "")) != from) return;
         if (seen.insert(mtl).second) found.push_back({mtl, std::move(where)});
+    }
+
+    void ScanLibrary(MtlBaseLib* library, const char* place) {
+        if (!library) return;
+        for (int i = 0; i < library->Count(); ++i) {
+            MtlBase* entry = (*library)[i];
+            if (!entry || entry->SuperClassID() != MATERIAL_CLASS_ID) continue;
+            Mtl* mtl = static_cast<Mtl*>(entry);
+            if (MaterialNamed(mtl, name)) Add(mtl, {{"found_in", place}});
+        }
     }
 
     void Walk(Mtl* parent, const json& origin) {
@@ -715,6 +758,9 @@ struct NamedMaterialSearch {
             }
             Walk(mtl, origin);
         }
+        if (!libraries) return;
+        ScanLibrary(ip->GetSceneMtls(), "scene_materials");
+        ScanLibrary(&ip->GetMaterialLibrary(), "material_library");
     }
 };
 
@@ -785,6 +831,8 @@ static std::string DescribeMaterialLocation(const json& where) {
         return "on object '" + where.value("object", "") + "'";
     if (foundIn == "material_editor")
         return "in Material Editor slot " + std::to_string(where.value("material_editor_slot", 0));
+    if (foundIn == "scene_materials") return "among the scene materials";
+    if (foundIn == "material_library") return "in the current material library";
     return "in slot " + std::to_string(where.value("slot_index", 0)) + " of '" +
            where.value("parent_material", "") + "'";
 }
@@ -801,36 +849,54 @@ static std::string MaterialReplaceStatus(
 
 // Plans one replacement against the scene as it is now (or as the overlay
 // says it will be), then applies it unless previewing. Every set is read back.
+// sourceFrom limits the source search to one place; includeSubs false matches
+// objects' own materials only. A preview with missingSourceOk plans without a
+// source (source_exists false), so the caller still sees what the target
+// would affect.
 static json RunMaterialReplacement(
     const std::string& sourceName, const std::string& targetName, bool preview,
-    bool identityObjects, const std::vector<INode*>& nodes, MaterialReplaceOverlay& overlay) {
+    bool identityObjects, const std::vector<INode*>& nodes, MaterialReplaceOverlay& overlay,
+    const std::string& sourceFrom = std::string(), bool includeSubs = true, bool missingSourceOk = false) {
     const std::wstring sourceW = Utf8ToWide(sourceName);
     const std::wstring targetW = Utf8ToWide(targetName);
 
     json entry;
     entry["source_material"] = sourceName;
     entry["target_material"] = targetName;
+    if (!sourceFrom.empty()) entry["source_from"] = sourceFrom;
+    entry["include_sub_materials"] = includeSubs;
 
-    NamedMaterialSearch sourceSearch{sourceW, overlay};
+    NamedMaterialSearch sourceSearch{sourceW, overlay, sourceFrom, true};
     sourceSearch.Run(nodes);
-    if (sourceSearch.found.empty()) {
-        entry["status"] = "error";
-        entry["error"] = "Source material '" + sourceName +
-            "' not found on objects, in sub-material slots or in the Material Editor";
-        return entry;
-    }
-
-    Mtl* source = sourceSearch.found.front().first;
+    const std::string sourceScope = sourceFrom.empty()
+        ? std::string("on objects, in sub-material slots, in the Material Editor, among the scene materials "
+                      "or in the current material library")
+        : "(searched only source_from=" + sourceFrom + ")";
+    entry["source_exists"] = !sourceSearch.found.empty();
     json warnings = json::array();
-    json sourceInfo = sourceSearch.found.front().second;
-    sourceInfo["name"] = MaterialName(source);
-    sourceInfo["class"] = MaxScriptVisibleClassName(source);
-    sourceInfo["candidates"] = static_cast<int>(sourceSearch.found.size());
-    if (sourceSearch.found.size() > 1) {
-        warnings.push_back(std::to_string(sourceSearch.found.size()) + " materials are named '" +
-            sourceName + "'; used the one " + DescribeMaterialLocation(sourceInfo) + ".");
+    Mtl* source = nullptr;
+    if (sourceSearch.found.empty()) {
+        if (!(preview && missingSourceOk)) {
+            entry["status"] = "error";
+            entry["error"] = "Source material '" + sourceName + "' not found " + sourceScope;
+            return entry;
+        }
+        // source_exists false says it; the Python tool adds the warning.
+    } else {
+        source = sourceSearch.found.front().first;
+        json sourceInfo = sourceSearch.found.front().second;
+        sourceInfo["name"] = MaterialName(source);
+        sourceInfo["class"] = MaxScriptVisibleClassName(source);
+        sourceInfo["candidates"] = static_cast<int>(sourceSearch.found.size());
+        entry["source_found_in"] = ReplaceSourcePlace(sourceInfo.value("found_in", ""));
+        if (sourceSearch.found.size() > 1) {
+            entry["source_ambiguous"] = true;
+            entry["source_candidates"] = static_cast<int>(sourceSearch.found.size());
+            warnings.push_back(std::to_string(sourceSearch.found.size()) + " materials are named '" +
+                sourceName + "'; used the one " + DescribeMaterialLocation(sourceInfo) + ".");
+        }
+        entry["source"] = sourceInfo;
     }
-    entry["source"] = sourceInfo;
 
     std::vector<MaterialReplaceMatch> matches;
     std::map<std::pair<Mtl*, int>, size_t> slotIndex;
@@ -845,6 +911,7 @@ static json RunMaterialReplacement(
             matches.push_back(std::move(match));
             continue;
         }
+        if (!includeSubs) continue;
         std::set<Mtl*> visited;
         CollectSlotMatches(own, node, targetW, overlay, visited, matches, slotIndex);
     }
@@ -863,7 +930,9 @@ static json RunMaterialReplacement(
         if (match.node) {
             where = {{"kind", "object"}, {"object", WideToUtf8(match.node->GetName())},
                      {"handle", NodeHandle(match.node)}};
-            if (match.previous == source) {
+            if (!source) {
+                // Preview without a source: report the match, plan nothing.
+            } else if (match.previous == source) {
                 reason = "already_source";
             } else if (WouldCreateLoop(source, match.node, nullptr, overlay)) {
                 reason = "would_create_loop";
@@ -886,7 +955,9 @@ static json RunMaterialReplacement(
                      {"slot_name", WideToUtf8(slotLabel.data())},
                      {"previous_material", MaterialName(match.previous)},
                      {"object_count", static_cast<int>(match.users.size())}};
-            if (match.previous == source) {
+            if (!source) {
+                // Preview without a source: report the match, plan nothing.
+            } else if (match.previous == source) {
                 reason = "already_source";
             } else if (match.parent == source) {
                 reason = "parent_is_source";
@@ -980,6 +1051,8 @@ std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridge
         std::string sourceName = p.value("source_material", "");
         std::string targetName = p.value("target_material", "");
         bool preview = p.value("preview", false);
+        bool includeSubs = p.value("include_sub_materials", true);
+        const std::string sourceFrom = ReadReplaceSourceFrom(p, "");
 
         if (sourceName.empty() || targetName.empty())
             throw std::runtime_error("source_material and target_material are required");
@@ -989,7 +1062,8 @@ std::string NativeHandlers::ReplaceMaterial(const std::string& params, MCPBridge
         CollectNodes(ip->GetRootNode(), nodes);
 
         MaterialReplaceOverlay overlay;
-        json result = RunMaterialReplacement(sourceName, targetName, preview, false, nodes, overlay);
+        json result = RunMaterialReplacement(sourceName, targetName, preview, false, nodes, overlay,
+                                             sourceFrom, includeSubs, true);
         if (result.value("status", "") == "error")
             throw std::runtime_error(StructuredErrorPayload("NOT_FOUND", result.value("error", "")));
 
@@ -1009,6 +1083,8 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
         auto replacements = p.contains("replacements") && !p["replacements"].is_null()
                             ? p["replacements"] : json::array();
         bool preview = p.value("preview", false) || p.value("dry_run", false);
+        bool includeSubs = p.value("include_sub_materials", true);
+        const std::string defaultFrom = ReadReplaceSourceFrom(p, "");
 
         Interface* ip = GetCOREInterface();
         std::vector<INode*> nodes;
@@ -1017,6 +1093,7 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
         MaterialReplaceOverlay overlay;
         json results = json::array();
         int totalReplaced = 0;
+        int totalSlots = 0;
         int totalSkipped = 0;
         int errorCount = 0;
 
@@ -1035,9 +1112,25 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
                 continue;
             }
 
-            json entry = RunMaterialReplacement(src, tgt, preview, true, nodes, overlay);
+            // source_from: per entry, or the batch-wide default.
+            std::string sourceFrom = defaultFrom;
+            try {
+                sourceFrom = ReadReplaceSourceFrom(rep, defaultFrom);
+            } catch (const std::exception& e) {
+                json entry;
+                entry["source_material"] = src;
+                entry["target_material"] = tgt;
+                entry["status"] = "error";
+                entry["error"] = e.what();
+                results.push_back(entry);
+                ++errorCount;
+                continue;
+            }
+
+            json entry = RunMaterialReplacement(src, tgt, preview, true, nodes, overlay, sourceFrom, includeSubs);
             if (entry.value("status", "") == "error") ++errorCount;
             totalReplaced += entry.value("replaced_count", 0);
+            totalSlots += entry.value("replaced_slot_count", 0);
             totalSkipped += entry.value("skipped_count", 0);
             results.push_back(entry);
         }
@@ -1049,7 +1142,9 @@ std::string NativeHandlers::BatchReplaceMaterials(const std::string& params, MCP
         json result;
         result["results"] = results;
         result["total_replaced"] = totalReplaced;
+        result["total_replaced_slots"] = totalSlots;
         result["total_skipped"] = totalSkipped;
+        result["include_sub_materials"] = includeSubs;
         result["error_count"] = errorCount;
         result["status"] = totalReplaced > 0 ? (preview ? "preview" : "replaced") : "no_changes";
         result["preview"] = preview;
