@@ -249,7 +249,7 @@ def _skip_summary(skipped: list) -> str:
 
 
 def _source_from_ignored(source_from: str) -> str:
-    # A bridge without source_from (stock upstream) searches every place.
+    # An older bridge without source_from searches every place.
     return (f"source_from='{source_from}' was not echoed back, so the bridge may have ignored it and used the "
             "default search order; check source.found_in and update the native bridge.")
 
@@ -260,7 +260,7 @@ def _subs_ignored() -> str:
 
 
 def _finish_entry(entry: dict, source: str, target: str, source_from: str, preview: bool) -> dict:
-    """Fork additions to a native or fallback entry: source hints and the blocked hint."""
+    """Hints added to a native or fallback entry: source hints and the blocked hint."""
     if "error" in entry:
         return entry
     if entry.get("source_exists") is False:
@@ -276,8 +276,8 @@ def _finish_entry(entry: dict, source: str, target: str, source_from: str, previ
                             f"({', '.join(_SOURCE_FROM)}), so objects already using it are left alone. To apply "
                             "a re-imported copy, pass source_from (e.g. source_from=\"material_editor\").")
     if entry.get("status") == "no_objects":
-        # The fork's #3 case: with the arguments reversed, the "target" is a freshly imported
-        # material that sits only in the Material Editor.
+        # Typical of reversed arguments: the "target" is a freshly imported material
+        # that sits only in the Material Editor.
         _add_warning(entry, f"If you meant to put '{target}' onto the objects that use '{source}', the "
                             "arguments are reversed: source = material to apply, target = material to replace.")
     if entry.get("status") == "blocked":
@@ -377,62 +377,59 @@ _FALLBACK_SCRIPT = r"""(
     -- true when owner referencing src would close a reference loop.
     fn mcpLoop src owner = (try (refs.dependencyLoopTest src owner) catch (undefined))
 
-    fn mcpFindTree m wanted found places visited = (
+    -- Records a hit unless only (a place, "" for any) excludes it. The place
+    -- filter comes first, so a material listed in several places is found in
+    -- the requested one, as in the native search.
+    fn mcpKeep m place found places only = (
+        if (only == "" or place == only) and (findItem found m) == 0 do (
+            append found m
+            append places place
+        )
+    )
+    fn mcpFindTree m wanted found places visited only = (
         if (mcpIsMtl m) and (findItem visited m) == 0 do (
             append visited m
             for i = 1 to (mcpSubCount m) do (
                 local sub = mcpSubAt m i
                 if (mcpIsMtl sub) do (
-                    if sub.name == wanted and (findItem found sub) == 0 do (
-                        append found sub
-                        append places "sub_material"
-                    )
-                    mcpFindTree sub wanted found places visited
+                    if sub.name == wanted do mcpKeep sub "sub_material" found places only
+                    mcpFindTree sub wanted found places visited only
                 )
             )
         )
     )
     -- Lookup order: object materials, their sub-material trees, then Material
     -- Editor slots and their trees.
-    fn mcpFindNamed wanted found places = (
-        for obj in objects where (mcpIsMtl obj.material) and obj.material.name == wanted and (findItem found obj.material) == 0 do (
-            append found obj.material
-            append places "object"
+    fn mcpFindNamed wanted found places only = (
+        for obj in objects where (mcpIsMtl obj.material) and obj.material.name == wanted do (
+            mcpKeep obj.material "object" found places only
         )
         local visited = #()
-        for obj in objects do mcpFindTree obj.material wanted found places visited
+        for obj in objects do mcpFindTree obj.material wanted found places visited only
         for i = 1 to meditMaterials.count do (
             local m = meditMaterials[i]
-            if (mcpIsMtl m) and m.name == wanted and (findItem found m) == 0 do (
-                append found m
-                append places "material_editor"
-            )
-            mcpFindTree m wanted found places visited
+            if (mcpIsMtl m) and m.name == wanted do mcpKeep m "material_editor" found places only
+            mcpFindTree m wanted found places visited only
         )
     )
     -- The source: mcpFindNamed's places, then the scene materials and the
     -- current material library. srcFrom (non-empty) keeps one place only.
+    -- sceneMaterials is rebuilt only on request and still lists the materials
+    -- of deleted objects, so it is refreshed first.
     fn mcpFindSource wanted srcFrom found places = (
-        local allFound = #()
-        local allPlaces = #()
-        mcpFindNamed wanted allFound allPlaces
+        local only = if srcFrom == "node" then "object" else srcFrom
+        mcpFindNamed wanted found places only
+        try (UpdateSceneMaterialLib()) catch ()
         try (
-            for m in sceneMaterials where (mcpIsMtl m) and m.name == wanted and (findItem allFound m) == 0 do (
-                append allFound m
-                append allPlaces "scene_materials"
+            for m in sceneMaterials where (mcpIsMtl m) and m.name == wanted do (
+                mcpKeep m "scene_materials" found places only
             )
         ) catch ()
         try (
-            for m in currentMaterialLibrary where (mcpIsMtl m) and m.name == wanted and (findItem allFound m) == 0 do (
-                append allFound m
-                append allPlaces "material_library"
+            for m in currentMaterialLibrary where (mcpIsMtl m) and m.name == wanted do (
+                mcpKeep m "material_library" found places only
             )
         ) catch ()
-        local wantedPlace = if srcFrom == "node" then "object" else srcFrom
-        for i = 1 to allFound.count where wantedPlace == "" or allPlaces[i] == wantedPlace do (
-            append found allFound[i]
-            append places allPlaces[i]
-        )
     )
     -- Slots holding a material named wanted in one object's material tree. A
     -- matched material is not descended: its slot is the one replaced.
@@ -557,7 +554,7 @@ _FALLBACK_SCRIPT = r"""(
             local targetExists = matchCount > 0
             if not targetExists do (
                 local tgtFound = #()
-                mcpFindNamed tgtName tgtFound #()
+                mcpFindNamed tgtName tgtFound #() ""
                 targetExists = tgtFound.count > 0
             )
             local sourceJson = "null"
