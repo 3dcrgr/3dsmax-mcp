@@ -341,11 +341,24 @@ class DeadlineTests(_ClientCase):
         client._hung_pids[PID] = {"state": "blocked", "process": diag("blocked"), "inflight": None,
                                   "source": "abandoned", "started": 1}
 
-    def test_remembered_pid_now_busy_is_cleared(self):
+    def test_remembered_pid_busy_sample_keeps_verdict_while_window_hung(self):
+        # Other Max threads wake now and then, so a short CPU sample of a hung Max can read
+        # "busy". While the main window is still hung that must not clear the verdict.
         kernel = self.use_kernel(FakeKernel(self.clock, [(0, REPLY)]))
         client = self.pinned_client()
         self.remember_blocked(client)
         max_client.quick_hung_check.return_value = True
+        self.states = ["busy"]
+        with self.assertRaises(max_client.MaxNotRespondingError):
+            client.send_command("x", timeout=1.0)
+        self.assertIn(PID, client._hung_pids)
+        self.assertEqual(kernel.writes, 0)
+
+    def test_remembered_pid_window_pumping_again_is_cleared(self):
+        kernel = self.use_kernel(FakeKernel(self.clock, [(0, REPLY)]))
+        client = self.pinned_client()
+        self.remember_blocked(client)
+        max_client.quick_hung_check.return_value = False
         self.states = ["busy"]
         self.assertEqual(client.send_command("x", timeout=1.0)["result"], "late")
         self.assertNotIn(PID, client._hung_pids)

@@ -888,7 +888,11 @@ class MaxClient:
             self._hung_pids.pop(pid, None)  # PID reused/gone, or the window pumps messages again
             return
         process = diagnose_process(pid, _RECHECK_SAMPLE_S)
-        if process.get("state") != "blocked":
+        # The window is still hung. A short CPU sample alone must not clear the verdict. Other Max
+        # threads wake now and then, so a 0.25 s sample of a hung Max sometimes reads "busy" and the
+        # call would go to a Max that cannot serve it. Only a window that pumps again, an exited
+        # process or a reused PID ends the verdict.
+        if process.get("state") not in ("blocked", "busy"):
             self._hung_pids.pop(pid, None)
             return
         why = ("an earlier request was abandoned" if verdict.get("source") == "abandoned"
