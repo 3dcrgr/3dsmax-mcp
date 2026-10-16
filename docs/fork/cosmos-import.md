@@ -1,5 +1,7 @@
 # Cosmos imports that stall or deadlock 3ds Max
 
+Upstream pull request: **Cosmos import**, not opened yet ([list](../FORK.md#upstream-pull-requests)).
+
 Fork issues #1, #2, #7, #9, #10 and #13. Commits `25bb1fc`, `ed1fb1c`, `2853b1c` (#9), `c1e09a7` (#10), `c88975e` (#9, #10) and `3b3210d` (#13). Dialog handling came with the upstream 1.7.5 merge: `a07ef93`, `6e03f99`, `f70b0cc`, `34a7ce5` and `cb4d0ff`.
 
 All of this is in the Python server, so it works with any bridge, with three exceptions. The dialog checks need the dialog monitor of a 1.7.5 or later bridge; an older bridge skips them. Only the fork's bridge reports a hung main thread, so with upstream's a dialog always counts. The native half of `6e03f99` needs the fork's bridge; with upstream's, the client filters the same windows.
@@ -194,4 +196,4 @@ Unit tests are in `tests/test_cosmos_import.py`. They use fake windows to cover 
 
 ## Upstream status
 
-Not fixed upstream as of 2026-10-01. None of the 45 reachable forks touches `cosmos.py`. The other two of the 47, `rocksek` and `mseep-ai`, are deleted. The dialog-monitor exclusions are their own commit (`6e03f99`), so they can go upstream as a separate pull request.
+Not fixed upstream as of 2026-10-01. None of the 45 reachable forks touches `cosmos.py`. The other two of the 47, `rocksek` and `mseep-ai`, are deleted. The dialog-monitor exclusions are their own commit (`6e03f99`) and go upstream with Hangs and dialogs.

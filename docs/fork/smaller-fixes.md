@@ -1,8 +1,10 @@
 # Smaller fixes
 
+Upstream pull requests, none opened yet ([list](../FORK.md#upstream-pull-requests)): interrupted scripts and quiet mode go with **Hangs and dialogs**. The agent viewport reclaim, `contact_check` and closed-group cloning go with **Scene checks**. The Listener and Line object fixes are upstream's own already.
+
 Problems that came up during the same production work. Most of them misled the agent or the user; #12 could have lost unsaved work.
 
-**Which bridge has the native fixes.** Some fixes below are in the native bridge, so they need a fork build of it. Since the 1.7.6 merge, only the 2027 bridge in `native/bin/` is one: the merge's own build (hash in `native/bin/bridge_manifest.json`), not deployed or live-tested yet. A 2027 fork bridge has run in production since 2026-10-11 (`48c186df…` first, `04815449…`, 1.7.5-based, since 2026-10-14). The 2023, 2024, 2025 and 2026 bridges there are upstream's stock 1.7.6 builds; the fork's 1.7.5-based 2026 build (`d5cd6ba5…`) was never deployed and was dropped in the merge. The Python fixes work with any bridge, and production runs the fork's Python from source.
+**Which bridge has the native fixes.** Some fixes below are in the native bridge, so they need a fork build of it. Since the 1.7.6 merge, only the 2027 bridge in `native/bin/` is one: the fork's own build (hash in `native/bin/bridge_manifest.json`), not deployed or live-tested yet. A 2027 fork bridge has run in production since 2026-10-11 (`48c186df…` first, `04815449…`, 1.7.5-based, from 2026-10-14, and the 1.7.6 merge's `c5903978…` since 2026-10-15). The 2023, 2024, 2025 and 2026 bridges there are upstream's stock builds from `71f72a8` (1.7.6 plus #35); the fork's 1.7.5-based 2026 build (`d5cd6ba5…`) was never deployed and was dropped in the merge. The Python fixes work with any bridge, and production runs the fork's Python from source.
 
 ## `execute_maxscript` reported interrupted scripts as parse errors
 

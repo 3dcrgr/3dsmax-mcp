@@ -4,6 +4,8 @@ Fork issue #3. Commits `a9d2a0d`, `16528de`, `cd85cd2`, `a670484` (review fixes)
 
 **Since the 1.7.6 merge** (`298a295`), the tool is upstream 1.7.6's rewrite (sub-material slots, Material Editor sources, a reference-loop guard, in-order batches, and its result fields and statuses) plus what only the fork does: `include_sub_materials`, `source_from` (with the scene materials and the current material library as sources), a preview with a missing source, and the direction and `blocked` hints. The native handler and the MAXScript fallback match. What follows describes the fork's fix and says where the merge changed it.
 
+**Upstream since #35.** The fork's additions went upstream in pull request [#35](https://github.com/cl0nazepamm/3dsmax-mcp/pull/35), merged on 2026-10-15, and upstream followed up with `8ecefad`. Since `a86ade0` (2026-10-16) the fork carries upstream's `material_replace.py` and `material_handlers.cpp` as they are. See [Upstream status](#upstream-status).
+
 ## What happened
 
 On a Revit scene with Hebrew names, `replace_material` was asked to swap a plaster material for a freshly imported Cosmos material. It answered `{"status": "replaced", "replaced_count": 0}`, and nothing changed. At first this looked like a Unicode bug with the Hebrew name.
@@ -84,11 +86,11 @@ A preview uses the same keys, with `preview: true`. The batch result adds `total
 
 **The MAXScript fallback matches the native handler.** This is the fallback used when the native bridge isn't available. It has the same lookup order and slot matching, returns the same keys and statuses (`replaced` on success since the 1.7.6 merge; before it, `"success"`), and derives status and warnings with the same rules. Its loop guard uses `refs.dependencyLoopTest`. Since the merge, a batch runs every entry in order in one script, inside one undo record when applied.
 
-**With a stock bridge, most of this works now.** Upstream 1.7.6's native handler has sub-material matching, Material Editor sources, the loop guard and the in-order batch. What it lacks is the fork's part, so that needs the fork's bridge:
+**With a stock bridge, all of this works now** if the bridge was built after #35, like the 2023-2026 ones in `native/bin/` since `a86ade0`. Upstream 1.7.6's native handler has sub-material matching, Material Editor sources, the loop guard and the in-order batch. What it lacks is the part that went upstream in #35:
 - `source_from`, and the scene materials and current material library as sources. A stock bridge ignores `source_from`; the result then carries a warning that the bridge didn't echo it back.
 - `include_sub_materials=false`. A stock bridge always searches slots; the result then warns that slots may have been replaced.
 - A preview with a missing source, which fails on a stock bridge.
-- In `native/bin/`, only the 2027 bridge is a fork build (the 1.7.6 merge's build; the production Max 2027 runs the 1.7.5-based `04815449…`). An install on 2023–2026 gets upstream's 1.7.6 bridge. Upstream's 1.7.5 and older bridges match object materials only and need the source on an object.
+- In `native/bin/`, only the 2027 bridge is a fork build. An install on 2023–2026 gets upstream's rebuild from `71f72a8`, which has #35. Upstream's 1.7.5 and older bridges match object materials only and need the source on an object.
 
 **An error box fails the call** (upstream `5c44e76`, merged in `a07ef93`). If Max shows a MAXScript error box during a real run, from a callback script or a scripted material for example, the bridge acknowledges it and the call fails with `MAX_DIALOG_ERROR`. The same happens if the agent presses OK on it with `max_dialogs`. As the error says, check the scene before retrying.
 - **Native handler:** the dispatcher rolls back the call's undo transaction. A `batch_replace_materials` call is one transaction, so every entry is undone. A stock 1.7.5 bridge could commit the call before the error was recorded; the fork's bridges wait for it (`ffccbab`, see [hung-max.md](hung-max.md#upstream-175s-dialog-handling-fixed-on-the-merge)).
@@ -137,7 +139,10 @@ Before the 1.7.6 merge, the first example reported `affected_slot_count` and `af
   - The rollback after an error box hasn't been tried in Max. `native/tests/dialog_watch_tests.cpp` checks, without Max, that an acknowledged error box fails the operation where it resumes (`ffccbab`).
   - The fallback batch stopping at a failed call comes from reading the code; no test covers it.
 - **The 1.7.6 merge** (`298a295`) replaced the handler with upstream's rewrite plus the fork's additions, in both the native handler and the fallback. `tests/test_material_replace.py` was updated for upstream's result fields and skip reasons and passes. Nothing on this page has been run live with the merged handler yet.
+- **The merge of upstream's `master`** (`a86ade0`) took upstream's `material_replace.py` and `material_handlers.cpp` from #35 and `8ecefad` as they are. `tests/test_material_replace.py` passes against them. Nothing on this page has been run live with upstream's code yet.
 
 ## Upstream status
 
-Not fixed in upstream v1.7.5. Upstream 1.7.6 (`5a92193`) fixed most of it its own way: sub-material slots, Material Editor sources, the loop guard, the in-order batch, `no_match` with a warning and `no_objects`. Not upstream: `include_sub_materials`, `source_from`, the scene materials and material library as sources, a preview with a missing source, and the direction and `blocked` hints. The older, explicit docstring survives in kanzaka110's fork.
+Merged upstream. Not fixed in upstream v1.7.5. Upstream 1.7.6 (`5a92193`) fixed most of it its own way: sub-material slots, Material Editor sources, the loop guard, the in-order batch, `no_match` with a warning and `no_objects`. The rest went upstream in pull request [#35](https://github.com/cl0nazepamm/3dsmax-mcp/pull/35), merged on 2026-10-15 (`e156c00`): `include_sub_materials`, `source_from`, the scene materials and material library as sources, a preview with a missing source, and the direction and `blocked` hints.
+
+Upstream then added `8ecefad`. It refreshes the scene material list before `replace_material` takes a source from it, so a batch entry whose source an earlier entry removed no longer picks up a deleted object's material. A native batch preview skips materials an earlier entry takes off every object. The MAXScript fallback applies `source_from` before it removes duplicates. The fork carries upstream's code since `a86ade0`. The older, explicit docstring survives in kanzaka110's fork.

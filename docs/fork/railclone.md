@@ -1,5 +1,7 @@
 # RailClone: inspect, parameters, library, and two fixes
 
+Upstream pull request: **iToo and Vantage**, not opened yet ([list](../FORK.md#upstream-pull-requests)).
+
 Two live test sessions on 2026-10-06 (3ds Max 2026.3, RailClone Pro 7.1.1, V-Ray 7, centimetres) found two bugs in the RailClone tools and worked out how RailClone behaves from MAXScript. This page covers the fixes, the four new tools and the facts they rely on. The changes are all Python and need no bridge change.
 
 ## Fixes

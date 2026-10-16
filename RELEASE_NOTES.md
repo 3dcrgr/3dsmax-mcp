@@ -103,4 +103,4 @@ Nothing of upstream's is removed: all 179 upstream tools remain. These behaviour
 
 - [README](https://github.com/3dcrgr/3dsmax-mcp#readme): the full tool catalog.
 - [docs/FORK.md](https://github.com/3dcrgr/3dsmax-mcp/blob/fix/fork-fixes/docs/FORK.md): every change and how it was verified.
-- These changes are being offered upstream as separate pull requests.
+- Some of these changes are merged upstream ([#35](https://github.com/cl0nazepamm/3dsmax-mcp/pull/35), materials). The rest are being offered upstream as separate pull requests, one at a time ([list](https://github.com/3dcrgr/3dsmax-mcp/blob/fix/fork-fixes/docs/FORK.md#upstream-pull-requests)).

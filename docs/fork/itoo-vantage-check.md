@@ -1,5 +1,7 @@
 # iToo → Chaos Vantage readiness check
 
+Upstream pull request: **iToo and Vantage**, not opened yet ([list](../FORK.md#upstream-pull-requests)).
+
 `itoo_vantage_check` (fork issue #25, branch `feat/itoo-vantage-check`, 2026-10-11) reports, for each Forest Pack, RailClone and ForestIvy object, how ready it is for Chaos Vantage. It is strictly read-only.
 
 The checks come from the iToo documentation (the knowledge pack's digests A §3.1 and S5, C2 §3.2–3.4, F §2.2, §2.5 and §6.3), from live probes in a scratch 3ds Max 2027.2 with RailClone 7.3.5 and Forest Pack 9.4.3, and from the user's Vantage 3.4 conversion notes. Vantage itself was never rendered by the tool or its tests. Whatever Vantage does beyond what the docs say is marked unverified: Vantage's own log (`%APPDATA%\Chaos\Vantage\debug_log.txt`) decides.

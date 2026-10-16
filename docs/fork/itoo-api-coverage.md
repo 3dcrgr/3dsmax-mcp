@@ -1,5 +1,7 @@
 # iToo API coverage â€” Max 2027, 2026-10-12
 
+Upstream pull request: **iToo and Vantage**, not opened yet ([list](../FORK.md#upstream-pull-requests)).
+
 The API is larger than the dedicated MCP tool list. Inspect the installed
 surface using `itoo_api_inventory(plugin="railclone"|"forest")`: it reports
 interfaces, signatures, property types, module product versions, and coverage

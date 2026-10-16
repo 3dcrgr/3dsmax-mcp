@@ -1,10 +1,12 @@
 # When 3ds Max hangs: a diagnosis instead of timeouts
 
+Upstream pull request: **Hangs and dialogs**, not opened yet ([list](../FORK.md#upstream-pull-requests)).
+
 Fork issues #4 and #6, and the executor shutdown fix. Commits `adcfd93`, `a9d2a0d`, `ed1fb1c`, `2ce5928`, `011e547`, `f7dbb87`, `03f4d64`, `4ba8059` and `b4dd573`. Since the 1.7.5 merge (`a07ef93`), all of this is built to work alongside upstream's dialog handling; see [the last section](#upstream-175s-dialog-handling-fixed-on-the-merge). Since the 1.7.6 merge (`298a295`), it also sits alongside upstream's own reply deadline and shutdown handling; see [Upstream status](#upstream-status).
 
 **Which bridge.** The client side, the Python half of the dialog fixes, `capture_hang_diagnostics` and the orphaned-server watchdog are Python, and work with upstream's bridges too. `health` and the native half of the dialog fixes need the fork's bridge. The shutdown drain and the connected-pipe cancellation (#29) are in upstream's 1.7.6 bridges too.
-- In `native/bin/`, only `mcp_bridge_2027.gup` is a fork build: the 1.7.6 merge's own build with the Max 2027 SDK (hash in `native/bin/bridge_manifest.json`), not deployed or live-tested yet. The 2023, 2024, 2025 and 2026 files are upstream's 1.7.6 builds.
-- A 2027 fork bridge has run on the production machine since 2026-10-11; since 2026-10-14 that's the 1.7.5-based `04815449…` (from `538a241`).
+- In `native/bin/`, only `mcp_bridge_2027.gup` is a fork build: the fork's own build with the Max 2027 SDK (hash in `native/bin/bridge_manifest.json`), not deployed or live-tested yet. The 2023, 2024, 2025 and 2026 files are upstream's builds from `71f72a8` (1.7.6 plus #35).
+- A 2027 fork bridge has run on the production machine since 2026-10-11: the 1.7.5-based `04815449…` (from `538a241`) from 2026-10-14, and the 1.7.6 merge's `c5903978…` (from `298a295`) since 2026-10-15.
 
 ## What happened
 

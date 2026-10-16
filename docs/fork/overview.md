@@ -9,11 +9,11 @@
 
 This page was the fork's README until 2026-10-14. The repository README is now upstream's, with a short fork note, so the fork stays a set of changes to upstream rather than a separate project. [FORK.md](../FORK.md) lists every change and how it was verified.
 
-This is a fork of [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax-mcp), based on upstream **1.7.6** (`5a92193`, merged in `298a295`). Before that merge it was based on 1.7.5 (`29aed53`). The merge has passed the unit tests, the SDK-independent native tests and a Max 2027 build; it hasn't been tested live yet. Upstream 1.7.6 now has its own versions of some of the fixes below; [FORK.md](../FORK.md#what-upstream-176-now-covers) lists them.
+This is a fork of [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax-mcp), based on upstream **1.7.6** (`5a92193`, merged in `298a295`). Before that merge it was based on 1.7.5 (`29aed53`). The merge has passed the unit tests, the SDK-independent native tests and a Max 2027 build; it was deployed on Max 2027 on 2026-10-15 and confirmed live. Since `a86ade0` (2026-10-16, not deployed yet) the fork also has upstream's later `master` up to `71f72a8`, with the materials pull request #35. Upstream 1.7.6 now has its own versions of some of the fixes below; [FORK.md](../FORK.md#what-upstream-176-now-covers) lists them.
 
 It carries fixes for problems found while using the MCP on production architectural visualization. The worst of them hung 3ds Max and lost unsaved work. It also adds tools for Chaos Vantage, RailClone, Forest Pack and props that float or sink.
 
-Verified and deployed improvements are published on the fork's default branch, `fix/fork-fixes`. We are consolidating the improvements into one pull request to upstream.
+Verified and deployed improvements are published on the fork's default branch, `fix/fork-fixes`. The improvements are offered upstream as five pull requests, one at a time. The materials one is merged ([#35](https://github.com/cl0nazepamm/3dsmax-mcp/pull/35)). See [FORK.md](../FORK.md#upstream-pull-requests).
 
 ## At a glance
 
@@ -26,7 +26,7 @@ Forest Effects supports guarded ordering, numeric parameters, object, spline, ex
   - Chaos Cosmos and Chaos Vantage 3.4;
   - RailClone 7.3.5 and Forest Pack 9.4.3;
   - scenes linked from Revit.
-- **Native bridges:** a fork build for Max 2027 only in `native/bin/`. The 2023–2026 bridges are upstream's 1.7.6 builds; see [Native bridge](#native-bridge).
+- **Native bridges:** a fork build for Max 2027 only in `native/bin/`. The 2023–2026 bridges are upstream's builds from `71f72a8` (1.7.6 plus #35); see [Native bridge](#native-bridge).
 - **Same requirements as upstream:** Windows, 3ds Max 2023–2027, and an MCP client such as Claude Desktop, Claude Code, Codex or Cursor.
 
 [docs/FORK.md](../FORK.md) lists every change with how it was verified (live in Max, or unit-tested only). The pages under [docs/fork/](./) give the details.
@@ -36,6 +36,8 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
 ## What it fixes
 
 ### When 3ds Max hangs or is busy
+*Upstream pull request: Hangs and dialogs.*
+
 - A hung Max no longer turns every tool into a bare timeout.
   - Calls fail fast with `MAX_BUSY` or `MAX_NOT_RESPONDING` and a process diagnosis: whether the main window responds, CPU use, whether it exited.
   - The client never replays a request that may already have run.
@@ -45,6 +47,8 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
 - An MCP server whose client crashed exits with it, instead of staying connected to Max.
 
 ### Dialogs and unsaved work
+*Upstream pull request: Hangs and dialogs.*
+
 - **Save prompts:** quiet mode never answers a "Save changes?" prompt by itself. A script that mentions a reset, open, fetch or quit command runs with quiet mode off, so the prompt reaches the agent as `BLOCKED_BY_DIALOG`. Forcing `quiet=True` on such a script also needs `allow_discard=True`.
 - **Fixes to upstream 1.7.5's dialog handling:**
   - A hung main thread is reported as a hang, not as "blocked by a dialog".
@@ -55,44 +59,58 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
 - **Interrupted scripts:** a script interrupted by `quitMax` is reported as `MAXSCRIPT_INTERRUPTED`, not as a parse error.
 
 ### Several sessions or several 3ds Max instances
+*Upstream pull request: Hangs and dialogs.*
+
 - **Shared selection:** the selected Max belongs to the MCP server process, so sessions that share a server share it.
   - Every tool except the four routing tools takes an optional `expected_pid`. The call is refused, with nothing sent, if it would reach another Max.
   - Every reply's `transport` carries `selection_generation`, so a session can see that the selection moved.
 - **A default target whose Max exited** re-resolves to the new Max when that choice is unambiguous, and the reply warns. With several Max instances running it refuses instead of guessing. An explicit selection is never replaced.
 
 ### Chaos Cosmos
+*Upstream pull request: Cosmos import.*
+
 - **No more stalls:** `cosmos_import` no longer stalls Max for minutes or deadlocks it on a later window close. It opens the Cosmos browser on Max's main thread first, waits for Max to settle, and refuses other calls with `IMPORT_SETTLING` while Max is still busy.
 - **Lighter waiting:** it polls with light read-only probes instead of a full class scan every 250 ms. `cosmos_search` works without Max's main thread.
 - **Finds what it created** by handle, whatever the names: materials, maps, proxies, containers and groups. Untouched default slot materials aren't listed as new.
 - **Leaves the user's things alone:** it keeps the active Material Editor slot, and minimizes the browser it opened once the import is confirmed.
 
 ### Materials
+*Upstream's since [#35](https://github.com/cl0nazepamm/3dsmax-mcp/pull/35) (merged 2026-10-15).*
+
 - **`replace_material`:**
   - It no longer "replaces" nothing while reporting success.
   - Its direction is documented, and `no_match` warns.
   - It matches Multi/Sub sub-material slots, and finds source materials outside the scene.
   - Batch entries apply in order.
-  - Upstream 1.7.6 now does the slots, Material Editor sources and batch order itself; the fork adds `source_from`, the scene materials and material library as sources, `include_sub_materials` and a preview without a source.
+  - Upstream 1.7.6 does the slots, Material Editor sources and batch order itself. The rest, `source_from`, the scene materials and material library as sources, `include_sub_materials` and a preview without a source, is upstream's since #35. The fork carries upstream's code since `a86ade0`.
 - **`material_roles`:**
   - It reads texture paths of Revit materials (Autodesk Bitmap), which read as empty before.
   - It flags unreadable paths.
   - It gives one row per VRayBitmap slot.
 
 ### Modeling and scene
+*Upstream pull request: Scene checks. The Line fix is upstream 1.7.6's own.*
+
 - The curve tools accept Line objects as editable splines (now upstream's fix, in 1.7.6).
 - `contact_check` takes its thresholds in millimetres, skips non-mesh nodes with a warning, and works within a work budget and a time budget (`time_budget_s`) on dense meshes. Upstream 1.7.6 has a simpler time budget; the merge keeps the fork's.
 - Cloning a member of a closed group clones only that member, instead of the whole group stacked invisibly on the original (upstream 1.7.6 refuses such a clone instead). `scene_qa` reports such stacked duplicates.
 
 ### Agent viewport
+*Upstream pull request: Scene checks.*
+
 - `agent_viewport` reclaims its own floating viewport after a restart, save or Hold/Fetch. It never takes an untagged panel.
 - The V-Ray previews (`vray_ipr`, `vray_vfb`) work with **V-Ray GPU**. They used to require a V-Ray CPU property and refused GPU.
 
 ### RailClone (the existing tools)
+*Upstream pull request: iToo and Vantage.*
+
 - `get_railclone_style` and `set_railclone_style` accept the repeated attributes RailClone 7 writes. They rejected 7 of 43 stock styles.
 - `get_railclone_output` rebuilds before reading, so it no longer returns stale positions after a move or copy. It flags placeholder items and adds world bounds.
 - Reading never re-captures segment geometry. A reload only renames linked segments, so it is opt-in (`reload_segments`), and `force_rebuild` picks up source edits made while auto-update is off.
 
 ### Forest Pack (the existing tool)
+*Upstream pull request: iToo and Vantage.*
+
 - `scatter_forest_pack`:
   - **Density** is set through the tile size (`items_per_m2`, or `density` as a % of `density_units_*_cm`). The old `maxdensity` write did nothing.
   - **"Up" facing** is `direction` 100, on the real −100…100 range.
@@ -102,22 +120,22 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
 
 ## What it adds
 
-| Area | New tools | What they do |
-|---|---|---|
-| Diagnostics | `capture_hang_diagnostics` | Native thread stacks of a hung Max, read from the OS, showing what blocks the main thread |
-| Props | `resting_check`, `drop_to_surface` | Find props floating above or sunk into the surface below them, gaps in millimetres; drop floating ones onto it (dry run by default, one undo step) |
-| Chaos Vantage | `vantage_status`, `vantage_get_image`, `vantage_live_link` | Read Vantage's state over its local command port, save the frame it shows as a PNG, start or stop V-Ray GPU Live Link. Vantage's command port isn't documented by Chaos |
-| RailClone | `railclone_inspect`, `railclone_set_param`, `railclone_library`, `railclone_from_library` | Inspect bases, exposed parameters, segments and output; set parameters by name within their limits; search the library; create items by route or name, with splines assigned by role. They report the running RailClone version, warn about version-specific library bugs, and handle Proxy Cache |
-| Forest Pack | `forest_items`, `forest_edit_items`, `forest_set_mode`, `forest_instances`, `forest_library`, `forest_from_library`, `forest_validate` | Read items with instance-ready transforms; edit items in custom edit mode with a revert list (Forest doesn't undo item edits); search the library and place presets or 3D items; validate item and area lists, including Reference-mode forests fed by a RailClone and warnings when random X/Y translation can cross active spline boundaries; name why a forest is empty |
-| iToo API extensions | `itoo_api_inventory`, `itoo_catalog`, `railclone_slots`, `railclone_metadata`, `railclone_proxy`, `railclone_instances`, `railclone_settings`, `forest_inspect`, `forest_effects`, `forest_effect_parameters`, `forest_effect_curves`, `forest_settings`, `forest_effect_library` | [Coverage and remaining gaps](itoo-api-coverage.md): live API signatures, guarded source/segment/settings edits, read-only Forest translation extents and CurveControl inspection, metadata, cache/instance controls and tested Forest Effects editing and library reads |
-| iToo → Vantage | `itoo_vantage_check` | Read-only check of how ready Forest Pack, RailClone and ForestIvy objects are for Chaos Vantage: colour-map slot 1, opacity maps, CPU-only features, ID-driven maps, render settings, caps and the `fullMeshProxy` setting. A fallback is suggested for objects with errors |
+| Area | New tools | What they do | Upstream PR |
+|---|---|---|---|
+| Diagnostics | `capture_hang_diagnostics` | Native thread stacks of a hung Max, read from the OS, showing what blocks the main thread | Hangs and dialogs |
+| Props | `resting_check`, `drop_to_surface` | Find props floating above or sunk into the surface below them, gaps in millimetres; drop floating ones onto it (dry run by default, one undo step) | Scene checks |
+| Chaos Vantage | `vantage_status`, `vantage_get_image`, `vantage_live_link` | Read Vantage's state over its local command port, save the frame it shows as a PNG, start or stop V-Ray GPU Live Link. Vantage's command port isn't documented by Chaos | iToo and Vantage |
+| RailClone | `railclone_inspect`, `railclone_set_param`, `railclone_library`, `railclone_from_library` | Inspect bases, exposed parameters, segments and output; set parameters by name within their limits; search the library; create items by route or name, with splines assigned by role. They report the running RailClone version, warn about version-specific library bugs, and handle Proxy Cache | iToo and Vantage |
+| Forest Pack | `forest_items`, `forest_edit_items`, `forest_set_mode`, `forest_instances`, `forest_library`, `forest_from_library`, `forest_validate` | Read items with instance-ready transforms; edit items in custom edit mode with a revert list (Forest doesn't undo item edits); search the library and place presets or 3D items; validate item and area lists, including Reference-mode forests fed by a RailClone and warnings when random X/Y translation can cross active spline boundaries; name why a forest is empty | iToo and Vantage |
+| iToo API extensions | `itoo_api_inventory`, `itoo_catalog`, `railclone_slots`, `railclone_metadata`, `railclone_proxy`, `railclone_instances`, `railclone_settings`, `forest_inspect`, `forest_effects`, `forest_effect_parameters`, `forest_effect_curves`, `forest_settings`, `forest_effect_library` | [Coverage and remaining gaps](itoo-api-coverage.md): live API signatures, guarded source/segment/settings edits, read-only Forest translation extents and CurveControl inspection, metadata, cache/instance controls and tested Forest Effects editing and library reads | iToo and Vantage |
+| iToo → Vantage | `itoo_vantage_check` | Read-only check of how ready Forest Pack, RailClone and ForestIvy objects are for Chaos Vantage: colour-map slot 1, opacity maps, CPU-only features, ID-driven maps, render settings, caps and the `fullMeshProxy` setting. A fallback is suggested for objects with errors | iToo and Vantage |
 
 New options on existing tools:
-- `expected_pid` on every tool, and `selection_generation` in every reply's transport;
-- `allow_discard` on `execute_maxscript`;
-- `time_budget_s` on `contact_check`;
-- `reload_segments` and `force_rebuild` on the RailClone read tools;
-- `items_per_m2` and `direction` on `scatter_forest_pack`.
+- `expected_pid` on every tool, and `selection_generation` in every reply's transport (Hangs and dialogs);
+- `allow_discard` on `execute_maxscript` (Hangs and dialogs);
+- `time_budget_s` on `contact_check` (Scene checks);
+- `reload_segments` and `force_rebuild` on the RailClone read tools (iToo and Vantage);
+- `items_per_m2` and `direction` on `scatter_forest_pack` (iToo and Vantage).
 
 ## What it removes or changes on purpose
 
@@ -169,14 +187,14 @@ The installer's runtime ignores `PYTHONPATH`, hence the `sys.path` line. See [Ad
 
 | Max | Bridge in `native/bin/` |
 |---|---|
-| 2027 | Fork build from the 1.7.6 merge: upstream 1.7.6's shell and core with every native fix (hash in `native/bin/bridge_manifest.json`); not deployed or live-tested yet |
-| 2023–2026 | Upstream's 1.7.6 builds. The fork's 1.7.5-based 2026 build (`d5cd6ba5…`) was dropped in the merge |
+| 2027 | Fork build from `a86ade0`: upstream's shell and core as of `71f72a8` with every native fix (hash in `native/bin/bridge_manifest.json`); not deployed or live-tested yet |
+| 2023–2026 | Upstream's rebuilds from `71f72a8` (1.7.6 plus #35). The fork's 1.7.5-based 2026 build (`d5cd6ba5…`) was dropped in the 1.7.6 merge |
 
 With an upstream bridge, the Python-side fixes work but the native ones are missing. For those, build the bridge for your version yourself: see [Building the native bridge](../FORK.md#building-the-native-bridge). It needs Visual Studio 2022 with the v143 14.38 toolset and the 3ds Max SDK. To replace only a bridge, close every 3ds Max first and keep a copy of the old file.
 
 ## Tools
 
-The ★ marks tools this fork adds. The others are upstream's, some fixed here, as described above.
+The ★ marks tools this fork adds. The others are upstream's, some fixed here, as described above. Upstream pull requests for the ★ tools ([list](../FORK.md#upstream-pull-requests)): `capture_hang_diagnostics` goes with Hangs and dialogs, `resting_check` and `drop_to_surface` with Scene checks, and every RailClone, Forest Pack, iToo API and Vantage tool with iToo and Vantage.
 
 <details>
 <summary>Browse all 210 tools</summary>

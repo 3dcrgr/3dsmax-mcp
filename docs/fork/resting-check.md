@@ -1,5 +1,7 @@
 # Floating and sunk props: `resting_check` and `drop_to_surface`
 
+Upstream pull request: **Scene checks**, not opened yet ([list](../FORK.md#upstream-pull-requests)).
+
 Fork issue #17 (feature request, 2026-10-06).
 
 ## What happened

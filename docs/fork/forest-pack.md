@@ -1,5 +1,7 @@
 # Forest Pack: items, custom edits, library presets and list checks
 
+Upstream pull request: **iToo and Vantage**, not opened yet ([list](../FORK.md#upstream-pull-requests)).
+
 Added on 2026-10-06, from a live study of Forest Pack Pro 9 in a scratch 3ds Max 2026 with centimetre units (`Forest_Pro.version()` = 900 is an API number: Forest Pack 9.4.3 returns it too). The original changes were Python only. The 2026-10-14 controller repair and curve-slot guard require the updated native bridge; see [deployed verification](forest-effects-verification-2026-10-14.md).
 
 ## Why

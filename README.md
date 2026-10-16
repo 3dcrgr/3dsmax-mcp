@@ -9,7 +9,7 @@
 
 Connect AI agents to Autodesk 3ds Max through the [Model Context Protocol](https://modelcontextprotocol.io).
 
-> **This is a fork** of [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax-mcp), based on upstream 1.7.6 (`5a92193`). It adds fixes for problems found in production use (hangs, unsaved work lost to save prompts, Cosmos imports, Revit materials) and tools for Chaos Vantage, RailClone, Forest Pack and props that float or sink. The fixes are being offered upstream as pull requests.
+> **This is a fork** of [cl0nazepamm/3dsmax-mcp](https://github.com/cl0nazepamm/3dsmax-mcp), based on upstream 1.7.6 (`5a92193`) and upstream's later `master` (`71f72a8`). It adds fixes for problems found in production use (hangs, unsaved work lost to save prompts, Cosmos imports, Revit materials) and tools for Chaos Vantage, RailClone, Forest Pack and props that float or sink. The materials fixes are merged upstream ([#35](https://github.com/cl0nazepamm/3dsmax-mcp/pull/35)). The rest are being offered upstream as pull requests, one at a time ([list](docs/FORK.md#upstream-pull-requests)).
 >
 > - Every change and how it was verified: [docs/FORK.md](docs/FORK.md). Per-fix details: [docs/fork/](docs/fork/).
 > - The fork's features, install notes and full tool list (new tools marked ★): [docs/fork/overview.md](docs/fork/overview.md).

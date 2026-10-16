@@ -1,5 +1,7 @@
 # Chaos Vantage: status, image and Live Link
 
+Upstream pull request: **iToo and Vantage**, not opened yet ([list](../FORK.md#upstream-pull-requests)).
+
 Added on the `merge-1.7.5` branch (2026-10-06). Chaos is working on an official MCP server for Vantage but hasn't shipped one: Vantage 3.4.0 has none. These tools cover what can be done safely without it.
 
 ## What they use

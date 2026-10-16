@@ -1,5 +1,7 @@
 # Forest Effects fixes #43 and #45: deployed verification
 
+Upstream pull request: **iToo and Vantage**, not opened yet ([list](../FORK.md#upstream-pull-requests)).
+
 Verified on 2026-10-14 in disposable 3ds Max 2027 instances with Forest Pack Pro 9.4.3 and safe mode enabled. Calls were pinned to each scratch PID. Fixtures were preserved.
 
 ## Fixes
