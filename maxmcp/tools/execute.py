@@ -45,9 +45,8 @@ class UnsavedChangesError(RuntimeError):
 
 def _refuse_if_unsaved(script: str) -> None:
     # loadMaxFile never asks to save, even with prompts shown, so a modified scene would be replaced
-    # without a word. A script that calls checkForSave() asks by itself and is left to do so.
-    if "checkforsave" in _normalized(script):
-        return
+    # without a word. No exception for scripts that call checkForSave(): the name may only sit in a
+    # comment, and a script can ignore the answer. With allow_discard=True such a script still asks.
     response = client.send_command(_SAVE_REQUIRED_SCRIPT, cmd_type="maxscript")
     if str(response.get("result", "")).strip().lower() == "true":
         raise UnsavedChangesError(
@@ -82,8 +81,9 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     Answer a shown prompt with max_dialogs. Such a script is refused with
     UNSAVED_CHANGES, before anything runs, while the scene has unsaved changes
     (loadMaxFile never asks to save, even with prompts on); save first, or pass
-    allow_discard=True with the user's OK. A script that calls checkForSave() is
-    left to ask. Edits made with undo off don't mark the scene modified, in Max too.
+    allow_discard=True with the user's OK (a script that calls checkForSave()
+    still shows its prompt then). Edits made with undo off, as plain
+    execute_maxscript edits are by default, don't mark the scene modified, in Max too.
 
     Always pass #noPrompt to importFile, including OBJ/FBX imports:
     importFile @"C:/assets/model.fbx" #noPrompt

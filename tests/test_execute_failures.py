@@ -170,9 +170,19 @@ class UnsavedChangesTests(unittest.TestCase):
         self.assertEqual(call(), "ran")
         self.assertEqual(self.sent_scripts(client), ["resetMaxFile #noPrompt"])
 
-    def test_script_that_asks_itself_is_left_to_ask(self):
+    def test_checkforsave_script_is_refused_too(self):
+        # The name may only sit in a comment, and a script can ignore the answer.
+        for script in ('-- checkForSave\nloadMaxFile @"C:\\a.max" quiet:true',
+                       'checkForSave()\nresetMaxFile #noPrompt',
+                       'if checkForSave() do loadMaxFile @"C:\\a.max"'):
+            execute, client, call = self._run(script, True)
+            with self.assertRaises(execute.UnsavedChangesError):
+                call()
+            self.assertEqual(self.sent_scripts(client), ["getSaveRequired()"])
+
+    def test_checkforsave_script_runs_with_allow_discard(self):
         script = 'if checkForSave() do loadMaxFile @"C:\\a.max"'
-        _, client, call = self._run(script, True)
+        _, client, call = self._run(script, True, allow_discard=True)
         self.assertEqual(call(), "ran")
         self.assertEqual(self.sent_scripts(client), [script])
 
