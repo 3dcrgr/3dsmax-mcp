@@ -17,10 +17,43 @@ _SCENE_FILE_COMMANDS = ("resetmaxfile", "loadmaxfile", "fetchmaxfile", "quitmax"
 _ASCII_SPACE = re.compile(r"[ \t\n\v\f\r]+")
 
 
+def _normalized(script: str) -> str:
+    return _ASCII_SPACE.sub(" ", script).strip(" ").lower()
+
+
 def mentions_scene_file_command(script: str) -> bool:
     """True when the script's text mentions a command that can prompt to save or discard the scene."""
-    text = _ASCII_SPACE.sub(" ", script).strip(" ").lower()
+    text = _normalized(script)
     return any(name in text for name in _SCENE_FILE_COMMANDS)
+
+
+# The same state Max's own "save changes?" prompt reads. Edits made with undo off don't set it,
+# in Max itself as well, so they are not protected by the prompt or by this check.
+_SAVE_REQUIRED_SCRIPT = "getSaveRequired()"
+
+
+class UnsavedChangesError(RuntimeError):
+    """The scene has unsaved changes and the script would reset, open, fetch or quit; nothing ran."""
+
+    code = "UNSAVED_CHANGES"
+    retryable = False
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.details = {"script_sent": False}
+
+
+def _refuse_if_unsaved(script: str) -> None:
+    # loadMaxFile never asks to save, even with prompts shown, so a modified scene would be replaced
+    # without a word. A script that calls checkForSave() asks by itself and is left to do so.
+    if "checkforsave" in _normalized(script):
+        return
+    response = client.send_command(_SAVE_REQUIRED_SCRIPT, cmd_type="maxscript")
+    if str(response.get("result", "")).strip().lower() == "true":
+        raise UnsavedChangesError(
+            "The scene has unsaved changes and this script resets, opens, fetches or quits, so they would "
+            "be lost. Nothing was run. Ask the user: save first (saveMaxFile or manage_scene), or run it "
+            "again with allow_discard=True if they agree to lose the changes.")
 
 
 @mcp.tool()
@@ -46,7 +79,11 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     both only when the user agreed to lose unsaved changes. The check reads only
     this text: for a script that runs other scripts (fileIn, include,
     python.ExecuteFile, macros.run) that may reset, open or quit, pass quiet=False.
-    Answer a shown prompt with max_dialogs.
+    Answer a shown prompt with max_dialogs. Such a script is refused with
+    UNSAVED_CHANGES, before anything runs, while the scene has unsaved changes
+    (loadMaxFile never asks to save, even with prompts on); save first, or pass
+    allow_discard=True with the user's OK. A script that calls checkForSave() is
+    left to ask. Edits made with undo off don't mark the scene modified, in Max too.
 
     Always pass #noPrompt to importFile, including OBJ/FBX imports:
     importFile @"C:/assets/model.fbx" #noPrompt
@@ -56,7 +93,10 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     script = code or command
     if not script:
         return "Error: provide MAXScript code in the 'code' parameter"
-    quiet_ignored = bool(quiet) and not allow_discard and mentions_scene_file_command(script)
+    file_command = mentions_scene_file_command(script)
+    if file_command and not allow_discard:
+        _refuse_if_unsaved(script)
+    quiet_ignored = bool(quiet) and not allow_discard and file_command
     if quiet_ignored:
         quiet = False  # #12: quiet mode would answer "save changes?" by discarding the scene
     response = client.send_command(script, cmd_type="maxscript",

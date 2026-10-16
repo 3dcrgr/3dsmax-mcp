@@ -135,6 +135,59 @@ class QuietRequestFieldTests(unittest.TestCase):
         self.assertIn("BLOCKED_BY_DIALOG", doc)
 
 
+class UnsavedChangesTests(unittest.TestCase):
+    """A reset/open/fetch/quit script on a modified scene is refused before it runs."""
+
+    def _run(self, script, save_required, **kwargs):
+        client = mock.Mock()
+
+        def send(code, **_kw):
+            return {"result": "true" if save_required else "false"} if code == "getSaveRequired()" else {"result": "ran"}
+
+        client.send_command.side_effect = send
+        execute = _load_execute(client)
+        return execute, client, (lambda: execute.execute_maxscript(code=script, **kwargs))
+
+    def sent_scripts(self, client):
+        return [c.args[0] for c in client.send_command.call_args_list]
+
+    def test_modified_scene_refuses_load_and_runs_nothing(self):
+        execute, client, call = self._run('loadMaxFile @"C:\\a.max"', True)
+        with self.assertRaises(execute.UnsavedChangesError) as cm:
+            call()
+        self.assertEqual(cm.exception.code, "UNSAVED_CHANGES")
+        self.assertFalse(cm.exception.retryable)
+        self.assertEqual(cm.exception.details, {"script_sent": False})
+        self.assertEqual(self.sent_scripts(client), ["getSaveRequired()"])
+
+    def test_saved_scene_runs_the_script(self):
+        _, client, call = self._run("resetMaxFile()", False)
+        self.assertEqual(call(), "ran")
+        self.assertEqual(self.sent_scripts(client), ["getSaveRequired()", "resetMaxFile()"])
+
+    def test_allow_discard_skips_the_check(self):
+        _, client, call = self._run("resetMaxFile #noPrompt", True, allow_discard=True)
+        self.assertEqual(call(), "ran")
+        self.assertEqual(self.sent_scripts(client), ["resetMaxFile #noPrompt"])
+
+    def test_script_that_asks_itself_is_left_to_ask(self):
+        script = 'if checkForSave() do loadMaxFile @"C:\\a.max"'
+        _, client, call = self._run(script, True)
+        self.assertEqual(call(), "ran")
+        self.assertEqual(self.sent_scripts(client), [script])
+
+    def test_other_scripts_make_no_extra_call(self):
+        _, client, call = self._run("box()", True)
+        self.assertEqual(call(), "ran")
+        self.assertEqual(self.sent_scripts(client), ["box()"])
+
+    def test_error_code_reaches_the_envelope(self):
+        err = tool_response._error_from_exception(_load_execute(mock.Mock()).UnsavedChangesError("x"))
+        self.assertEqual(err["code"], "UNSAVED_CHANGES")
+        self.assertFalse(err["retryable"])
+        self.assertEqual(err["details"], {"script_sent": False})
+
+
 class QuietPolicySourceTests(unittest.TestCase):
     """#12: the bridge never runs a scene file command in Max's quiet mode by default."""
 
