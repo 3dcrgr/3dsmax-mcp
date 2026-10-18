@@ -1,4 +1,5 @@
 import json
+import re
 
 from ..helpers.error_hints import suggest_tools_for_maxscript
 from ..helpers.python_execution import python_execution_script
@@ -7,22 +8,82 @@ from ..server import mcp, client
 
 _MAXSCRIPT_ERROR_SENTINEL = "__MCP_MS_ERR__:"
 
+# Mirrors QuietPolicy::MentionsSceneFileCommand (native/include/mcp_bridge/quiet_policy.h):
+# commands whose "save changes?" prompt quiet mode would answer by discarding work.
+_SCENE_FILE_COMMANDS = ("resetmaxfile", "loadmaxfile", "fetchmaxfile", "quitmax", "checkforsave",
+                        "max reset file", "max file new", "max file open", "max fetch",
+                        # Interface spellings, e.g. through Autodesk.Max's COREInterface.
+                        "filereset", "filefetch", "loadfromfile")
+_ASCII_SPACE = re.compile(r"[ \t\n\v\f\r]+")
+
+
+def _normalized(script: str) -> str:
+    return _ASCII_SPACE.sub(" ", script).strip(" ").lower()
+
+
+def mentions_scene_file_command(script: str) -> bool:
+    """True when the script's text mentions a command that can prompt to save or discard the scene."""
+    text = _normalized(script)
+    return any(name in text for name in _SCENE_FILE_COMMANDS)
+
+
+# The same state Max's own "save changes?" prompt reads. Edits made with undo off don't set it,
+# in Max itself as well, so they are not protected by the prompt or by this check.
+_SAVE_REQUIRED_SCRIPT = "getSaveRequired()"
+
+
+class UnsavedChangesError(RuntimeError):
+    """The scene has unsaved changes and the script would reset, open, fetch or quit; nothing ran."""
+
+    code = "UNSAVED_CHANGES"
+    retryable = False
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.details = {"script_sent": False}
+
+
+def _refuse_if_unsaved(script: str) -> None:
+    # loadMaxFile never asks to save, even with prompts shown, so a modified scene would be replaced
+    # without a word. No exception for scripts that call checkForSave(): the name may only sit in a
+    # comment, and a script can ignore the answer. With allow_discard=True such a script still asks.
+    response = client.send_command(_SAVE_REQUIRED_SCRIPT, cmd_type="maxscript")
+    if str(response.get("result", "")).strip().lower() == "true":
+        raise UnsavedChangesError(
+            "The scene has unsaved changes and this script resets, opens, fetches or quits, so they would "
+            "be lost. Nothing was run. Ask the user: save first (saveMaxFile or manage_scene), or run it "
+            "again with allow_discard=True if they agree to lose the changes.")
+
 
 @mcp.tool()
-def execute_maxscript(code: str = "", command: str = "", quiet: bool = True) -> str:
+def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = None,
+                      allow_discard: bool = False) -> str:
     """Execute arbitrary MAXScript in 3ds Max and return the result.
 
     Use when: no dedicated MCP tool covers the operation (custom one-offs, rare APIs).
     Not when: objects, materials, selection, transforms, modifiers, layers, or scene queries —
     prefer the matching dedicated tool instead of raw MAXScript.
 
-    quiet=True (default) runs in Max's quiet mode: prompts such as queryBox,
+    By default the script runs in Max's quiet mode: prompts such as queryBox,
     overwrite and missing-file warnings silently take their default answer.
-    quiet=False shows them; a prompt then returns BLOCKED_BY_DIALOG to read and
-    answer with max_dialogs. Use it when the user wants to be asked.
-    Quiet mode also skips the save-changes prompt: checkForSave() returns true
-    and resetMaxFile() discards unsaved work (loadMaxFile never asks). Ask the
-    user before resetting, loading, fetching or quitting, and pass quiet=False.
+    A script that mentions resetMaxFile, loadMaxFile, fetchMaxFile, quitMax,
+    checkForSave, "max file new/open", "max reset file", "max fetch" or the
+    Interface's FileReset/FileFetch/LoadFromFile runs with prompts shown, because
+    quiet mode skips the save-changes prompt (checkForSave() returns true and
+    resetMaxFile() discards unsaved work): a save-changes prompt then returns
+    BLOCKED_BY_DIALOG instead of discarding work (#noPrompt or quiet:true arguments
+    in the script still suppress it, and so discard unsaved changes: add them only
+    with the user's OK). quiet=False always shows prompts. quiet=True forces quiet
+    mode, except on such a script: there it needs allow_discard=True as well; pass
+    both only when the user agreed to lose unsaved changes. The check reads only
+    this text: for a script that runs other scripts (fileIn, include,
+    python.ExecuteFile, macros.run) that may reset, open or quit, pass quiet=False.
+    Answer a shown prompt with max_dialogs. Such a script is refused with
+    UNSAVED_CHANGES, before anything runs, while the scene has unsaved changes
+    (loadMaxFile never asks to save, even with prompts on); save first, or pass
+    allow_discard=True with the user's OK (a script that calls checkForSave()
+    still shows its prompt then). Edits made with undo off, as plain
+    execute_maxscript edits are by default, don't mark the scene modified, in Max too.
 
     Always pass #noPrompt to importFile, including OBJ/FBX imports:
     importFile @"C:/assets/model.fbx" #noPrompt
@@ -32,8 +93,19 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool = True) -> 
     script = code or command
     if not script:
         return "Error: provide MAXScript code in the 'code' parameter"
+    file_command = mentions_scene_file_command(script)
+    if file_command and not allow_discard:
+        _refuse_if_unsaved(script)
+    quiet_ignored = bool(quiet) and not allow_discard and file_command
+    if quiet_ignored:
+        quiet = False  # quiet mode would answer "save changes?" by discarding the scene
     response = client.send_command(script, cmd_type="maxscript",
-                                   request_fields=None if quiet else {"quiet": False})
+                                   request_fields=None if quiet is None else {"quiet": bool(quiet)})
+    if quiet_ignored and isinstance(response, dict):
+        meta = response.get("meta")
+        if not isinstance(meta, dict):
+            meta = response["meta"] = {}
+        meta["quietOverride"] = "file_command_quiet_ignored"  # reported as a warning
     result = response.get("result", "")
 
     if isinstance(result, str) and result.startswith(_MAXSCRIPT_ERROR_SENTINEL):

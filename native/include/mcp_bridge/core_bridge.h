@@ -18,6 +18,9 @@ public:
     static void EnableDirectMode();
     static void DisableDirectMode();
     static bool IsDirectMode();
+    // True on Max's main thread (the shell executor's own thread), also inside
+    // a Dispatch nested there. False when the core is not bound.
+    static bool IsMainThread();
 };
 
 // Handlers keep their signature `std::string Fn(const std::string& params,

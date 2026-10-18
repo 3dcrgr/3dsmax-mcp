@@ -115,6 +115,20 @@ MAXSCRIPT_SUGGESTION_RULES: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] 
 
 # Message patterns applied to any tool error when no tool-authored hint exists.
 _MESSAGE_HINT_RULES: tuple[tuple[re.Pattern[str], ToolHint], ...] = (
+    # MAX_NOT_RESPONDING / IMPORT_SETTLING texts (max_client). First: they can also
+    # mention "the bridge" or "main window not found".
+    (
+        re.compile(r"\bis (still )?not responding\b|\bis still settling after\b", re.IGNORECASE),
+        {
+            "message": (
+                "3ds Max is hung or still settling. Wait up to ~10 min, re-checking with get_bridge_status: "
+                "some stalls (e.g. a V-Ray preview render) clear after several minutes, a deadlock never does. "
+                "capture_hang_diagnostics (OS-only, pauses each Max thread for milliseconds) "
+                "shows what blocks its main thread."
+            ),
+            "suggested_tools": ["capture_hang_diagnostics", "get_bridge_status"],
+        },
+    ),
     (
         re.compile(r"\bnot found\b|\bunknown (object|node|material)\b", re.IGNORECASE),
         {

@@ -74,7 +74,7 @@ add_custom_target(gen_tool_smoke DEPENDS "${TOOL_SMOKE_INC}")
 # SHELL: what Max loads and keeps, and everything Max holds a pointer to:
 # plugin registration, named pipe, main-thread executor, dialog monitor and its
 # Qt reader, scene journal, GDI+ lifetime, the agent viewport, render_start's
-# armed job and notifications, and undo records. It answers ping,
+# armed job and notifications, and undo records. It answers ping, health,
 # native:max_dialogs and native:core itself and reaches the core only through
 # McpCoreApi, behind the drain gate (core_control.cpp, core_host.cpp).
 set(MCP_SHELL_SOURCES
@@ -83,6 +83,7 @@ set(MCP_SHELL_SOURCES
     src/pipe_server.cpp
     src/main_thread_executor.cpp
     src/dialog_watch.cpp
+    src/bridge_health.cpp
     src/qt_dialogs.cpp
     src/gdiplus_runtime.cpp
     src/scene_journal.cpp
@@ -221,7 +222,9 @@ endforeach()
 add_custom_target(qt_import_libs DEPENDS ${MCP_QT_IMPORT_LIBS})
 set_source_files_properties(src/qt_dialogs.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${MCP_QT_DIR}/include"
-    COMPILE_DEFINITIONS "QT_NO_VERSION_TAGGING"
+    # QT_NO_DEBUG compiles out Q_ASSERT in inline Qt code: NDEBUG does not,
+    # and a failing assert would call qFatal and abort 3ds Max.
+    COMPILE_DEFINITIONS "QT_NO_VERSION_TAGGING;QT_NO_DEBUG"
     COMPILE_OPTIONS "/Zc:__cplusplus;/permissive-")
 
 # ── Object libraries ─────────────────────────────────────────────

@@ -2,6 +2,7 @@
 #include "mcp_bridge/core_bridge.h"
 #include "mcp_bridge/native_handlers.h"
 #include "mcp_bridge/handler_helpers.h"
+#include "mcp_bridge/quiet_policy.h"
 #include "mcp_bridge/response_envelope.h"
 #include "mcp_bridge/transaction_policy.h"
 #include <nlohmann/json.hpp>
@@ -229,14 +230,18 @@ private:
     MSTR label_;
 };
 
-// RAII guard — enables direct mode on construction, disables on destruction
+// RAII guard — enables direct mode on construction and restores the previous
+// mode on destruction, so a nested Dispatch never clears its caller's mode.
 struct DirectModeGuard {
     bool active;
-    DirectModeGuard(bool enable) : active(enable) {
+    bool previous;
+    DirectModeGuard(bool enable) : active(enable), previous(HostExecutor::IsDirectMode()) {
         if (active) HostExecutor::EnableDirectMode();
     }
     ~DirectModeGuard() {
-        if (active) HostExecutor::DisableDirectMode();
+        if (!active) return;
+        if (previous) HostExecutor::EnableDirectMode();
+        else HostExecutor::DisableDirectMode();
     }
 };
 
@@ -257,6 +262,10 @@ static std::string WideToUtf8(const wchar_t* w) {
     return s;
 }
 
+// Set on the pipe thread while dispatching one request; BuildResponse reports
+// it so callers can see that a script ran with Max's quiet mode off.
+static thread_local std::string tl_quiet_override;
+
 // ── Build JSON response ─────────────────────────────────────────
 static std::string BuildResponse(
     bool success,
@@ -268,8 +277,14 @@ static std::string BuildResponse(
     // Same envelope as the shell's own answers (response_envelope.h).
     const bool safe_mode = IsSafeModeEnabled();
     const bool direct = HostExecutor::IsDirectMode();
-    return McpEnvelope::Build(success, result, error, request_id, cmd_type, duration_ms, safe_mode, direct,
-                              McpHost::DialogWatch::OpenDialogs());
+    std::string response = McpEnvelope::Build(success, result, error, request_id, cmd_type, duration_ms,
+                                              safe_mode, direct, McpHost::DialogWatch::OpenDialogs());
+    if (tl_quiet_override.empty()) return response;
+    // A script ran with Max's quiet mode off although the caller left quiet
+    // unset. Rare, so the envelope is reparsed only then.
+    json resp = json::parse(response);
+    resp["meta"]["quietOverride"] = tl_quiet_override;
+    return resp.dump();
 }
 
 // ── Safe mode filter ────────────────────────────────────────────
@@ -322,10 +337,13 @@ static std::string HandleMaxScript(
     return McpHost::RunOnMainThread([&command, quiet]() -> std::string {
         HandlerHelpers::RequireMaxScriptThread();
         // Quiet mode lets prompts take their defaults, as batch scripts expect.
-        // quiet=false leaves Max's mode alone so prompts reach the agent as
-        // blocking dialogs. quietErrors keeps errors textual either way.
+        // quiet=false forces quiet mode off for the script (restored after),
+        // even if a plugin or script left Max quiet, so prompts reach the
+        // agent as blocking dialogs. Only the main thread changes the
+        // process-wide flag; this lambda always runs there.
+        // quietErrors keeps errors textual either way.
         std::optional<TempQuietMode> quiet_mode;
-        if (quiet) quiet_mode.emplace(TRUE);
+        quiet_mode.emplace(quiet ? TRUE : FALSE);
         std::wstring wcmd = HandlerHelpers::WrapForErrorCapture(
             HandlerHelpers::Utf8ToWide(command));
 
@@ -345,10 +363,14 @@ static std::string HandleMaxScript(
         }
 
         if (!ok) {
-            // Parse-time errors fall through here; runtime errors are caught
-            // inside MAXScript and surface as a sentinel string in fpv below.
+            // Runtime errors are caught inside MAXScript and surface as a
+            // sentinel string in fpv below. FALSE means a parse error OR an
+            // abort try/catch cannot catch (quitMax, escape): classify it,
+            // with Max's own error text as the fallback detail.
             const std::string detail = fpv.type == TYPE_TSTR && fpv.tstr ? WideToUtf8(fpv.tstr->data()) : "";
-            throw std::runtime_error("MAXScript execution failed: " + detail);
+            std::string code;
+            std::string message = HandlerHelpers::MaxScriptFailureMessage(wcmd, &code, detail);
+            throw std::runtime_error(HandlerHelpers::StructuredErrorPayload(code, message));
         }
         McpHost::DialogWatch::ThrowIfDismissed();
 
@@ -388,6 +410,7 @@ std::string CommandDispatcher::Dispatch(
     const std::string& client_session_id) {
 
     auto start = std::chrono::steady_clock::now();
+    tl_quiet_override.clear();  // set below only for this request's script
 
     // Parse request
     json req;
@@ -400,12 +423,18 @@ std::string CommandDispatcher::Dispatch(
     std::string command = req.value("command", "");
     std::string cmd_type = req.value("type", "maxscript");
     std::string request_id = req.value("requestId", "");
+    // health and native:max_dialogs never reach the core: the shell answers
+    // them on the pipe thread, and labels every core request for health
+    // (core_control.cpp).
     McpHost::DialogWatch::RequestContext request_context(request_id, cmd_type);
 
     // Route to handler — read-only handlers run directly on pipe thread
     // _forceMainThread flag allows benchmarking the same handler both ways
     bool forceMain = req.value("_forceMainThread", false);
-    bool direct = !forceMain && IsDirectHandler(cmd_type);
+    // A Dispatch nested on the main thread (invoke_tool, run_tool_smoke) is
+    // already where main-thread work runs: direct mode would only make it look
+    // like a pipe thread (no quiet mode, no compile check, threadMode "direct").
+    bool direct = !forceMain && IsDirectHandler(cmd_type) && !HostExecutor::IsMainThread();
     DirectModeGuard dmg(direct);
 
     try {
@@ -422,7 +451,15 @@ std::string CommandDispatcher::Dispatch(
             if (command.empty()) {
                 throw std::runtime_error("Empty MAXScript command");
             }
-            result = HandleMaxScript(command, req.value("quiet", true));
+            // Quiet mode unless the caller chose, or the script could prompt
+            // to save or discard the scene (quiet would answer for them).
+            int explicitQuiet = -1;
+            if (req.contains("quiet") && req["quiet"].is_boolean())
+                explicitQuiet = req["quiet"].get<bool>() ? 1 : 0;
+            bool overridden = false;
+            const bool quiet = QuietPolicy::ResolveQuiet(command, explicitQuiet, &overridden);
+            if (overridden) tl_quiet_override = "file_command";
+            result = HandleMaxScript(command, quiet);
         // Native handlers
         } else if (cmd_type == "native:scene_info") {
             result = NativeHandlers::SceneInfo(command, gup);

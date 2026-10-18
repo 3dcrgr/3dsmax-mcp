@@ -34,7 +34,14 @@ inline std::string ErrorCodeForMessage(const std::string& message) {
     if (lower.find("user_busy") != std::string::npos) return "USER_BUSY";
     if (lower.find("stale_view") != std::string::npos) return "STALE_VIEW";
     if (lower.find("safe mode") != std::string::npos) return "SAFE_MODE";
+    // The executor refused or failed the request before it started (Max is
+    // exiting, the bridge never came up, or the post failed): bridge down,
+    // and the work provably never ran.
     if (lower.find("main thread execution timed out") != std::string::npos ||
+        lower.find("3ds max is exiting; the request did not run") != std::string::npos ||
+        lower.find("mainthreadexecutor is shutting down") != std::string::npos ||
+        lower.find("mainthreadexecutor not initialized") != std::string::npos ||
+        lower.find("failed to post work to main thread") != std::string::npos ||
         lower.find("named pipe") != std::string::npos ||
         (lower.find("bridge") != std::string::npos && lower.find("not found") != std::string::npos))
         return "BRIDGE_DOWN";
@@ -55,6 +62,11 @@ inline std::string ErrorCodeForMessage(const std::string& message) {
     return "BAD_PARAM";
 }
 
+// Codes a client may retry: the request did not run, or will run when Max is free.
+inline bool IsRetryableCode(const std::string& code) {
+    return code == "BRIDGE_DOWN" || code == "RENDER_BUSY" || code == "USER_BUSY";
+}
+
 // A structured error passes through; any other message becomes a NativeError.
 inline std::string NormalizeError(const std::string& message) {
     nlohmann::json structured = nlohmann::json::parse(message, nullptr, false);
@@ -67,7 +79,7 @@ inline std::string NormalizeError(const std::string& message) {
     payload["type"] = "NativeError";
     payload["message"] = message;
     payload["code"] = code;
-    payload["retryable"] = (code == "BRIDGE_DOWN" || code == "RENDER_BUSY" || code == "USER_BUSY");
+    payload["retryable"] = IsRetryableCode(code);
     return payload.dump();
 }
 

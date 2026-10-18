@@ -75,6 +75,9 @@ void LeaseProperty(ULONG_PTR handle, const std::string& property, const std::str
 }
 
 void RestorePreviewSettings() {
+    // Restore every leased setting even after an acknowledged MAXScript error;
+    // the operation still fails with MAX_DIALOG_ERROR.
+    DialogWatch::DeferDismissed finish_restore;
     // Compare before restoring: retain edits made by the user during preview.
     for(auto i=previewProperties.rbegin();i!=previewProperties.rend();++i)
         RunMAXScript("(local r=getAnimByHandle "+std::to_string(i->handle)+"; if r!=undefined and "
@@ -392,6 +395,9 @@ void ToggleVRay(int engine, bool desired) {
 }
 
 void StopOwnedRender() {
+    // Also the cleanup after a failed start: an acknowledged MAXScript error
+    // must not stop it halfway (the operation still fails with MAX_DIALOG_ERROR).
+    DialogWatch::DeferDismissed finish_stop;
     LeaseBusy busy;
     const auto state=ReadRenderState();
     if(ownsCoronaVFB) {

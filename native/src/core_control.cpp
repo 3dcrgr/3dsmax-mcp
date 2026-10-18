@@ -1,8 +1,10 @@
-// Every pipe request passes here. ping, native:max_dialogs and native:core are
-// answered by the shell without entering the core, so health checks, dialog
-// recovery and core control keep working while the core is missing, failed
-// to load, or is being replaced. Everything else enters the bound core
-// through the drain gate (core_reload.h).
+// Every pipe request passes here. ping, health, native:max_dialogs and
+// native:core are answered by the shell without entering the core, so health
+// checks, dialog recovery and core control keep working while the core is
+// missing, failed to load, or is being replaced. Everything else enters the
+// bound core through the drain gate (core_reload.h). Each request except
+// health and native:max_dialogs is recorded for health while it runs: the
+// client registry (bridge_health.h) and the executor's work label.
 //
 // Also owns the core's lifecycle. The static layout binds the linked core
 // once. MCP_HOT_CORE loads core/mcp_core.dll through the shadow-copy loader
@@ -10,6 +12,7 @@
 // new core while the old one serves, drain, swap on Max's main thread, free
 // the old one. Any failure before the swap leaves the old core bound.
 #include "mcp_bridge/core_host.h"
+#include "mcp_bridge/bridge_health.h"
 #include "mcp_bridge/core_api.h"
 #include "mcp_bridge/core_reload.h"
 #include "mcp_bridge/dialog_watch.h"
@@ -28,6 +31,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -173,6 +177,127 @@ std::string Ping() {
         return result.dump();
     });
 }
+
+// ── health (pipe thread only) ───────────────────────────────────
+// Answers from bookkeeping alone: never posts to the main thread and never
+// calls into the scene (Get3DSMAXVersion is a compile-time constant). Unlike
+// ping it still answers while the main thread is hung, and it says whether an
+// MCP request (this client's or another's) or something outside the bridge
+// holds the main thread. Nested dispatches inside the core (invoke_tool,
+// tool smoke probes) are not listed: their work runs under the outer
+// request's label, so health attributes it to that request.
+constexpr long long kHeartbeatStaleMs = 3LL * MainThreadExecutor::kHeartbeatMs;
+
+std::string Health(const std::string& clientSessionId) {
+    const MainThreadExecutor::Health ex = g_executor ? g_executor->GetHealth() : MainThreadExecutor::Health{};
+    const BridgeHealth::ClientsSnapshot clients = BridgeHealth::Snapshot();
+
+    // -1: the heartbeat timer could not be created; never read that as stale.
+    const bool heartbeatKnown = ex.heartbeat_age_ms >= 0;
+    const bool heartbeatStale = heartbeatKnown && ex.heartbeat_age_ms > kHeartbeatStaleMs;
+    std::string state;
+    if (!ex.initialized) state = "not_initialized";
+    else if (ex.shutting_down) state = "shutting_down";
+    else if (ex.running) state = "busy_mcp";        // a bridge request is executing on it
+    else if (!heartbeatKnown) state = "unknown";    // no heartbeat: callers fall back to ping
+    else if (heartbeatStale) state = "busy_other";  // stopped pumping outside the bridge
+    else state = "responsive";
+
+    json result;
+    result["server"] = "3dsmax-mcp-native";
+#ifdef MCP_BRIDGE_VERSION
+    result["bridgeVersion"] = MCP_BRIDGE_VERSION;
+#endif
+    // 2: posted-message heartbeat (1 used WM_TIMER, which paints and posted
+    // messages starve), request ids on executor items, internal clients.
+    result["healthVersion"] = 2;
+    result["protocolVersion"] = 2;
+    result["transport"] = "namedpipe";
+    result["pid"] = static_cast<unsigned long>(GetCurrentProcessId());
+    DWORD v = Get3DSMAXVersion();
+    result["maxVersion"] = 1998 + (HIWORD(v) / 1000);
+    result["mainThread"] = {
+        {"state", state},
+        {"pumping", heartbeatKnown ? json(!heartbeatStale) : json(nullptr)},
+        {"heartbeatAgeMs", ex.heartbeat_age_ms < 0 ? json(nullptr) : json(ex.heartbeat_age_ms)},
+        {"heartbeatPeriodMs", MainThreadExecutor::kHeartbeatMs},
+        {"windowHung", ex.executor_window_hung},
+    };
+    json running = nullptr;
+    if (ex.running) {
+        running = {{"cmdType", ex.running_label.cmd_type}, {"runningMs", ex.running_ms},
+                   {"clientId", ex.running_label.client_id},
+                   {"requestId", ex.running_label.request_id}};
+    }
+    result["executor"] = {
+        {"running", running},
+        {"queued", ex.queued},
+        {"oldestQueuedMs", ex.queued ? json(ex.oldest_queued_ms) : json(nullptr)},
+        {"oldestQueuedCmd", ex.queued ? json(ex.oldest_queued_label.cmd_type) : json(nullptr)},
+        {"oldestQueuedRequestId", ex.queued ? json(ex.oldest_queued_label.request_id) : json(nullptr)},
+        {"completed", ex.completed},
+        {"shuttingDown", ex.shutting_down},
+    };
+    json inflight = json::array();
+    for (const auto& r : clients.inflight) {
+        inflight.push_back({
+            {"clientId", r.client_id},
+            {"requestId", r.request_id},
+            {"cmdType", r.cmd_type},
+            {"elapsedMs", r.elapsed_ms},
+            {"nested", r.nested},
+            {"internal", r.internal},
+        });
+    }
+    result["clients"] = {
+        {"connected", clients.connected},  // includes the client asking
+        {"totalConnections", clients.total_connections},
+        {"requestingClient", clientSessionId},
+        {"inflight", inflight},
+    };
+    return result.dump();
+}
+
+// A string member of a parsed request, or empty.
+std::string StringMember(const json& req, const char* key) {
+    const auto it = req.find(key);
+    return it != req.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+
+// health runs on the pipe worker, outside the dialog monitor's request context
+// and both request registries (it would only ever report itself).
+std::string DispatchHealth(const json& req, const std::string& clientSessionId) {
+    try {
+        const std::string request_id = StringMember(req, "requestId");
+        DirectModeScope directMode(true);  // reported as threadMode "direct"
+        try {
+            return Envelope(true, Health(clientSessionId), "", request_id, "health", 0);
+        } catch (const std::exception& e) {
+            return Envelope(false, "", McpEnvelope::NormalizeError(e.what()), request_id, "health", 0);
+        }
+    } catch (const std::exception& e) {
+        return McpInternalErrorResponse(e.what());
+    } catch (...) {
+        return McpInternalErrorResponse("unknown exception");
+    }
+}
+
+// One request in flight for health: listed under its client, and the
+// main-thread work it submits from this pipe worker carries its label.
+class InFlight {
+public:
+    InFlight(const std::string& clientId, const std::string& requestId, const std::string& cmdType)
+        : scope_(clientId, requestId, cmdType), previous_(MainThreadExecutor::ThreadLabel()) {
+        MainThreadExecutor::SetThreadLabel(MainThreadExecutor::WorkLabel{cmdType, clientId, requestId});
+    }
+    ~InFlight() { MainThreadExecutor::SetThreadLabel(previous_); }
+    InFlight(const InFlight&) = delete;
+    InFlight& operator=(const InFlight&) = delete;
+
+private:
+    BridgeHealth::RequestScope scope_;
+    MainThreadExecutor::WorkLabel previous_;
+};
 
 #ifdef MCP_HOT_CORE
 const int kModuleAnchor = 0;  // an address inside this .gup
@@ -479,8 +604,19 @@ void Shutdown() {
 std::string Dispatch(const std::string& request, const std::string& clientSessionId) {
     if (McpMayBeShellRequest(request)) {
         const json parsed = json::parse(request, nullptr, false);
-        if (!parsed.is_discarded() && !McpShellType(parsed).empty()) return DispatchShell(parsed);
+        const std::string type = parsed.is_discarded() ? std::string() : McpShellType(parsed);
+        if (type == "health") return DispatchHealth(parsed, clientSessionId);
+        if (!type.empty()) {
+            // native:max_dialogs is a control request like health: it never
+            // reaches the main thread, and listing the client's 1 s dialog
+            // polls as in-flight work would misreport them as other clients'.
+            std::optional<InFlight> inflight;
+            if (type != "native:max_dialogs") inflight.emplace(clientSessionId, StringMember(parsed, "requestId"), type);
+            return DispatchShell(parsed);
+        }
     }
+    const McpRequestLabel label = McpLabelRequest(request);
+    InFlight inflight(clientSessionId, label.requestId, label.type);
     McpCoreGate::Admission admission(g_gate);
     switch (admission.Status()) {
     case McpCoreGate::Admit::Busy:

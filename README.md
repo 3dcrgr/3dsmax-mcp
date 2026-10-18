@@ -15,7 +15,7 @@ Automate everything!
 
 ## Features
 
-- **160 MCP tools** — For scene reads, modeling, materials, modifiers, controllers, viewport capture, procedural graphs, and plugin workflows.
+- **161 MCP tools** — For scene reads, modeling, materials, modifiers, controllers, viewport capture, procedural graphs, and plugin workflows.
 - **Native Bridge** — only 2023-2027 versions.
 - **Introspection** — discover arbitrary Max classes for all kinds of automation and scripting purposes. 
 - **Bundled agent skill** — There is a bundled maxscript documentation if you want to create your own tools.
@@ -115,7 +115,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 
 | Tool | Description |
 |------|-------------|
-| `get_bridge_status` | Ping the MCP bridge when diagnosing connection errors |
+| `get_bridge_status` | Bridge health: whether Max is responsive, busy or hung and what holds its main thread; answers while Max is hung |
 | `get_session_context` | Bundle bridge status, capabilities, scene summary, and selection in one call |
 | `get_plugin_capabilities` | Max version, renderers, installed plugins, and class counts |
 
@@ -215,7 +215,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `watch_scene` | Live event watcher for interactive sessions |
 | `isolate_and_capture_selected` | Per-selection isolated viewport captures |
 | `main_thread` | Inspect or clean up callbacks and timers running on Max's main/UI thread |
-| `max_dialogs` | Read any dialog blocking Max (Win32 or Qt) and press a chosen button, even while a tool call waits on it |
+| `max_dialogs` | Read any dialog blocking Max (Win32 or Qt) and press a chosen button, even while a tool call waits on it, on Max's main thread |
 
 ### Plugins & introspection
 
@@ -387,9 +387,10 @@ and existing procedural skies use the provider's dome or environment binding.
 
 | Tool | Description |
 |------|-------------|
-| `execute_maxscript` | Run MAXScript when no dedicated tool exists (respects safe mode) |
+| `execute_maxscript` | Run MAXScript when no dedicated tool exists (respects safe mode); scripts that reset, open, fetch or quit keep the save prompt |
 | `execute_python` | Run Python with captured output, JSON results, tracebacks and undo rollback (requires safe mode off) |
 | `invoke_tool` | Call any registered tool from inside Max (testing) |
+| `capture_hang_diagnostics` | Capture native thread stacks of a hung Max from the OS, without contacting it |
 
 </details>
 
