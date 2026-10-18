@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from ..max_client import (_NOT_DIALOG_TITLE, ALWAYS_ASK, BLOCKED_CAUSE, HANG_ADVICE, DialogBlocked, MaxBusyError,
-                          MaxNotRespondingError, RequestOutcomeUnknown, _grace, real_dialogs, settling_state)
+                          MaxNotRespondingError, RequestOutcomeUnknown, _grace, real_dialogs)
 from ..process_health import describe as describe_process, diagnose_process
 from ..server import mcp, client
 
@@ -40,7 +40,8 @@ def _legacy_bridge_status() -> str:
         ",\"port\":" + (MCP_Server.port as string) + \
         "}"
     )"""
-    response = client.send_command(maxscript, timeout=5.0)
+    # Read-only: dropped at 5 s like ping instead of waiting out a busy Max.
+    response = client.send_command(maxscript, timeout=5.0, probe=True)
     payload = json.loads(response.get("result", "{}"))
     payload["requestId"] = response.get("requestId")
     payload["meta"] = response.get("meta", {})
@@ -97,9 +98,6 @@ def _seconds(ms) -> float | None:
 def _skip_ping(health: dict) -> bool:
     """True when the health reply alone shows a ping would only queue behind a busy main thread."""
     main = health.get("mainThread") or {}
-    pid = health.get("pid")
-    if pid and settling_state(int(pid)):
-        return False  # the ping path refuses with IMPORT_SETTLING and its advice
     state = main.get("state")
     if state == "busy_mcp":
         # A request that just started (another client's quick call) is not "busy": ping queues briefly.
@@ -329,7 +327,7 @@ def _unhealthy_status(exc: MaxBusyError | MaxNotRespondingError, health: dict | 
         "inflight": details.get("inflight"),
         "process": details.get("process"),
         "request_sent": details.get("request_sent", False),
-        **{key: details[key] for key in ("settling", "previous") if details.get(key)},
+        **({"previous": details["previous"]} if details.get("previous") else {}),
         **({"open_dialogs": _dialog_summaries(health["openDialogs"])} if (health or {}).get("openDialogs") else {}),
         **({"health": _compact_health(health)} if health else {}),
     })
@@ -389,13 +387,13 @@ def get_bridge_status() -> str:
     bridge_state blocked_by_dialog: a modal dialog holds a request; read it with max_dialogs.
     Not when: starting a session or before every task — prefer query_scene for scene work.
     """
-    # Precedence: silent bridge; import settling guard (calls get IMPORT_SETTLING, nothing
-    # sent); a dialog holding the running request while the main thread pumps
-    # (BLOCKED_BY_DIALOG); busy or hung (MAX_BUSY / MAX_NOT_RESPONDING); then a ping.
+    # Precedence: silent bridge; a dialog holding the running request while the main
+    # thread pumps (BLOCKED_BY_DIALOG); busy or hung (MAX_BUSY / MAX_NOT_RESPONDING);
+    # then a ping.
     health = _native_health()
     if isinstance(health, (MaxBusyError, MaxNotRespondingError)):
         return _silent_bridge_status(health)  # a ping would wait out the same silence
-    if health and not (health.get("pid") and settling_state(int(health["pid"]))):
+    if health:
         status = _held_by_dialog(health)
         if status is not None:
             return status

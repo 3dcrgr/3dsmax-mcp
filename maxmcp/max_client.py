@@ -12,7 +12,7 @@ from typing import Any, Iterator, Optional
 from uuid import uuid4
 
 from .process_health import describe as describe_process
-from .process_health import diagnose_process, process_gone, process_start_time, quick_hung_check, window_hung
+from .process_health import diagnose_process, process_gone, process_start_time, quick_hung_check
 from .process_health import list_processes
 
 DEFAULT_HOST = "127.0.0.1"
@@ -24,12 +24,12 @@ MCP_PIPE_ENV = "MCP_MAX_PIPE"
 DIALOG_CHECK_AFTER = 1.0
 DIALOG_POLL_INTERVAL = 1.0
 MAX_BLOCKED_CALLS = 16
-# Reply deadline for a request whose Max can't be diagnosed (no PID; with one,
-# the deadline diagnosis decides, see MaxClient._await_response). Max cancels
-# main-thread work that has not started within its executor timeout (120 s
-# unless the handler sets more) and replies, so an ordinary call waits a little
-# past that. A probe's timeout is its deadline, as is every control request's.
-# Probes are marked explicitly (probe=True, _PROBE_CMD_TYPES), not by a short timeout.
+# Reply deadline of every sent request (see MaxClient._await_response). Max
+# cancels main-thread work that has not started within its executor timeout
+# (120 s unless the handler sets more) and replies, so an ordinary call waits a
+# little past that. A probe's timeout is its deadline, as is every control
+# request's. Probes are marked explicitly (probe=True, _PROBE_CMD_TYPES), not by
+# a short timeout.
 NATIVE_QUEUE_TIMEOUT = 120.0
 REPLY_GRACE = 10.0
 # native:core control (hot-reloadable core). Only CORE_BUSY is retried: the
@@ -146,61 +146,11 @@ class MaxNotRespondingAfterDispatch(MaxNotRespondingError, RequestOutcomeUnknown
     """Max stopped responding after the request was written; never replay it."""
 
 
-class MaxImportSettlingError(MaxBusyError):
-    """A native import left Max (or its Cosmos browser window) not responding; nothing was sent."""
-
-    code = "IMPORT_SETTLING"
-
-
 BLOCKED_CAUSE = "deadlock, stalled I/O, or a long blocking call (possibly from another MCP client)"
 HANG_ADVICE = ("Some stalls (e.g. a V-Ray Material Editor preview render) clear after several minutes, but a "
                "cross-thread deadlock never does: wait up to ~10 min, re-checking with get_bridge_status. If "
                "Max is still blocked after that, treat it as a deadlock: the user must end the process "
                "(unsaved work is lost).")
-
-# Import settling guard, shared by every MaxClient (Cosmos imports use their own client).
-SETTLING_MAX_S = 900.0  # hard expiry: the guard can never lock the user out for good
-_settling_lock = threading.Lock()
-_settling: dict[int, dict[str, Any]] = {}
-
-
-def mark_settling(pid: int, windows: dict[int, str], reason: str, evidence: Any = None,
-                  max_seconds: float = SETTLING_MAX_S, owner: Any = None) -> dict[str, Any]:
-    """Refuse requests to `pid` (nothing sent) while any of `windows` {hwnd: title} is hung.
-
-    With `owner` (an import in progress) every other client is refused outright;
-    only the owner client may send. Returns the entry for release_settling.
-    """
-    now = time.perf_counter()
-    entry = {"windows": {int(h): str(t) for h, t in windows.items()}, "reason": reason, "evidence": evidence,
-             "since": now, "until": now + max(1.0, max_seconds), "started": process_start_time(pid),
-             "owner": owner}
-    with _settling_lock:
-        _settling[pid] = entry
-    return entry
-
-
-def release_settling(pid: int, entry: dict[str, Any] | None) -> None:
-    """Drop `entry` only if it is still the PID's guard (a newer one is kept)."""
-    if entry is not None:
-        _drop_settling(pid, entry)
-
-
-def clear_settling(pid: int) -> None:
-    with _settling_lock:
-        _settling.pop(pid, None)
-
-
-def settling_state(pid: int) -> dict[str, Any] | None:
-    with _settling_lock:
-        entry = _settling.get(pid)
-        return dict(entry) if entry else None
-
-
-def _drop_settling(pid: int, entry: dict[str, Any]) -> None:
-    with _settling_lock:
-        if _settling.get(pid) is entry:
-            _settling.pop(pid, None)
 
 
 class MaxBusy(RequestOutcomeUnknown):
@@ -210,31 +160,35 @@ class MaxBusy(RequestOutcomeUnknown):
     ordinary call is tracked like a DialogBlocked one: blocked_calls() reports
     its eventual result. Control requests are not tracked.
 
-    Only raised for a request whose Max the client cannot diagnose (no PID): with
-    a PID, the deadline diagnosis decides instead (MaxNotRespondingAfterDispatch
-    once Max exited or stayed blocked; a busy or responsive Max is waited for).
-    Unlike MaxBusyError, the request was sent, so it is never retryable.
+    With a PID, the deadline diagnosis picks the error: MaxNotRespondingAfterDispatch
+    once Max exited or stayed blocked, this error while Max is busy, responsive or
+    can't be judged (process then carries the evidence). Unlike MaxBusyError, the
+    request was sent, so it is never retryable.
     """
 
     code = "MAX_BUSY"
     retryable = False
 
     def __init__(self, request_id: str, command: str, waited: float,
-                 state: str | None = None, tracked: bool = True) -> None:
+                 state: str | None = None, tracked: bool = True,
+                 process: dict[str, Any] | None = None) -> None:
         self.request_id = request_id
+        evidence = f" ({describe_process(process)})" if process else ""
         if tracked:
             where = "waiting for Max's main thread" if state == "queued" else "running inside 3ds Max"
-            message = f"3ds Max has not answered after {waited:g} s. The call is still {where}."
+            message = f"3ds Max has not answered after {waited:g} s{evidence}. The call is still {where}."
             hint = ("Do not repeat the call: it is still in progress and would run twice. Check "
                     "max_dialogs(action='inspect'): blocked_calls reports this call's result once Max "
                     "finishes it, and dialogs lists anything holding Max.")
         else:
-            message = f"3ds Max has not answered {command} after {waited:g} s."
+            message = f"3ds Max has not answered {command} after {waited:g} s{evidence}."
             hint = "The request may still finish inside Max. Check its effect with a fresh read before repeating it."
         details: dict[str, Any] = {"request_id": request_id, "command": command, "waited_s": round(waited, 1),
                                    "request_sent": True}
         if state:
             details["state"] = state
+        if process:
+            details["process"] = process
         self.bridge_message = json.dumps({
             "type": "MaxBusy", "code": self.code, "retryable": False, "message": message,
             "hint": {"message": hint, "suggested_tools": ["max_dialogs"]} if tracked else hint,
@@ -329,7 +283,6 @@ _kernel32.GetNamedPipeServerProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTE
 _INVALID_HANDLE = wintypes.HANDLE(-1).value
 
 INSTANCE_LOCK_TIMEOUT = 10.0
-_REDIAGNOSE_S = 15.0
 _BLOCKED_CONFIRM_S = 20.0
 _CPU_SAMPLE_S = 1.0
 _RECHECK_SAMPLE_S = 0.25
@@ -338,7 +291,7 @@ _PROBE_CMD_TYPES = frozenset({"ping", "health"})
 # Answered on a bridge pipe thread without touching Max's main thread. Sent on the
 # control channel so a stuck request holding the pipe lock cannot delay them.
 _MAIN_THREAD_FREE_CMD_TYPES = frozenset({"health", "native:max_dialogs"})
-# Separate connection: bypasses the pipe lock, the hung-PID latch and the settling guard.
+# Separate connection: bypasses the pipe lock and the hung-PID latch.
 # native:core is the bridge shell's hot-reloadable core control (status / reload).
 _CONTROL_CMD_TYPES = frozenset({"native:render_cancel", "native:render_cancel_capture",
                                 "native:capture_screen", "native:core"}) | _MAIN_THREAD_FREE_CMD_TYPES
@@ -376,7 +329,7 @@ class MaxTargetMismatchError(ConnectionError):
 
 
 # A call that raised one of these may still be running in Max, Max can't take it
-# (busy, hung, settling after an import), or its target is gone or not the
+# (busy or hung), or its target is gone or not the
 # expected one. Tools pass them through unchanged so their code and hint reach the
 # agent, instead of reporting an ordinary failure that invites a retry or a fallback.
 CALL_STATE_ERRORS = (DialogBlocked, RequestOutcomeUnknown, TargetUnavailable, MaxHealthError,
@@ -499,6 +452,7 @@ class MaxClient:
         self._pipe_lock = threading.Lock()
         self._local = threading.local()
         self._control_channel = False
+        self._diagnose_probes = True  # off when the caller discards a dropped probe's error
         self._pinned_pipe_name: str | None = None
         self._bound_target: dict[str, Any] | None = None
         self._bound_started: int | None = None  # creation time of the bound Max, against PID reuse
@@ -648,17 +602,6 @@ class MaxClient:
             target = self._default_target()
         self._local.route_candidate = dict(target)
         return target["target_pipe"]
-
-    def resolve_target(self) -> dict[str, Any]:
-        """The Max the next command would reach. Never binds, takes the lock or sends."""
-        target = self._bound_target
-        if self._pinned_pipe_name is not None:
-            target = self._target(self._pinned_pipe_name, "explicit")
-        if target is None and self._startup_pipe:
-            target = self._target(self._startup_pipe, self._startup_source)
-        if target is None:
-            target = self._default_target()
-        return {**target, "available": self._probe_pipe_available(target["target_pipe"])}
 
     def selected_pid_nowait(self) -> dict[str, Any]:
         """PID of the Max this client is talking to, from memory only: {pid, source, pipe}.
@@ -905,50 +848,6 @@ class MaxClient:
              "previous_process": verdict.get("process"), "request_sent": False},
         )
 
-    def _check_settling(self, pid: int | None, pipe_name: str) -> None:
-        """Refuse (nothing sent) while a native import left a remembered window hung.
-
-        Fast path: IsHungAppWindow on the remembered hwnds only. Clears itself once
-        they pump again, the process changed, or the guard expired.
-        """
-        if not pid or self._control_channel or not _settling:
-            return
-        with _settling_lock:
-            entry = _settling.get(pid)
-        if entry is None:
-            return
-        now = time.perf_counter()
-        if now >= entry["until"] or entry.get("started") != process_start_time(pid):
-            _drop_settling(pid, entry)
-            return
-        owner = entry.get("owner")
-        if owner is self:
-            return
-        expires = entry["until"] - now
-        details = {"inflight": None, "process": None, "request_sent": False,
-                   "settling": {"reason": entry["reason"], "since_s": round(now - entry["since"], 1),
-                                "expires_in_s": round(expires, 1), "in_progress": owner is not None,
-                                "evidence": entry.get("evidence")}}
-        if owner is not None:
-            raise MaxImportSettlingError(
-                f"{self._label(pid, pipe_name)} is busy with {entry['reason']} ({now - entry['since']:.0f} s so "
-                f"far). Nothing was sent. Retry once it returns (this guard lifts within {expires:.0f} s at the "
-                "latest). Do not open or close the Material Editor meanwhile.",
-                details,
-            )
-        hung = {h: t for h, t in entry["windows"].items() if window_hung(h) is True}
-        if not hung:
-            _drop_settling(pid, entry)
-            return
-        names = ", ".join(sorted({f"'{t}'" if t else "main window" for t in hung.values()}))
-        details["settling"]["hung_windows"] = sorted({t or "main window" for t in hung.values()})
-        raise MaxImportSettlingError(
-            f"{self._label(pid, pipe_name)} is still settling after {entry['reason']}: {names} not responding "
-            f"({now - entry['since']:.0f} s so far; this guard lifts within {expires:.0f} s at the latest). "
-            "Nothing was sent. Do not open or close the Material Editor. " + HANG_ADVICE,
-            details,
-        )
-
     def _probe_pipe_available(self, pipe_name: str | None = None) -> bool:
         """Best-effort probe that treats a busy pipe as available."""
         pipe_name = pipe_name or self.pipe_name
@@ -1035,13 +934,14 @@ class MaxClient:
             )
 
     def _send_control_command(self, command: str, cmd_type: str, timeout: Optional[float],
-                              probe: bool = False) -> dict[str, Any]:
+                              probe: bool = False, diagnose: bool = True) -> dict[str, Any]:
         """Bypass an in-flight request's pipe lock, without changing Max targets.
 
         Cancellation, dialog recovery, pure desktop capture and the main-thread-free
         health probe use this channel. It cannot fall back to TCP or re-resolve another
         Max after a claim/environment change. probe=True drops a read-only request at
-        its deadline instead of waiting out a stuck bridge.
+        its deadline instead of waiting out a stuck bridge; diagnose=False skips the
+        process diagnosis on that drop, for callers that discard the error.
         """
         acquired = self._pipe_lock.acquire(blocking=False)
         try:
@@ -1052,6 +952,7 @@ class MaxClient:
             control = MaxClient(host=self.host, port=self.port, timeout=timeout or min(self.timeout, 15.0),
                                 transport="pipe", pipe_name=pipe)
             control._control_channel = True
+            control._diagnose_probes = diagnose
             control._bound_target = target
             self.clear_last_response()
             try:
@@ -1165,10 +1066,12 @@ class MaxClient:
         request_id: str | None = None,
         probe: bool = False,
     ) -> bytes:
-        deadline = time.perf_counter() + timeout
         data = (request + "\n").encode("utf-8")
-        if not self._pipe_lock.acquire(timeout=max(0.001, timeout)):
-            raise self._busy_error(timeout)
+        # Nothing is sent while another call holds the pipe, so giving up early is safe to retry.
+        lock_wait = min(timeout, INSTANCE_LOCK_TIMEOUT)
+        if not self._pipe_lock.acquire(timeout=max(0.001, lock_wait)):
+            raise self._busy_error(lock_wait)
+        deadline = time.perf_counter() + timeout  # the call's own time starts once it holds the pipe
         try:
             self._drop_exited_default()
             pipe_name = self._resolve_pipe_name()
@@ -1177,14 +1080,12 @@ class MaxClient:
                 self._selected_pipe_name = pipe_name
             self._check_expected_pid(self._pid_for_pipe(pipe_name), pipe_name)
             self._check_known_hung(self._pid_for_pipe(pipe_name), pipe_name)
-            self._check_settling(self._pid_for_pipe(pipe_name), pipe_name)
 
             for attempt in range(2):
                 handle = self._ensure_pipe_handle(deadline, pipe_name)
                 pid = self._pid_for_pipe(pipe_name, handle)
                 self._check_expected_pid(pid, pipe_name, connected=True)
                 self._check_known_hung(pid, pipe_name)
-                self._check_settling(pid, pipe_name)
                 if self._bound_target is None:
                     self._bind(getattr(self._local, "route_candidate", None) or self._target(pipe_name, "default"))
                 self._local.request_target = dict(self._bound_target)
@@ -1282,9 +1183,10 @@ class MaxClient:
     def _abandon_probe(self, pid: int | None, timeout: float, reader: _PipeReader) -> None:
         """Drop a read-only probe that missed its deadline (safe: it changes nothing).
 
-        Returns without raising when the reply arrived during the diagnosis.
+        Returns without raising when the reply arrived during the diagnosis. Without
+        _diagnose_probes the CPU sample is skipped: the caller discards the error.
         """
-        process = diagnose_process(pid, _CPU_SAMPLE_S) if pid else None
+        process = diagnose_process(pid, _CPU_SAMPLE_S) if pid and self._diagnose_probes else None
         if reader.done.is_set():
             return
         inflight = self._inflight_snapshot()
@@ -1343,13 +1245,13 @@ class MaxClient:
         )
 
     def _reply_wait(self, timeout: float, probe: bool = False) -> float:
-        """Seconds a sent request whose Max can't be diagnosed waits for its reply.
+        """Seconds a sent request waits for its reply before it is left running in Max.
 
         The reply deadline (since 1.7.6): Max cancels main-thread work that has not
         started within its executor timeout (120 s unless the handler sets more) and
         replies, so an ordinary call waits a little past that. A probe's timeout, and
         every control request's, is its deadline. With a known PID the deadline
-        diagnosis in _await_response decides instead.
+        diagnosis in _await_response picks the error.
         """
         if probe or self._control_channel:
             return timeout
@@ -1359,32 +1261,27 @@ class MaxClient:
                         timeout: float, pid: int | None, probe: bool = False) -> bytes:
         """Wait for the reply on a reader thread; this thread never blocks in ReadFile.
 
-        Precedence while waiting (the pre-send refusals - pipe lock, hung-PID latch,
-        settling guard - already passed, so the request was written):
+        Precedence while waiting (the pre-send refusals - pipe lock, hung-PID latch -
+        already passed, so the request was written):
         1. From DIALOG_CHECK_AFTER, every DIALOG_POLL_INTERVAL (not on the control
            channel): a dialog holding this request raises DialogBlocked
            (BLOCKED_BY_DIALOG). Max keeps running the call; blocked_calls() reports it.
-        2. From the deadline (probes) or deadline + grace: a probe is dropped
-           (MAX_BUSY / MAX_NOT_RESPONDING); anything else is diagnosed and keeps
-           waiting while Max is busy or responsive, and is abandoned with
-           MaxNotRespondingAfterDispatch once Max exited or stayed blocked
-           (blocked_calls() then reports its result if Max ever answers).
-        3. Without a PID to diagnose, the plain reply deadline (_reply_wait) ends
-           the wait with MaxBusy (MAX_BUSY, sent, never replayed; tracked for
-           blocked_calls() unless on the control channel).
-        A reply that arrives meanwhile always wins. Each check is bounded (dialog
-        polls and probes, the control channel's included, are dropped at their
-        deadline), but a request on a Max that stays responsive or busy waits until
-        it answers, with no upper limit: only an exited or confirmed-blocked Max
-        ends the wait.
+        2. At its deadline a probe is dropped (MAX_BUSY / MAX_NOT_RESPONDING).
+        3. At the reply deadline (_reply_wait) anything else stops waiting. With a
+           PID, outside the control channel, Max is diagnosed first: an exited Max,
+           or one still blocked _BLOCKED_CONFIRM_S later, gives
+           MaxNotRespondingAfterDispatch, and later calls fail fast while it stays
+           hung. A busy, responsive or undiagnosable Max gives MaxBusy (MAX_BUSY,
+           sent, never replayed). Either way blocked_calls() reports the call's
+           result if Max ever answers (control requests are not tracked).
+        A reply that arrives meanwhile always wins, and no wait is unbounded: a
+        runaway script on a Max that keeps burning CPU ends in MAX_BUSY.
         """
         reader = _PipeReader(handle)
         sent_at = time.perf_counter()
         watch = bool(request_id) and not self._control_channel
         next_dialog = time.perf_counter() + DIALOG_CHECK_AFTER if watch else float("inf")
-        next_check = deadline if probe else deadline + _grace(timeout)
-        if not probe and not pid:
-            next_check = sent_at + self._reply_wait(timeout)  # nothing to diagnose: plain deadline
+        next_check = deadline if probe else sent_at + self._reply_wait(timeout)
         blocked_since: float | None = None
         while not reader.done.wait(max(0.0, min(next_dialog, next_check) - time.perf_counter())):
             if time.perf_counter() >= next_dialog:
@@ -1403,30 +1300,28 @@ class MaxClient:
             if probe:
                 self._abandon_probe(pid, timeout, reader)
                 continue  # the reply arrived during the diagnosis
-            if not pid:
-                # The status read can take a moment; a reply that lands meanwhile is used.
-                state = self._request_state(request_id) if watch else None
-                if reader.done.is_set():
-                    break
-                self._detach(reader, request_id, cmd_type, dialog=False, sent_at=sent_at, timeout=timeout)
-                raise MaxBusy(request_id, cmd_type, time.perf_counter() - sent_at, state,
-                              tracked=not self._control_channel)
-            process = diagnose_process(pid, _CPU_SAMPLE_S)
+            process = diagnose_process(pid, _CPU_SAMPLE_S) if pid and not self._control_channel else None
             if reader.done.is_set():
                 break
-            state = process.get("state")
+            state = (process or {}).get("state")
             now = time.perf_counter()
             if state == "exited" or (state == "blocked" and blocked_since is not None
                                      and now - blocked_since >= _BLOCKED_CONFIRM_S):
                 self._abandon_request(pid, process, blocked_since, reader, request_id=request_id,
                                       cmd_type=cmd_type, sent_at=sent_at, timeout=timeout)
             if state == "blocked":
+                # One sample is not enough to call Max hung: confirm it before giving up on the call.
                 if blocked_since is None:
                     blocked_since = now
-                next_check = now + _BLOCKED_CONFIRM_S
-            else:
-                blocked_since = None
-                next_check = now + _REDIAGNOSE_S
+                next_check = blocked_since + _BLOCKED_CONFIRM_S
+                continue
+            # The status read can take a moment; a reply that lands meanwhile is used.
+            request_state = self._request_state(request_id) if watch else None
+            if reader.done.is_set():
+                break
+            self._detach(reader, request_id, cmd_type, dialog=False, sent_at=sent_at, timeout=timeout)
+            raise MaxBusy(request_id, cmd_type, time.perf_counter() - sent_at, request_state,
+                          tracked=not self._control_channel, process=process)
         return reader.result()
 
     def _detach(self, reader: _PipeReader, request_id: str, cmd_type: str, *, dialog: bool,
@@ -1464,7 +1359,8 @@ class MaxClient:
     def _dialog_control(self, action: str) -> dict[str, Any]:
         """Query the dialog monitor over the control channel, keeping this call's metadata.
 
-        A read-only probe: dropped at its 3 s deadline. A bridge without the dialog
+        A read-only probe: dropped at its 3 s deadline, undiagnosed, since every
+        caller treats a failed read as no dialogs. A bridge without the dialog
         monitor is remembered per pipe and not asked again.
         """
         pipe = (self._bound_target or {}).get("target_pipe")
@@ -1473,7 +1369,7 @@ class MaxClient:
         saved = getattr(self._local, "last_response", None), getattr(self._local, "last_error", None)
         try:
             response = self._send_control_command(json.dumps({"action": action}), "native:max_dialogs", 3.0,
-                                                  probe=True)
+                                                  probe=True, diagnose=False)
             result = json.loads(response.get("result") or "{}")
             return result if isinstance(result, dict) else {}
         except MaxBridgeError as exc:

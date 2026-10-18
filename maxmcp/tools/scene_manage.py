@@ -18,13 +18,15 @@ def manage_scene(action: str) -> str:
             "Hold saved successfully"
         )"""
     elif action == "fetch":
+        # Prompts shown, as in the native handler: Fetch confirms, and Reset asks to save
+        # unsaved changes instead of discarding them.
         maxscript = """(
-            fetchMaxFile quiet:true
+            fetchMaxFile quiet:false
             "Fetched (restored) held state"
         )"""
     elif action == "reset":
         maxscript = """(
-            resetMaxFile #noPrompt
+            resetMaxFile()
             "Scene reset to empty"
         )"""
     elif action == "save":
@@ -60,7 +62,10 @@ def manage_scene(action: str) -> str:
     else:
         return f"Unknown action: {action}. Use hold, fetch, reset, save, or info."
 
-    response = client.send_command(maxscript)
+    # quiet=false keeps a native bridge from running the script in quiet mode, where the
+    # prompts above take their default; the TCP listener ignores the field.
+    fields = {"quiet": False} if action in ("fetch", "reset") else None
+    response = client.send_command(maxscript, request_fields=fields)
     return response.get("result", "")
 
 

@@ -26,7 +26,7 @@ def _unit_context() -> dict:
         "}"
     )"""
     try:
-        response = client.send_command(script, cmd_type="maxscript", timeout=5.0)
+        response = client.send_command(script, cmd_type="maxscript", timeout=5.0, probe=True)
         payload = json.loads(response.get("result", "{}"))
         return payload if isinstance(payload, dict) else {}
     except Exception:

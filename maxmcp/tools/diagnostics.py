@@ -110,8 +110,8 @@ def capture_hang_diagnostics(pid: int | None = None, all_threads: bool = False, 
     OS-only: never sends anything to Max, so it is safe while Max is hung; each
     thread is paused for a few milliseconds while its stack is read (on Windows 11
     the OS resumes it even if this server is killed meanwhile).
-    Use when: a tool returned MAX_NOT_RESPONDING or IMPORT_SETTLING, or
-    get_bridge_status reports not_responding.
+    Use when: a tool returned MAX_NOT_RESPONDING, or get_bridge_status reports
+    not_responding.
     Not when: Max is responsive; this is not a profiler.
     pid defaults to the selected Max, else the only running one. all_threads=True
     dumps every thread (default: main thread, window owners, busy threads).
