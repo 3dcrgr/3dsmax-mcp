@@ -484,7 +484,7 @@ def _snapshot_script(asset, light=False, renderer="", scan_classes=False, known=
     known = {} if record else (known or {})
     diff = {kind: kind in diff_kinds and known.get(kind) is not None for kind in ("materials", "maps")}
     node_min = _node_min(known)
-    node_diff = asset["kind"] == "model" and (record or node_min >= 0)
+    node_diff = asset["kind"] in ("model", "hdri") and (record or node_min >= 0)  # an HDRI makes its dome light
     return (_ASSET_SNAPSHOT.replace("__DEFAULT_NAME__", _DEFAULT_NAME_MXS)
             .replace("__NODE_DIFF__", "true" if node_diff else "false").replace("__NODE_MIN__", "%dL" % node_min)
             .replace("__MAT_MIN__", "%dL" % _newest_known({"known": known}))

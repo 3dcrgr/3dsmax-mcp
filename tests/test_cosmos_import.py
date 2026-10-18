@@ -1296,6 +1296,14 @@ class ModelImportTests(_FlowCase):
         self.assertEqual(cosmos._node_min({"newest": "bad"}), -1)
         self.assertEqual(cosmos._node_min(None), -1)
 
+    def test_hdri_import_lists_its_dome_light(self):
+        # An HDRI import makes a dome light node, so its nodes are diffed like a model's.
+        hdri = {"id": ASSET_ID, "name": "Sky Dome", "kind": "hdri"}
+        mat = {"id": ASSET_ID, "name": "Oak Floor", "kind": "material"}
+        self.assertIn("local nodeDiff=true", cosmos._snapshot_script(hdri, record=True))
+        self.assertIn("local nodeDiff=true", cosmos._snapshot_script(RUG, record=True))
+        self.assertIn("local nodeDiff=false", cosmos._snapshot_script(mat, record=True))
+
     def test_node_diff_script_shape(self):
         known = MODEL_BEFORE["known"]
         light = cosmos._snapshot_script(RUG, light=True, renderer="V-Ray", known=known)
