@@ -297,5 +297,30 @@ class WrapperTests(unittest.TestCase):
         self.assertTrue(server._pid_guarded(type("F", (), {"__module__": "maxmcp.tools.execute"})))
 
 
+class PipeGapTests(unittest.TestCase):
+    """The bridge has no pipe instance for a moment when several connections close at once."""
+
+    def _open(self, results):
+        kernel = mock.Mock()
+        kernel.CreateFileW.side_effect = [max_client._INVALID_HANDLE if r is None else r for r in results]
+        errors = iter([max_client._ERROR_FILE_NOT_FOUND] * len(results))
+        client = MaxClient(transport="pipe")
+        with mock.patch.object(max_client, "_kernel32", kernel), \
+                mock.patch.object(max_client.ctypes, "get_last_error", lambda: next(errors)), \
+                mock.patch.object(max_client.time, "sleep", lambda s: None):
+            return client._ensure_pipe_handle(max_client.time.perf_counter() + 5, r"\\.\pipe\x"), kernel
+
+    def test_short_gap_is_retried(self):
+        handle, kernel = self._open([None, None, 1234])
+        self.assertEqual(handle, 1234)
+        self.assertEqual(kernel.CreateFileW.call_count, 3)
+
+    def test_pipe_gone_for_good_still_fails(self):
+        clock = iter([0.0, 0.1, 0.3, 0.6])
+        with mock.patch.object(max_client.time, "perf_counter", lambda: next(clock, 1.0)):
+            with self.assertRaises(ConnectionError):
+                self._open([None] * 10)
+
+
 if __name__ == "__main__":
     unittest.main()
