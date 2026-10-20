@@ -15,6 +15,8 @@ Connect AI agents to Autodesk 3ds Max through the [Model Context Protocol](https
 > - The fork's features, install notes and full tool list (new tools marked ★): [docs/fork/overview.md](docs/fork/overview.md).
 > - Installing the fork, and its native bridges (a fork build for Max 2027 only in `native/bin/`): [docs/FORK.md#installing](docs/FORK.md#installing). Fork release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md).
 >
+> **Verified deployed follow-up:** brief native-pipe gaps are retried for up to 0.25 s, and HDRI imports report their created dome lights. Independent Max 2027 checks and installed-file equality are recorded in [verification](docs/fork/verification-2026-10-18-pipe-cosmos.md). No rebuilt Setup/release is included.
+>
 > Everything below is upstream's README, unchanged.
 
 Automate everything!

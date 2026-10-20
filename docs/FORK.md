@@ -217,3 +217,7 @@ Registry cleanup passed a live scan and exact-PID pings. The #32–#34 Python fi
 - **Pipe-lock timeout:** the idea comes from [stoxsss111](https://github.com/stoxsss111/3dsmax-mcp)'s fork.
 - **Exiting orphaned servers:** the idea comes from [kanzaka110](https://github.com/kanzaka110/3dsmax-mcp)'s fork (an auto-shutdown watchdog). It was re-targeted here to follow the client process rather than Max.
 - **`material_roles`:** came from [EdgecraftStudio](https://github.com/EdgecraftStudio/3dsmax-mcp) (upstream PR 29). The Autodesk Bitmap fix builds on it.
+
+## Deployed pipe and HDRI follow-up (2026-10-20 publication)
+
+Commits 608b3d0 and 993ed0b were deployed and independently live-tested on Max 2027 on 2026-10-18. A fresh source/installed comparison found all 458 maxmcp files identical and no missing files; both native copies match the source bridge. The pipe-gap check passed all 8 live rounds, and two HDRI imports each reported their new dome light. See [the full regression report](fork/verification-2026-10-18-pipe-cosmos.md), including the rerun limitations and exact test scope. Publication adds documentation; no repeat deployment or live tests were needed. Setup/release distribution remains pending.
