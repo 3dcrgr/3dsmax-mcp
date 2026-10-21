@@ -439,10 +439,19 @@ def summarize(capture: dict[str, Any], rules: Iterable[dict[str, Any]] = RULES) 
         main_summary = {"tid": main.get("tid"), "source": capture.get("main_thread_source"),
                         "state": main.get("state_hint"), "top_modules": top_modules(main, 5),
                         "blocked_in": _blocked_in(main), "frames_preview": _preview(main, 12)}
+    # A hung thread's windows are all hung, its hidden tooltips and helper windows too:
+    # list the visible ones and count the hidden ones per thread.
+    hung = [(t, w) for t in threads for w in t.get("windows") or [] if w.get("hung")]
     hung_windows = [{"tid": t.get("tid"), "title": w.get("title"), "class": w.get("class"),
-                     "visible": w.get("visible"), "main_thread": bool(t.get("is_main"))}
-                    for t in threads for w in t.get("windows") or [] if w.get("hung")]
-    return {"main_thread": main_summary, "findings": findings, "hung_windows": hung_windows}
+                     "visible": True, "main_thread": bool(t.get("is_main"))} for t, w in hung if w.get("visible")]
+    hidden: dict[Any, dict[str, Any]] = {}
+    for t, w in hung:
+        if not w.get("visible"):
+            entry = hidden.setdefault(t.get("tid"), {"tid": t.get("tid"), "main_thread": bool(t.get("is_main")),
+                                                     "count": 0})
+            entry["count"] += 1
+    return {"main_thread": main_summary, "findings": findings, "hung_windows": hung_windows,
+            **({"hidden_hung_windows": list(hidden.values())} if hidden else {})}
 
 
 def format_text(capture: dict[str, Any], summary: dict[str, Any] | None = None) -> str:
@@ -477,6 +486,8 @@ def format_text(capture: dict[str, Any], summary: dict[str, Any] | None = None) 
         lines.extend(f"# [{f.get('kind')}] {f.get('message')}" for f in summary.get("findings") or [])
         for window in summary.get("hung_windows") or []:
             lines.append(f"# hung window: {_window_brief(window)} on thread {window.get('tid')}")
+        for entry in summary.get("hidden_hung_windows") or []:
+            lines.append(f"# {entry.get('count')} hidden hung windows on thread {entry.get('tid')}")
     return "\n".join(lines) + "\n"
 
 

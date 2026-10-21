@@ -117,7 +117,8 @@ def capture_hang_diagnostics(pid: int | None = None, all_threads: bool = False, 
     dumps every thread (default: main thread, window owners, busy threads).
     save writes the full .txt/.json under %LOCALAPPDATA%/3dsmax-mcp/diagnostics
     (the newest 20 captures are kept).
-    Returns findings, the main-thread stack preview, hung windows and process health.
+    Returns findings, the main-thread stack preview, hung windows (visible ones;
+    hidden ones are counted per thread) and process health.
     """
     target = resolve_pid(pid)
     if "error" in target:

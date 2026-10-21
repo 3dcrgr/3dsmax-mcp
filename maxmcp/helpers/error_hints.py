@@ -129,6 +129,19 @@ _MESSAGE_HINT_RULES: tuple[tuple[re.Pattern[str], ToolHint], ...] = (
             "suggested_tools": ["capture_hang_diagnostics", "get_bridge_status"],
         },
     ),
+    # No bridge to connect to (max_client: "Named pipe ... not found"). Before the
+    # target rule: a missing pipe is not a missing scene object.
+    (
+        re.compile(r"\bnamed pipe\b.*\bnot found\b", re.IGNORECASE),
+        {
+            "message": (
+                "The 3ds Max bridge could not be reached: Max may not be running or still starting, or the "
+                "MCP bridge plugin is not loaded. list_max_instances shows the Max instances this server can "
+                "reach; start 3ds Max if none is listed, then retry."
+            ),
+            "suggested_tools": ["list_max_instances", "get_bridge_status"],
+        },
+    ),
     (
         re.compile(r"\bnot found\b|\bunknown (object|node|material)\b", re.IGNORECASE),
         {
@@ -302,7 +315,8 @@ def resolve_error_hint(
             if tool_name == "get_bridge_status" and "get_bridge_status" in hint.get(
                 "suggested_tools", []
             ):
-                return {"message": hint["message"]}
+                others = [t for t in hint["suggested_tools"] if t != "get_bridge_status"]
+                return {"message": hint["message"], **({"suggested_tools": others} if others else {})}
             return dict(hint)
 
     return None
