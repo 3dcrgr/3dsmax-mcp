@@ -36,7 +36,7 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
 ## What it fixes
 
 ### When 3ds Max hangs or is busy
-*Upstream pull request: Hangs and dialogs.*
+*Upstream pull request: Hangs and dialogs, merged upstream as #36.*
 
 - A hung Max no longer turns every tool into a bare timeout.
   - Calls fail fast with `MAX_BUSY` or `MAX_NOT_RESPONDING` and a process diagnosis: whether the main window responds, CPU use, whether it exited.
@@ -47,7 +47,7 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
 - An MCP server whose client crashed exits with it, instead of staying connected to Max.
 
 ### Dialogs and unsaved work
-*Upstream pull request: Hangs and dialogs.*
+*Upstream pull request: Hangs and dialogs, merged upstream as #36.*
 
 - **Save prompts:** quiet mode never answers a "Save changes?" prompt by itself. A script that mentions a reset, open, fetch or quit command runs with quiet mode off, so the prompt reaches the agent as `BLOCKED_BY_DIALOG`. Forcing `quiet=True` on such a script also needs `allow_discard=True`.
 - **Fixes to upstream 1.7.5's dialog handling:**
@@ -59,7 +59,7 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
 - **Interrupted scripts:** a script interrupted by `quitMax` is reported as `MAXSCRIPT_INTERRUPTED`, not as a parse error.
 
 ### Several sessions or several 3ds Max instances
-*Upstream pull request: Hangs and dialogs.*
+*Upstream pull request: Hangs and dialogs, merged upstream as #36.*
 
 - **Shared selection:** the selected Max belongs to the MCP server process, so sessions that share a server share it.
   - Every tool except the four routing tools takes an optional `expected_pid`. The call is refused, with nothing sent, if it would reach another Max.
