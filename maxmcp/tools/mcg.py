@@ -272,11 +272,21 @@ def _exception_error(exc: BaseException, *, details: dict[str, Any] | None = Non
     """
     code = _exception_code(exc)
     structured = parse_error_payload(getattr(exc, "bridge_message", None)) or {}
+    explicit = getattr(exc, "retryable", None)  # MaxBusyError (nothing sent) is retryable, MaxBusy is not
+    if "retryable" in structured:
+        retryable = bool(structured["retryable"])
+    elif isinstance(explicit, bool):
+        retryable = explicit
+    else:
+        retryable = code == "BRIDGE_DOWN"
+    exc_details = getattr(exc, "details", None)
+    if isinstance(exc_details, dict) and exc_details:
+        details = {**exc_details, **(details or {})}  # request_sent, process evidence
     return _error(
         str(exc),
         error_type=exc.__class__.__name__,
         code=code,
-        retryable=bool(structured["retryable"]) if "retryable" in structured else code == "BRIDGE_DOWN",
+        retryable=retryable,
         details=details,
         hint=structured.get("hint") or None,
     )

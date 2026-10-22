@@ -232,10 +232,17 @@ class QuietTrueFileCommandTests(unittest.TestCase):
             self.assertEqual(fields, {"quiet": True}, code)
             self.assertNotIn("meta", response)
 
-    def test_default_and_quiet_false_are_unchanged(self):
-        self.assertIsNone(self.sent("resetMaxFile()")[0])
-        self.assertEqual(self.sent("resetMaxFile()", quiet=False)[0], {"quiet": False})
-        self.assertIsNone(self.sent("resetMaxFile()", allow_discard=True)[0])
+    def test_default_sends_quiet_false_and_quiet_false_is_unchanged(self):
+        # Upstream 1e2c559: a file command sent without quiet goes out as quiet=False, so an
+        # older bridge without the quiet policy shows the prompt too.
+        fields, response = self.sent("resetMaxFile()")
+        self.assertEqual(fields, {"quiet": False})
+        self.assertEqual(response["meta"]["quietOverride"], "file_command")
+        fields, response = self.sent("resetMaxFile()", quiet=False)
+        self.assertEqual(fields, {"quiet": False})
+        self.assertNotIn("meta", response)
+        self.assertEqual(self.sent("resetMaxFile()", allow_discard=True)[0], {"quiet": False})
+        self.assertIsNone(self.sent("1+1")[0])
 
     def test_matches_the_native_policy_list(self):
         execute = _load("execute", mock.Mock())

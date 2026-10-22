@@ -176,8 +176,10 @@ class SummarizeTests(unittest.TestCase):
         self.assertIn("thread 24948 owns 'Chaos Cosmos Browser' (hidden, hung)", cosmos["message"])
         self.assertIn("bridge", bridge["message"])
         self.assertEqual(summary["main_thread"]["blocked_in"], "USER32 call in win32u+0x2564, called from 3dsmax+0x21a20b")
+        # Upstream c70ba1a: hung_windows lists visible windows only; hidden ones are counted per thread.
         titles = [(w["title"], w["visible"], w["tid"]) for w in summary["hung_windows"]]
-        self.assertIn(("Chaos Cosmos Browser", False, 24948), titles)
+        self.assertNotIn(("Chaos Cosmos Browser", False, 24948), titles)
+        self.assertIn({"tid": 24948, "main_thread": False, "count": 1}, summary["hidden_hung_windows"])
 
     def test_cross_thread_needs_a_hung_partner_window(self):
         summary = stackdump.summarize(cosmos_deadlock_capture(browser_hung=False))

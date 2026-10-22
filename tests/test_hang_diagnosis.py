@@ -17,6 +17,7 @@ from maxmcp import max_client, process_health, tool_response  # noqa: E402
 from maxmcp.max_client import (  # noqa: E402
     DialogBlocked,
     MaxBridgeError,
+    MaxBusy,
     MaxBusyError,
     MaxClient,
     MaxImportSettlingError,
@@ -250,16 +251,36 @@ class ReadLoopTests(_ClientCase):
 
 
 class DeadlineTests(_ClientCase):
-    def test_busy_diagnosis_keeps_waiting_for_late_result(self):
+    # Upstream 1e2c559: a sent call waits until the reply deadline (max(timeout, 120) + 10 s),
+    # then Max is diagnosed. A busy or responsive Max gives MAX_BUSY instead of a longer wait.
+    def test_reply_before_the_deadline_needs_no_diagnosis(self):
         start = self.clock.now
         kernel = self.use_kernel(FakeKernel(self.clock, [(start + 70.0, REPLY)]))
         self.states = ["busy"]
         client = self.pinned_client()
         response = client.send_command("render()", timeout=1.0)
         self.assertEqual(response["result"], "late")
-        self.assertGreaterEqual(len(self.diagnoses), 2)
+        self.assertEqual(self.diagnoses, [])
         self.assertEqual(kernel.closed, [])
         self.assertIsNone(client._inflight)
+
+    def test_busy_at_the_reply_deadline_is_max_busy(self):
+        start = self.clock.now
+        kernel = self.use_kernel(FakeKernel(self.clock))
+        self.states = ["busy"]
+        client = self.pinned_client()
+        with self.assertRaises(MaxBusy) as ctx:
+            client.send_command("render()", timeout=1.0)
+        exc = ctx.exception
+        self.assertEqual(exc.code, "MAX_BUSY")
+        self.assertFalse(exc.retryable)
+        self.assertEqual(self.diagnoses, ["busy"])
+        self.assertGreaterEqual(self.clock.now - start, max_client.NATIVE_QUEUE_TIMEOUT + max_client.REPLY_GRACE)
+        self.assertTrue(kernel.readers[-1].detached)
+        self.assertNotIn(HANDLE, kernel.closed)
+        self.assertNotIn(PID, client._hung_pids)
+        self.assertIsNone(client._inflight)
+        self.assertFalse(client._pipe_lock.locked())
 
     def test_blocked_twice_aborts_and_hands_the_handle_to_the_reader(self):
         kernel = self.use_kernel(FakeKernel(self.clock))
@@ -286,12 +307,14 @@ class DeadlineTests(_ClientCase):
         self.assertIsNone(client._inflight)
         self.assertFalse(client._pipe_lock.locked())
 
-    def test_blocked_then_busy_resets_confirmation(self):
-        start = self.clock.now
-        self.use_kernel(FakeKernel(self.clock, [(start + 120.0, REPLY)]))
-        self.states = ["blocked", "busy", "blocked", "busy", "busy"]
-        response = self.pinned_client().send_command("x", timeout=1.0)
-        self.assertEqual(response["result"], "late")
+    def test_blocked_then_busy_is_max_busy_not_hung(self):
+        self.use_kernel(FakeKernel(self.clock))
+        self.states = ["blocked", "busy"]
+        client = self.pinned_client()
+        with self.assertRaises(MaxBusy):
+            client.send_command("x", timeout=1.0)
+        self.assertEqual(self.diagnoses, ["blocked", "busy"])
+        self.assertNotIn(PID, client._hung_pids)
 
     def test_exited_aborts_immediately(self):
         kernel = self.use_kernel(FakeKernel(self.clock))
@@ -378,8 +401,8 @@ class DeadlineTests(_ClientCase):
 
     def test_reply_during_diagnosis_is_returned_not_abandoned(self):
         start = self.clock.now
-        # Diagnosis starts at deadline + grace (1 + 10 s) and takes 1 s; the reply lands within it.
-        kernel = self.use_kernel(FakeKernel(self.clock, [(start + 11.5, REPLY)]))
+        # Diagnosis starts at the reply deadline (max(1, 120) + 10 s) and takes 1 s; the reply lands within it.
+        kernel = self.use_kernel(FakeKernel(self.clock, [(start + 130.5, REPLY)]))
         self.states = ["exited"]
         client = self.pinned_client()
         self.assertEqual(client.send_command("x", timeout=1.0)["result"], "late")
@@ -572,7 +595,7 @@ class DialogTests(_ClientCase):
     def test_dialog_beats_the_deadline_diagnosis(self):
         self.use_kernel(FakeKernel(self.clock))
         self.states = ["blocked"]
-        self.dialog_after(12)  # after deadline + grace (1 + 10 s) and its first diagnosis
+        self.dialog_after(132)  # after the reply deadline (max(1, 120) + 10 s) and its first diagnosis
         with self.assertRaises(DialogBlocked):
             self.pinned_client().send_command("x", timeout=1.0)
         self.assertEqual(self.diagnoses, ["blocked"])  # one sample: not yet abandoned
@@ -697,10 +720,11 @@ class DialogCheckTests(unittest.TestCase):
         self.inspect = {"dialogs": []}
         self.actions: list[str] = []
 
-        def control(command, cmd_type, timeout, probe=False):
+        def control(command, cmd_type, timeout, probe=False, diagnose=True):
             action = json.loads(command)["action"]
             self.actions.append(action)
             self.assertTrue(probe)
+            self.assertFalse(diagnose)  # upstream 1e2c559: a dropped dialog poll skips its CPU sample
             return {"result": json.dumps(self.status if action == "status" else self.inspect)}
 
         p = mock.patch.object(self.client, "_send_control_command", side_effect=control)
@@ -961,7 +985,9 @@ class BridgeStatusTests(unittest.TestCase):
         client = mock.Mock()
         legacy = {"result": json.dumps({"pong": True}), "requestId": "r", "meta": {}}
 
-        def send(command, cmd_type="maxscript", timeout=None):
+        def send(command, cmd_type="maxscript", timeout=None, probe=False):
+            if cmd_type == "maxscript":
+                self.assertTrue(probe)  # upstream 1e2c559: the legacy status read is a probe again
             if cmd_type in ("health", "ping"):
                 raise RuntimeError(f"Unknown command type: {cmd_type}")
             return legacy

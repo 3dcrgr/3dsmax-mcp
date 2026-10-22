@@ -115,10 +115,11 @@ MAXSCRIPT_SUGGESTION_RULES: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] 
 
 # Message patterns applied to any tool error when no tool-authored hint exists.
 _MESSAGE_HINT_RULES: tuple[tuple[re.Pattern[str], ToolHint], ...] = (
-    # MAX_NOT_RESPONDING / IMPORT_SETTLING texts (max_client). First: they can also
-    # mention "the bridge" or "main window not found".
+    # MAX_NOT_RESPONDING texts (max_client: "3ds Max (PID n) is not responding") and the
+    # fork's IMPORT_SETTLING texts ("3ds Max (PID n) is still settling after ..."). First:
+    # they can also mention "the bridge" or "main window not found".
     (
-        re.compile(r"\bis (still )?not responding\b|\bis still settling after\b", re.IGNORECASE),
+        re.compile(r"\b3ds Max \([^)]*\) is (still )?not responding\b|\bis still settling after\b", re.IGNORECASE),
         {
             "message": (
                 "3ds Max is hung or still settling. Wait up to ~10 min, re-checking with get_bridge_status: "
@@ -127,6 +128,19 @@ _MESSAGE_HINT_RULES: tuple[tuple[re.Pattern[str], ToolHint], ...] = (
                 "shows what blocks its main thread."
             ),
             "suggested_tools": ["capture_hang_diagnostics", "get_bridge_status"],
+        },
+    ),
+    # No bridge to connect to (max_client: "Named pipe ... not found"). Before the
+    # target rule: a missing pipe is not a missing scene object.
+    (
+        re.compile(r"\bnamed pipe\b.*\bnot found\b", re.IGNORECASE),
+        {
+            "message": (
+                "The 3ds Max bridge could not be reached: Max may not be running or still starting, or the "
+                "MCP bridge plugin is not loaded. list_max_instances shows the Max instances this server can "
+                "reach; start 3ds Max if none is listed, then retry."
+            ),
+            "suggested_tools": ["list_max_instances", "get_bridge_status"],
         },
     ),
     (
@@ -302,7 +316,8 @@ def resolve_error_hint(
             if tool_name == "get_bridge_status" and "get_bridge_status" in hint.get(
                 "suggested_tools", []
             ):
-                return {"message": hint["message"]}
+                others = [t for t in hint["suggested_tools"] if t != "get_bridge_status"]
+                return {"message": hint["message"], **({"suggested_tools": others} if others else {})}
             return dict(hint)
 
     return None

@@ -34,7 +34,7 @@ class ErrorCode(str, Enum):
     USER_BUSY = "USER_BUSY"
     MAX_BUSY = "MAX_BUSY"
     MAX_NOT_RESPONDING = "MAX_NOT_RESPONDING"
-    IMPORT_SETTLING = "IMPORT_SETTLING"
+    IMPORT_SETTLING = "IMPORT_SETTLING"  # fork: cosmos_import's settling guard
     SAFE_MODE = "SAFE_MODE"
     BAD_PARAM = "BAD_PARAM"
     BAD_NODE_REF = "BAD_NODE_REF"
@@ -308,7 +308,7 @@ def _classify_error_code(message: str, error_type: str = "") -> ErrorCode:
         return ErrorCode.SAFE_MODE
     if "maxscript did not complete" in lowered:
         return ErrorCode.MAXSCRIPT_INTERRUPTED
-    if "is not responding" in lowered:
+    if "3ds max (" in lowered and "not responding" in lowered:  # max_client's "3ds Max (PID n) is not responding"
         return ErrorCode.MAX_NOT_RESPONDING
     if "busy with another request" in lowered:
         return ErrorCode.MAX_BUSY

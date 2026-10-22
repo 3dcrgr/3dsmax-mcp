@@ -22,6 +22,9 @@ _INTERNAL_CLIENTS = frozenset({"native-tool-probe"})
 _ATTRIBUTION_SLACK_MS = 250
 # Control requests answered on a bridge pipe thread; never another client's work on Max.
 _CONTROL_REQUESTS = frozenset({"native:max_dialogs", "health"})
+# Status pings queue on the main thread but change nothing: not work to report, and a
+# dropped one may be this server's own earlier probe.
+_STATUS_PROBES = frozenset({"ping"})
 
 
 def _legacy_bridge_status() -> str:
@@ -40,7 +43,8 @@ def _legacy_bridge_status() -> str:
         ",\"port\":" + (MCP_Server.port as string) + \
         "}"
     )"""
-    response = client.send_command(maxscript, timeout=5.0)
+    # Read-only: dropped at 5 s like ping instead of waiting out a busy Max.
+    response = client.send_command(maxscript, timeout=5.0, probe=True)
     payload = json.loads(response.get("result", "{}"))
     payload["requestId"] = response.get("requestId")
     payload["meta"] = response.get("meta", {})
@@ -94,11 +98,16 @@ def _seconds(ms) -> float | None:
     return round(ms / 1000.0, 1) if isinstance(ms, (int, float)) else None
 
 
+def _settling(health: dict) -> bool:
+    """True while the fork's import settling guard holds this Max (calls get IMPORT_SETTLING)."""
+    pid = health.get("pid")
+    return bool(pid and settling_state(int(pid)))
+
+
 def _skip_ping(health: dict) -> bool:
     """True when the health reply alone shows a ping would only queue behind a busy main thread."""
     main = health.get("mainThread") or {}
-    pid = health.get("pid")
-    if pid and settling_state(int(pid)):
+    if _settling(health):
         return False  # the ping path refuses with IMPORT_SETTLING and its advice
     state = main.get("state")
     if state == "busy_mcp":
@@ -163,7 +172,7 @@ def _blocked_by_dialog_status(dialogs: list, *, health: dict | None = None, runn
     })
 
 
-def _held_by_dialog(health: dict) -> str | None:
+def _held_by_dialog(health: dict, request_sent: bool = False) -> str | None:
     """blocked_by_dialog status when a main-thread dialog holds the running MCP request.
 
     Only while the main thread still pumps (a modal loop does); a main thread that
@@ -193,7 +202,7 @@ def _held_by_dialog(health: dict) -> str | None:
         entry = next((r for r in (health.get("clients") or {}).get("inflight") or []
                       if r.get("requestId") == request_id), None)
         owner = "other_client" if entry is not None and not _internal(entry) else "unknown"
-    return _blocked_by_dialog_status(holding, health=health, running=running, owner=owner)
+    return _blocked_by_dialog_status(holding, health=health, running=running, owner=owner, request_sent=request_sent)
 
 
 def _running_owner(running: dict, inflight: list[dict], mine_id, abandoned_id) -> str:
@@ -218,11 +227,12 @@ def _running_owner(running: dict, inflight: list[dict], mine_id, abandoned_id) -
     return "unknown"
 
 
-def _busy_from_health(health: dict) -> str | None:
-    """pong=false status built from the health reply alone; no request is queued behind Max.
+def _busy_from_health(health: dict, probe_queued: bool = False) -> str | None:
+    """pong=false status built from the health reply alone.
 
     None means the evidence is inconclusive (the main window still responds while no
-    bridge work runs) and the caller should ping instead.
+    bridge work runs) and the caller should ping instead. probe_queued: this call's
+    dropped ping still waits behind the running request (it changes nothing).
     """
     main = health.get("mainThread") or {}
     executor = health.get("executor") or {}
@@ -240,7 +250,8 @@ def _busy_from_health(health: dict) -> str | None:
     blocked_ids = _blocked_ids()
     ours = {i for i in (mine_id, abandoned_id) if i} | blocked_ids
     others = [r for r in inflight if r.get("requestId") not in ours and not _internal(r)
-              and r.get("cmdType") not in _CONTROL_REQUESTS]
+              and r.get("cmdType") not in _CONTROL_REQUESTS | _STATUS_PROBES]
+    sent = "This status ping waits behind it and changes nothing" if probe_queued else "Nothing was sent"
 
     held_by_dialog = False
     if running:
@@ -278,12 +289,12 @@ def _busy_from_health(health: dict) -> str | None:
     if blocked:
         state, code = "not_responding", MaxNotRespondingError.code
         message = (f"3ds Max (PID {pid}) is not responding: {what}; {describe_process(process)}. "
-                   f"Max is blocked: {BLOCKED_CAUSE}. Nothing was sent. {HANG_ADVICE} "
+                   f"Max is blocked: {BLOCKED_CAUSE}. {sent}. {HANG_ADVICE} "
                    "capture_hang_diagnostics shows where it is stuck (OS-only; pauses each Max thread for milliseconds).")
     else:
         state, code = "busy", MaxBusyError.code
         evidence = f" ({describe_process(process)})" if process else ""
-        message = (f"3ds Max (PID {pid}) is busy: {what}{evidence}. Nothing was sent; "
+        message = (f"3ds Max (PID {pid}) is busy: {what}{evidence}. {sent}; "
                    "new requests queue behind it. Wait and re-check with get_bridge_status.")
     return json.dumps({
         "pong": False,
@@ -309,7 +320,7 @@ def _busy_from_health(health: dict) -> str | None:
         "other_clients": [{"client_id": r.get("clientId"), "cmd_type": r.get("cmdType"),
                            "elapsed_s": _seconds(r.get("elapsedMs"))} for r in others],
         "process": process,
-        "request_sent": False,
+        "request_sent": probe_queued,
         "health": _compact_health(health),
     })
 
@@ -389,13 +400,15 @@ def get_bridge_status() -> str:
     bridge_state blocked_by_dialog: a modal dialog holds a request; read it with max_dialogs.
     Not when: starting a session or before every task — prefer query_scene for scene work.
     """
-    # Precedence: silent bridge; import settling guard (calls get IMPORT_SETTLING, nothing
-    # sent); a dialog holding the running request while the main thread pumps
+    # Precedence: silent bridge; import settling guard (fork: calls get IMPORT_SETTLING,
+    # nothing sent); a dialog holding the running request while the main thread pumps
     # (BLOCKED_BY_DIALOG); busy or hung (MAX_BUSY / MAX_NOT_RESPONDING); then a ping.
+    # A ping held by a request that started meanwhile is attributed from a second
+    # health reading, in the same order.
     health = _native_health()
     if isinstance(health, (MaxBusyError, MaxNotRespondingError)):
         return _silent_bridge_status(health)  # a ping would wait out the same silence
-    if health and not (health.get("pid") and settling_state(int(health["pid"]))):
+    if health and not _settling(health):
         status = _held_by_dialog(health)
         if status is not None:
             return status
@@ -408,6 +421,16 @@ def get_bridge_status() -> str:
     except DialogBlocked as exc:
         return _blocked_by_dialog_status(exc.dialogs, health=health or None, request_sent=True)
     except (MaxBusyError, MaxNotRespondingError) as exc:
+        # A request that had only just started when health was read held the ping:
+        # a fresh reading says whose it is.
+        sent = bool((getattr(exc, "details", None) or {}).get("request_sent"))
+        later = _native_health() if health and sent else None
+        if isinstance(later, dict) and not _settling(later):
+            status = _held_by_dialog(later, request_sent=True)
+            if status is None and _skip_ping(later):
+                status = _busy_from_health(later, probe_queued=True)
+            if status is not None:
+                return status
         return _unhealthy_status(exc, health)
     except RequestOutcomeUnknown as exc:
         return _lost_ping_status(exc, health or None)

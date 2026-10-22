@@ -2,7 +2,9 @@ import json
 import re
 
 from ..helpers.error_hints import suggest_tools_for_maxscript
+from ..helpers.precheck import PrecheckBlocked
 from ..helpers.python_execution import python_execution_script
+from ..max_client import DialogBlocked
 from ..server import mcp, client
 
 
@@ -43,11 +45,15 @@ class UnsavedChangesError(RuntimeError):
         self.details = {"script_sent": False}
 
 
-def _refuse_if_unsaved(script: str) -> None:
+def _refuse_if_unsaved(tool: str) -> None:
     # loadMaxFile never asks to save, even with prompts shown, so a modified scene would be replaced
     # without a word. No exception for scripts that call checkForSave(): the name may only sit in a
     # comment, and a script can ignore the answer. With allow_discard=True such a script still asks.
-    response = client.send_command(_SAVE_REQUIRED_SCRIPT, cmd_type="maxscript")
+    try:
+        response = client.send_command(_SAVE_REQUIRED_SCRIPT, cmd_type="maxscript")
+    except DialogBlocked as blocked:
+        # Only this read-only check waits on the dialog; the script itself was never sent.
+        raise PrecheckBlocked(blocked, tool, "Nothing was run") from None
     if str(response.get("result", "")).strip().lower() == "true":
         raise UnsavedChangesError(
             "The scene has unsaved changes and this script resets, opens, fetches or quits, so they would "
@@ -93,19 +99,28 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     script = code or command
     if not script:
         return "Error: provide MAXScript code in the 'code' parameter"
+    return _run_script(script, quiet, allow_discard, "execute_maxscript")
+
+
+def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str) -> str:
     file_command = mentions_scene_file_command(script)
     if file_command and not allow_discard:
-        _refuse_if_unsaved(script)
-    quiet_ignored = bool(quiet) and not allow_discard and file_command
-    if quiet_ignored:
-        quiet = False  # #12: quiet mode would answer "save changes?" by discarding the scene
+        _refuse_if_unsaved(tool)
+    override = None
+    if file_command and quiet is None:
+        # The bridge's quiet policy would pick this too; sent explicitly, it also holds on an older
+        # bridge without that policy, which would run the script quiet and discard unsaved work.
+        quiet, override = False, "file_command"
+    elif file_command and quiet and not allow_discard:
+        # #12: quiet would answer "save changes?" by discarding the scene
+        quiet, override = False, "file_command_quiet_ignored"
     response = client.send_command(script, cmd_type="maxscript",
                                    request_fields=None if quiet is None else {"quiet": bool(quiet)})
-    if quiet_ignored and isinstance(response, dict):
+    if override and isinstance(response, dict):
         meta = response.get("meta")
         if not isinstance(meta, dict):
             meta = response["meta"] = {}
-        meta["quietOverride"] = "file_command_quiet_ignored"  # reported as a warning
+        meta["quietOverride"] = override  # reported as a warning
     result = response.get("result", "")
 
     if isinstance(result, str) and result.startswith(_MAXSCRIPT_ERROR_SENTINEL):
@@ -131,7 +146,7 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
 
 
 @mcp.tool()
-def execute_python(code: str) -> str:
+def execute_python(code: str, allow_discard: bool = False) -> str:
     """Execute Python in 3ds Max; return stdout, stderr and a JSON-compatible value.
 
     Use when no dedicated tool covers the operation. Runs on Max's main thread
@@ -141,7 +156,11 @@ def execute_python(code: str) -> str:
     Undoable scene edits form one undo step and roll back on an uncaught error.
     File I/O and other effects outside Max's undo system cannot be rolled back.
     Python errors include captured output and a traceback in error.details.
+    Code that mentions a reset, open, fetch or quit command (rt.loadMaxFile,
+    rt.resetMaxFile, ...; see execute_maxscript) runs with prompts shown and is
+    refused with UNSAVED_CHANGES while the scene has unsaved changes; save
+    first, or pass allow_discard=True with the user's OK.
     """
     if not code.strip():
         return "Error: provide Python code in the 'code' parameter"
-    return execute_maxscript(code=python_execution_script(code))
+    return _run_script(python_execution_script(code), None, allow_discard, "execute_python")

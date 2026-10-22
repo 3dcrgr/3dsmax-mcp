@@ -1,9 +1,10 @@
 """Read-only health probes for a 3ds Max process (hung window, CPU, exit).
 
-Only query rights are requested; nothing here signals or injects into the
-target, except window_responsive's no-op WM_NULL (settle checks only) and
-minimize_window's posted ShowWindowAsync (cosmos_import only).
-Every public function returns a verdict instead of raising.
+Only query rights are requested; nothing here signals, injects into or sends
+a message to the target, except two helpers the fork's cosmos_import uses:
+window_responsive's no-op WM_NULL (settle checks only) and minimize_window's
+posted ShowWindowAsync. Every public function returns a verdict instead of
+raising.
 """
 
 from __future__ import annotations
@@ -203,9 +204,24 @@ def _top_level_windows(pid: int) -> list[int]:
     return found
 
 
-def _windows_hung(pid: int) -> tuple[bool, bool | None]:
-    """Return (main_window_found, any_window_hung)."""
+def _main_thread_windows(pid: int) -> list[int]:
+    """Visible, unowned top-level windows on the thread of Max's main window.
+
+    That thread owns the window titled "... 3ds Max ..."; when no title matches,
+    every visible unowned window counts. A modeless window on another thread,
+    such as a Cosmos browser stuck on its importer thread, never makes Max look hung.
+    """
     windows = _top_level_windows(pid)
+    named = [h for h in windows if "3ds max" in _window_title(h).casefold()]
+    if not named:
+        return windows
+    threads = {_user32.GetWindowThreadProcessId(h, None) for h in named}
+    return [h for h in windows if _user32.GetWindowThreadProcessId(h, None) in threads]
+
+
+def _windows_hung(pid: int) -> tuple[bool, bool | None]:
+    """Return (main_window_found, any_main_thread_window_hung)."""
+    windows = _main_thread_windows(pid)
     if not windows:
         return False, None
     return True, any(bool(_user32.IsHungAppWindow(hwnd)) for hwnd in windows)
