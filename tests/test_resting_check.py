@@ -125,10 +125,20 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("rcCoincident s m posEps", script)
         self.assertIn('format:".9g"', script)
         self.assertIn("for o in objects where o.name == nm collect o", script)  # getNodeByName fallback
-        self.assertIn("(poolMin[k].z < medZ - eps or poolMax[k].z <= medZ + tol)", script)  # a zero-thickness mat supports
+        self.assertIn("(poolMin[k].z < medZ - eps or poolMax[k].z <= medZ + tol or", script)  # a zero-thickness mat supports
         self.assertIn('append skipWhy "hidden"', script)
         self.assertIn("rcGap gridOf[k] pts[i] lift maxDrop jit topZ poolMin[k].z eps", script)
         self.assertEqual(script.count("("), script.count(")"))
+
+    def test_measure_script_keeps_a_flat_sheet_the_item_is_sunk_into(self):
+        # Live: an item sunk 2-15 mm into a Plane floor read no_support, because a support had to
+        # start below the item's median underside. A flat sheet at most max_sink above it, below
+        # the item's top (never a decal lying on it), now stays a support and a blocker.
+        script = rs.build_measure_script(settings(names=["item"], supports=["floor"]))
+        self.assertIn("poolMax[k].z - poolMin[k].z <= tol and poolMin[k].z <= medZ + lift and poolMax[k].z < uMax[u].z - tol",
+                      script)
+        self.assertIn("skipMax[j].z - skipMin[j].z <= tol and skipMin[j].z <= medZ + lift and skipMax[j].z < uMax[u].z - tol",
+                      script)
 
     def test_names_with_placeholders_are_literal(self):
         script = rs.build_measure_script(settings(names=["Plate@@SAMPLES@@x", "A@@B"]))

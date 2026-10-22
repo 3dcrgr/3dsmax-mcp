@@ -18,6 +18,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from maxmcp import max_client, process_health, tool_response  # noqa: E402
 from maxmcp.helpers import cosmos, error_hints  # noqa: E402
 from maxmcp.helpers.cosmos_client import CosmosError  # noqa: E402
+from maxmcp.helpers.precheck import PrecheckBlocked  # noqa: E402
 from maxmcp.max_client import (DialogBlocked, MaxBridgeError, MaxBusyError, MaxClient,  # noqa: E402
                                MaxImportSettlingError, MaxNotRespondingAfterDispatch)
 
@@ -485,6 +486,30 @@ def dialog_error(title="MAXScript Callback script Exception"):
 
 class DialogTests(_FlowCase):
     """BLOCKED_BY_DIALOG (upstream 1.7.5) inside the import: a lost call, never an action failure."""
+
+    def test_dialog_before_import_is_a_retryable_precheck_refusal(self):
+        # Only the read-only renderer query is queued behind the dialog. Live, the raw DialogBlocked said
+        # "still running inside Max" and "Do not repeat the call" for an import that was never sent.
+        self.flow["renderer"] = blocked("renderer")
+        with self.assertRaises(PrecheckBlocked) as info:
+            self.run_import()
+        exc = info.exception
+        self.assertEqual(exc.code, "BLOCKED_BY_DIALOG")
+        self.assertTrue(exc.retryable)
+        payload = json.loads(exc.bridge_message)
+        self.assertTrue(payload["retryable"])
+        self.assertIn("Nothing was imported", payload["message"])
+        self.assertNotIn("still running inside Max", payload["message"])
+        self.assertIn("repeat cosmos_import", payload["hint"])
+        self.assertFalse(payload["details"]["changed"])
+        self.assertEqual(self.bridge_kinds(), ["renderer"])  # the import itself was never sent
+        self.assertTrue(cosmos._import_lock.acquire(blocking=False))  # a later import is not USER_BUSY
+        cosmos._import_lock.release()
+
+    def test_other_errors_before_import_are_unchanged(self):
+        self.flow["renderer"] = CosmosError("Select a running Max instance first.", "COSMOS_NO_IMPORTER")
+        with self.assertRaises(CosmosError):
+            self.run_import()
 
     def test_browser_action_is_sent_with_quiet_mode_off(self):
         self.browsers = []

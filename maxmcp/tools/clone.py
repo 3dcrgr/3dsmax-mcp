@@ -84,7 +84,9 @@ def clone_objects(
     if count > 1:
         return _clone_array(names, mode, list(offset or [0.0, 0.0, 0.0]), count,
                             guard_groups=not clone_whole_group)
-    if client.native_available:
+    # The native handler always refuses a closed-group member (it has no switch for Max's raw
+    # whole-group clone), so clone_whole_group takes the MAXScript path below.
+    if client.native_available and not clone_whole_group:
         try:
             params: dict = {"names": names, "mode": mode}
             if offset:

@@ -66,7 +66,11 @@ def cosmos_import(
     swap_medit_renderer (optional; forced on if the browser cannot be opened) uses
     Scanline for the Material Editor during the import, restored later if
     restore_medit_renderer. Waits up to settle_seconds (0-300, at least 8) for Max to
-    settle; other calls get IMPORT_SETTLING meanwhile. If safe_to_edit is false,
+    settle. A second call through the same MCP server just waits for the import to finish.
+    IMPORT_SETTLING refuses only calls from another thread of the same process while it runs,
+    or calls made after it returned while Max is still hung. A dialog open before the import
+    gives a retryable BLOCKED_BY_DIALOG with nothing imported: answer it, then repeat the call.
+    If safe_to_edit is false,
     follow next and run pending_restore later. Never open or close the Material
     Editor right after. The importer fills the active Material Editor slot: a used
     one is swapped for a free (unused, unedited) slot first and made active again after (medit_active_slot;

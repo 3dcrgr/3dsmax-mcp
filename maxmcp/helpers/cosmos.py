@@ -14,6 +14,7 @@ from ..max_client import (HANG_ADVICE, DialogBlocked, MaxBridgeError, MaxClient,
 
 from .cosmos_client import Cosmos, CosmosError, asset_id as normalize_id
 from .dialogs import open_main_dialogs as _open_main_dialogs
+from .precheck import PrecheckBlocked
 
 _KIND_TAGS = {"all": (), "model": (1,), "material": (38,), "hdri": (427,)}
 _STATES = {1: "unavailable", 2: "not_downloaded", 3: "ready",
@@ -1484,7 +1485,11 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         raise CosmosError("A Cosmos import is already in progress.", "USER_BUSY", True)
     operation_client = import_guard = pid = None
     try:
-        service, importer = _context(client, renderer)
+        try:
+            service, importer = _context(client, renderer)
+        except DialogBlocked as blocked:
+            # Only the read-only renderer query is queued behind the dialog; the import was never sent.
+            raise PrecheckBlocked(blocked, "cosmos_import", "Nothing was imported") from None
         asset = _download(service, package_id, wait_seconds)
         result = _summary(service, asset)
         if result["state"] != "ready":

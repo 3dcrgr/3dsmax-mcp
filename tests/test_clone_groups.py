@@ -172,11 +172,12 @@ class UnchangedPathTests(unittest.TestCase):
         self.assertEqual(out["cloned"], ["Box002", "Box003"])
 
     def test_clone_whole_group_skips_detection(self):
-        with patch.object(cl, "client", _client(True, [json.dumps(self.NATIVE)])) as client:
+        fallback = json.dumps({"cloned": ["GRP001"], "notFound": [], "handles": ["900"]})
+        with patch.object(cl, "client", _client(True, [fallback, _spatial(["GRP001"])])) as client:
             out = json.loads(cl.clone_objects(["Vase01"], clone_whole_group=True))
-        calls = client.send_command.call_args_list
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].kwargs["cmd_type"], "native:clone_objects")
+        script = _scripts(client)[0]
+        self.assertIn("maxOps.cloneNodes srcNodes", script)
+        self.assertNotIn("mcpIsMember", script)
         self.assertNotIn("detached_from_group", out)
 
     def test_clone_whole_group_array_uses_clone_nodes(self):
@@ -186,18 +187,16 @@ class UnchangedPathTests(unittest.TestCase):
         # Upstream's closed-group refusal is skipped: Max's whole-group clone is wanted.
         self.assertIn('local groupError = ""', _scripts(client)[0])
 
-    def test_clone_whole_group_falls_back_past_native_refusal(self):
-        # Upstream's native handler refuses closed-group members; the MAXScript
-        # fallback then clones the whole group as asked.
-        client = MagicMock()
-        client.native_available = True
+    def test_clone_whole_group_skips_the_native_handler(self):
+        # The native handler always refuses a closed-group member (live, count=1, it returned
+        # "Max would clone the whole group"), so clone_whole_group goes straight to MAXScript.
         fallback = json.dumps({"cloned": ["GRP001"], "notFound": [], "handles": ["900"]})
-        client.send_command.side_effect = [RuntimeError("Clone source 'Vase01' is in closed group"),
-                                           {"result": fallback}, {"result": _spatial(["GRP001"])}]
-        with patch.object(cl, "client", client):
-            out = json.loads(cl.clone_objects(["Vase01"], clone_whole_group=True))
-        script = _scripts(client)[1]
-        self.assertIn('local groupError = ""', script)
+        with patch.object(cl, "client", _client(True, [fallback, _spatial(["GRP001"])])) as client:
+            out = json.loads(cl.clone_objects(["Vase01"], mode="copy", clone_whole_group=True))
+        kinds = [c.kwargs.get("cmd_type") for c in client.send_command.call_args_list]
+        self.assertNotIn("native:clone_objects", kinds)
+        script = _scripts(client)[0]
+        self.assertIn('local groupError = ""', script)  # group guard off: Max's raw whole-group clone
         self.assertIn("maxOps.cloneNodes srcNodes", script)
         self.assertEqual(out["cloned"], ["GRP001"])
 

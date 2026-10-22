@@ -1011,7 +1011,9 @@ _MEASURE_BODY = r'''
                     )
                     for d in twins do format "C|%|%|%|%|%|%\n" u (rcH d) (rcB64 d.name) (rcNotMovable d) (rcG9 d.transform.row4.z) (rcAncestors d) to:ss
                     -- supports: start below the item's median underside (or lie wholly at or below it, a
-                    -- zero-thickness mat; never the cup standing on that mat), overlap its footprint,
+                    -- zero-thickness mat; never the cup standing on that mat; or are a flat open sheet at most
+                    -- max_sink above it that the item passes through, e.g. a Plane floor it is sunk into,
+                    -- never a decal lying on its top), overlap its footprint,
                     -- reach within max_drop of its lowest point; never its own descendants
                     local sup = #()
                     for k = 1 to pool.count do (
@@ -1022,7 +1024,7 @@ _MEASURE_BODY = r'''
                                 if (rcCoincident s m posEps) do dup = true
                             )
                             if dup then (format "Q|%|%|coincident|%\n" (rcH s) (rcB64 s.name) u to:ss) else (
-                                if (poolMin[k].z < medZ - eps or poolMax[k].z <= medZ + tol) and poolMax[k].z >= lowZ - maxDrop - eps do (
+                                if (poolMin[k].z < medZ - eps or poolMax[k].z <= medZ + tol or (poolMax[k].z - poolMin[k].z <= tol and poolMin[k].z <= medZ + lift and poolMax[k].z < uMax[u].z - tol)) and poolMax[k].z >= lowZ - maxDrop - eps do (
                                     local below = false
                                     for m in unitMeshes[u] while not below do (
                                         if (rcIsAncestor m s) do below = true
@@ -1034,7 +1036,7 @@ _MEASURE_BODY = r'''
                     )
                     -- anything left out that could be the real surface blocks a drop
                     for j = 1 to skipN.count do (
-                        if skipMin[j].x <= uMax[u].x and skipMax[j].x >= uMin[u].x and skipMin[j].y <= uMax[u].y and skipMax[j].y >= uMin[u].y and (skipMin[j].z < medZ - eps or skipMax[j].z <= medZ + tol) and skipMax[j].z >= lowZ - maxDrop - eps and (findItem twins skipN[j]) == 0 do (
+                        if skipMin[j].x <= uMax[u].x and skipMax[j].x >= uMin[u].x and skipMin[j].y <= uMax[u].y and skipMax[j].y >= uMin[u].y and (skipMin[j].z < medZ - eps or skipMax[j].z <= medZ + tol or (skipMax[j].z - skipMin[j].z <= tol and skipMin[j].z <= medZ + lift and skipMax[j].z < uMax[u].z - tol)) and skipMax[j].z >= lowZ - maxDrop - eps and (findItem twins skipN[j]) == 0 do (
                             format "B|%|%|%|%\n" u (rcH skipN[j]) (rcB64 skipN[j].name) skipWhy[j] to:ss
                         )
                     )
