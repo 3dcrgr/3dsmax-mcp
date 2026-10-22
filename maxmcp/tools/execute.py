@@ -1,7 +1,7 @@
 import json
 import re
 
-from ..helpers.error_hints import suggest_tools_for_maxscript
+from ..helpers.error_hints import edit_poly_hint, suggest_tools_for_maxscript
 from ..helpers.precheck import PrecheckBlocked
 from ..helpers.python_execution import python_execution_script
 from ..max_client import DialogBlocked
@@ -131,7 +131,10 @@ def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str)
             "error": message,
         }
         suggested = suggest_tools_for_maxscript(script)
-        if suggested:
+        edit_poly = edit_poly_hint(script, message)
+        if edit_poly is not None:
+            payload["hint"] = edit_poly
+        elif suggested:
             payload["hint"] = {
                 "message": (
                     "execute_maxscript is a fallback. Before retrying the same "

@@ -282,6 +282,9 @@ polyop.setVertColor $obj 0 #{1..n} (color 255 128 0)
 ```maxscript
 ep = Edit_Poly()
 addModifier $obj ep
+-- Most Edit_Poly methods need ep current in the Modify panel, or they fault
+-- (EXCEPTION_ACCESS_VIOLATION) or silently do nothing (issue #47):
+select $obj; max modify mode; modPanel.setCurrentObject ep
 
 -- Selection via EditPolyMod interface (FAST standalone access)
 EditPolyMod.SetEPolySelLevel ep #Face

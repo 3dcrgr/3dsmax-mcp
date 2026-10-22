@@ -197,6 +197,45 @@ _MESSAGE_HINT_RULES: tuple[tuple[re.Pattern[str], ToolHint], ...] = (
 )
 
 
+# Issue #47: Edit_Poly MODIFIER methods (ButtonOp, SetSelection, GetFaceNormal,
+# SetOperation, Commit, ...) need that modifier to be the current object in the
+# Modify panel. Otherwise they fault with EXCEPTION_ACCESS_VIOLATION (MAXScript
+# catches it as a system exception) or silently do nothing. The script pattern
+# names the modifier class or its interface, or calls one of those methods on
+# something reached through .modifiers.
+_EDIT_POLY_SCRIPT = re.compile(
+    r"\bEdit_Poly\b|\bEditPolyMod\b|"
+    r"\bmodifiers\b.*?\.(ButtonOp|SetSelection|GetSelection|GetFaceNormal|GetFaceCenter|"
+    r"SetOperation|Commit|SetSlicePlane|SetEPolySelLevel)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_EDIT_POLY_FAULT = re.compile(r"access.?violation|system exception|unknown exception", re.IGNORECASE)
+_SET_CURRENT_OBJECT = re.compile(r"\bmodPanel\.setCurrentObject\b", re.IGNORECASE)
+
+EDIT_POLY_HINT_MESSAGE = (
+    "Edit_Poly modifier methods (ButtonOp, SetSelection, GetFaceNormal, SetOperation, "
+    "Commit...) only work while that modifier is the current object in the Modify panel. "
+    "Otherwise they fault with EXCEPTION_ACCESS_VIOLATION or silently do nothing. Make it "
+    "current first: select obj; max modify mode; modPanel.setCurrentObject "
+    "obj.modifiers[#Edit_Poly]. For face selections, ep.Select #Face bits select:true "
+    "node:obj worked where SetSelection returned true but selected nothing. To edit the "
+    "Editable Poly base instead, use mesh_edit."
+)
+
+
+def edit_poly_hint(script: str | None, message: str = "") -> ToolHint | None:
+    """Hint for a failed script that calls Edit_Poly modifier methods (#47).
+
+    Fires on a fault-like error, or on any error when the script never makes
+    the modifier current with modPanel.setCurrentObject.
+    """
+    if not script or not _EDIT_POLY_SCRIPT.search(script):
+        return None
+    if not (_EDIT_POLY_FAULT.search(message or "") or not _SET_CURRENT_OBJECT.search(script)):
+        return None
+    return {"message": EDIT_POLY_HINT_MESSAGE, "suggested_tools": ["mesh_edit", "inspect_mesh"]}
+
+
 def suggest_tools_for_maxscript(script: str) -> list[str]:
     """Return dedicated MCP tools that match MAXScript intent patterns."""
     suggestions: list[str] = []
@@ -287,6 +326,18 @@ def resolve_error_hint(
     if authored is not None:
         return authored
 
+    message = ""
+    if error:
+        message = str(error.get("message") or "")
+    elif isinstance(raw_result, str):
+        message = raw_result
+    elif isinstance(raw_result, dict):
+        message = str(raw_result.get("error") or raw_result.get("message") or "")
+
+    edit_poly = edit_poly_hint(script, message)
+    if edit_poly is not None:
+        return edit_poly
+
     if script:
         suggested = suggest_tools_for_maxscript(script)
         if suggested:
@@ -298,14 +349,6 @@ def resolve_error_hint(
                 ),
                 "suggested_tools": suggested,
             }
-
-    message = ""
-    if error:
-        message = str(error.get("message") or "")
-    elif isinstance(raw_result, str):
-        message = raw_result
-    elif isinstance(raw_result, dict):
-        message = str(raw_result.get("error") or raw_result.get("message") or "")
 
     if not message:
         return None
