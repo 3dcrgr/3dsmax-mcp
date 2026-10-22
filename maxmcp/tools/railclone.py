@@ -34,7 +34,7 @@ REBUILD_TIMEOUT_S = 300.0
 # A library load merges a .max file or loads by route, may load a matlib (loadTempMaterialLibrary on a .pmat
 # blocked for over 120 s live, docs/fork/railclone.md), then rebuilds. Same value as forest_from_library.
 LIBRARY_TIMEOUT_S = 300.0
-TOKEN =re.compile(r"[0-9A-F]{2}(?:-[0-9A-F]{2}){31}")
+TOKEN = re.compile(r"[0-9A-F]{2}(?:-[0-9A-F]{2}){31}")
 MS_ERROR = "__MCP_MS_ERR__:"
 UNDO_PARAMS = "MCP RailClone params"
 UNDO_LIBRARY = "MCP RailClone from library"

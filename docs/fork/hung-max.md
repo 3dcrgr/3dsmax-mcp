@@ -248,7 +248,7 @@ Tests:
 Upstream 1.7.5 (2026-10-01) covers two parts: a call waiting on a modal dialog returns `BLOCKED_BY_DIALOG` (answered with `max_dialogs`), and a timed-out queued request is cancelled.
 
 Upstream 1.7.6 (2026-10-14) adds three more:
-- **A reply deadline on every request:** after about 130 s for ordinary calls, `MAX_BUSY`, sent and not retryable. The 1.7.6 merge kept the fork's rule as the main one (wait while Max is busy or responsive, give up only when it exited or is confirmed hung) and used upstream's deadline only when Max's PID couldn't be found. Since the merge of `f434ec2` the fork follows upstream's deadline for every call. See [Client side](#client-side-a9d2a0d).
+- **A reply deadline on every request:** after about 130 s for ordinary calls, `MAX_BUSY`, sent and not retryable. The 1.7.6 merge kept the fork's rule as the main one (wait while Max is busy or responsive, give up only when it exited or is confirmed hung) and used upstream's deadline only when Max's PID couldn't be found. Since the merge of `f434ec2` the fork follows upstream's deadline for every call. A hang is confirmed about 20 s after the deadline, so a hung call ends as `MAX_NOT_RESPONDING` at about 150 s, and a call that finishes before then still returns its result (live, 2026-10-22). See [Client side](#client-side-a9d2a0d).
 - **The shutdown drain** (`StopAccepting`) and **pipe I/O cancelled on `Stop`** (covers #29), so Max quits with clients connected. See [Native executor](#native-executor-adcfd93-ported-from-geddarts-fork).
 - **MAXScript-backed reads on Max's main thread**, which settles the quiet-mode race fixed in `8a8b26c`.
 
