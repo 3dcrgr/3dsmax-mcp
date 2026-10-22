@@ -45,7 +45,7 @@ The MCP made both problems worse in three ways:
 6. **If Max is still busy after `settle_seconds`**, the result has `state: "settling"` and `safe_to_edit: false`. Once `get_bridge_status` reports Max responding, run `pending_restore.maxscript` once with `execute_maxscript`.
    - It also arms an `IMPORT_SETTLING` guard. Until that Max's windows pump messages again, further calls from this server to it fail fast and aren't sent. The guard expires after 15 minutes at most.
 
-The same guard covers the import itself: while it runs, other calls from this server to that Max fail at once with `IMPORT_SETTLING`. `get_bridge_status` and `max_dialogs` still answer, over the control channel. It's also armed when a hung browser (step 1) or a main window that doesn't answer (step 2) refuses the import.
+The same guard covers the import itself, but only for calls from another thread of the same process: through a real stdio server a second call simply waits until the import returns (live, 2026-10-22). After the import returns while Max is still hung, calls to that Max fail at once with `IMPORT_SETTLING`. `get_bridge_status` and `max_dialogs` still answer, over the control channel. It's also armed when a hung browser (step 1) or a main window that doesn't answer (step 2) refuses the import.
 
 New parameters:
 
