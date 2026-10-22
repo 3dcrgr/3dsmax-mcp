@@ -56,6 +56,11 @@ def scripts(client):
     return [c.args[0] for c in client.send_command.call_args_list]
 
 
+def timeouts(client):
+    """The timeout each call passed, None when it kept the client default."""
+    return [c.kwargs.get("timeout") for c in client.send_command.call_args_list]
+
+
 def decoded_strings(script):
     """Every rcDecode "<b64>" literal in a script, decoded."""
     return [unb64(m) for m in re.findall(r'rcDecode "([A-Za-z0-9+/=]*)"', script)]
@@ -177,6 +182,9 @@ class OutputTests(unittest.TestCase):
         with patch.object(rc, "client", client_with(out_raw())) as client:
             out = rc.get_railclone_output(name="RC_Fence", limit=2)
         script = scripts(client)[0]
+        # a rebuild has no budget of its own: past upstream's default reply deadline on a heavy RailClone
+        self.assertEqual(timeouts(client), [rc.REBUILD_TIMEOUT_S])
+        self.assertGreater(rc.REBUILD_TIMEOUT_S, 120)
         # Live (RC 7.3.5): seed = seed rebuilds without touching the segments; segmentsUpdate renames linked
         # segments to their source node, so a read never runs it unless reload_segments asks for it
         self.assertIn("rebuilt = false or not autoOff\n"
@@ -212,6 +220,7 @@ class OutputTests(unittest.TestCase):
         raw = out_raw(shared=b64("RC_Fence001"), rebuilt="0")
         with patch.object(rc, "client", client_with(raw)) as client:
             out = rc.get_railclone_output(name="RC_Fence", rebuild=False, include_xml=True)
+        self.assertEqual(timeouts(client), [None])  # a plain read keeps the default deadline
         body = scripts(client)[0].replace(rc._FUNCTIONS, "")
         self.assertNotIn("rcRebuildOutput", body)
         self.assertIn("xml = api.getXMLOutput()", body)
@@ -346,6 +355,10 @@ class InspectTests(unittest.TestCase):
         with patch.object(rc, "client", client_with(inspect_raw())) as client:
             self.out = rc.railclone_inspect(name="RC_Fence")
         self.script = scripts(client)[0]
+        self.timeouts = timeouts(client)
+
+    def test_rebuild_gets_the_rebuild_timeout(self):
+        self.assertEqual(self.timeouts, [rc.REBUILD_TIMEOUT_S])
 
     def test_script_reads_everything_in_one_call(self):
         for needle in ("#paid", "#paselector", "#banode", "#sobjref", "getXMLStyle", "getXMLOutput",
@@ -417,6 +430,7 @@ class InspectTests(unittest.TestCase):
         with patch.object(rc, "client", client_with(inspect_raw(rebuilt=False))) as client:
             out = rc.railclone_inspect(name="RC_Fence", rebuild=False)
         self.assertIn("local rcBuild = false and (false or not", scripts(client)[0])
+        self.assertEqual(timeouts(client), [None])
         self.assertFalse(out["output"]["rebuilt"])
         self.assertTrue(any(w.startswith("NOT_REBUILT") for w in out["warnings"]))
         with patch.object(rc, "client", client_with()) as client:
@@ -538,6 +552,13 @@ class SetParamTests(unittest.TestCase):
                 rc.railclone_set_param(params, name="RC_Fence")
         self.assertEqual(client.send_command.call_count, 1)  # read only, nothing written
         return str(ctx.exception)
+
+    def test_write_gets_the_rebuild_timeout(self):
+        write = setp_raw({("before", 1, "paunitval"): 10.0, ("after", 1, "paunitval"): 60.0})
+        with patch.object(rc, "client", client_with(read_raw(), write)) as client:
+            rc.railclone_set_param({"Pickets Distance": "60cm"}, name="RC_Fence")
+        # the read builds nothing, the write rebuilds twice (before and after)
+        self.assertEqual(timeouts(client), [None, rc.REBUILD_TIMEOUT_S])
 
     def test_distance_by_name_and_unit_string(self):
         write = setp_raw({("before", 1, "paunitval"): 10.0, ("after", 1, "paunitval"): 60.0})
@@ -853,6 +874,8 @@ class FromLibraryTests(LibraryFixture):
         sent = scripts(client)
         self.assertEqual(len(sent), 2)
         self.assert_roots_read(sent[0])
+        # the roots read is short, the load (merge or route, matlib, rebuild) can pass 120 s
+        self.assertEqual(timeouts(client), [None, rc.LIBRARY_TIMEOUT_S])
         return out, sent[1]
 
     def assert_roots_read(self, script):

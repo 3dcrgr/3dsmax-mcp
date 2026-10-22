@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from maxmcp import max_client, process_health, tool_response  # noqa: E402
-from maxmcp.helpers import cosmos  # noqa: E402
+from maxmcp.helpers import cosmos, error_hints  # noqa: E402
 from maxmcp.helpers.cosmos_client import CosmosError  # noqa: E402
 from maxmcp.max_client import (DialogBlocked, MaxBridgeError, MaxBusyError, MaxClient,  # noqa: E402
                                MaxImportSettlingError, MaxNotRespondingAfterDispatch)
@@ -787,6 +787,10 @@ class ReviewFixTests(_FlowCase):
         self.assertTrue(ctx.exception.retryable)
         self.assertIn("main window hung", str(ctx.exception))
         self.assertIn("~10 min", str(ctx.exception))
+        # upstream's hint pattern only matches max_client's "3ds Max (PID n) is not responding" wording
+        self.assertIn("3ds Max (PID %s) is not responding" % PID, str(ctx.exception))
+        hint = error_hints.resolve_error_hint(tool_name="cosmos_import", error={"message": str(ctx.exception)})
+        self.assertIn("capture_hang_diagnostics", hint["suggested_tools"])
         self.assertFalse(self.bridge_kinds("operation"))
         self.assertNotIn(("dispatch",), self.events)
         self.assertIsNone(max_client.settling_state(PID))

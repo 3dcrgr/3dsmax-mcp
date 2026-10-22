@@ -2044,13 +2044,24 @@ class ForestInstancesTests(unittest.TestCase):
                 self.assertTrue(out["source_disabled"])
 
     def test_count_and_delete(self):
-        out, script, _ = self.run_tool(ok("C|12|0", "D|0"), action="count")
+        out, script, kwargs = self.run_tool(ok("C|12|0", "D|0"), action="count")
         check_script(self, script)
         self.assertEqual(out["instances"], 12)
         self.assertNotIn("t.update()", script.split("else (")[-1])
-        out, script, _ = self.run_tool(ok("C|12|1", "D|0"), action="delete", confirm_delete=True)
+        self.assertEqual(kwargs, {})  # a count only reads user properties: default deadline
+        out, script, kwargs = self.run_tool(ok("C|12|1", "D|0"), action="delete", confirm_delete=True)
         self.assertIn('undo "MCP Forest instances delete" on (delete mine)', script)
         self.assertEqual(out["deleted"], 12)
+        # the number of tagged instances isn't known beforehand, so a delete gets the cap
+        self.assertEqual(kwargs, {"timeout": fh.INSTANCES_TIMEOUT_MAX_S})
+
+    def test_instances_timeout_scales_with_max_items(self):
+        self.assertEqual(fh.instances_timeout(1000), 110.0)
+        self.assertEqual(fh.instances_timeout(4000), 260.0)
+        self.assertEqual(fh.instances_timeout(10000), 560.0)  # forest_instances' own max_items cap
+        self.assertEqual(fh.instances_timeout(100000), fh.INSTANCES_TIMEOUT_MAX_S)  # railclone_instances' cap
+        _, _, kwargs = self.run_tool(ok("H|240|250|0|" + b64("L") + "|" + b64("P") + "|0", "D|0"), max_items=4000)
+        self.assertEqual(kwargs, {"timeout": 260.0})
 
     def test_refusals_before_max(self):
         bad = ({"action": "explode"}, {"mode": "clone"}, {"max_items": 0}, {"max_items": 10001},

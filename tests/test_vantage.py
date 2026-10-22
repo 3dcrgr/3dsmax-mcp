@@ -465,6 +465,9 @@ class StartTests(LiveLinkTestCase):
         # pre-check probe, agent viewport, one atomic start, post probe; nothing while polling
         self.assertEqual(kinds, ["probe", "native:agent_viewport", "maxscript", "probe"])
         self.assertEqual(calls[2].kwargs["request_fields"], {"quiet": True})
+        # vrayGPUStartIPR can translate the whole scene inside the call: past the default 120 s deadline
+        self.assertEqual(calls[2].kwargs["timeout"], vt.START_TIMEOUT_S)
+        self.assertGreater(vt.START_TIMEOUT_S, 120)
         sent = scripts(client)[0]
         self.assertIn('vrayGPUSetLiveLinkServers #("localhost:20703")', sent)
         self.assertIn("vrayGPUStartIPR liveLinkMode:true", sent)
@@ -622,6 +625,9 @@ class StopTests(LiveLinkTestCase):
         self.assertEqual(out["vantage"]["live_link"], "Online")
         script = scripts(client)[0]
         self.assertIn("vrayGPUStopIPR()", script)
+        stop = [c for c in client.send_command.call_args_list
+                if c.kwargs.get("cmd_type") == "maxscript" and not c.kwargs.get("probe")]
+        self.assertIsNone(stop[0].kwargs["timeout"])  # a stop is short: default deadline
         self.assertIn('"123-abc" != "" and mcp_vantageLiveLink == "123-abc"', script)
         self.assertIn("not ours and not false", script)
         self.assertIsNone(vt._OWN)

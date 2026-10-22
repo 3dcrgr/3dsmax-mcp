@@ -419,6 +419,17 @@ def viewport_thinning(full: float, viewport_max: int | None) -> tuple[int, float
 # the prediction was within 2%; the estimate itself is rougher (bounding-box area, excludes, slope limits).
 THINNING_TOLERANCE = 0.25
 
+# Reply deadline for turning a scatter into scene nodes (forest_instances, railclone_instances). The client
+# waits max(timeout, 120 s) + 10 s (upstream 1e2c559). A create rebuilds and makes one node per item, so it
+# gets 60 s plus 50 ms per allowed item, at most 10 minutes. A delete removes every tagged instance, whose
+# number isn't known beforehand, so it gets the cap.
+INSTANCES_TIMEOUT_MAX_S = 600.0
+
+
+def instances_timeout(max_items: int) -> float:
+    """Reply timeout in seconds for a create of up to max_items scene nodes."""
+    return min(INSTANCES_TIMEOUT_MAX_S, 60.0 + max_items * 0.05)
+
 
 def count_checks(estimate: float | None, count: int | None, *, viewport_max: int | None,
                  maxdensity: float | None, candidates: float | None,

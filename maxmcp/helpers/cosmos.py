@@ -1497,7 +1497,7 @@ def import_asset(client, package_id, wait_seconds, renderer, settle_seconds=SETT
         iconic_before = _browser_iconic(browser_state)  # e.g. minimized by the previous import
         pre = _pre_dispatch_state(pid, browser_state)
         if pre["main_hung"]:
-            raise CosmosError("Max (PID %s) is not responding: its main window hung. Nothing was sent and nothing "
+            raise CosmosError("3ds Max (PID %s) is not responding: its main window hung. Nothing was sent and nothing "
                               "was imported. %s" % (pid, _WAIT_ADVICE), "IMPORT_SETTLING", True)
         if pre["browser_hung"]:
             # A browser thread still blocked by an earlier import plus main-thread work

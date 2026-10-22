@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from maxmcp.helpers import forest as fh
 from maxmcp.tools import itoo_api as api
 
 TOKEN = "-".join(["AB"] * 32)
@@ -164,6 +165,8 @@ class ControlsTests(unittest.TestCase):
         with patch.object(api.rc, "_send", return_value=raw) as send:
             api.railclone_proxy(name="rc", action="set", mode="external", path="C:/cache/a.rcproxy", confirm_change=True)
         script = send.call_args.args[0]
+        # cache generation is a full build: the rebuild deadline
+        self.assertEqual(send.call_args.kwargs, {"timeout": api.rc.REBUILD_TIMEOUT_S})
         self.assertIn("OVERWRITE_REQUIRED", script)
         self.assertIn("CACHE_WRITE_FAILED", script)
         self.assertNotIn("fullMeshProxy", script)
@@ -171,6 +174,18 @@ class ControlsTests(unittest.TestCase):
     def test_compatibility_requires_confirmation(self):
         with self.assertRaises(ValueError):
             api.railclone_metadata(name="rc", reset_compatibility=True)
+
+    def test_proxy_inspect_and_instance_timeouts(self):
+        with patch.object(api.rc, "_send", return_value="ITOOPROXY\nP|i0|s|s\nEND\n") as send:
+            api.railclone_proxy(name="rc")
+        self.assertEqual(send.call_args.kwargs, {"timeout": None})
+        raw = "ITOOINSTANCES\nN|7|" + api.rc._b64("new") + "\nS|b0\nEND\n"
+        for kw, timeout in (({"action": "create", "max_items": 100000}, fh.INSTANCES_TIMEOUT_MAX_S),
+                            ({"action": "delete", "confirm_delete": True}, fh.INSTANCES_TIMEOUT_MAX_S),
+                            ({"action": "enable"}, None)):
+            with self.subTest(**kw), patch.object(api.rc, "_send", return_value=raw) as send:
+                api.railclone_instances(name="rc", **kw)
+            self.assertEqual(send.call_args.kwargs, {"timeout": timeout})
 
     def test_delete_instances_requires_confirmation(self):
         with self.assertRaises(ValueError):
@@ -181,6 +196,7 @@ class ControlsTests(unittest.TestCase):
         with patch.object(api.rc, "_send", return_value=raw) as send:
             res = api.railclone_instances(name="rc", max_items=10)
         script = send.call_args.args[0]
+        self.assertEqual(send.call_args.kwargs, {"timeout": fh.instances_timeout(10)})
         self.assertEqual(res["created"][0]["handle"], 123)
         for text in ["ITEM_LIMIT", "AUTO_UPDATE_OFF", "PROXY_CACHE", "rcRestoreSel prev) catch (rcRestoreSel prev", "Instantiate 0"]:
             self.assertIn(text, script)

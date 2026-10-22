@@ -27,7 +27,14 @@ _NODE_LOOKUP_FNS = NODE_LOOKUP_FNS
 
 
 MAX_XML_CHARS = 4_000_000
-TOKEN = re.compile(r"[0-9A-F]{2}(?:-[0-9A-F]{2}){31}")
+# Reply deadlines (the client waits max(timeout, 120 s) + 10 s, upstream 1e2c559). A rebuild of a heavy
+# RailClone (rcRebuildOutput, Proxy Cache generation) blocks Max for as long as the build takes, with no
+# budget of its own, so a call that rebuilds gets more than the default 120 s.
+REBUILD_TIMEOUT_S = 300.0
+# A library load merges a .max file or loads by route, may load a matlib (loadTempMaterialLibrary on a .pmat
+# blocked for over 120 s live, docs/fork/railclone.md), then rebuilds. Same value as forest_from_library.
+LIBRARY_TIMEOUT_S = 300.0
+TOKEN =re.compile(r"[0-9A-F]{2}(?:-[0-9A-F]{2}){31}")
 MS_ERROR = "__MCP_MS_ERR__:"
 UNDO_PARAMS = "MCP RailClone params"
 UNDO_LIBRARY = "MCP RailClone from library"
@@ -326,9 +333,10 @@ def _target(name: str, handle: int) -> str:
     return code
 
 
-def _send(body: str) -> str:
-    response = client.send_command('(' + _FUNCTIONS + _NODE_LOOKUP_FNS + '\ntry (\n' + body +
-                                   '\n) catch ("RCERROR|" + (getCurrentException() as string))\n)')
+def _send(body: str, *, timeout: float | None = None) -> str:
+    script = ('(' + _FUNCTIONS + _NODE_LOOKUP_FNS + '\ntry (\n' + body +
+              '\n) catch ("RCERROR|" + (getCurrentException() as string))\n)')
+    response = client.send_command(script, timeout=timeout) if timeout else client.send_command(script)
     if response.get("error") or response.get("ok") is False:
         error = response.get("error") or {}
         if isinstance(error, dict):
@@ -595,7 +603,7 @@ local xml = undefined
 local shared = for n in (rcShared obj) collect (rcEncode n.name)
 local proxy = if isProperty base #proxymode then base.proxymode else 0
 "RCOUT|" + (rcH obj) + "|" + (rcEncode obj.name) + "|" + (rcTm obj.objectTransform) + "|" + (rcJoin shared ",") + "|" + (if rebuilt then "1" else "0") + "|" + (if autoOff then "1" else "0") + "|" + (proxy as string) + "|" + (rcEncode xml)
-''')
+''', timeout=REBUILD_TIMEOUT_S if rebuild else None)
     parts = raw.split("|", 8)
     if len(parts) != 9 or parts[0] != "RCOUT":
         raise RailCloneError("INVALID_READBACK", f"RailClone returned no output readback: {raw[:250]}")
@@ -801,7 +809,8 @@ def railclone_inspect(name: str = "", handle: int = 0, include_graph: bool = Tru
                          "rebuild=false")
     raw = _send(_target(name, handle) + _inspect_body(graph=include_graph, output=True, bases=True,
                                                        segments=True, reload=reload_segments, rebuild=rebuild,
-                                                       force=force_rebuild))
+                                                       force=force_rebuild),
+                timeout=REBUILD_TIMEOUT_S if rebuild else None)
     data = _parse_inspect(raw)
     info, warnings = data["info"], list(data["warnings"])
     upm = info.get("upm") if isinstance(info.get("upm"), float) and info.get("upm") > 0 else None
@@ -997,7 +1006,9 @@ def railclone_set_param(params: dict[str, Any], name: str = "", handle: int = 0)
     node_handle = info.get("handle")
     if not isinstance(node_handle, int) or not info.get("base_handle"):
         raise RailCloneError("INVALID_READBACK", "RailClone report has no handles")
-    raw = _send(_target("", node_handle) + _write_params_body(str(info["base_handle"]), plan))
+    # The write rebuilds the output twice (before and after), so it gets the rebuild deadline.
+    raw = _send(_target("", node_handle) + _write_params_body(str(info["base_handle"]), plan),
+                timeout=REBUILD_TIMEOUT_S)
     values: dict[tuple[str, int, str], Any] = {}
     stats: dict[str, dict[str, Any]] = {}
     try:
@@ -1480,7 +1491,8 @@ def railclone_from_library(
     maps_dir = maps_dir + "\\" if fix_maps and os.path.isdir(maps_dir) else ""
     default_name = "RC_" + (re.sub(r"\W+", "_", entry["name"]).strip("_") or "RailClone")
     raw = _send(_from_library_body(entry, chosen, splines, name, default_name, matlib, maps_dir,
-                                   undo_step=undo_step, clipping_splines=clipping_splines))
+                                   undo_step=undo_step, clipping_splines=clipping_splines),
+                timeout=LIBRARY_TIMEOUT_S)
     info: dict[str, Any] = {}
     extra, bases, missing, stats = [], [], [], None
     try:

@@ -24,6 +24,10 @@ POLL_INTERVAL = 0.5
 _sleep = time.sleep
 _clock = time.monotonic
 STOP_WAIT_LIMIT = 15
+# Reply timeout of the start call. vrayGPUStartIPR runs inside it on Max's main thread, and V-Ray can translate
+# the whole scene there before it returns. Not measured on a heavy scene, so it gets more than the default
+# 120 s (the client waits max(timeout, 120 s) + 10 s, upstream 1e2c559). The stop call keeps the default.
+START_TIMEOUT_S = 300.0
 # V-Ray GPU's renderer class ID, as Chaos's Vantage scripts check it.
 VRAY_GPU_CLASS_ID = (1770671000, 1323107829)
 # A Max global holding the token of the Live Link this tool started. No V-Ray
@@ -232,7 +236,7 @@ def _start(wait_seconds: int) -> dict[str, Any]:
     token = "%d-%s" % (os.getpid(), uuid.uuid4().hex[:12])
     log_before = _chaos_log_state()
     try:
-        outcome, detail = _run(_start_script(port, token, previous))
+        outcome, detail = _run(_start_script(port, token, previous), timeout=START_TIMEOUT_S)
     except RequestOutcomeUnknown as exc:
         _OWN = {"token": token, "log": log_before, "connected_seen": False}  # it may have started
         raise VantageError("The start request reached 3ds Max, but its reply was lost: Live Link may or may not "
@@ -424,9 +428,9 @@ def _agent_render_lease() -> dict[str, Any] | None:
     return None
 
 
-def _run(script: str) -> tuple[str, str]:
+def _run(script: str, timeout: float | None = None) -> tuple[str, str]:
     """Run a start/stop script; returns (outcome, detail) from its "outcome|detail" reply."""
-    response = client.send_command(script, cmd_type="maxscript", request_fields={"quiet": True})
+    response = client.send_command(script, cmd_type="maxscript", timeout=timeout, request_fields={"quiet": True})
     raw = response.get("result", "")
     if not isinstance(raw, str):
         raw = str(raw)

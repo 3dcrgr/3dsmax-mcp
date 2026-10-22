@@ -1530,7 +1530,8 @@ rcRow ss #("P", rcV base.proxymode, rcV base.proxyfile, rcV status)
 format "END\\n" to:ss
 ss as string
 '''
-    rows = rc._records(rc._send(body), "ITOOPROXY")
+    # set generates the cache from a full build, which blocks Max as long as a rebuild does
+    rows = rc._records(rc._send(body, timeout=rc.REBUILD_TIMEOUT_S if action == "set" else None), "ITOOPROXY")
     if len(rows) != 1 or rows[0][0] != "P":
         raise RailCloneError("INVALID_READBACK", "missing proxy status")
     row = rows[0]
@@ -1591,7 +1592,10 @@ format "END\\n" to:ss
 ss as string
 '''
     result: dict[str, Any] = {"action": action, "created": [], "deleted_count": 0, "undoable": False}
-    for row in rc._records(rc._send(body), "ITOOINSTANCES"):
+    from ..helpers import forest as fh
+    # create rebuilds and makes up to max_items nodes. delete removes every vendor-tagged instance (no count).
+    timeout = {"create": fh.instances_timeout(max_items), "delete": fh.INSTANCES_TIMEOUT_MAX_S}.get(action)
+    for row in rc._records(rc._send(body, timeout=timeout), "ITOOINSTANCES"):
         if row[0] == "N":
             result["created"].append({"handle": int(row[1]), "name": rc._unb64(row[2])})
         elif row[0] == "D":

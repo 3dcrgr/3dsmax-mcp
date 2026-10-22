@@ -848,7 +848,8 @@ def forest_instances(
             .replace("@@REFERENCE@@", str(fh.REFERENCE_MODE))
             .replace("@@LAYER@@", fh.b64(layer or f"{name}_instances"))
             .replace("@@NAME@@", fh.b64(name)))
-    timeout = min(600.0, 60.0 + max_items * 0.05) if action == "create" else None
+    # count only reads user properties. Create and delete make or remove up to thousands of nodes.
+    timeout = {"create": fh.instances_timeout(max_items), "delete": fh.INSTANCES_TIMEOUT_MAX_S}.get(action)
     rows = [line.split("|") for line in _send(body, timeout=timeout)]
     result: dict[str, Any] = {"forest": name, "action": action}
     for row in rows:
