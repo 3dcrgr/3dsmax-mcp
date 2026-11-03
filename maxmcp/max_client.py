@@ -549,6 +549,13 @@ class MaxClient:
             if meta.get("quietOverride"):
                 # #12: quiet mode was off for this script, so its prompts were shown.
                 transport["quiet_override"] = meta["quietOverride"]
+            if "undoRecord" in meta:
+                # #47: execute_maxscript's undo record label, or None with the reason it ran bare.
+                transport["undo_record"] = meta["undoRecord"]
+                if meta.get("undoSkipped"):
+                    transport["undo_skipped"] = meta["undoSkipped"]
+            if isinstance(meta.get("mcpWarnings"), list) and meta["mcpWarnings"]:
+                transport["mcp_warnings"] = list(meta["mcpWarnings"])  # reported as warnings
             return transport
         error = getattr(self._local, "last_error", None)
         if isinstance(error, dict):

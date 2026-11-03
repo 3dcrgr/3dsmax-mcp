@@ -34,6 +34,48 @@ def mentions_scene_file_command(script: str) -> bool:
 _SAVE_REQUIRED_SCRIPT = "getSaveRequired()"
 
 
+# #47: execute_maxscript runs the script inside one labelled undo record, so Ctrl+Z in Max undoes
+# the agent's change in one step. Bare scripts ran with undo off: their node deletes left older
+# undo records pointing at freed nodes, and a later Ctrl+Z crashed Max (pure virtual call in
+# UndoManager::undo). The prefix shares the script's first line, so compile errors keep the
+# script's own line numbers.
+UNDO_LABEL = "MCP execute_maxscript"
+_UNDO_PREFIX = 'undo "' + UNDO_LABEL + '" on ('
+_UNDO_SUFFIX = "\n)"
+# Scripts that drive the undo system themselves run as sent: a nested hold would change what
+# their theHold calls, clearUndoBuffer or max undo/redo do.
+_OWN_UNDO_HANDLING = re.compile(r"\btheHold\b|\bclearUndoBuffer\b|\bmax\s+(?:undo|redo)\b", re.IGNORECASE)
+_UNDO_OFF = re.compile(r"\bundo\s+(?:off|false)\b", re.IGNORECASE)
+_DELETES = re.compile(r"\bdelete\b", re.IGNORECASE)
+_UNDO_OFF_DELETE_WARNING = (
+    "Parts of this script ran with undo off and it mentions delete. If it deleted nodes there, tell the user "
+    "not to press Ctrl+Z in this Max until the next save or reload: older undo records may point at the "
+    "deleted nodes, and that crashed Max before (#47). Use delete_objects, or keep undo on.")
+
+
+def undo_wrapped(script: str) -> str:
+    """The script inside one labelled undo record (#47). Line numbers stay the script's own."""
+    return _UNDO_PREFIX + script + _UNDO_SUFFIX
+
+
+def undo_plan(script: str, undo: bool, file_command: bool) -> str | None:
+    """Why the script runs without the undo record, or None to wrap it."""
+    if not undo:
+        return "undo_false"
+    if file_command:
+        return "file_command"  # a reset, open or fetch clears the undo stack anyway
+    if _OWN_UNDO_HANDLING.search(script):
+        return "own_undo_handling"
+    return None
+
+
+def _add_warning(response: dict, text: str) -> None:
+    meta = response.get("meta")
+    if not isinstance(meta, dict):
+        meta = response["meta"] = {}
+    meta.setdefault("mcpWarnings", []).append(text)
+
+
 class UnsavedChangesError(RuntimeError):
     """The scene has unsaved changes and the script would reset, open, fetch or quit; nothing ran."""
 
@@ -63,7 +105,7 @@ def _refuse_if_unsaved(tool: str) -> None:
 
 @mcp.tool()
 def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = None,
-                      allow_discard: bool = False) -> str:
+                      allow_discard: bool = False, undo: bool = True) -> str:
     """Execute arbitrary MAXScript in 3ds Max and return the result.
 
     Use when: no dedicated MCP tool covers the operation (custom one-offs, rare APIs).
@@ -88,8 +130,18 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     UNSAVED_CHANGES, before anything runs, while the scene has unsaved changes
     (loadMaxFile never asks to save, even with prompts on); save first, or pass
     allow_discard=True with the user's OK (a script that calls checkForSave()
-    still shows its prompt then). Edits made with undo off, as plain
-    execute_maxscript edits are by default, don't mark the scene modified, in Max too.
+    still shows its prompt then).
+
+    undo (default True): the script runs inside one undo record labelled
+    "MCP execute_maxscript", so Ctrl+Z in Max undoes the whole change in one step,
+    and its edits mark the scene modified. On a MAXScript error Max rolls the
+    record back: the script's undoable edits before the error are undone (file
+    writes and other effects outside undo stay). Scripts that mention theHold,
+    clearUndoBuffer or "max undo/redo", and scene reset/open/fetch scripts, run as
+    sent. Pass undo=False only for a huge batch edit whose undo data would cost too
+    much memory (e.g. 100k+ vertex writes). Then, and in any part the script runs
+    with undo off, never delete nodes: use delete_objects. A node deleted with undo
+    off can make a later Ctrl+Z crash Max (#47). Never run "max undo" through MCP.
 
     Always pass #noPrompt to importFile, including OBJ/FBX imports:
     importFile @"C:/assets/model.fbx" #noPrompt
@@ -99,10 +151,13 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     script = code or command
     if not script:
         return "Error: provide MAXScript code in the 'code' parameter"
-    return _run_script(script, quiet, allow_discard, "execute_maxscript")
+    return _run_script(script, quiet, allow_discard, "execute_maxscript", undo=undo)
 
 
-def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str) -> str:
+def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str, *,
+                undo: bool = False) -> str:
+    """Send a script. undo=True (execute_maxscript) wraps it in one undo record (#47).
+    execute_python's script brings its own record."""
     file_command = mentions_scene_file_command(script)
     if file_command and not allow_discard:
         _refuse_if_unsaved(tool)
@@ -114,16 +169,26 @@ def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str)
     elif file_command and quiet and not allow_discard:
         # #12: quiet would answer "save changes?" by discarding the scene
         quiet, override = False, "file_command_quiet_ignored"
-    response = client.send_command(script, cmd_type="maxscript",
+    raw_tool = tool == "execute_maxscript"
+    skip = undo_plan(script, undo, file_command) if raw_tool else "own_undo_handling"
+    response = client.send_command(script if skip else undo_wrapped(script), cmd_type="maxscript",
                                    request_fields=None if quiet is None else {"quiet": bool(quiet)})
-    if override and isinstance(response, dict):
+    if isinstance(response, dict):
         meta = response.get("meta")
         if not isinstance(meta, dict):
             meta = response["meta"] = {}
-        meta["quietOverride"] = override  # reported as a warning
+        if override:
+            meta["quietOverride"] = override  # reported as a warning
+        if raw_tool:
+            meta["undoRecord"] = None if skip else UNDO_LABEL
+            if skip:
+                meta["undoSkipped"] = skip
+            if _DELETES.search(script) and (skip == "undo_false" or _UNDO_OFF.search(script)):
+                _add_warning(response, _UNDO_OFF_DELETE_WARNING)
     result = response.get("result", "")
+    failed = isinstance(result, str) and result.startswith(_MAXSCRIPT_ERROR_SENTINEL)
 
-    if isinstance(result, str) and result.startswith(_MAXSCRIPT_ERROR_SENTINEL):
+    if failed:
         message = result[len(_MAXSCRIPT_ERROR_SENTINEL):].strip()
         payload: dict[str, object] = {
             "status": "error",

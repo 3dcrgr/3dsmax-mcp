@@ -224,13 +224,13 @@ class QuietTrueFileCommandTests(unittest.TestCase):
     def test_allow_discard_keeps_quiet_mode(self):
         fields, response = self.sent("resetMaxFile()", quiet=True, allow_discard=True)
         self.assertEqual(fields, {"quiet": True})
-        self.assertNotIn("meta", response)
+        self.assertNotIn("quietOverride", response.get("meta", {}))
 
     def test_quiet_true_elsewhere_is_unchanged(self):
         for code in ("1+1", "mergeMaxFile @\"C:/a.max\"", "saveMaxFile @\"C:/a.max\"", "max hold"):
             fields, response = self.sent(code, quiet=True)
             self.assertEqual(fields, {"quiet": True}, code)
-            self.assertNotIn("meta", response)
+            self.assertNotIn("quietOverride", response.get("meta", {}))
 
     def test_default_sends_quiet_false_and_quiet_false_is_unchanged(self):
         # Upstream 1e2c559: a file command sent without quiet goes out as quiet=False, so an
@@ -240,7 +240,7 @@ class QuietTrueFileCommandTests(unittest.TestCase):
         self.assertEqual(response["meta"]["quietOverride"], "file_command")
         fields, response = self.sent("resetMaxFile()", quiet=False)
         self.assertEqual(fields, {"quiet": False})
-        self.assertNotIn("meta", response)
+        self.assertNotIn("quietOverride", response.get("meta", {}))
         self.assertEqual(self.sent("resetMaxFile()", allow_discard=True)[0], {"quiet": False})
         self.assertIsNone(self.sent("1+1")[0])
 

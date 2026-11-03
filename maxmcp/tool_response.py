@@ -568,6 +568,17 @@ def _add_quiet_override_warning(envelope: dict[str, Any], transport: dict[str, A
     return envelope
 
 
+def _add_mcp_warnings(envelope: dict[str, Any], transport: dict[str, Any] | None) -> dict[str, Any]:
+    """Warnings a tool put in its response meta (meta.mcpWarnings), e.g. execute_maxscript's (#47, #52)."""
+    for text in (transport or {}).get("mcp_warnings") or []:
+        warnings = envelope.get("warnings")
+        if not isinstance(warnings, list):
+            warnings = envelope["warnings"] = []
+        if text not in warnings:
+            warnings.append(text)
+    return envelope
+
+
 EXPECTED_PID_PARAM = "expected_pid"
 _EXPECTED_PID_TYPE = Annotated[int | None, Field(description=(
     "Optional. Refuse (nothing sent) unless this call reaches the 3ds Max with this PID. The Max selection "
@@ -638,23 +649,23 @@ def make_structured_tool(
                 raw = fn(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             transport = transport_provider() if transport_provider else None
-            return _add_target_warning(_add_quiet_override_warning(_add_dialog_warning(envelope_result(
+            return _add_target_warning(_add_mcp_warnings(_add_quiet_override_warning(_add_dialog_warning(envelope_result(
                 raw,
                 elapsed_ms=elapsed_ms,
                 transport=transport,
                 tool_name=tool_name,
                 script=script,
-            ), transport, tool_name), transport), transport)
+            ), transport, tool_name), transport), transport), transport)
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             transport = transport_provider() if transport_provider else None
-            return _add_target_warning(_add_quiet_override_warning(_add_dialog_warning(envelope_exception(
+            return _add_target_warning(_add_mcp_warnings(_add_quiet_override_warning(_add_dialog_warning(envelope_exception(
                 exc,
                 elapsed_ms=elapsed_ms,
                 transport=transport,
                 tool_name=tool_name,
                 script=script,
-            ), transport, tool_name), transport), transport)
+            ), transport, tool_name), transport), transport), transport)
 
     wrapped.__signature__ = fn_signature  # type: ignore[attr-defined]
     wrapped.__annotations__ = resolved_annotations

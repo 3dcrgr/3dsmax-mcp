@@ -189,7 +189,8 @@ class UnsavedChangesTests(unittest.TestCase):
     def test_other_scripts_make_no_extra_call(self):
         _, client, call = self._run("box()", True)
         self.assertEqual(call(), "ran")
-        self.assertEqual(self.sent_scripts(client), ["box()"])
+        # One send: the script itself, inside its undo record (#47).
+        self.assertEqual(self.sent_scripts(client), ['undo "MCP execute_maxscript" on (box()\n)'])
 
     def test_error_code_reaches_the_envelope(self):
         err = tool_response._error_from_exception(_load_execute(mock.Mock()).UnsavedChangesError("x"))
