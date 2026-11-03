@@ -1072,7 +1072,11 @@ ViewExp& Get() {
     }
     const std::string state=WindowState();
     if(state=="minimized") throw std::runtime_error("AGENT VIEWPORT is minimized; use agent_viewport restore before navigation or capture");
-    if(state=="hidden") throw std::runtime_error("AGENT VIEWPORT must remain visible for fresh Nitrous captures");
+    // #53: a Max restart or a closed window leaves the owned panel hidden.
+    if(state=="hidden") throw std::runtime_error(std::string("AGENT VIEWPORT must remain visible for fresh Nitrous captures; "
+        "it is hidden or was closed (for example after a Max restart). ")+(OwnedPanelReusable() ?
+        "Run agent_viewport(action=\"open\") to show it again, then retry." :
+        "Run agent_viewport(action=\"release\"), then agent_viewport(action=\"open\"), then retry."));
     if(state=="offscreen")
         throw std::runtime_error("AGENT VIEWPORT is offscreen; move it onto a monitor before capture");
     if(state!="visible") throw std::runtime_error("Agent viewport identity changed; release then open");

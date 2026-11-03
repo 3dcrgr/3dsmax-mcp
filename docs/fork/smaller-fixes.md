@@ -80,6 +80,8 @@ Fork issue #11. Commit `8330c2c`.
 - **On Max 2026,** a build with it (sha256 `1cf0f9d8…`) was deployed on 2026-10-01. The first live test was inconclusive: after the restart, `open` worked, but it couldn't reclaim the restored panel, because that Hold was written by the old bridge, which never tagged it. Closing the stale panel let agent captures work again. The real test, with a Hold taken under the new bridge, never ran before the move to Max 2027.
 - **Not tested live on Max 2027 yet.** The check: `agent_viewport open`, Hold, restart Max, `fetchMaxFile`, then `open` again, which should report `reclaimed: true`.
 
+**A hidden agent viewport (#53, `fixes-b`).** When the agent viewport's window was closed, or after a Max restart, `capture_viewport` and `set_viewport` failed with "AGENT VIEWPORT must remain visible for fresh Nitrous captures" and didn't say what to do. The error now adds that the window is hidden or was closed and names the steps from the viewport's status: `agent_viewport(action="open")` when the panel can be reused, else `release`, then `open`. The bridge says it itself after a deploy (`agent_viewport.cpp`). With older bridges, `capture_viewport` and `set_viewport` add it in Python after one status read. They don't reopen the window themselves, since that would move a window the user may have closed on purpose. Checked live on Max 2027 (2026-11-03): with the window closed (`WM_CLOSE`), `open` fails ("Agent viewport was closed; release then open") and `reclaim` leaves it hidden, so the hint gives `release`, then `open`, which brought captures back. Unit tested in `tests/test_agent_viewport_hidden.py`.
+
 ## Quiet mode could discard unsaved work
 
 Fork issue #12. Commit `aa3d91d`.

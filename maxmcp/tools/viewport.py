@@ -48,6 +48,36 @@ def _validate_screen_crop(crop) -> None:
         raise ValueError("crop exceeds the supported range")
 
 
+_HIDDEN_AGENT = "must remain visible"
+
+
+def _raise_agent_hint(exc: BaseException) -> None:
+    """#53: a hidden AGENT VIEWPORT (closed, or after a Max restart) fails captures with a message that
+    doesn't say what to run; bridges before fixes-b don't. Re-raise it naming the agent_viewport action
+    from its status (open, or release then open). Returns when exc is another error."""
+    message = str(getattr(exc, "bridge_message", "") or exc)
+    if _HIDDEN_AGENT not in message or "agent_viewport(action=" in message:
+        return
+    action = "release then open"
+    try:
+        status = json.loads(client.send_command('{"action":"status"}', cmd_type="native:agent_viewport")["result"])
+        if isinstance(status, dict) and status.get("next_action"):
+            action = str(status["next_action"])
+    except Exception:
+        pass
+    steps = ", then ".join('agent_viewport(action="%s")' % a.strip() for a in action.split(" then ") if a.strip())
+    text = ("AGENT VIEWPORT must remain visible for fresh Nitrous captures; it is hidden or was closed (for "
+            "example after a Max restart). Run %s, then retry." % steps)
+    try:
+        payload = json.loads(getattr(exc, "bridge_message", "") or "")
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        payload["message"] = text
+        text = json.dumps(payload)
+    raise MaxBridgeError(text, getattr(exc, "bridge_response", None) or {}) from exc
+
+
 def _agent_context(bridge=None) -> dict[str, Any] | None:
     bridge = bridge or client
     if not bridge.native_available: return None
@@ -261,7 +291,9 @@ def set_viewport(
             data=json.loads(client.send_command(json.dumps(p),cmd_type="native:agent_viewport")["result"])
             if data.get("handled") is not False: return data
         except (MaxBridgeError,RuntimeError) as exc:
-            if source=="agent" or not is_missing_native_route_error(exc): raise
+            if source=="agent" or not is_missing_native_route_error(exc):
+                _raise_agent_hint(exc)
+                raise
     elif source=="agent":
         raise RuntimeError("AGENT VIEWPORT requires the native bridge")
     name_arr = "#(" + ",".join(f'"{safe_string(n)}"' for n in names) + ")"
@@ -468,7 +500,11 @@ def capture_viewport(
         if capture_method!="auto": p["capture_method"]=capture_method
         if source!="auto": p["source"]=source
         if source=="agent": p["action"]="capture"
-        response = client.send_command(json.dumps(p), cmd_type="native:agent_viewport" if source=="agent" else "native:capture_viewport")
+        try:
+            response = client.send_command(json.dumps(p), cmd_type="native:agent_viewport" if source=="agent" else "native:capture_viewport")
+        except (MaxBridgeError,RuntimeError) as exc:
+            _raise_agent_hint(exc)
+            raise
         data = json.loads(response.get("result", "{}"))
         _verify_window_viewport(data,capture_method)
         file_path = data.get("file", "")

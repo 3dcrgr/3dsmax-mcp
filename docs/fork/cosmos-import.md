@@ -115,6 +115,19 @@ New result fields:
 - **The first live test (`c1e09a7`, Max 2026) was a partial pass.** The displaced material was kept alive, and the restore hint was right. But slots 16–24 held untouched V-Ray materials named "Material #16" to "Material #24", so no slot counted as free, and the import still landed in the user's active slot.
 - `c88975e` fixes that and was deployed the same day; it hasn't been retested live yet.
 
+### No free slot: the user's slot material always goes back (#53, `fixes-b`)
+
+**What happened.** On 2026-10-30, with every Material Editor slot in use, an import replaced the user's active slot material (a scene material). The warning said so, and the session put it back by hand. The code confirmed it: with no free slot, prepare makes no switch, the importer writes into the active slot, and finalize found no free slot for the import. So `medit_slot_restored` was false every time, and the kept material only stayed alive in `mcp_cosmosMeditDisplaced`.
+
+**What changed.** Finalize, which runs only once Max is quiet, now always puts the kept material back in its slot when the slot's new material is the import's:
+- A free slot takes the import, as before.
+- Else a slot whose material is on scene objects takes it. That material stays on its objects, so nothing is lost (`medit_active_slot.moved_over` and `moved_over_in_scene: true`, with a warning naming both).
+- Else the import goes in no slot. It's kept alive in `mcp_cosmosMeditDisplaced` for this session only, and the warning gives the `getAnimByHandle` line to slot or assign it before saving (`imported_unslotted: true`, `medit_slot: null`).
+
+`medit_slot_restored` is true and `state` is `restored` in all three cases. It's false only when the slot assignment itself fails in Max.
+
+**Status.** Unit tested in `tests/test_cosmos_import.py`. Verified live on Max 2027 (2026-11-03) without a Cosmos download: the real finalize script ran on 24 named, edited slot materials with a newer "import" in slot 13. With slot 7's material on a box, the import went to slot 7 and slot 13 held its material again. With none on an object, slot 13 held its material again and the import was in no slot. Kit: `docs/livetests-2027/runs-1103-fixes-b/l53a_slot_restore.py` in the MCP folder.
+
 ### Model nodes, slot noise and the browser (#13, `3b3210d`)
 
 **What happened.** Importing the Cosmos model "Rug 002" created a VRayProxy, "Rug 002_001", but the tool polled for 31 s and returned `imported_unverified` with no nodes. `other_new_materials` listed 10 untouched "Material #N" VRayMtls, most likely Material Editor slot defaults. The Cosmos browser the import had opened stayed on top of other windows, Vantage included.
