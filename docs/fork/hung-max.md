@@ -173,6 +173,25 @@ The original script set `SizeOfStruct` wrong for `SYMBOL_INFOW` (90 instead of 8
 
 Every command this server sends to Max, except the `ping`/`health` probes and `max_dialogs` reads, gets a line in `%LOCALAPPDATA%\3dsmax-mcp\diagnostics\recent-commands.jsonl`, the folder `capture_hang_diagnostics` saves to. A `sent` line is written just before the request goes to the bridge: time, MCP server PID, Max PID, tool, `cmd_type`, request id, transport, length, and the first 200 characters of the command on one line, with values after password, token, secret or key style names replaced by `<redacted>`. A `done` line follows when the reply or the error comes back (`ok`, `elapsed_ms`, the error code). A `sent` line without its `done` line was still running when Max died, so a crash dump (`%LOCALAPPDATA%\CrashDumps\3dsmax.exe.<pid>.dmp`) can be matched to its trigger by time and PID. The file keeps about the last 200 commands: past 800 lines it is cut to the newest 400. Several MCP servers can write to it. Logging never fails a call. `MCP_COMMAND_LOG=0` turns it off (the test suite does). An MCP server started by the Claude Desktop app may see a package-private `%LOCALAPPDATA%`, so look in its LocalCache too.
 
+### Target routing after a restart (1.7.7)
+
+The 1.7.7 merge (2026-11-03) took upstream's rule (`682aa6f`) in place of the fork's #22 rule. The client remembers when the bound Max last answered. When a default or claimed target's Max has exited:
+- A live claim wins.
+- Exactly one Max started after that moment: it is the restart. The call goes there and the reply warns (`retargeted_from`, kept for the whole tool call).
+- Several started since: `AMBIGUOUS`, nothing sent.
+- None started since but another Max runs: that Max was already open, so it may be another session's. The call fails with a retryable `TARGET_UNAVAILABLE` and nothing is sent. The binding stays, so the restart is picked up once it is up.
+- No other Max at all: the target is forgotten, and the next call resolves the Max that starts.
+
+The fork's rule moved to the only other running Max, which could be another session's scene. Every path now routes through one step (`MaxClient._route`), the control channel included. The fork's #48 abandoned-call refusal and the pipe-gap retry run after routing, on the Max the call reaches. Unit tested in `tests/test_target_routing.py`, including the case where an already open Max is never taken over.
+
+### Long calls: jobs and timeouts (1.7.7)
+
+Two mechanisms, each for its own tools:
+- **Jobs (upstream `ed1527c`):** `render_scene` and `capture_multi_view` wait up to `wait_seconds` (50 at most), then return `{"status": "running", "job": ...}` while Max keeps working. Call the same tool with `job=` to wait again. The work is never sent twice. `capture_multi_view` also reports progress (`native:job_progress`, answered on a pipe thread).
+- **Timeout (fork #48):** `execute_maxscript` takes `timeout` (10-600 s) and has no job handle. At its reply deadline the call is abandoned (`MAX_BUSY`), and later main-thread calls to that Max are refused until it finishes.
+
+A job is not an abandoned call: it is tracked for its tool, so the #48 refusal doesn't apply while it runs. A call sent meanwhile queues behind it in Max, as upstream does. `max_dialogs`' `blocked_calls` never consumes a job's result. The command log (#50) leaves a job's entry open and records its end when `wait_job` collects the result. Unit tested in `tests/test_jobs_vs_abandoned.py`. The job's native half (`native:job_progress`, the new capture options) needs a bridge built from the merge, so the fork's current 2027 bridge doesn't have it yet.
+
 ### Native executor (`adcfd93`, ported from Geddart's fork)
 
 - **Shutdown drain** (Geddart `8e004f7`). `MCPBridgeGUP::Stop()` now closes the executor gate first, then fails every queued and deferred work item, so client threads blocked in `ExecuteSync` wake at once. A background `ExecuteSync` during shutdown fails fast. `Initialize()` reopens the gate. Requests failed this way never ran, and report `BRIDGE_DOWN` (retryable) since `39c7e8e`. Upstream 1.7.6 added the same drain: `MainThreadExecutor::StopAccepting`, which the 1.7.6 merge uses in place of the fork's `BeginShutdown`, in upstream's shell. Work refused or drained while Max exits now fails with upstream's text, "3ds Max is exiting; the request did not run", still as `BRIDGE_DOWN`. The fork's executor adds reopening the gate in `Initialize()`, dropping the drained requests' queued messages on the main thread, and the `health` heartbeat. So every bridge in `native/bin/` has the drain now.

@@ -64,7 +64,7 @@ Startup and lifecycle diagnostic helpers also handle zero-padded Max.log PIDs an
 - **Shared selection:** the selected Max belongs to the MCP server process, so sessions that share a server share it.
   - Every tool except the four routing tools takes an optional `expected_pid`. The call is refused, with nothing sent, if it would reach another Max.
   - Every reply's `transport` carries `selection_generation`, so a session can see that the selection moved.
-- **A default target whose Max exited** re-resolves to the new Max when that choice is unambiguous, and the reply warns. With several Max instances running it refuses instead of guessing. An explicit selection is never replaced.
+- **A default target whose Max exited** follows its restart, the one Max that started since, and the reply warns (upstream 1.7.7's rule). A Max that was already open is never taken over, and several new ones are refused as ambiguous. An explicit selection is never replaced.
 
 ### Chaos Cosmos
 *Upstream pull request: Cosmos import.*
@@ -151,7 +151,7 @@ Nothing of upstream's is removed: every upstream tool and feature is still here.
 - **The dialog monitor** no longer reads or presses dialogs of other threads. The Cosmos browser, the Material Editor and the agent viewport are never dialogs.
 - **Max targets:**
   - An explicit selection is never replaced silently.
-  - A default target is only re-resolved after its Max exited, and only when that choice is unambiguous.
+  - A default target is only re-resolved after its Max exited, and only to a Max that started since (upstream 1.7.7).
 - **The 2027 bridge** in `native/bin/` is a fork build, not upstream's.
 - **Since the 1.7.6 merge:** upstream's strict names, `replace_material` result fields and skip reasons, and a second meaning of `MAX_BUSY` (sent, not retryable) apply; see [FORK.md](../FORK.md#what-the-176-merge-changed).
 
