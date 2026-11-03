@@ -60,6 +60,7 @@ single tool can: routing, tool choice, cross-tool workflows, safety rules and MA
 ### Lighting and plugin settings
 - `lighting_capabilities` → `create_lights` → `inspect_lights` → `edit_lights`. Never infer integer enum meanings. RGB is linear in the rendering color space, Kelvin is explicit, and EXR/HDR inputs get no extra gamma.
 - Other plugin settings: `inspect_plugin_class` or `inspect_plugin_instance` with `schema_version=2`, then `plugin_patch` with the returned schema and state tokens. Shared or animated resources need deliberate handling.
+- V-Ray GPU's `output_*` render settings (VFB output, raw `.vrimg`) are read-only on `renderers.current`. `plugin_patch` on `{root: "renderer"}` writes them through its settings sub-anim. In MAXScript use `renderers.current[1].value.output_saveRawFile = false`, never `renderers.current.output_saveRawFile`.
 
 ### Viewport and capture
 - Open `agent_viewport(action="open")` before inspection captures. Navigation and captures then default to it and never redirect into the user's view; `source="active"` targets the user's view explicitly. Release and reopen after a scene load.

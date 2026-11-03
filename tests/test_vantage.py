@@ -578,6 +578,47 @@ class StartTests(LiveLinkTestCase):
         self.assertEqual(out["result"], "start_failed")
         self.assertIsNone(vt._OWN)
 
+    def test_start_script_marks_max_log_before_starting(self):
+        sent = vt._start_script(20703, "tok", "")
+        self.assertIn("logsystem.getNetLogFileName()", sent)
+        self.assertIn('(getDir #maxData) + "Network\\\\Max.log"', sent)
+        self.assertLess(sent.index("getFileSize logPath"), sent.index("vrayGPUStartIPR liveLinkMode:true"))
+        self.assertIn('out = "started|" + logSize + "||" + logPath', sent)
+
+    def test_start_failed_quotes_vray_output_errors_from_max_log(self):
+        # #49: V-Ray couldn't write its raw .vrimg (locked by another process): no IPR runs.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = os.path.join(tmp.name, "Max.log")
+        with open(log, "wb") as f:
+            f.write(b"ERR: [42] [1] Cannot create output image file before.vrimg\r\n")
+        mark = os.path.getsize(log)
+        with open(log, "ab") as f:
+            f.write(b"ERR: [42] [7] [V-Ray] Cannot create output image file \"D:\\r\\x.vrimg\": Permission denied\r\n")
+        client = max_client('"started|%d||%s"' % (mark, log), probes=("0", "0"))
+        client.get_last_transport.return_value = {"target_pid": 42}  # Max.log is shared: only PID 42's lines
+        with open(log, "ab") as f:
+            f.write(b"ERR: [43] [7] [V-Ray] Cannot create output image file other_max.vrimg\r\n")
+        out = self.run_tool([status()], client, wait_seconds=3)
+        self.assertEqual(out["result"], "start_failed")
+        [line] = out["max_log_errors"]
+        self.assertIn("x.vrimg", line)
+        warning = " ".join(out["warnings"])
+        self.assertIn("Max.log shows V-Ray couldn't write its output", warning)
+        self.assertIn("raw .vrimg", warning)
+        self.assertNotIn("before.vrimg", warning)
+        self.assertNotIn("other_max.vrimg", warning)
+
+    def test_start_failed_without_log_errors_names_the_log(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = os.path.join(tmp.name, "Max.log")
+        open(log, "wb").close()
+        client = max_client('"started|0||%s"' % log, probes=("0", "0"))
+        out = self.run_tool([status()], client, wait_seconds=3)
+        self.assertNotIn("max_log_errors", out)
+        self.assertIn("found no V-Ray output errors since the start", " ".join(out["warnings"]))
+
     def test_link_failed_when_vantage_goes_offline(self):
         out = self.run_tool([status(), status(live_link="Offline")], max_client('"started|"'))
         self.assertEqual(out["result"], "link_failed")
