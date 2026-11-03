@@ -1680,9 +1680,12 @@ class MaxClient:
         now = time.perf_counter()
         with self._blocked_lock:
             while len(self._blocked) >= MAX_BLOCKED_CALLS:
-                # Read-only probes go first: a real call's result must stay reportable.
+                # Read-only probes go first: a real call's result must stay reportable. Then calls that
+                # aren't jobs, then finished jobs: a job's tool still holds its handle (wait_job).
                 victim = next((rid for rid, entry in self._blocked.items() if entry.get("probe")),
-                              next(iter(self._blocked)))
+                              next((rid for rid, entry in self._blocked.items() if not entry.get("job")),
+                                   next((rid for rid, entry in self._blocked.items() if entry["reader"].done.is_set()),
+                                        next(iter(self._blocked)))))
                 self._blocked.pop(victim)
             self._blocked[request_id] = {"command": cmd_type, "reader": reader, "blocked_at": now,
                                          "sent_at": now if sent_at is None else sent_at, "timeout_s": timeout,
