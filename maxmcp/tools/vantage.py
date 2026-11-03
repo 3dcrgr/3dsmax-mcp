@@ -60,8 +60,17 @@ def vantage_status() -> dict[str, Any]:
     while a Live Link is connected; it doesn't say which 3ds Max is linked.
     Uses Vantage's undocumented local command server (localhost, port 20702 by
     default), as Chaos's own 3ds Max scripts do. It can change between versions.
+    recent_crashes: Vantage crash events (Windows Application log, event 1000,
+    vantage*.exe) of the last 24 h, state found, none or unknown, with a hint
+    when the crash was in NVIDIA's NGX/DLSS module. Read-only, 3 s at most.
     """
-    return vc.read_status()
+    status = vc.read_status()
+    crashes = vdiag.recent_crashes()
+    status["recent_crashes"] = crashes
+    warning = vdiag.crash_warning(crashes)
+    if warning:
+        status["warnings"] = list(status.get("warnings") or []) + [warning]
+    return status
 
 
 @mcp.tool()

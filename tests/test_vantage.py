@@ -854,5 +854,36 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(env["error"]["details"], {"vantage": {"phase": "not_running"}})
 
 
+class StatusCrashTests(unittest.TestCase):
+    """#51: vantage_status adds recent Vantage crash events and their hint."""
+
+    def test_found_crashes_add_a_warning(self):
+        crashes = {"state": "found", "window_hours": 24, "count": 1, "hint": "Turn DLSS Frame Generation off.",
+                   "events": [{"time": "2026-11-01T13:49:24Z", "module": "_nvngx.dll", "module_version": "32",
+                               "exception": "c0000005"}]}
+        with patch.object(vt.vc, "read_status", return_value=status(warnings=["two instances"])), \
+                patch.object(vt.vdiag, "recent_crashes", return_value=crashes):
+            out = vt.vantage_status()
+        self.assertEqual(out["recent_crashes"], crashes)
+        self.assertEqual(out["warnings"][0], "two instances")
+        self.assertIn("DLSS Frame Generation off", out["warnings"][1])
+
+    def test_none_or_unknown_adds_nothing_else(self):
+        for state in ("none", "unknown"):
+            with patch.object(vt.vc, "read_status", return_value={"running": False, "phase": "not_running"}), \
+                    patch.object(vt.vdiag, "recent_crashes", return_value={"state": state, "window_hours": 24}):
+                out = vt.vantage_status()
+            self.assertEqual(out["recent_crashes"]["state"], state)
+            self.assertNotIn("warnings", out)
+
+    def test_polling_never_reads_the_event_log(self):
+        # _poll uses vc.read_status directly; only the vantage_status tool reads crash events.
+        with patch.object(vt.vdiag, "recent_crashes") as crashes, \
+                patch.object(vt.vc, "read_status", return_value=status(live_link="Connected")), \
+                patch.object(vt, "_sleep", lambda s: None):
+            vt._poll(lambda s: True, 1)
+        crashes.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
