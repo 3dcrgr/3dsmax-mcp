@@ -24,6 +24,8 @@ MCP_PIPE_ENV = "MCP_MAX_PIPE"
 DIALOG_CHECK_AFTER = 1.0
 DIALOG_POLL_INTERVAL = 1.0
 MAX_BLOCKED_CALLS = 16
+# #48: request ids this server stopped waiting for while Max kept running them.
+MAX_ABANDONED_CALLS = 64
 # Reply deadline of every sent request (see MaxClient._await_response). Max
 # cancels main-thread work that has not started within its executor timeout
 # (120 s unless the handler sets more) and replies, so an ordinary call waits a
@@ -344,6 +346,19 @@ _PROBE_CMD_TYPES = frozenset({"ping", "health"})
 _MAIN_THREAD_FREE_CMD_TYPES = frozenset({"health", "native:max_dialogs"})
 # Separate connection: bypasses the pipe lock, the hung-PID latch and the settling guard.
 # native:core is the bridge shell's hot-reloadable core control (status / reload).
+# Read-only handlers the bridge runs on its pipe thread (IsDirectHandler in
+# native/src/command_dispatcher.cpp): they never queue behind main-thread work.
+_DIRECT_CMD_TYPES = frozenset({
+    "native:scene_info", "native:selection", "native:scene_snapshot", "native:selection_snapshot",
+    "native:find_class_instances", "native:get_hierarchy", "native:scene_delta", "native:scene_qa_scan",
+    "native:get_object_properties", "native:analyze_node_orientation", "native:inspect_object",
+    "native:inspect_properties", "native:get_materials", "native:get_material_slots",
+    "native:inspect_material_network", "native:replicate_material_preview", "native:find_objects_by_property",
+    "native:get_instances", "native:get_dependencies", "native:list_plugin_classes", "native:discover_classes",
+    "native:introspect_class", "native:inspect_track_view", "native:list_wireable_params",
+    "native:walk_references", "native:map_class_relationships", "native:learn_scene_patterns",
+    "native:watch_scene", "native:get_effects", "native:list_macroscripts", "native:list_action_tables",
+})
 _CONTROL_CMD_TYPES = frozenset({"native:render_cancel", "native:render_cancel_capture",
                                 "native:capture_screen", "native:core"}) | _MAIN_THREAD_FREE_CMD_TYPES
 # Native ExecuteSync cancels work the main thread never started after 120 s.
@@ -514,6 +529,11 @@ class MaxClient:
         self._hung_pids: dict[int, dict[str, Any]] = {}
         self._blocked: dict[str, dict[str, Any]] = {}
         self._blocked_lock = threading.Lock()
+        # #48: calls this server stopped waiting for (MAX_BUSY / MAX_NOT_RESPONDING at the reply
+        # deadline) while Max kept running them. Kept after blocked_calls() reports them, so
+        # get_bridge_status can name the still-running request as ours, and later calls are refused
+        # instead of queueing silently behind it.
+        self._abandoned: dict[str, dict[str, Any]] = {}
         self._no_dialog_watch: set[str] = set()  # pipes whose bridge has no native:max_dialogs
         env_pipe = os.environ.get(MCP_PIPE_ENV)
         env_pid = os.environ.get("MCP_MAX_PID")
@@ -1199,6 +1219,7 @@ class MaxClient:
             self._check_expected_pid(self._pid_for_pipe(pipe_name), pipe_name)
             self._check_known_hung(self._pid_for_pipe(pipe_name), pipe_name)
             self._check_settling(self._pid_for_pipe(pipe_name), pipe_name)
+            self._check_own_abandoned(self._pid_for_pipe(pipe_name), pipe_name, cmd_type, probe)
 
             for attempt in range(2):
                 handle = self._ensure_pipe_handle(deadline, pipe_name)
@@ -1206,6 +1227,7 @@ class MaxClient:
                 self._check_expected_pid(pid, pipe_name, connected=True)
                 self._check_known_hung(pid, pipe_name)
                 self._check_settling(pid, pipe_name)
+                self._check_own_abandoned(pid, pipe_name, cmd_type, probe)
                 if self._bound_target is None:
                     self._bind(getattr(self._local, "route_candidate", None) or self._target(pipe_name, "default"))
                 self._local.request_target = dict(self._bound_target)
@@ -1281,7 +1303,7 @@ class MaxClient:
         The call stays tracked, so blocked_calls() reports its result if Max ever answers.
         """
         inflight = self._inflight_snapshot()
-        self._detach(reader, request_id, cmd_type, dialog=False, sent_at=sent_at, timeout=timeout)
+        self._detach(reader, request_id, cmd_type, dialog=False, sent_at=sent_at, timeout=timeout, pid=pid)
         details = {"inflight": inflight, "process": process, "request_sent": True}
         running = (f"request '{inflight['cmd_type']}' running for {inflight['running_s']:.0f} s"
                    if inflight else "request in flight")
@@ -1411,7 +1433,7 @@ class MaxClient:
                 if dialogs:
                     # Max keeps running the call; its connection now belongs to the reader.
                     self._detach(reader, request_id, cmd_type, dialog=True, sent_at=sent_at, timeout=timeout,
-                                 probe=probe)
+                                 probe=probe, pid=pid)
                     raise DialogBlocked(request_id, cmd_type, dialogs)
                 next_dialog = time.perf_counter() + DIALOG_POLL_INTERVAL
             now = time.perf_counter()
@@ -1439,13 +1461,14 @@ class MaxClient:
             request_state = self._request_state(request_id) if watch else None
             if reader.done.is_set():
                 break
-            self._detach(reader, request_id, cmd_type, dialog=False, sent_at=sent_at, timeout=timeout)
+            self._detach(reader, request_id, cmd_type, dialog=False, sent_at=sent_at, timeout=timeout, pid=pid)
             raise MaxBusy(request_id, cmd_type, time.perf_counter() - sent_at, request_state,
                           tracked=not self._control_channel, process=process)
         return reader.result()
 
     def _detach(self, reader: _PipeReader, request_id: str, cmd_type: str, *, dialog: bool,
-                sent_at: float | None = None, timeout: float | None = None, probe: bool = False) -> None:
+                sent_at: float | None = None, timeout: float | None = None, probe: bool = False,
+                pid: int | None = None) -> None:
         """Leave a sent call running in Max and keep its reader for blocked_calls().
 
         Max keeps running the call; its connection now belongs to the reader, and the
@@ -1467,6 +1490,12 @@ class MaxClient:
             self._blocked[request_id] = {"command": cmd_type, "reader": reader, "blocked_at": now,
                                          "sent_at": now if sent_at is None else sent_at, "timeout_s": timeout,
                                          "probe": probe, "dialog": dialog}
+            if not dialog and not probe:
+                while len(self._abandoned) >= MAX_ABANDONED_CALLS:
+                    self._abandoned.pop(next(iter(self._abandoned)))
+                self._abandoned[request_id] = {"cmd_type": cmd_type, "reader": reader, "pid": pid,
+                                               "sent_at": now if sent_at is None else sent_at,
+                                               "abandoned_at": now, "timeout_s": timeout}
 
     def _request_state(self, request_id: str) -> str | None:
         """The dialog monitor's state for a request (queued, running...), if it tracks it."""
@@ -1607,6 +1636,55 @@ class MaxClient:
             return {"cmd_type": entry["command"], "request_id": request_id, "timeout_s": entry.get("timeout_s"),
                     "running_s": round(now - entry.get("sent_at", entry["blocked_at"]), 1),
                     "waiting_s": round(now - entry["blocked_at"], 1)}
+
+    def abandoned_request_ids(self) -> list[str]:
+        """Request ids this server stopped waiting for at the reply deadline while Max kept running
+        them (#48), still running or not. They are this server's own, never another client's."""
+        with self._blocked_lock:
+            return list(self._abandoned)
+
+    def abandoned_call(self, request_id: str) -> dict[str, Any] | None:
+        """An abandoned call (#48) shaped like inflight(), with abandoned_s and still_running."""
+        with self._blocked_lock:
+            entry = self._abandoned.get(request_id)
+            if entry is None:
+                return None
+            now = time.perf_counter()
+            return {"cmd_type": entry["cmd_type"], "request_id": request_id, "target_pid": entry.get("pid"),
+                    "timeout_s": entry.get("timeout_s"), "running_s": round(now - entry["sent_at"], 1),
+                    "abandoned_s": round(now - entry["abandoned_at"], 1),
+                    "still_running": not entry["reader"].done.is_set()}
+
+    def _running_abandoned(self, pid: int | None) -> dict[str, Any] | None:
+        """The oldest call of ours to Max `pid` that we stopped waiting for and Max still runs (#48)."""
+        if not pid:
+            return None
+        with self._blocked_lock:
+            rid = next((rid for rid, entry in self._abandoned.items()
+                        if entry.get("pid") == pid and not entry["reader"].done.is_set()), None)
+        return self.abandoned_call(rid) if rid else None
+
+    def _check_own_abandoned(self, pid: int | None, pipe_name: str, cmd_type: str | None, probe: bool) -> None:
+        """Refuse (nothing sent) a main-thread call while our own abandoned call still runs in that Max (#48).
+
+        It would queue behind that call: on 2026-10-30 a capture_viewport sent after a hung
+        polyop.setVert script waited in the queue, and the MCP host gave up on it with no result.
+        Probes and the bridge's pipe-thread reads never queue there, so they still go.
+        """
+        if probe or cmd_type in _PROBE_CMD_TYPES or cmd_type in _DIRECT_CMD_TYPES:
+            return
+        previous = self._running_abandoned(pid)
+        if previous is None:
+            return
+        raise MaxBusyError(
+            f"{self._label(pid, pipe_name)} is still running this server's earlier '{previous['cmd_type']}' "
+            f"request (request id {previous['request_id']}, abandoned at its reply deadline "
+            f"{previous['abandoned_s']:.0f} s ago, running for {previous['running_s']:.0f} s). Nothing was sent: "
+            "this call would only queue behind it. Do not repeat the earlier call. Wait, then check "
+            "get_bridge_status or max_dialogs(action='inspect') (blocked_calls reports the earlier call's "
+            "result once Max finishes it), and retry this call after that.",
+            {"inflight": None, "previous": previous, "request_sent": False},
+        )
 
     def blocked_calls(self, wait: float = 0.0) -> list[dict[str, Any]]:
         """Report calls released while still running in Max; finished ones are reported once.

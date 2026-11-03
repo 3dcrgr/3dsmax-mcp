@@ -355,7 +355,9 @@ class DeadlineTests(_ClientCase):
         self.assertIn("abandoned", str(ctx.exception))
 
         max_client.quick_hung_check.return_value = False
-        kernel.chunks = [(0, REPLY)]
+        # Max recovered: the abandoned "x" got its reply first (#48: until then "z" is refused,
+        # since it would queue behind "x"), then "z" gets its own.
+        kernel.chunks = [(0, REPLY), (0, REPLY)]
         self.assertEqual(client.send_command("z", timeout=1.0)["result"], "late")
         self.assertNotIn(PID, client._hung_pids)
         self.assertEqual(kernel.writes, writes + 1)

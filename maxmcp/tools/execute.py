@@ -51,6 +51,8 @@ _UNDO_OFF_DELETE_WARNING = (
     "Parts of this script ran with undo off and it mentions delete. If it deleted nodes there, tell the user "
     "not to press Ctrl+Z in this Max until the next save or reload: older undo records may point at the "
     "deleted nodes, and that crashed Max before (#47). Use delete_objects, or keep undo on.")
+# #48: a raw script's own time limit, the range MCG's long tools use.
+MIN_TIMEOUT_S, MAX_TIMEOUT_S = 10, 600
 
 
 def undo_wrapped(script: str) -> str:
@@ -67,6 +69,13 @@ def undo_plan(script: str, undo: bool, file_command: bool) -> str | None:
     if _OWN_UNDO_HANDLING.search(script):
         return "own_undo_handling"
     return None
+
+
+def clamp_timeout(timeout: float | None) -> float | None:
+    """execute_maxscript's timeout in seconds, kept within 10-600 (None: the client default)."""
+    if timeout is None:
+        return None
+    return float(max(MIN_TIMEOUT_S, min(int(timeout), MAX_TIMEOUT_S)))
 
 
 def _add_warning(response: dict, text: str) -> None:
@@ -105,7 +114,7 @@ def _refuse_if_unsaved(tool: str) -> None:
 
 @mcp.tool()
 def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = None,
-                      allow_discard: bool = False, undo: bool = True) -> str:
+                      allow_discard: bool = False, undo: bool = True, timeout: int | None = None) -> str:
     """Execute arbitrary MAXScript in 3ds Max and return the result.
 
     Use when: no dedicated MCP tool covers the operation (custom one-offs, rare APIs).
@@ -143,6 +152,12 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     with undo off, never delete nodes: use delete_objects. A node deleted with undo
     off can make a later Ctrl+Z crash Max (#47). Never run "max undo" through MCP.
 
+    timeout: seconds this call waits for Max (10-600, default 120). Max still runs
+    a script past it: the call then ends with MAX_BUSY or MAX_NOT_RESPONDING and
+    the script keeps running. The wait is never shorter than about 130 s, because
+    the bridge's queue window is 120 s. Pass up to 600 for a known long script.
+    Better: split long work into chunks that each finish well inside the wait.
+
     Always pass #noPrompt to importFile, including OBJ/FBX imports:
     importFile @"C:/assets/model.fbx" #noPrompt
     Import dialogs block execution and can cause MCP timeouts. Configure importer
@@ -151,11 +166,12 @@ def execute_maxscript(code: str = "", command: str = "", quiet: bool | None = No
     script = code or command
     if not script:
         return "Error: provide MAXScript code in the 'code' parameter"
-    return _run_script(script, quiet, allow_discard, "execute_maxscript", undo=undo)
+    return _run_script(script, quiet, allow_discard, "execute_maxscript", undo=undo,
+                       timeout=clamp_timeout(timeout))
 
 
 def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str, *,
-                undo: bool = False) -> str:
+                undo: bool = False, timeout: float | None = None) -> str:
     """Send a script. undo=True (execute_maxscript) wraps it in one undo record (#47).
     execute_python's script brings its own record."""
     file_command = mentions_scene_file_command(script)
@@ -172,6 +188,7 @@ def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str,
     raw_tool = tool == "execute_maxscript"
     skip = undo_plan(script, undo, file_command) if raw_tool else "own_undo_handling"
     response = client.send_command(script if skip else undo_wrapped(script), cmd_type="maxscript",
+                                   timeout=timeout,
                                    request_fields=None if quiet is None else {"quiet": bool(quiet)})
     if isinstance(response, dict):
         meta = response.get("meta")

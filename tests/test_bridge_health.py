@@ -52,13 +52,16 @@ def _process(state, cpu=0.01):
 
 class _StatusCase(unittest.TestCase):
     def status(self, health, *, mine=None, process=None, ping=PING, verdict=None, transport="auto",
-               open_dialogs=None, dialog_status=None, blocked=(), blocked_call=None):
+               open_dialogs=None, dialog_status=None, blocked=(), blocked_call=None,
+               abandoned=(), abandoned_call=None):
         client = mock.Mock()
         client.transport = transport
         client.inflight.return_value = mine
         client.hung_verdict.return_value = verdict
         client.blocked_request_ids.return_value = list(blocked)
         client.blocked_call.return_value = blocked_call
+        client.abandoned_request_ids.return_value = list(abandoned)  # #48
+        client.abandoned_call.return_value = abandoned_call
         client._dialog_control.return_value = dialog_status or {}
         self.client = client
         sent = []

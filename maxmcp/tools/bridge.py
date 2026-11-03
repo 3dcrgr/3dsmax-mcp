@@ -131,6 +131,13 @@ def _blocked_ids() -> set:
     return {i for i in ids if isinstance(i, str)} if isinstance(ids, (list, tuple, set)) else set()
 
 
+def _abandoned_ids() -> set:
+    """Requests this server stopped waiting for at the reply deadline (#48): ours, not another client's."""
+    getter = getattr(client, "abandoned_request_ids", None)
+    ids = getter() if callable(getter) else ()
+    return {i for i in ids if isinstance(i, str)} if isinstance(ids, (list, tuple, set)) else set()
+
+
 def _dialog_summaries(dialogs) -> list[dict]:
     keep = ("dialog_id", "title", "kind", "main_thread", "age_ms", "during_requests", "text", "buttons")
     return [{k: d[k] for k in keep if k in d} for d in dialogs or [] if isinstance(d, dict)]
@@ -196,7 +203,7 @@ def _held_by_dialog(health: dict, request_sent: bool = False) -> str | None:
         return None
     mine = client.inflight()
     mine_id = mine.get("request_id") if isinstance(mine, dict) else None
-    if request_id == mine_id or request_id in _blocked_ids():
+    if request_id == mine_id or request_id in _blocked_ids() or request_id in _abandoned_ids():
         owner = "this_server"
     else:
         entry = next((r for r in (health.get("clients") or {}).get("inflight") or []
@@ -205,8 +212,13 @@ def _held_by_dialog(health: dict, request_sent: bool = False) -> str | None:
     return _blocked_by_dialog_status(holding, health=health, running=running, owner=owner, request_sent=request_sent)
 
 
-def _running_owner(running: dict, inflight: list[dict], mine_id, abandoned_id) -> str:
-    """Who submitted the running item: this_server, abandoned (ours), other_client or unknown."""
+def _running_owner(running: dict, inflight: list[dict], mine_id, abandoned_id,
+                   abandoned_ids: set | frozenset = frozenset()) -> str:
+    """Who submitted the running item: this_server, abandoned (ours), other_client or unknown.
+
+    abandoned_ids: every request this server stopped waiting for while Max kept running it
+    (#48), besides the hung verdict's abandoned_id.
+    """
     request_id = running.get("requestId")
     if request_id:  # healthVersion >= 2 names the running request
         entry = next((r for r in inflight if r.get("requestId") == request_id), None)
@@ -220,7 +232,7 @@ def _running_owner(running: dict, inflight: list[dict], mine_id, abandoned_id) -
         request_id = entry.get("requestId") if entry else None
     if request_id and request_id == mine_id:
         return "this_server"
-    if request_id and request_id == abandoned_id:
+    if request_id and (request_id == abandoned_id or request_id in abandoned_ids):
         return "abandoned"
     if entry is not None and not _internal(entry):
         return "other_client"
@@ -248,21 +260,26 @@ def _busy_from_health(health: dict, probe_queued: bool = False) -> str | None:
     abandoned_id = (abandoned or {}).get("request_id")
     inflight = (health.get("clients") or {}).get("inflight") or []
     blocked_ids = _blocked_ids()
-    ours = {i for i in (mine_id, abandoned_id) if i} | blocked_ids
+    abandoned_ids = _abandoned_ids()
+    ours = {i for i in (mine_id, abandoned_id) if i} | blocked_ids | abandoned_ids
     others = [r for r in inflight if r.get("requestId") not in ours and not _internal(r)
               and r.get("cmdType") not in _CONTROL_REQUESTS | _STATUS_PROBES]
     sent = "This status ping waits behind it and changes nothing" if probe_queued else "Nothing was sent"
 
     held_by_dialog = False
     if running:
-        owner = _running_owner(running, inflight, mine_id, abandoned_id)
+        owner = _running_owner(running, inflight, mine_id, abandoned_id, abandoned_ids)
         if owner in ("other_client", "unknown") and running.get("requestId") in blocked_ids:
             owner, held_by_dialog = "this_server", True  # returned BLOCKED_BY_DIALOG, still running in Max
         cmd = running.get("cmdType") or "unlabelled"
         elapsed = _seconds(running.get("runningMs"))
         if owner == "abandoned":
-            what = (f"this server's earlier '{cmd}' request (abandoned after Max stopped responding) is still "
-                    f"running on Max's main thread after {elapsed} s")
+            what = (f"this server's earlier '{cmd}' request (abandoned at its reply deadline, after Max "
+                    f"stopped answering) is still running on Max's main thread after {elapsed} s")
+            lookup = getattr(client, "abandoned_call", None)
+            if abandoned is None and running.get("requestId") and callable(lookup):
+                found = lookup(running["requestId"])  # #48: reported as previous
+                abandoned = found if isinstance(found, dict) else None
         else:
             holder = {"this_server": "this server's", "other_client": "another MCP client's",
                       "unknown": "a bridge"}[owner]
@@ -316,7 +333,7 @@ def _busy_from_health(health: dict, probe_queued: bool = False) -> str | None:
         },
         **({"open_dialogs": _dialog_summaries(health["openDialogs"])} if health.get("openDialogs") else {}),
         "inflight": mine,
-        **({"previous": abandoned, "previous_process": verdict.get("process")} if abandoned else {}),
+        **({"previous": abandoned, "previous_process": (verdict or {}).get("process")} if abandoned else {}),
         "other_clients": [{"client_id": r.get("clientId"), "cmd_type": r.get("cmdType"),
                            "elapsed_s": _seconds(r.get("elapsedMs"))} for r in others],
         "process": process,
