@@ -189,6 +189,58 @@ std::string NativeHandlers::BatchRenameObjects(const std::string& params, MCPBri
 }
 
 // ── native:manage_scene ─────────────────────────────────────
+// #46: a reset or fetch keeps its prompt, so the user can decline it. Max
+// broadcasts NOTIFY_SYSTEM_POST_RESET only for a reset that ran, and
+// NOTIFY_FILE_POST_OPEN when a fetch loaded the hold file (a reset sends it too,
+// for its start-up scene). The counts decide what happened; the scene state
+// before and after is reported alongside.
+namespace {
+struct SceneSwapWatch {
+    int resets = 0;
+    int opens = 0;
+    static void OnReset(void* param, NotifyInfo*) { ++static_cast<SceneSwapWatch*>(param)->resets; }
+    static void OnOpen(void* param, NotifyInfo*) { ++static_cast<SceneSwapWatch*>(param)->opens; }
+    SceneSwapWatch() {
+        RegisterNotification(OnReset, this, NOTIFY_SYSTEM_POST_RESET);
+        RegisterNotification(OnOpen, this, NOTIFY_FILE_POST_OPEN);
+    }
+    ~SceneSwapWatch() {
+        UnRegisterNotification(OnReset, this, NOTIFY_SYSTEM_POST_RESET);
+        UnRegisterNotification(OnOpen, this, NOTIFY_FILE_POST_OPEN);
+    }
+    SceneSwapWatch(const SceneSwapWatch&) = delete;
+    SceneSwapWatch& operator=(const SceneSwapWatch&) = delete;
+};
+
+json SceneState(Interface* ip) {
+    std::vector<INode*> nodes;
+    CollectNodes(ip->GetRootNode(), nodes);
+    return {{"file", WideToUtf8(ip->GetCurFilePath().data())},
+            {"objects", static_cast<int>(nodes.size())},
+            {"save_required", GetSaveRequiredFlag() != FALSE}};
+}
+
+std::string SceneSwapResult(const std::string& action, bool done, const json& before, const json& after) {
+    const bool reset = action == "reset";
+    json result;
+    result["action"] = action;
+    result[reset ? "reset" : "fetched"] = done;
+    result["before"] = before;
+    result["after"] = after;
+    if (done) {
+        result["message"] = reset ? "Scene reset to empty" : "Fetched (restored) held state";
+    } else {
+        result["status"] = reset ? "not_reset" : "not_fetched";
+        result["message"] = reset
+            ? "Scene was not reset: the prompt was declined or cancelled, so the scene is unchanged"
+            : "Hold was not fetched: the prompt was declined or cancelled (or there is no hold), so the "
+              "scene is unchanged";
+        result["warnings"] = json::array({result["message"]});
+    }
+    return result.dump();
+}
+}  // namespace
+
 std::string NativeHandlers::ManageScene(const std::string& params, MCPBridgeGUP* gup) {
     return gup->GetExecutor().ExecuteSync([&params]() -> std::string {
         json p = json::parse(params, nullptr, false);
@@ -205,9 +257,15 @@ std::string NativeHandlers::ManageScene(const std::string& params, MCPBridgeGUP*
             // Fetch replaces the scene with the Hold buffer after a
             // confirmation; keep it visible even if something left Max quiet.
             TempQuietMode prompts(FALSE);
-            ip->FileFetch();
-            NativeHandlers::ResetSceneDeltaSessions();
-            return "Fetched (restored) held state";
+            const json before = SceneState(ip);
+            bool fetched = false;
+            {
+                SceneSwapWatch watch;
+                ip->FileFetch();
+                fetched = watch.opens > 0 && watch.resets == 0;
+            }
+            if (fetched) NativeHandlers::ResetSceneDeltaSessions();
+            return SceneSwapResult(action, fetched, before, SceneState(ip));
         }
         if (action == "reset") {
             // noPrompt=FALSE: Max asks to confirm (and to save unsaved changes)
@@ -215,9 +273,15 @@ std::string NativeHandlers::ManageScene(const std::string& params, MCPBridgeGUP*
             // work is never discarded silently; the prompt reaches the agent
             // as BLOCKED_BY_DIALOG.
             TempQuietMode prompts(FALSE);
-            ip->FileReset(FALSE);
-            NativeHandlers::ResetSceneDeltaSessions();
-            return "Scene reset to empty";
+            const json before = SceneState(ip);
+            bool reset = false;
+            {
+                SceneSwapWatch watch;
+                ip->FileReset(FALSE);
+                reset = watch.resets > 0;
+            }
+            if (reset) NativeHandlers::ResetSceneDeltaSessions();
+            return SceneSwapResult(action, reset, before, SceneState(ip));
         }
         if (action == "save") {
             const MSTR currentPath = ip->GetCurFilePath();

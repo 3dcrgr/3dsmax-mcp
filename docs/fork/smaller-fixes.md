@@ -92,13 +92,27 @@ Fork issue #12. Commit `aa3d91d`.
 - Merging isn't listed, because it never asks to save.
 - `quiet=False` always shows prompts. `execute_maxscript(quiet=True)` forces quiet mode on such a script only together with `allow_discard=True`, because quiet mode answers the save prompt by discarding unsaved changes. Upstream's `execute_maxscript` defaults to `quiet=True`, so agents and saved prompts may pass it explicitly and would bypass the rule; on such a script `quiet=True` alone is now sent as `quiet=False` (the Python check uses the same list as the bridge). The bridge's own `quiet: true` request field still forces quiet mode, for example through `invoke_tool`.
 - When quiet mode was off for this reason, the bridge marks the response `meta.quietOverride: "file_command"` (or the client `"file_command_quiet_ignored"` when it set `quiet=True` aside). The agent sees it as `transport.quiet_override` (full tripback mode) and as a reply warning.
-- Native tools that run MAXScript internally follow the same rule, and the native `manage_scene` reset and fetch keep quiet mode off, so their prompts show. Its MAXScript fallbacks, used without the native bridge (`resetMaxFile #noPrompt`, `fetchMaxFile quiet:true`), still run without a prompt.
+- Native tools that run MAXScript internally follow the same rule, and the native `manage_scene` reset and fetch keep quiet mode off, so their prompts show. Since upstream's `1e2c559` its MAXScript fallbacks keep their prompts too (`resetMaxFile()`, `fetchMaxFile quiet:false`). Since #46 both say whether the reset or fetch really ran, see below.
 - **Limits:** the check reads only the submitted text. It doesn't see a command name built from pieces at runtime (`execute ("reset" + "MaxFile()")`), a file action run through `actionMan`, or commands inside scripts run with `fileIn`, `include`, `python.ExecuteFile` or `macros.run` (or startup and pipeline scripts called by name). Those run inside the quiet call, so their save prompts take the default answer. Agents should pass `quiet=False` when a script runs other scripts that may reset, open or quit. `#noPrompt` and `quiet:true` arguments in the script suppress the prompt whatever the bridge does, so the skill tells agents to add them only with the user's OK.
 
 **Status.** Unit tested (`native/tests/quiet_policy_tests.cpp`, `tests/test_execute_failures.py`, `tests/test_merge_review_safety.py`). Not tested live yet, on either Max version. The second merge review added `max fetch` and the Interface spellings to the list (`39c7e8e`), and the client-side `allow_discard` rule (`ec903a5`).
 - **With a fork bridge** (see the top of this page), the whole rule applies: the default quiet decision, `meta.quietOverride: "file_command"`, the native tools and `manage_scene`. On Max 2027 that's the merge's bridge in `native/bin/`, and the 1.7.5-based one running in production.
 - **With a stock bridge** (2023 to 2026 since the 1.7.6 merge), only the Python side works, and it only turns an explicit `quiet=True` into `quiet=False`. A script that mentions a file command and is sent with no explicit `quiet` still runs in quiet mode, so its save prompt takes the default answer. MAXScript that native tools run is always quiet there too. On a stock bridge, pass `quiet=False` for such scripts.
 - **The live check:** on a throwaway scene with unsaved changes, `resetMaxFile()` should return `BLOCKED_BY_DIALOG` with the save prompt, not reset.
+
+## A declined reset still said "Scene reset to empty" (#46)
+
+Fork issue #46, found in the 2026-10-22 merge test. Fixed on branch `fixes-b`.
+
+**What happened.** `manage_scene` reset and fetch keep Max's prompt ("Do you really want to reset?", "About to Fetch. OK?"), so the user can say No. The native handler and the MAXScript fallback still returned "Scene reset to empty" or "Fetched (restored) held state", whatever the answer.
+
+**What changed.**
+- Both decide from Max's own notifications during the call. A reset that ran sends `NOTIFY_SYSTEM_POST_RESET` (`#systemPostReset` in MAXScript). A fetch that loaded the hold file sends `NOTIFY_FILE_POST_OPEN` (`#filePostOpen`) and no reset. A reset sends `#filePostOpen` too, for its start-up scene, so the reset count decides there. This was checked live on Max 2027: a fetch fires `#filePreOpenProcess`, `#filePreOpen`, `#filePostOpen` and `#filePostOpenProcess`, a reset adds `#systemPreReset` and `#systemPostReset`.
+- The reply is JSON: `action`, `reset` or `fetched` (true or false), `message`, and `before` and `after` with the scene's `file`, `objects` and `save_required` (`getSaveRequired()`).
+- A declined reset or fetch returns `status: "not_reset"` or `"not_fetched"` with a warning that the scene is unchanged. The scene-delta sessions are reset only when the scene really changed.
+- A MAXScript error in the fallback is reported as `maxscript_error`.
+
+**Status.** Unit tested in `tests/test_scene_manage_outcome.py`. The native change needs a bridge deploy. The 2027 build is clean, normal and `MCP_HOT_CORE`, but isn't deployed. Verified live on Max 2027 (2026-11-03) through the MAXScript fallback against the installed bridge: reset declined (`reset: false`, 21 objects before and after), reset accepted (`reset: true`, 22 objects to 4 from the start-up scene), fetch declined and fetch accepted, each answered with `max_dialogs`. Kit and results: `docs/livetests-2027/runs-1103-fixes-b` in the MCP folder.
 
 ## `contact_check` thresholds, non-mesh nodes and dense meshes (#14, #15)
 
