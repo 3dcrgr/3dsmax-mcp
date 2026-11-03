@@ -4,7 +4,7 @@ import re
 from ..helpers.error_hints import cloth_success_warning, current_modifier_hint, suggest_tools_for_maxscript
 from ..helpers.precheck import PrecheckBlocked
 from ..helpers.python_execution import python_execution_script
-from ..max_client import DialogBlocked
+from ..max_client import DialogBlocked, MaxBridgeError
 from ..server import mcp, client
 
 
@@ -58,6 +58,29 @@ MIN_TIMEOUT_S, MAX_TIMEOUT_S = 10, 600
 def undo_wrapped(script: str) -> str:
     """The script inside one labelled undo record (#47). Line numbers stay the script's own."""
     return _UNDO_PREFIX + script + _UNDO_SUFFIX
+
+
+def strip_undo_prefix(exc: MaxBridgeError) -> None:
+    """Drop the #47 prefix from a bridge error's text, in place.
+
+    The bridge quotes the failing line of a parse error ("In line: ..."). On line 1 that
+    line starts with the undo prefix, which is not the agent's code, so the agent would
+    see it as part of its own script. Plain and JSON-escaped forms are both removed.
+    """
+    forms = (_UNDO_PREFIX, json.dumps(_UNDO_PREFIX)[1:-1])
+    message = exc.bridge_message
+    if not isinstance(message, str) or not any(f in message for f in forms):
+        return
+    for form in forms:
+        message = message.replace(form, "")
+    exc.bridge_message = message
+    exc.args = (f"MAXScript error: {message}",)
+    response = exc.bridge_response
+    if isinstance(response, dict) and isinstance(response.get("error"), str):
+        error = response["error"]
+        for form in forms:
+            error = error.replace(form, "")
+        response["error"] = error
 
 
 def undo_plan(script: str, undo: bool, file_command: bool) -> str | None:
@@ -187,9 +210,14 @@ def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str,
         quiet, override = False, "file_command_quiet_ignored"
     raw_tool = tool == "execute_maxscript"
     skip = undo_plan(script, undo, file_command) if raw_tool else "own_undo_handling"
-    response = client.send_command(script if skip else undo_wrapped(script), cmd_type="maxscript",
-                                   timeout=timeout,
-                                   request_fields=None if quiet is None else {"quiet": bool(quiet)})
+    try:
+        response = client.send_command(script if skip else undo_wrapped(script), cmd_type="maxscript",
+                                       timeout=timeout,
+                                       request_fields=None if quiet is None else {"quiet": bool(quiet)})
+    except MaxBridgeError as exc:
+        if not skip:
+            strip_undo_prefix(exc)  # a line-1 parse error quotes the wrapped line
+        raise
     if isinstance(response, dict):
         meta = response.get("meta")
         if not isinstance(meta, dict):
