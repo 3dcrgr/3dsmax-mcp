@@ -236,6 +236,69 @@ def edit_poly_hint(script: str | None, message: str = "") -> ToolHint | None:
     return {"message": EDIT_POLY_HINT_MESSAGE, "suggested_tools": ["mesh_edit", "inspect_mesh"]}
 
 
+# Issue #52: the Cloth modifier has the same rule. simulate and simulateLocal return
+# at once and do nothing (or fault, seen live on Max 2027) unless Cloth is the current
+# modifier. get/setObjectProperty
+# on a COLLISION object faults with EXCEPTION_ACCESS_VIOLATION, and after that every
+# simulate on that modifier faults until it is deleted and added again.
+_CLOTH_SCRIPT = re.compile(r"\bCloth\s*\(|\bclassOf\b[^\n]*\bCloth\b|\bmodifiers\s*\[\s*#Cloth\b", re.IGNORECASE)
+_CLOTH_CALL = re.compile(
+    r"\.(simulate|simulateLocal|setObjectType|getObjectType|getObjectProperty|setObjectProperty|"
+    r"resetState|createSimCache|clearSimCache)\b",
+    re.IGNORECASE,
+)
+_CLOTH_SIMULATE = re.compile(r"\.simulate(?:Local)?\b", re.IGNORECASE)
+# Cloth's own method names: they identify a Cloth call even on a modifier reached by index.
+_CLOTH_ONLY_CALL = re.compile(r"\.(simulateLocal|setObjectType|getObjectProperty|setObjectProperty)\b",
+                              re.IGNORECASE)
+
+CLOTH_HINT_MESSAGE = (
+    "Cloth modifier calls (simulate, simulateLocal, setObjectType, getObjectProperty, setObjectProperty) "
+    "need the Cloth modifier current in the Modify panel: select clothNode; max modify mode; "
+    "modPanel.setCurrentObject theCloth. Otherwise simulate returns at once and does nothing, or faults "
+    "with EXCEPTION_ACCESS_VIOLATION. Never read or write getObjectProperty/setObjectProperty on a COLLISION object "
+    "(setObjectType 1): it faults with EXCEPTION_ACCESS_VIOLATION, and then every simulate on that "
+    "modifier faults until the modifier is deleted and added again. Only cloth objects' properties "
+    "(setObjectType 2) are safe."
+)
+CLOTH_SIMULATE_WARNING = (
+    "This script calls Cloth simulate/simulateLocal but never runs modPanel.setCurrentObject. Cloth only "
+    "simulates while it is the current modifier (select clothNode; max modify mode; "
+    "modPanel.setCurrentObject theCloth), otherwise the call returns at once and does nothing (#52). Check "
+    "that the cloth moved."
+)
+
+
+def _mentions_cloth(script: str) -> bool:
+    return bool(_CLOTH_ONLY_CALL.search(script) or (_CLOTH_SCRIPT.search(script) and _CLOTH_CALL.search(script)))
+
+
+def cloth_hint(script: str | None, message: str = "") -> ToolHint | None:
+    """Hint for a failed script that calls Cloth modifier methods (#52).
+
+    Same rule as edit_poly_hint: a fault-like error, or any error when the script
+    never makes the modifier current.
+    """
+    if not script or not _mentions_cloth(script):
+        return None
+    if not (_EDIT_POLY_FAULT.search(message or "") or not _SET_CURRENT_OBJECT.search(script)):
+        return None
+    return {"message": CLOTH_HINT_MESSAGE}
+
+
+def cloth_success_warning(script: str | None) -> str | None:
+    """Warning for a script that ran Cloth simulate without making Cloth current (#52)."""
+    if not script or not _CLOTH_SIMULATE.search(script) or not (
+            _CLOTH_SCRIPT.search(script) or _CLOTH_ONLY_CALL.search(script)):
+        return None
+    return None if _SET_CURRENT_OBJECT.search(script) else CLOTH_SIMULATE_WARNING
+
+
+def current_modifier_hint(script: str | None, message: str = "") -> ToolHint | None:
+    """The Edit_Poly (#47) or Cloth (#52) "make the modifier current" hint, if one applies."""
+    return edit_poly_hint(script, message) or cloth_hint(script, message)
+
+
 def suggest_tools_for_maxscript(script: str) -> list[str]:
     """Return dedicated MCP tools that match MAXScript intent patterns."""
     suggestions: list[str] = []
@@ -334,9 +397,9 @@ def resolve_error_hint(
     elif isinstance(raw_result, dict):
         message = str(raw_result.get("error") or raw_result.get("message") or "")
 
-    edit_poly = edit_poly_hint(script, message)
-    if edit_poly is not None:
-        return edit_poly
+    current = current_modifier_hint(script, message)
+    if current is not None:
+        return current
 
     if script:
         suggested = suggest_tools_for_maxscript(script)

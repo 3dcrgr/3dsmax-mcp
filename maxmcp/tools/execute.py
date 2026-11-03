@@ -1,7 +1,7 @@
 import json
 import re
 
-from ..helpers.error_hints import edit_poly_hint, suggest_tools_for_maxscript
+from ..helpers.error_hints import cloth_success_warning, current_modifier_hint, suggest_tools_for_maxscript
 from ..helpers.precheck import PrecheckBlocked
 from ..helpers.python_execution import python_execution_script
 from ..max_client import DialogBlocked
@@ -187,6 +187,9 @@ def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str,
                 _add_warning(response, _UNDO_OFF_DELETE_WARNING)
     result = response.get("result", "")
     failed = isinstance(result, str) and result.startswith(_MAXSCRIPT_ERROR_SENTINEL)
+    cloth = cloth_success_warning(script) if raw_tool and not failed else None
+    if cloth:
+        _add_warning(response, cloth)  # #52: simulate returned, maybe without simulating
 
     if failed:
         message = result[len(_MAXSCRIPT_ERROR_SENTINEL):].strip()
@@ -196,9 +199,9 @@ def _run_script(script: str, quiet: bool | None, allow_discard: bool, tool: str,
             "error": message,
         }
         suggested = suggest_tools_for_maxscript(script)
-        edit_poly = edit_poly_hint(script, message)
-        if edit_poly is not None:
-            payload["hint"] = edit_poly
+        current = current_modifier_hint(script, message)
+        if current is not None:
+            payload["hint"] = current
         elif suggested:
             payload["hint"] = {
                 "message": (

@@ -149,6 +149,7 @@ Only when changing the bridge's native C++ handlers; ordinary sessions never nee
 - `getHandleByAnim` returns values like `12345P`; quote them when building JSON.
 - Open Unwrap UVW with `$Box001.modifiers[#Unwrap_UVW].edit()`, not only the `OpenUnwrapUI` macro.
 - Edit_Poly modifier methods (`ButtonOp`, `SetSelection`, `GetFaceNormal`, `SetOperation`, `Commit`) need that modifier current in the Modify panel, or they fault with EXCEPTION_ACCESS_VIOLATION or silently do nothing. First `select obj; max modify mode; modPanel.setCurrentObject ep`. For face selections use `ep.Select #Face bits select:true node:obj`. To edit the Editable Poly base, prefer `mesh_edit`.
+- Cloth modifier: `simulate` and `simulateLocal` return at once and do nothing, or fault with EXCEPTION_ACCESS_VIOLATION, unless Cloth is the current modifier (`select clothNode; max modify mode; modPanel.setCurrentObject theCloth`). Never call `getObjectProperty`/`setObjectProperty` on a COLLISION object (`setObjectType` 1; 2 is cloth): it faults with EXCEPTION_ACCESS_VIOLATION, and then every simulate on that modifier faults until the modifier is deleted and added again (#52). Cloth-object properties (dynFric, staticFric, density, bend, thickness) are safe.
 - TCP fallback is opt-in. If viewport interaction stutters while it runs, stop it and use the native bridge.
 
 ## MAXScript Reference (bundled)
