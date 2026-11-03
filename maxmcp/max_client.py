@@ -14,6 +14,7 @@ from uuid import uuid4
 from .process_health import describe as describe_process
 from .process_health import diagnose_process, process_gone, process_start_time, quick_hung_check, window_hung
 from .process_health import list_processes
+from .helpers import command_log
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -421,6 +422,17 @@ def expect_pid(pid: int | None) -> Iterator[None]:
         yield
     finally:
         _call_guard.pid = previous
+
+
+@contextmanager
+def current_tool(name: str | None) -> Iterator[None]:
+    """Name the MCP tool whose bridge calls this thread makes, for the command log (#50)."""
+    previous = getattr(_call_guard, "tool", None)
+    _call_guard.tool = name or None
+    try:
+        yield
+    finally:
+        _call_guard.tool = previous
 
 
 class MaxBridgeError(Exception):
@@ -1124,8 +1136,36 @@ class MaxClient:
         """
         if cmd_type in _CONTROL_CMD_TYPES and self.transport != "tcp" and not self._control_channel:
             return self._send_control_command(command, cmd_type, timeout, probe=probe)
+        if cmd_type in _PROBE_CMD_TYPES or cmd_type in _MAIN_THREAD_FREE_CMD_TYPES:
+            return self._send_command(command, cmd_type, timeout, request_fields, probe=probe)
+        started = time.perf_counter()
+        request_id_box: list[str] = []
+        try:
+            response = self._send_command(command, cmd_type, timeout, request_fields, probe=probe,
+                                          request_id_box=request_id_box)
+        except Exception as exc:
+            if request_id_box and command_log.was_sent(request_id_box[0]):
+                command_log.record_done(request_id_box[0], cmd_type, started, ok=False,
+                                        code=getattr(exc, "code", None) or type(exc).__name__)
+            raise
+        if request_id_box and command_log.was_sent(request_id_box[0]):
+            command_log.record_done(request_id_box[0], cmd_type, started, ok=bool(response.get("success", True)))
+        return response
+
+    def _send_command(
+        self,
+        command: str,
+        cmd_type: str,
+        timeout: Optional[float],
+        request_fields: Optional[dict[str, Any]],
+        *,
+        probe: bool = False,
+        request_id_box: list[str] | None = None,
+    ) -> dict[str, Any]:
         effective_timeout = timeout or self.timeout
         request_id = uuid4().hex
+        if request_id_box is not None:
+            request_id_box.append(request_id)
         started_at = time.perf_counter()
         transport_used = self.transport
         fallback_error: str | None = None
@@ -1236,6 +1276,8 @@ class MaxClient:
                     self._retargeted = None
                 self._inflight = {"cmd_type": cmd_type, "request_id": request_id, "target_pipe": pipe_name,
                                   "target_pid": pid, "timeout_s": timeout, "started": time.perf_counter()}
+                if cmd_type not in _PROBE_CMD_TYPES and cmd_type not in _MAIN_THREAD_FREE_CMD_TYPES:
+                    command_log.record_sent(request, request_id, cmd_type, pid, "namedpipe")
                 try:
                     total_written = 0
                     while total_written < len(data):
@@ -1744,6 +1786,7 @@ class MaxClient:
 
     # ── TCP transport (legacy) ───────────────────────────────────
     def _send_via_tcp(self, request: str, timeout: float) -> bytes:
+        command_log.record_sent(request, None, None, None, "tcp")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         connected = False
