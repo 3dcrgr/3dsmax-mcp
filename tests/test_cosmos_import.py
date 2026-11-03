@@ -1404,10 +1404,11 @@ def slot_prep(active=13, keep=True, free_slot=4, switched=True, **extra):
 
 
 def slot_fin(original=13, switched_to=4, displaced=None, occupant=None, fresh=False, moved_to=0, restored=False,
-             kept_alive=False, active_restored=True, error=""):
+             kept_alive=False, active_restored=True, error="", in_scene=None, unslotted=False):
     return {"original": original, "switched_to": switched_to, "displaced": displaced, "occupant": occupant,
             "imported_occupant": fresh, "moved_to": moved_to, "restored": restored, "kept_alive": kept_alive,
-            "active_restored": active_restored, "error": error}
+            "active_restored": active_restored, "error": error, "moved_over_in_scene": in_scene,
+            "unslotted": unslotted}
 
 
 USER_MAT = {"handle": "2", "name": "Steel_Blurry"}
@@ -1461,8 +1462,8 @@ class ActiveSlotTests(_FlowCase):
         self.assertIn(">(3L)", finalize)  # newest pre-dispatch material handle from KNOWN_BEFORE
 
     def test_free_slot_appeared_after_prepare_displaced_material_restored(self):
-        # No free slot before dispatch, but one was freed meanwhile (e.g. by hand); otherwise the
-        # no-free-slot case ends in the warning below.
+        # No free slot before dispatch, but one was freed meanwhile (e.g. by hand). Without one, a
+        # scene material's slot or no slot takes the import (#53, tests below).
         fin = slot_fin(switched_to=0, displaced=USER_MAT, occupant=IMPORTED, fresh=True, moved_to=5, restored=True,
                        active_restored=None)
         self.use(slot_prep(free_slot=0, switched=False), fin, imported_slot=13)
@@ -1477,7 +1478,9 @@ class ActiveSlotTests(_FlowCase):
         self.assertEqual(result["primary_material"]["medit_slot"], 5)
         self.assertEqual(self.slots(result), {"2": 13, "77": 5})
 
-    def test_no_free_slot_displaced_material_not_restorable_is_warned(self):
+    def test_no_free_slot_restore_that_failed_is_warned(self):
+        # Since #53 the no-free-slot path always restores; restored false now means the slot
+        # assignment itself failed in Max.
         fin = slot_fin(switched_to=0, displaced=USER_MAT, occupant=IMPORTED, fresh=True, kept_alive=True,
                        active_restored=None)
         self.use(slot_prep(free_slot=0, switched=False), fin, imported_slot=13)
@@ -1490,6 +1493,51 @@ class ActiveSlotTests(_FlowCase):
         for needle in ("'Steel_Blurry'", "slot 13", "'Steel_Polished #0'", "no free slot (one holding an unused",
                        "mcp_cosmosMeditDisplaced", "meditMaterials[13] = getAnimByHandle 2L"):
             self.assertIn(needle, warning)
+
+    def test_no_free_slot_import_moves_over_a_scene_material(self):
+        # #53: no free slot. The kept material goes back; the import takes a slot whose material
+        # is on scene objects (it stays there).
+        scene_mat = {"handle": "9", "name": "Floor_Oak"}
+        fin = slot_fin(switched_to=0, displaced=USER_MAT, occupant=IMPORTED, fresh=True, moved_to=7, restored=True,
+                       active_restored=None, in_scene=scene_mat)
+        self.use(slot_prep(free_slot=0, switched=False), fin, imported_slot=13)
+        result = self.run_import()
+        self.assertTrue(result["medit_slot_restored"])
+        self.assertEqual(result["medit_active_slot"]["state"], "restored")
+        self.assertEqual(result["medit_active_slot"]["moved_over"], scene_mat)
+        self.assertTrue(result["medit_active_slot"]["moved_over_in_scene"])
+        self.assertEqual(self.slots(result), {"2": 13, "77": 7})
+        self.assertEqual(result["medit_slot"], 7)
+        [warning] = result["warnings"]
+        for needle in ("slot 13 holds 'Steel_Blurry' again", "'Steel_Polished #0' was put in slot 7",
+                       "replacing 'Floor_Oak'", "still assigned to scene objects"):
+            self.assertIn(needle, warning)
+
+    def test_no_free_or_scene_slot_import_leaves_the_slots(self):
+        fin = slot_fin(switched_to=0, displaced=USER_MAT, occupant=IMPORTED, fresh=True, moved_to=0, restored=True,
+                       active_restored=None, unslotted=True)
+        self.use(slot_prep(free_slot=0, switched=False), fin, imported_slot=13)
+        result = self.run_import()
+        self.assertTrue(result["medit_slot_restored"])
+        self.assertEqual(result["medit_active_slot"]["state"], "restored")
+        self.assertTrue(result["medit_active_slot"]["imported_unslotted"])
+        self.assertEqual(self.slots(result), {"2": 13, "77": None})
+        self.assertIsNone(result["medit_slot"])
+        [warning] = result["warnings"]
+        for needle in ("slot 13 holds 'Steel_Blurry' again", "'Steel_Polished #0'", "in no slot",
+                       "mcp_cosmosMeditDisplaced", "for this session only", "getAnimByHandle 77L"):
+            self.assertIn(needle, warning)
+
+    def test_finalize_always_puts_the_kept_material_back(self):
+        restore = cosmos._SLOT_RESTORE
+        self.assertIn("movedTo=mcpSceneSlot #(a)", restore)
+        self.assertIn("(refs.dependentNodes meditMaterials[i]).count>0", cosmos._SLOT_FNS)
+        # Free slot first, then a scene material's slot, then no slot (the import kept alive).
+        self.assertLess(restore.index("mcpFreeSlot #(a) maxH:__NEWEST__"), restore.index("mcpSceneSlot #(a)"))
+        unslot = restore[restore.index("else (try("):]
+        self.assertLess(unslot.index("mcpKeepAlive cur"), unslot.index("meditMaterials[a]=m"))
+        self.assertIn("unslotted=restored", unslot)
+        self.assertIn('\\"moved_over_in_scene\\":"+(if restored then inScene else "null")', restore)
 
     def test_switched_but_displaced_anyway_uses_the_free_slot(self):
         fin = slot_fin(displaced=USER_MAT, occupant=IMPORTED, fresh=True, moved_to=4, restored=True)

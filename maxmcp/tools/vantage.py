@@ -10,6 +10,7 @@ import uuid
 from typing import Any, Literal, Optional
 
 from ..helpers import vantage_client as vc
+from ..helpers import vantage_diagnostics as vdiag
 from ..helpers import vantage_image as vimg
 from ..helpers.dialogs import open_main_dialogs
 from ..helpers.maxscript import safe_string
@@ -59,8 +60,17 @@ def vantage_status() -> dict[str, Any]:
     while a Live Link is connected; it doesn't say which 3ds Max is linked.
     Uses Vantage's undocumented local command server (localhost, port 20702 by
     default), as Chaos's own 3ds Max scripts do. It can change between versions.
+    recent_crashes: Vantage crash events (Windows Application log, event 1000,
+    vantage*.exe) of the last 24 h, state found, none or unknown, with a hint
+    when the crash was in NVIDIA's NGX/DLSS module. Read-only, 3 s at most.
     """
-    return vc.read_status()
+    status = vc.read_status()
+    crashes = vdiag.recent_crashes()
+    status["recent_crashes"] = crashes
+    warning = vdiag.crash_warning(crashes)
+    if warning:
+        status["warnings"] = list(status.get("warnings") or []) + [warning]
+    return status
 
 
 @mcp.tool()
@@ -235,6 +245,7 @@ def _start(wait_seconds: int) -> dict[str, Any]:
     previous = _OWN["token"] if _OWN else ""
     token = "%d-%s" % (os.getpid(), uuid.uuid4().hex[:12])
     log_before = _chaos_log_state()
+    log_mark = None
     try:
         outcome, detail = _run(_start_script(port, token, previous), timeout=START_TIMEOUT_S)
     except RequestOutcomeUnknown as exc:
@@ -248,6 +259,11 @@ def _start(wait_seconds: int) -> dict[str, Any]:
                                   "note": "The Live Link IPR this server started earlier is still running; "
                                           "waiting for Vantage to connect."}
     elif outcome == "started":
+        log_mark = vdiag.parse_log_mark(detail)
+        if log_mark and not log_mark.get("pid"):
+            # Max.log is shared by every Max of this version: keep this Max's lines (its PID is their first tag).
+            pid = (client.get_last_transport() or {}).get("target_pid")
+            log_mark["pid"] = pid if isinstance(pid, int) and not isinstance(pid, bool) else None
         _OWN = {"token": token, "log": _chaos_log_state(), "connected_seen": False}
         result = {"action": "start", "changed": True, "link_server": "localhost:%d" % port,
                   "note": "Chaos's Vantage toolbar button in Max doesn't show this link; clicking it stops it."}
@@ -283,8 +299,18 @@ def _start(wait_seconds: int) -> dict[str, Any]:
         if ipr == 0 and wait_seconds >= 2 and result["result"] != "linked":
             result["result"] = "start_failed"
             _OWN = None
-            warnings.append("No V-Ray IPR is running in Max after the start: V-Ray didn't start the Live Link IPR. "
-                            "Check the V-Ray log in Max.")
+            errors = vdiag.vray_output_errors(log_mark)
+            if errors:
+                result["max_log_errors"] = errors
+                warnings.append("No V-Ray IPR is running in Max after the start. Max.log shows V-Ray couldn't write "
+                                "its output: %s. Another process may hold the output file (e.g. the raw .vrimg) or "
+                                "its folder isn't writable: free it, or change or turn off that output in Render "
+                                "Setup (V-Ray frame buffer), then retry." % " / ".join(errors))
+            else:
+                warnings.append("No V-Ray IPR is running in Max after the start: V-Ray didn't start the Live Link "
+                                "IPR. Check the V-Ray log in Max%s." % (
+                                    " (%s found no V-Ray output errors since the start)" % log_mark["path"]
+                                    if log_mark else ""))
     dialogs = open_main_dialogs(client)
     if dialogs:
         result["dialogs"] = dialogs
@@ -508,10 +534,13 @@ def _start_script(port: int, token: str, previous: str) -> str:
                         out = (if "{safe_string(previous)}" != "" and {MARKER} == "{safe_string(previous)}" then "own_running|" else "ipr_running|") + (ipr as string)
                     else if viewportIPR then out = "viewport_ipr|"
                     else (
+                        -- #49: Max.log's size before the start, so a failed start can quote what V-Ray logged
+                        local logPath = try (logsystem.getNetLogFileName()) catch ((getDir #maxData) + "Network\\\\Max.log")
+                        local logSize = try (formattedPrint (getFileSize logPath) format:"d") catch ("-1")
                         vrayGPUSetLiveLinkServers #("localhost:{port}")
                         vrayGPUStartIPR liveLinkMode:true
                         {MARKER} = "{safe_string(token)}"
-                        out = "started|"
+                        out = "started|" + logSize + "||" + logPath
                     )
                 )
             )

@@ -30,6 +30,7 @@ Reads Vantage's state without sending anything to 3ds Max:
   - Fields Vantage adds later go in `other_fields`.
   - `linked` is true while a link is connected. It doesn't say which 3ds Max or DCC is linked.
 - A warning when more than one `vantage.exe` runs. A second instance can't open the Live Link port, but may still answer on the command port.
+- `recent_crashes` (#51): Vantage crashes of the last 24 h, from Windows Error Reporting's "Application Error" events (ID 1000) for `vantage*.exe` in the Application log. One `wevtutil` query, with a 3 s timeout (about 0.06 s measured), cached for a minute. `state` is `found` (with `count` and the 5 newest `events`: time, app, module, module version, exception, offset), `none` or `unknown` (any failure). `vantage_live_link`'s status polls don't read it. A found crash adds a warning. When the faulting module is NVIDIA's NGX/DLSS (`_nvngx.dll`), the `hint` and the warning say to turn DLSS Frame Generation off in Vantage or update the NVIDIA driver. On 2026-11-01 Vantage 3.4 crashed 6 times in `_nvngx.dll` 32.0.16.1742 (0xc0000005 at 0x44e54). Verified live on 2026-11-03: the 24 h read gave `none`, a 72 h read found those 6 crashes with the hint.
 
 ## `vantage_get_image`
 
@@ -89,7 +90,7 @@ Only on request. `action` is required.
   - `linked`, on `Connected`.
   - `link_failed`, if Vantage reports `Offline`.
   - `starting`, on timeout. The IPR keeps running, because large scenes take longer to translate.
-  - `start_failed`, if no V-Ray IPR runs in Max afterwards (checked when `wait_seconds` is 2 or more).
+  - `start_failed`, if no V-Ray IPR runs in Max afterwards (checked when `wait_seconds` is 2 or more). Since #49 it quotes what V-Ray logged: the start call records Max.log's size just before `vrayGPUStartIPR` (`logsystem.getNetLogFileName()`, else `getDir #maxData` + `Network\Max.log`). After a failed start the tool reads only what came after that, only lines of this Max (Max.log is shared, and each line carries the PID), and lists V-Ray output errors ("Cannot create output image file", "Permission denied" and the like) in `max_log_errors`, at most 5. The warning then says another process may hold the output file, for example the raw `.vrimg`. That was the cause on 2026-10-30.
   - `requested`, with `wait_seconds=0`.
 - **Afterwards,** one read-only probe reports `vrayIsRenderingIPR()` as `vray_ipr`, and any dialog open in Max is listed under `dialogs`.
 - **If the start request's reply is lost** (`REQUEST_OUTCOME_UNKNOWN`), the link may have started. Check `vantage_status` before doing anything else.
@@ -118,6 +119,12 @@ Any call that sees no IPR running clears the global. After an MCP server restart
 - `rt_system_vrayLog_show` isn't touched. Chaos's scripts set it to 0 on start, then to 2 once Vantage answers the ping, on timeout and on stop, without restoring the user's value.
 - The link server list is left set, as Chaos's stop leaves it.
 - Chaos's Vantage toolbar button in Max doesn't show a link started by this tool, and clicking it stops that link.
+
+## V-Ray GPU output settings (#49)
+
+V-Ray GPU 7.40's own `output_*` parameters (VFB output, the raw `.vrimg` file and so on) are read-only, transient mirrors of the V-Ray settings object in its sub-anim 1 ("V_Ray_settings", a V-Ray renderer instance). So `renderers.current.output_saveRawFile = false` raises "Attempt to set read-only property", while `renderers.current[1].value.output_saveRawFile = false` works. No MCP tool wrote these through `renderers.current`. The one that writes renderer settings is `plugin_patch` with `owner_ref={root: "renderer"}`, and the bridge refuses those parameters with `READ_ONLY`. On that refusal, when every edit is an `output_*` property of the V-Ray GPU production renderer and its schema and inspected state are unchanged, `plugin_patch` now writes them to `renderers.current[1].value` in one undo step and reads them back. The result says `route: "vray_gpu_settings_subanim"`, and a mismatch puts the earlier values back. Other refusals, owners and types are left as they were.
+
+Verified live on Max 2027 (2026-11-03), V-Ray GPU 7 update 4 hotfix 2, no render or IPR: the direct write failed as reported, the sub-anim write worked, and `plugin_patch` turned `output_saveRawFile` from true to false through the new route. The user's raw `.vrimg` lock itself wasn't reproduced. Unit tests: `tests/test_plugin_patch_vray_gpu.py`, `tests/test_vantage_diagnostics.py`, `tests/test_vantage.py`.
 
 ## Not included
 

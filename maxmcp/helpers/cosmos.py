@@ -593,6 +593,11 @@ _SLOT_FNS = r"""local mcpFresh=#()
   for loose in #(false, true) while s==0 do try(for i=1 to meditMaterials.count while s==0 do if (findItem skip i)==0 and (mcpLooksFree meditMaterials[i] loose:loose) and (not loose or (mcpOld meditMaterials[i] maxH)) do s=i)catch(s=0)
   s
  )
+ fn mcpSceneSlot skip = (
+  local s=0
+  try(for i=1 to meditMaterials.count while s==0 do if (findItem skip i)==0 and (try((refs.dependentNodes meditMaterials[i]).count>0)catch(false)) do s=i)catch(s=0)
+  s
+ )
  fn mcpKeepAlive m = (
   if mcp_cosmosMeditDisplaced==undefined do mcp_cosmosMeditDisplaced=#()
   try(appendIfUnique mcp_cosmosMeditDisplaced m; true)catch(false)
@@ -647,7 +652,10 @@ _SLOT_PREPARE = r"""try(
 # The free slot is the one switched to (still pristine; when not default-named, only if
 # it predates dispatch), else any default-named pristine slot, else any pristine slot that
 # predates dispatch (__NEWEST__; moved_over names what it held, kept alive in
-# mcp_cosmosMeditDisplaced); with none, the result is the warning. An open undo
+# mcp_cosmosMeditDisplaced). With none (#53), a slot whose material is on a scene object
+# (it stays there; moved_over_in_scene); with none of those either, the import leaves the
+# slots (unslotted, kept alive in mcp_cosmosMeditDisplaced). Either way the kept
+# material always goes back to its slot. An open undo
 # transaction (busy) leaves the record for pending_restore; a deleted material, another
 # scene file or none of the other slots' prepare-time materials left in any slot (reset or
 # new scene, also untitled) is "stale": the slots are left as they are. Slot assignments
@@ -670,17 +678,29 @@ _SLOT_RESTORE = r"""(
     local cur=try(meditMaterials[a])catch(undefined)
     local displaced=(cur!=undefined and cur!=m)
     local fresh=displaced and (__FRESH_TEST__)
-    local movedTo=0, restored=false, keptAlive=false, activeRestored=undefined, err="", over="null"
+    local movedTo=0, restored=false, keptAlive=false, activeRestored=undefined, err="", over="null", inScene="null", unslotted=false
     if fresh do (
      local fm=if f>0 then (try(meditMaterials[f])catch(undefined)) else undefined
      movedTo=if f>0 and (mcpLooksFree fm loose:(mcpOld fm __NEWEST__)) then f else (mcpFreeSlot #(a) maxH:__NEWEST__)
-     if movedTo>0 do try(
-      over=mcpLooseRef meditMaterials[movedTo]
-      if over!="null" do mcpKeepAlive meditMaterials[movedTo]
+     if movedTo==0 do (
+      movedTo=mcpSceneSlot #(a)
+      if movedTo>0 do inScene=mcpSlotRef meditMaterials[movedTo]
+     )
+     if movedTo>0 then (try(
+      if inScene=="null" do (
+       over=mcpLooseRef meditMaterials[movedTo]
+       if over!="null" do mcpKeepAlive meditMaterials[movedTo]
+      )
       meditMaterials[movedTo]=cur
       meditMaterials[a]=m
       restored=(meditMaterials[a]==m)
-     )catch(err=getCurrentException())
+     )catch(err=getCurrentException()))
+     else (try(
+      mcpKeepAlive cur
+      meditMaterials[a]=m
+      restored=(meditMaterials[a]==m)
+      unslotted=restored
+     )catch(err=getCurrentException()))
     )
     if displaced and not restored do (
      if mcp_cosmosMeditDisplaced==undefined do mcp_cosmosMeditDisplaced=#()
@@ -691,7 +711,7 @@ _SLOT_RESTORE = r"""(
      activeRestored=(activeMeditSlot==a)
     )catch(activeRestored=false; if err=="" do err=getCurrentException())
     mcp_cosmosMeditSlot=undefined
-    out="{\"original\":"+(a as string)+",\"switched_to\":"+(f as string)+",\"displaced\":"+(if displaced then mcpSlotRef m else "null")+",\"occupant\":"+(if displaced then mcpSlotRef cur else "null")+",\"imported_occupant\":"+(if fresh then "true" else "false")+",\"moved_to\":"+(movedTo as string)+",\"moved_over\":"+(if restored then over else "null")+",\"restored\":"+(if restored then "true" else "false")+",\"kept_alive\":"+(if keptAlive then "true" else "false")+",\"active_restored\":"+(if activeRestored==true then "true" else if activeRestored==false then "false" else "null")+",\"error\":\""+(MCP_Server.escapeJsonString(err as string))+"\"}"
+    out="{\"original\":"+(a as string)+",\"switched_to\":"+(f as string)+",\"displaced\":"+(if displaced then mcpSlotRef m else "null")+",\"occupant\":"+(if displaced then mcpSlotRef cur else "null")+",\"imported_occupant\":"+(if fresh then "true" else "false")+",\"moved_to\":"+(movedTo as string)+",\"moved_over\":"+(if restored then over else "null")+",\"moved_over_in_scene\":"+(if restored then inScene else "null")+",\"unslotted\":"+(if unslotted then "true" else "false")+",\"restored\":"+(if restored then "true" else "false")+",\"kept_alive\":"+(if keptAlive then "true" else "false")+",\"active_restored\":"+(if activeRestored==true then "true" else if activeRestored==false then "false" else "null")+",\"error\":\""+(MCP_Server.escapeJsonString(err as string))+"\"}"
    )
   )catch(out="{\"error\":\""+(MCP_Server.escapeJsonString(getCurrentException() as string))+"\"}")
   out
@@ -1378,7 +1398,27 @@ def _slot_record(response, prep, fin, warnings, ran, lost=False):
             _set_slot(response, occupant.get("handle"), fin.get("moved_to"))
             _set_slot(response, displaced.get("handle"), original)
             moved_over = fin.get("moved_over")
-            if moved_over and str(moved_over.get("handle")) != str((over or {}).get("handle")):
+            in_scene = fin.get("moved_over_in_scene")
+            name = occupant.get("name")
+            if fin.get("unslotted"):
+                # #53: every other slot held an unused, edited material: the user's slot is back, and the
+                # import is in no slot (kept alive for this session only).
+                record["imported_unslotted"] = True
+                handle = str(occupant.get("handle") or "")
+                ref = "getAnimByHandle %sL" % handle if handle.isdigit() else "its entry in mcp_cosmosMeditDisplaced"
+                warnings.append("Material Editor slot %s holds '%s' again. No other slot could take the imported "
+                                "'%s' without losing an unassigned material, so it is in no slot: it is kept alive "
+                                "in the MAXScript global mcp_cosmosMeditDisplaced for this session only. Assign it "
+                                "to an object, or put it in a slot (meditMaterials[<slot>] = %s), before saving or "
+                                "resetting." % (original, displaced.get("name"), name, ref))
+            elif in_scene:
+                record["moved_over"] = in_scene
+                record["moved_over_in_scene"] = True
+                warnings.append("No free Material Editor slot: slot %s holds '%s' again, and the imported '%s' was "
+                                "put in slot %s, replacing '%s' there. '%s' is still assigned to scene objects, so "
+                                "it is not lost." % (original, displaced.get("name"), name, fin.get("moved_to"),
+                                                     in_scene.get("name"), in_scene.get("name")))
+            elif moved_over and str(moved_over.get("handle")) != str((over or {}).get("handle")):
                 record["moved_over"] = moved_over
                 warnings.append("The imported material was moved to Material Editor slot %s, replacing '%s' there "
                                 "(unused and unedited, but not default-named; no default-named unused slot was "
