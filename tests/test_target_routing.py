@@ -45,6 +45,7 @@ class _Case(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.gone: set[int] = set()
+        self.started: dict[int, int] = {}  # process start FILETIMEs; 1 (long ago) unless restarted()
         self.live = {OLD_PIPE: True, NEW_PIPE: True}
         self.default_pipe = OLD_PIPE
         self.default_source = "default"
@@ -53,7 +54,7 @@ class _Case(unittest.TestCase):
         for target, value in (
             ("_kernel32", self.kernel),
             ("process_gone", lambda pid, started=None: pid in self.gone),
-            ("process_start_time", mock.Mock(return_value=1)),
+            ("process_start_time", lambda pid: self.started.get(pid, 1)),
             ("quick_hung_check", mock.Mock(return_value=None)),
         ):
             p = mock.patch.object(max_client, target, value)
@@ -87,25 +88,51 @@ class _Case(unittest.TestCase):
         self.gone.add(pid)
         self.live[pipe] = False
 
+    def restarted(self, *pids):
+        """These Max instances started after the bound one last answered (1.7.7: a restart)."""
+        for pid in pids:
+            self.started[pid] = max_client._filetime_now() + 10**9
+
 
 class DefaultRebindTests(_Case):
-    """#22: a target the server picked itself follows the default once its Max has exited."""
+    """#22, with upstream 1.7.7's rule (682aa6f): a target the server picked itself follows its
+    Max's restart once that Max has exited, never a Max that was already open."""
 
     def test_exited_default_re_resolves_with_a_note(self):
         first = self.send()
         self.assertEqual((first["target_pid"], first["target_source"]), (OLD, "default"))
         self.max_exits()
+        self.restarted(NEW)
         self.default_pipe = NEW_PIPE
         moved = self.send()
         self.assertEqual((moved["target_pid"], moved["target_source"]), (NEW, "default"))
         self.assertEqual(moved["retargeted_from"], {"pid": OLD, "pipe": OLD_PIPE, "source": "default"})
         self.assertGreater(moved["selection_generation"], first["selection_generation"])
-        self.assertNotIn("retargeted_from", self.send())  # reported once
+        self.assertIn("retargeted_from", self.send())  # 1.7.7: kept for the rest of this tool call
+        self.client.clear_last_response()  # the next tool call
+        self.assertNotIn("retargeted_from", self.send())  # reported once per tool call
+
+    def test_already_open_max_is_never_taken_over(self):
+        self.send()
+        self.max_exits()
+        self.default_pipe = NEW_PIPE  # NEW was open all along: another session's Max
+        with self.assertRaises(max_client.TargetUnavailable) as ctx:
+            self.send()
+        self.assertTrue(ctx.exception.retryable)
+        self.assertIn("Nothing was sent", str(ctx.exception))
+        self.assertEqual(self.client._bound_target["target_pid"], OLD)
+        self.assertNotIn(NEW_PIPE, self.opened)
+        self.assertEqual(self.kernel.writes, 1)
+        self.live[THIRD_PIPE] = True
+        self.restarted(THIRD)  # the restart comes up: followed, NEW still untouched
+        self.assertEqual(self.send()["target_pid"], THIRD)
+        self.assertNotIn(NEW_PIPE, self.opened)
 
     def test_two_other_instances_refuse_instead_of_guessing(self):
         self.send()
         self.max_exits()
-        self.live[THIRD_PIPE] = True  # e.g. a production Max and a scratch Max both running
+        self.live[THIRD_PIPE] = True  # e.g. a production Max and a scratch Max both started since
+        self.restarted(NEW, THIRD)
         self.default_pipe = NEW_PIPE
         with self.assertRaisesRegex(max_client.AmbiguousMaxInstanceError, f"PIDs {NEW}, {THIRD}") as ctx:
             self.send()
@@ -120,6 +147,7 @@ class DefaultRebindTests(_Case):
         self.send(client)
         self.max_exits()
         self.live[THIRD_PIPE] = True
+        self.restarted(NEW, THIRD)
         with mock.patch.object(MaxClient, "_send_via_tcp") as tcp:
             with self.assertRaises(max_client.AmbiguousMaxInstanceError):
                 client.send_command("1")
@@ -128,6 +156,7 @@ class DefaultRebindTests(_Case):
     def test_claimed_target_also_re_resolves(self):
         self.client._bind(self.client._target(OLD_PIPE, "claim"))
         self.max_exits()
+        self.restarted(NEW)
         self.default_pipe = NEW_PIPE
         self.assertEqual(self.send()["target_pid"], NEW)
 

@@ -89,7 +89,9 @@ class HiddenAgentViewportTests(unittest.TestCase):
 class NativeMessageSourceTests(unittest.TestCase):
     def test_bridge_message_names_the_action(self):
         src = (ROOT / "native" / "src" / "agent_viewport.cpp").read_text(encoding="utf-8")
-        self.assertIn("it is hidden or was closed (for example after a Max restart). ", src)
+        # 1.7.7 (45c3a2e): a first open on a fresh Max no longer leaves the panel half-open,
+        # so the bridge no longer names a restart as a cause.
+        self.assertIn("it is hidden or was closed. ", src)
         self.assertIn('Run agent_viewport(action=\\"open\\") to show it again, then retry.', src)
         self.assertIn('Run agent_viewport(action=\\"release\\"), then agent_viewport(action=\\"open\\"), then retry.',
                       src)

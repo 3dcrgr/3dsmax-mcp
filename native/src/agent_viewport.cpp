@@ -803,6 +803,23 @@ void SetMinimized(bool minimize) {
     if((IsIconic(top)!=FALSE)!=minimize) throw std::runtime_error("Could not change AGENT VIEWPORT minimized state");
 }
 
+// Every Nitrous visual style by name; the artistic ones are Max's "Stylized" menu.
+const char* StyleName(MaxSDK::Graphics::VisualStyle style) {
+    using namespace MaxSDK::Graphics;
+    switch(style) {
+        case VisualStyleRealistic: return "realistic";
+        case VisualStyleShaded: return "smooth";
+        case VisualStyleFacets: return "facets";
+        case VisualStyleConsistentColor: return "flat";
+        case VisualStyleHiddenLine: return "hidden_line";
+        case VisualStyleWireframe: return "wireframe";
+        case VisualStyleBoundingBox: return "bounding_box";
+        case VisualStyleClay: return "clay";
+        case VisualStyleModelAssist: return "model_assist";
+        default: return "stylized";
+    }
+}
+
 class Label final : public ViewportDisplayCallback {
 public:
     void Display(TimeValue, ViewExp* view, int) override {
@@ -954,6 +971,25 @@ std::string Token(ViewExp& view, const RenderState* renderState=nullptr) {
     std::ostringstream out; out << std::hex << hash; return out.str();
 }
 
+// The owned panel after Max has shown it. The first show of a floating panel
+// in a Max session rebuilds it from Max's saved layout: a ViewExp taken before
+// that is replaced (its ID no longer matches, so no redraw is counted and the
+// view reads as "layout changed"), and its visual style reverts to the default.
+// Carry ownership over to the shown panel and restore the single view.
+IViewPanel* AdoptShownPanel(IViewPanelManager& manager) {
+    const int index=manager.GetViewPanelIndexFromFloatingID(floatingID);
+    auto* panel=index>=0 ? manager.GetViewPanel(index) : nullptr;
+    if(!panel || !IsWindow(panel->GetHWnd())) throw std::runtime_error("Owned floating viewport is unavailable after showing it");
+    if(panel->GetHWnd()!=panelWindow) {
+        if(IsWindow(panelWindow)) RemovePropW(panelWindow,kOwner);
+        panelWindow=panel->GetHWnd();
+        if(!SetPropW(panelWindow,kOwner,reinterpret_cast<HANDLE>(&floatingID))) throw std::runtime_error("Cannot reserve viewport ownership");
+    }
+    panel->SetViewPanelName(MSTR(kWindowTitle));
+    if(panel->GetLayout()!=VP_LAYOUT_1) panel->SetLayout(VP_LAYOUT_1);
+    return panel;
+}
+
 // Returns true when an existing agent panel was reclaimed instead of a free one taken.
 bool Open(const json& p, bool reclaimOnly) {
     const int width=static_cast<int>(Number(p,"width",1000,320,4096));
@@ -1002,7 +1038,17 @@ bool Open(const json& p, bool reclaimOnly) {
         if(wcscmp(currentName.data(),kWindowTitle)!=0) { previousPanelName=currentName; restoreName=true; }
         candidate->SetViewPanelName(MSTR(kWindowTitle));
         candidate->SetLayout(VP_LAYOUT_1);
-        auto& view = candidate->GetViewExpByIndex(0);
+        if (!registered) {
+            GetCOREInterface()->RegisterViewportDisplayCallback(FALSE,&label);
+            RegisterNotification(SceneChanged,nullptr,NOTIFY_FILE_POST_OPEN);
+            RegisterNotification(SceneChanged,nullptr,NOTIFY_SYSTEM_POST_RESET);
+            RegisterNotification(SceneChanged,nullptr,NOTIFY_SYSTEM_POST_NEW);
+            registered=true;
+        }
+        // Show first, then configure the view Max actually shows (AdoptShownPanel).
+        manager->SetFloatingViewPanelVisibility(floatingID,true);
+        auto& view = AdoptShownPanel(*manager)->GetViewExpByIndex(0);
+        if (!view.IsAlive()) throw std::runtime_error("AGENT VIEWPORT has no live view after showing its panel");
         viewID = view.GetViewID(); ++generation;
         view.SetViewUser(perspective);
         if (perspective) Extended(view)->SetFOV(fov);
@@ -1021,14 +1067,6 @@ bool Open(const json& p, bool reclaimOnly) {
             settings->SetShadeSelectedObjects(false);
             settings->SetViewportDisable(false);
         }
-        if (!registered) {
-            GetCOREInterface()->RegisterViewportDisplayCallback(FALSE,&label);
-            RegisterNotification(SceneChanged,nullptr,NOTIFY_FILE_POST_OPEN);
-            RegisterNotification(SceneChanged,nullptr,NOTIFY_SYSTEM_POST_RESET);
-            RegisterNotification(SceneChanged,nullptr,NOTIFY_SYSTEM_POST_NEW);
-            registered=true;
-        }
-        manager->SetFloatingViewPanelVisibility(floatingID,true);
         HWND top = FloatingWindow();
         if(!top) throw std::runtime_error("Owned floating viewport window is unavailable");
         if (top) {
@@ -1049,7 +1087,12 @@ bool Open(const json& p, bool reclaimOnly) {
     }
     // Minimized Nitrous panels cannot produce trustworthy images. The caller
     // explicitly restores this panel before navigation or capture.
-    if(!startMinimized) Redraw();
+    if(!startMinimized) {
+        // A just-shown window can miss the first synchronous paint while Max
+        // processes its show and size messages; one more full redraw settles it.
+        try { Redraw(); }
+        catch(...) { Redraw(); }
+    }
     return reclaimed;
 }
 }
@@ -1072,9 +1115,10 @@ ViewExp& Get() {
     }
     const std::string state=WindowState();
     if(state=="minimized") throw std::runtime_error("AGENT VIEWPORT is minimized; use agent_viewport restore before navigation or capture");
-    // #53: a Max restart or a closed window leaves the owned panel hidden.
+    // #53: a closed window leaves the owned panel hidden. (Since 1.7.7 a first open on a
+    // fresh Max no longer leaves it half-open: Open adopts the panel Max shows.)
     if(state=="hidden") throw std::runtime_error(std::string("AGENT VIEWPORT must remain visible for fresh Nitrous captures; "
-        "it is hidden or was closed (for example after a Max restart). ")+(OwnedPanelReusable() ?
+        "it is hidden or was closed. ")+(OwnedPanelReusable() ?
         "Run agent_viewport(action=\"open\") to show it again, then retry." :
         "Run agent_viewport(action=\"release\"), then agent_viewport(action=\"open\"), then retry."));
     if(state=="offscreen")
@@ -1151,10 +1195,7 @@ json Snapshot() {
         {"draw_count",draws},{"isolation_supported",false},{"render",RenderInfo(renderState)}};
     auto* settings=static_cast<MaxSDK::Graphics::IViewportViewSetting*>(view.GetInterface(IVIEWPORT_SETTINGS_INTERFACE_ID));
     if(settings) {
-        const auto style=settings->GetViewportVisualStyle();
-        out["shading"]=style==MaxSDK::Graphics::VisualStyleWireframe ? "wireframe" :
-            style==MaxSDK::Graphics::VisualStyleConsistentColor ? "flat" :
-            style==MaxSDK::Graphics::VisualStyleShaded ? "smooth" : "other";
+        out["shading"]=StyleName(settings->GetViewportVisualStyle());
         out["edges"]=settings->GetShowEdgedFaces();
     }
     return out;
