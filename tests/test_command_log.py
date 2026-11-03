@@ -61,6 +61,20 @@ class CommandLogTests(_LogCase):
         self.assertIn("<redacted>", text)
         self.assertIn("a = 1", text)
 
+    def test_preview_redacts_file_paths(self):
+        cases = {
+            r'loadMaxFile @"\\SERVER\projects\Client X\74X-1.max" quiet:true':
+                'loadMaxFile @"<path>.max" quiet:true',
+            r'loadMaxFile "C:\\Users\\bob\\Desktop\\a b.max"': 'loadMaxFile "<path>.max"',
+            r'bm = openBitmap "D:/Proj/tex/wood.jpg"': 'bm = openBitmap "<path>.jpg"',
+            r'fileIn \\SERVER\share\tool.ms': "fileIn <path>.ms",
+            'box name:"A" pos:[1,2,3]': 'box name:"A" pos:[1,2,3]',
+            'print "ratio 1:2"': 'print "ratio 1:2"',
+        }
+        for script, expected in cases.items():
+            with self.subTest(script=script):
+                self.assertEqual(command_log.preview(script), expected)
+
     def test_done_line_and_disable(self):
         command_log.record_done("R1", "maxscript", 0.0, ok=False, code="MAX_BUSY")
         (entry,) = self.lines()

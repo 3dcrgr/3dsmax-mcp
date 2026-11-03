@@ -9,8 +9,9 @@ File: %LOCALAPPDATA%\\3dsmax-mcp\\diagnostics\\recent-commands.jsonl, the folder
 capture_hang_diagnostics saves to. Size-capped: once it holds more than
 2 * KEEP_LINES lines it is rewritten with the newest KEEP_LINES (about the last
 200 commands). Several MCP servers may append to it, each line names its server
-PID. Scripts are cut to PREVIEW_CHARS, and values after password, token, secret
-or key style names are replaced by <redacted>.
+PID. Scripts are cut to PREVIEW_CHARS, values after password, token, secret
+or key style names are replaced by <redacted>, and file paths by <path> plus
+their extension.
 
 Logging never raises: a full disk or a locked file only loses log lines.
 Set MCP_COMMAND_LOG=0 to turn it off.
@@ -43,6 +44,29 @@ _SECRET = re.compile(
     (\s*[:=]\s*|\s+)
     ("[^"]*"|'[^']*'|@"[^"]*"|[^\s,;)]+)""")
 _WHITESPACE = re.compile(r"\s+")
+# File paths name users, clients and projects: keep only the extension. A quoted
+# string that holds a drive path (C:\..., C:/...) or a UNC path (\\server\...) is
+# replaced whole, spaces included. Unquoted paths are cut at the first space.
+_PATH_START = re.compile(r"""(?:\b[A-Za-z]:[\\/]|\\\\[^\\\s"'])""")
+_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|@"[^"]*"|\'[^\']*\'')
+_BARE_PATH = re.compile(r"""(?:\b[A-Za-z]:[\\/]|\\\\(?=[^\\\s"']))[^"'\s,;)\]]*""")
+_EXT = re.compile(r"\.[A-Za-z0-9]{1,8}(?=[\"']?$)")
+
+
+def _path_stub(text: str) -> str:
+    ext = _EXT.search(text)
+    return "<path>" + (ext.group(0) if ext else "")
+
+
+def _redact_paths(text: str) -> str:
+    def quoted(match: re.Match) -> str:
+        s = match.group(0)
+        if not _PATH_START.search(s):
+            return s
+        quote = '@"' if s.startswith('@"') else s[0]
+        return quote + _path_stub(s) + s[-1]
+    text = _QUOTED.sub(quoted, text)
+    return _BARE_PATH.sub(lambda m: _path_stub(m.group(0)), text)
 
 
 def enabled() -> bool:
@@ -64,6 +88,7 @@ def preview(text: Any, limit: int = PREVIEW_CHARS) -> str:
     """One line, secrets redacted, at most `limit` characters."""
     flat = _WHITESPACE.sub(" ", str(text or "")).strip()
     flat = _SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", flat)
+    flat = _redact_paths(flat)
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
