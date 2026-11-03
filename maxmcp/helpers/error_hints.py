@@ -299,6 +299,21 @@ def current_modifier_hint(script: str | None, message: str = "") -> ToolHint | N
     return edit_poly_hint(script, message) or cloth_hint(script, message)
 
 
+_VRAY_OUTPUT_READ_ONLY = re.compile(r"read-only property:\s*output_", re.IGNORECASE)
+
+
+def vray_output_hint(message: str = "") -> ToolHint | None:
+    """V-Ray GPU exposes output_* as read-only copies, the real settings live in sub-anim 1 (#49)."""
+    if not _VRAY_OUTPUT_READ_ONLY.search(message or ""):
+        return None
+    return ToolHint(
+        message=("On V-Ray GPU the output_* render settings are read-only through renderers.current. "
+                 "Write them through its V-Ray settings object, renderers.current[1].value.<property>, "
+                 "or use plugin_patch with root renderer, which does that for you."),
+        suggested_tools=["plugin_patch"],
+    )
+
+
 def suggest_tools_for_maxscript(script: str) -> list[str]:
     """Return dedicated MCP tools that match MAXScript intent patterns."""
     suggestions: list[str] = []
@@ -397,7 +412,7 @@ def resolve_error_hint(
     elif isinstance(raw_result, dict):
         message = str(raw_result.get("error") or raw_result.get("message") or "")
 
-    current = current_modifier_hint(script, message)
+    current = current_modifier_hint(script, message) or vray_output_hint(message)
     if current is not None:
         return current
 

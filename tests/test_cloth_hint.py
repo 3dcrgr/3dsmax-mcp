@@ -99,3 +99,15 @@ class ClothWarningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VRayOutputHintTests(unittest.TestCase):
+    def test_read_only_output_points_at_the_settings_object(self):
+        from maxmcp.helpers.error_hints import resolve_error_hint
+        hint = resolve_error_hint(error={"message": "Attempt to set read-only property: output_saveRawFile"})
+        self.assertIn("renderers.current[1].value", hint["message"])
+        self.assertEqual(hint["suggested_tools"], ["plugin_patch"])
+
+    def test_other_read_only_errors_are_left_alone(self):
+        from maxmcp.helpers.error_hints import vray_output_hint
+        self.assertIsNone(vray_output_hint("Attempt to set read-only property: width"))
