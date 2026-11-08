@@ -1821,6 +1821,12 @@ class MaxClient:
         except Exception:
             return []
 
+    def job_request_ids(self) -> list[str]:
+        """Unfinished jobs owned by this server; do not consume their replies."""
+        with self._blocked_lock:
+            return [rid for rid, entry in self._blocked.items()
+                    if entry.get("job") and not entry["reader"].done.is_set()]
+
     def blocked_request_ids(self) -> list[str]:
         """Request ids of BLOCKED_BY_DIALOG calls still waiting in Max. Never consumes results."""
         with self._blocked_lock:

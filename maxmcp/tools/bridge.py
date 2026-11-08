@@ -138,6 +138,13 @@ def _abandoned_ids() -> set:
     return {i for i in ids if isinstance(i, str)} if isinstance(ids, (list, tuple, set)) else set()
 
 
+def _job_ids() -> set:
+    """Long-running jobs remain ours after their tool returns a job handle."""
+    getter = getattr(client, "job_request_ids", None)
+    ids = getter() if callable(getter) else ()
+    return {i for i in ids if isinstance(i, str)} if isinstance(ids, (list, tuple, set)) else set()
+
+
 def _dialog_summaries(dialogs) -> list[dict]:
     keep = ("dialog_id", "title", "kind", "main_thread", "age_ms", "during_requests", "text", "buttons")
     return [{k: d[k] for k in keep if k in d} for d in dialogs or [] if isinstance(d, dict)]
@@ -203,7 +210,7 @@ def _held_by_dialog(health: dict, request_sent: bool = False) -> str | None:
         return None
     mine = client.inflight()
     mine_id = mine.get("request_id") if isinstance(mine, dict) else None
-    if request_id == mine_id or request_id in _blocked_ids() or request_id in _abandoned_ids():
+    if request_id == mine_id or request_id in _blocked_ids() or request_id in _abandoned_ids() or request_id in _job_ids():
         owner = "this_server"
     else:
         entry = next((r for r in (health.get("clients") or {}).get("inflight") or []
@@ -261,7 +268,8 @@ def _busy_from_health(health: dict, probe_queued: bool = False) -> str | None:
     inflight = (health.get("clients") or {}).get("inflight") or []
     blocked_ids = _blocked_ids()
     abandoned_ids = _abandoned_ids()
-    ours = {i for i in (mine_id, abandoned_id) if i} | blocked_ids | abandoned_ids
+    job_ids = _job_ids()
+    ours = {i for i in (mine_id, abandoned_id) if i} | blocked_ids | abandoned_ids | job_ids
     others = [r for r in inflight if r.get("requestId") not in ours and not _internal(r)
               and r.get("cmdType") not in _CONTROL_REQUESTS | _STATUS_PROBES]
     sent = "This status ping waits behind it and changes nothing" if probe_queued else "Nothing was sent"
@@ -269,6 +277,8 @@ def _busy_from_health(health: dict, probe_queued: bool = False) -> str | None:
     held_by_dialog = False
     if running:
         owner = _running_owner(running, inflight, mine_id, abandoned_id, abandoned_ids)
+        if running.get("requestId") in job_ids:
+            owner = "this_server"
         if owner in ("other_client", "unknown") and running.get("requestId") in blocked_ids:
             owner, held_by_dialog = "this_server", True  # returned BLOCKED_BY_DIALOG, still running in Max
         cmd = running.get("cmdType") or "unlabelled"

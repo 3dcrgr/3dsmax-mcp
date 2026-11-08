@@ -746,6 +746,6 @@ def capture_multi_view(
     result["grid"] = data.get("grid")
     result["framed_root"] = data.get("framed_root")
     for key in ("source","agent_views","restored_agent_viewport","isolation_applied","capture_contract","capture_methods",
-                "occlusion_free","frames","restored_frame","shading","edges"):
+                "occlusion_free","frames","framed_over_frames","restored_frame","shading","edges"):
         if key in data: result[key]=data[key]
     return result

@@ -53,7 +53,7 @@ def _process(state, cpu=0.01):
 class _StatusCase(unittest.TestCase):
     def status(self, health, *, mine=None, process=None, ping=PING, verdict=None, transport="auto",
                open_dialogs=None, dialog_status=None, blocked=(), blocked_call=None,
-               abandoned=(), abandoned_call=None):
+               abandoned=(), abandoned_call=None, jobs=()):
         client = mock.Mock()
         client.transport = transport
         client.inflight.return_value = mine
@@ -61,6 +61,7 @@ class _StatusCase(unittest.TestCase):
         client.blocked_request_ids.return_value = list(blocked)
         client.blocked_call.return_value = blocked_call
         client.abandoned_request_ids.return_value = list(abandoned)  # #48
+        client.job_request_ids.return_value = list(jobs)
         client.abandoned_call.return_value = abandoned_call
         client._dialog_control.return_value = dialog_status or {}
         self.client = client
@@ -175,6 +176,19 @@ def _entry(client_id, request_id, cmd_type, elapsed_ms, **extra):
 
 
 class AttributionTests(_StatusCase):
+    def test_owned_job_is_neither_foreign_nor_abandoned(self):
+        running = {"cmdType": "native:capture_multi_view", "runningMs": 6000,
+                   "clientId": "pipe-828", "requestId": "job-ours"}
+        inflight = [dict(running, elapsedMs=6100)]
+        health = _health("busy_mcp", pumping=False, heartbeat_ms=6000,
+                         running=running, inflight=inflight, version=2)
+        payload, _, _ = self.status(health, jobs=["job-ours"], process=_process("busy"))
+        own = payload["main_thread"]["running"]
+        self.assertEqual(own["owner"], "this_server")
+        self.assertFalse(own["abandoned"])
+        self.assertNotIn("blocked_by_dialog", own)
+        self.assertEqual(payload["other_clients"], [])
+
     def test_queued_own_request_behind_another_clients_same_type_request(self):
         # cmd-type-only matching used to call the other client's running request ours.
         mine = {"cmd_type": "maxscript", "request_id": "MINE", "running_s": 2.0, "timeout_s": 120.0}

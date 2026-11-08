@@ -46,6 +46,20 @@ def message(exc):
 
 
 class HiddenAgentViewportTests(unittest.TestCase):
+    def test_capture_forwards_frame_framing_on_initial_and_job_results(self):
+        viewport = _load(mock.Mock(native_available=True))
+        data = {"file": "scratch.png", "frames": [0, 5, 10], "framed_root": "subject",
+                "framed_over_frames": True, "restored_frame": 0}
+        outcome = viewport.jobs.Outcome(response={"result": json.dumps(data)})
+        for job in (None, "capture_multi_view:test-job"):
+            with self.subTest(job=job), \
+                    mock.patch.object(viewport.jobs, "start", return_value=outcome), \
+                    mock.patch.object(viewport.jobs, "resume", return_value=outcome), \
+                    mock.patch.object(viewport, "_image_file_result", return_value={}):
+                result = viewport.capture_multi_view(frames=[0, 5, 10], frame_root="subject", job=job)
+                self.assertIs(result["framed_over_frames"], True)
+                self.assertEqual(result["framed_root"], "subject")
+
     def test_capture_names_release_then_open_from_status(self):
         status = {"owner": "agent", "window_state": "hidden", "next_action": "release then open"}
         viewport = _load(_client(MaxBridgeError(OLD, {"error": OLD}), status))
