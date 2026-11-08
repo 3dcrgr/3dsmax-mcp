@@ -17,6 +17,8 @@ Connect AI agents to Autodesk 3ds Max through the [Model Context Protocol](https
 >
 > **Verified deployed follow-up:** brief native-pipe gaps are retried for up to 0.25 s, and HDRI imports report their created dome lights. Independent Max 2027 checks and installed-file equality are recorded in [verification](docs/fork/verification-2026-10-18-pipe-cosmos.md). No rebuilt Setup/release is included.
 >
+> **1.7.7 deployed verification:** pending capture jobs retain correct server ownership, frame strips preserve framing metadata, and the corrected restart/claim checks pass. See [scope and receipt hashes](docs/fork/verification-2026-11-08-177.md). Existing user servers need restarting to load changed Python.
+>
 > Everything below is upstream's README, unchanged.
 
 Automate everything!

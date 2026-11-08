@@ -247,3 +247,7 @@ Registry cleanup passed a live scan and exact-PID pings. The #32–#34 Python fi
 ## Deployed pipe and HDRI follow-up (2026-10-20 publication)
 
 Commits 608b3d0 and 993ed0b were deployed and independently live-tested on Max 2027 on 2026-10-18. A fresh source/installed comparison found all 458 maxmcp files identical and no missing files; both native copies match the source bridge. The pipe-gap check passed all 8 live rounds, and two HDRI imports each reported their new dome light. See [the full regression report](fork/verification-2026-10-18-pipe-cosmos.md), including the rerun limitations and exact test scope. Publication adds documentation; no repeat deployment or live tests were needed. Setup/release distribution remains pending.
+
+## 1.7.7 deployed acceptance, 2026-11-08
+
+The installed upstream 1.7.7 merge and follow-up ccdaaad passed 24 targeted live checks: 10 for job ownership/lifecycle, 4 for frame-strip metadata, and 10 for private-registry restart/claim routing. The full Python suite ran 1255 tests with 5 skips. All 461 installed package files match the candidate; both installed Max 2027 bridges match the source binary. See [the verification record](fork/verification-2026-11-08-177.md) for exact scope, earlier receipt corrections, hashes and remaining gaps. No rebuilt Setup/release is included.

@@ -187,7 +187,7 @@ The installer's runtime ignores `PYTHONPATH`, hence the `sys.path` line. See [Ad
 
 | Max | Bridge in `native/bin/` |
 |---|---|
-| 2027 | Fork build from `a86ade0`: upstream's shell and core as of `71f72a8` with every native fix (hash in `native/bin/bridge_manifest.json`); not deployed or live-tested yet |
+| 2027 | Fork build on upstream 1.7.7, artifact `cd6d7c2` (hash in `native/bin/bridge_manifest.json`); deployed on the verified scratch runtime. See [acceptance scope](verification-2026-11-08-177.md). |
 | 2023–2026 | Upstream's rebuilds from `71f72a8` (1.7.6 plus #35). The fork's 1.7.5-based 2026 build (`d5cd6ba5…`) was dropped in the 1.7.6 merge |
 
 With an upstream bridge, the Python-side fixes work but the native ones are missing. For those, build the bridge for your version yourself: see [Building the native bridge](../FORK.md#building-the-native-bridge). It needs Visual Studio 2022 with the v143 14.38 toolset and the 3ds Max SDK. To replace only a bridge, close every 3ds Max first and keep a copy of the old file.
